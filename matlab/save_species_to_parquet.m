@@ -1,0 +1,126 @@
+function save_species_to_parquet(species_data, output_file, project_root, chunk_params)
+%SAVE_SPECIES_TO_PARQUET Save extracted species data to Parquet format via Python
+%
+% This function converts MATLAB species data to JSON, then calls a Python
+% script to write the data in Parquet format for efficient storage.
+%
+% Inputs:
+%   species_data  - Struct from extract_all_species_arrays with fields:
+%                   .n_sims, .n_species, .species_names, .time_arrays,
+%                   .species_arrays, .status
+%   output_file   - Path to output Parquet file
+%   project_root  - Path to project root directory (for finding Python script)
+%   chunk_params  - (Optional) Struct with parameter names and values:
+%                   .names - Cell array of parameter names
+%                   .(param_name).LHS - Array of parameter values for each simulation
+%
+% Example:
+%   save_species_to_parquet(species_data, '/path/to/output.parquet', pwd, chunk_params);
+
+fprintf('   Saving species data to Parquet: %s\n', output_file);
+
+% Create temporary JSON file for data transfer
+temp_json = tempname;
+temp_json = [temp_json '.json'];
+
+try
+    % Convert MATLAB cell arrays to nested JSON structure
+    json_data = struct();
+    json_data.n_sims = species_data.n_sims;
+    json_data.n_species = species_data.n_species;
+    json_data.species_names = species_data.species_names;
+    json_data.status = species_data.status;
+
+    % Extract and include parameter data if provided
+    if nargin >= 4 && ~isempty(chunk_params) && isfield(chunk_params, 'names')
+        fprintf('   Including %d parameters in Parquet file\n', length(chunk_params.names));
+        json_data.param_names = chunk_params.names;
+
+        % Extract parameter values into matrix (n_sims x n_params)
+        param_values = zeros(species_data.n_sims, length(chunk_params.names));
+        for j = 1:length(chunk_params.names)
+            param_name = chunk_params.names{j};
+            if isfield(chunk_params, param_name) && isfield(chunk_params.(param_name), 'LHS')
+                param_values(:, j) = chunk_params.(param_name).LHS;
+            end
+        end
+        json_data.param_values = param_values;
+    else
+        % No parameters provided
+        json_data.param_names = {};
+        json_data.param_values = [];
+    end
+
+    % Convert time arrays (cell array -> array of arrays)
+    json_data.time_arrays = cell(species_data.n_sims, 1);
+    for i = 1:species_data.n_sims
+        if isempty(species_data.time_arrays{i})
+            json_data.time_arrays{i} = [];
+        else
+            json_data.time_arrays{i} = species_data.time_arrays{i};
+        end
+    end
+
+    % Convert species arrays (n_sims x n_species cell array -> nested arrays)
+    json_data.species_arrays = cell(species_data.n_sims, 1);
+    for i = 1:species_data.n_sims
+        json_data.species_arrays{i} = cell(species_data.n_species, 1);
+        for j = 1:species_data.n_species
+            if isempty(species_data.species_arrays{i, j})
+                json_data.species_arrays{i}{j} = [];
+            else
+                json_data.species_arrays{i}{j} = species_data.species_arrays{i, j};
+            end
+        end
+    end
+
+    % Write JSON file
+    json_str = jsonencode(json_data);
+    fid = fopen(temp_json, 'w');
+    fprintf(fid, '%s', json_str);
+    fclose(fid);
+
+    % Call Python script to write Parquet
+    python_script = fullfile(project_root, 'metadata', 'write_species_parquet.py');
+
+    % Try to use HPC venv Python from environment variable first
+    hpc_venv_path = getenv('HPC_VENV_PATH');
+    if ~isempty(hpc_venv_path)
+        venv_python = fullfile(hpc_venv_path, 'bin', 'python');
+    else
+        % Fallback to default location
+        home_dir = getenv('HOME');
+        venv_python = fullfile(home_dir, 'qspio_venv', 'bin', 'python');
+    end
+
+    if exist(venv_python, 'file')
+        % Use venv Python (HPC)
+        python_cmd = venv_python;
+        fprintf('   Using HPC venv Python: %s\n', python_cmd);
+    else
+        % Fall back to system Python (local)
+        python_cmd = 'python';
+        fprintf('   Using system Python\n');
+    end
+
+    cmd = sprintf('"%s" "%s" "%s" "%s"', python_cmd, python_script, temp_json, output_file);
+    [status, output] = system(cmd);
+
+    if status ~= 0
+        error('Python Parquet writer failed:\n%s', output);
+    end
+
+    fprintf('   Parquet file saved: %s\n', output_file);
+
+catch ME
+    fprintf('   ⚠️  Error saving Parquet: %s\n', ME.message);
+    rethrow(ME);
+
+finally
+    % Clean up temporary JSON file
+    if exist(temp_json, 'file')
+        delete(temp_json);
+    end
+end
+
+end

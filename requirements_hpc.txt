@@ -1,0 +1,11 @@
+# Python dependencies for HPC QSP simulation processing
+# These are needed for:
+# - Saving full simulations to Parquet format
+# - Deriving test statistics from full simulations
+#
+# Managed by uv with Python 3.11+
+
+numpy>=1.24.0
+pandas>=2.0.0
+pyarrow>=12.0.0
+scipy>=1.10.0

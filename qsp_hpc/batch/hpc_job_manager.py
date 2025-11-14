@@ -119,15 +119,42 @@ class HPCJobManager:
         ]
 
     def _load_config_from_yaml(self) -> BatchConfig:
-        """Load configuration from batch_credentials.yaml."""
-        config_file = Path('batch_credentials.yaml')
-        if not config_file.exists():
-            raise FileNotFoundError(
-                "batch_credentials.yaml not found. Required for HPC job submission."
-            )
+        """
+        Load configuration with hierarchical override:
+        1. ~/.config/qsp-hpc/credentials.yaml (global defaults)
+        2. ./batch_credentials.yaml (project-specific overrides)
+        """
+        # Check for global config
+        global_config_file = Path.home() / '.config' / 'qsp-hpc' / 'credentials.yaml'
+        project_config_file = Path('batch_credentials.yaml')
 
-        with open(config_file, 'r') as f:
-            yaml_config = yaml.safe_load(f)
+        yaml_config = {}
+
+        # Load global config if it exists
+        if global_config_file.exists():
+            with open(global_config_file, 'r') as f:
+                yaml_config = yaml.safe_load(f) or {}
+
+        # Load and merge project config if it exists
+        if project_config_file.exists():
+            with open(project_config_file, 'r') as f:
+                project_config = yaml.safe_load(f) or {}
+                # Deep merge: project config overrides global config
+                for key in ['ssh', 'cluster']:
+                    if key in project_config:
+                        if key in yaml_config:
+                            yaml_config[key].update(project_config[key])
+                        else:
+                            yaml_config[key] = project_config[key]
+
+        # Require at least one config file
+        if not yaml_config:
+            raise FileNotFoundError(
+                "No configuration found. Please create one of:\n"
+                f"  - {global_config_file} (global defaults)\n"
+                f"  - {project_config_file} (project-specific)\n"
+                "See batch_credentials.yaml.template for format."
+            )
 
         ssh = yaml_config.get('ssh', {})
         cluster = yaml_config.get('cluster', {})

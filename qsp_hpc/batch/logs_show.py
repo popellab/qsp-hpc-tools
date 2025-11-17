@@ -7,25 +7,20 @@ for test statistic derivation.
 
 Usage:
     # Show task 0 from latest job
-    python metadata/cli/logs_show.py
+    python -m qsp_hpc.batch.logs_show
 
     # Show task 3 from latest job
-    python metadata/cli/logs_show.py 3
+    python -m qsp_hpc.batch.logs_show 3
 
     # Show last 100 lines instead of 50
-    python metadata/cli/logs_show.py 3 --lines 100
+    python -m qsp_hpc.batch.logs_show 3 --lines 100
 
     # Use different project
-    python metadata/cli/logs_show.py 3 --project pdac_2024
+    python -m qsp_hpc.batch.logs_show 3 --project pdac_2024
 """
 
 import argparse
-import sys
 from pathlib import Path
-
-# Add project root to path
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
 
 from qsp_hpc.batch.hpc_job_manager import HPCJobManager
 

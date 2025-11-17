@@ -24,7 +24,6 @@ import csv
 import tempfile
 import subprocess
 import numpy as np
-import torch
 import time
 import re
 import yaml
@@ -634,7 +633,7 @@ class QSPSimulator:
         # Import HPC job manager
         from qsp_hpc.batch.hpc_job_manager import HPCJobManager
 
-        # Create job manager (loads from batch_credentials.yaml)
+        # Create job manager (loads from global config)
         job_manager = HPCJobManager()
 
         # Extract project name from test_stats_csv path
@@ -687,7 +686,7 @@ class QSPSimulator:
 
     def _load_batch_config(self) -> Dict:
         """
-        Load batch configuration from batch_credentials.yaml.
+        Load batch configuration from ~/.config/qsp-hpc/credentials.yaml.
 
         Returns:
             Dictionary with SSH and cluster configuration
@@ -695,10 +694,11 @@ class QSPSimulator:
         if self.batch_config is not None:
             return self.batch_config
 
-        config_file = Path('batch_credentials.yaml')
+        config_file = Path.home() / '.config' / 'qsp-hpc' / 'credentials.yaml'
         if not config_file.exists():
             raise FileNotFoundError(
-                "batch_credentials.yaml not found. This file is required for HPC job monitoring."
+                f"Configuration not found at {config_file}\n"
+                "Please run 'qsp-hpc setup' to configure HPC connection."
             )
 
         with open(config_file, 'r') as f:
@@ -713,7 +713,10 @@ class QSPSimulator:
         }
 
         if not self.batch_config['ssh_host']:
-            raise ValueError("SSH host not configured in batch_credentials.yaml")
+            raise ValueError(
+                "SSH host not configured in credentials.yaml\n"
+                "Please run 'qsp-hpc setup' to configure HPC connection."
+            )
 
         return self.batch_config
 
@@ -728,7 +731,7 @@ class QSPSimulator:
             # Import HPC job manager
             from qsp_hpc.batch.hpc_job_manager import HPCJobManager
 
-            # Create job manager (loads from batch_credentials.yaml)
+            # Create job manager (loads from global config)
             job_manager = HPCJobManager()
 
             # Validate SSH connection (fast - should return in 1-2s)

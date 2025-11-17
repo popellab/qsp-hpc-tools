@@ -48,4 +48,3 @@ Thumbs.db
 *.csv
 cache/
 simulations/
-batch_credentials.yaml

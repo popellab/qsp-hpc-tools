@@ -114,65 +114,53 @@ class HPCJobManager:
             '*.swo',
             '__pycache__/',
             'node_modules/',
-            'batch_credentials.yaml',
             'slurm_config.yaml'
         ]
 
     def _load_config_from_yaml(self) -> BatchConfig:
         """
-        Load configuration with hierarchical override:
-        1. ~/.config/qsp-hpc/credentials.yaml (global defaults)
-        2. ./batch_credentials.yaml (project-specific overrides)
+        Load configuration from ~/.config/qsp-hpc/credentials.yaml
+
+        Run 'qsp-hpc setup' to create this configuration file.
         """
-        # Check for global config
         global_config_file = Path.home() / '.config' / 'qsp-hpc' / 'credentials.yaml'
-        project_config_file = Path('batch_credentials.yaml')
 
-        yaml_config = {}
-
-        # Load global config if it exists
-        if global_config_file.exists():
-            with open(global_config_file, 'r') as f:
-                yaml_config = yaml.safe_load(f) or {}
-
-        # Load and merge project config if it exists
-        if project_config_file.exists():
-            with open(project_config_file, 'r') as f:
-                project_config = yaml.safe_load(f) or {}
-                # Deep merge: project config overrides global config
-                for key in ['ssh', 'cluster']:
-                    if key in project_config:
-                        if key in yaml_config:
-                            yaml_config[key].update(project_config[key])
-                        else:
-                            yaml_config[key] = project_config[key]
-
-        # Require at least one config file
-        if not yaml_config:
+        if not global_config_file.exists():
             raise FileNotFoundError(
-                "No configuration found. Please create one of:\n"
-                f"  - {global_config_file} (global defaults)\n"
-                f"  - {project_config_file} (project-specific)\n"
-                "See batch_credentials.yaml.template for format."
+                f"Configuration not found at {global_config_file}\n"
+                "Please run 'qsp-hpc setup' to configure HPC connection."
+            )
+
+        with open(global_config_file, 'r') as f:
+            yaml_config = yaml.safe_load(f) or {}
+
+        if not yaml_config:
+            raise ValueError(
+                f"Configuration file {global_config_file} is empty.\n"
+                "Please run 'qsp-hpc setup' to configure HPC connection."
             )
 
         ssh = yaml_config.get('ssh', {})
         cluster = yaml_config.get('cluster', {})
+        paths = yaml_config.get('paths', {})
+        slurm = yaml_config.get('slurm', {})
 
         # Require simulation_pool_path (no fallback)
-        simulation_pool_path = ssh.get('simulation_pool_path')
+        simulation_pool_path = paths.get('simulation_pool_path')
         if not simulation_pool_path:
             raise ValueError(
-                "ssh.simulation_pool_path must be specified in batch_credentials.yaml. "
-                "This is the HPC path where simulation pools are stored (e.g., '/home/username/data/qsp_simulations')"
+                "paths.simulation_pool_path must be specified in credentials.yaml. "
+                "This is the HPC path where simulation pools are stored (e.g., '/scratch/username/simulations'). "
+                "Run 'qsp-hpc setup' to configure."
             )
 
         # Require hpc_venv_path (no fallback)
-        hpc_venv_path = ssh.get('hpc_venv_path')
+        hpc_venv_path = paths.get('hpc_venv_path')
         if not hpc_venv_path:
             raise ValueError(
-                "ssh.hpc_venv_path must be specified in batch_credentials.yaml. "
-                "This is the HPC Python virtual environment path (e.g., '/home/username/qspio_venv')"
+                "paths.hpc_venv_path must be specified in credentials.yaml. "
+                "This is the HPC Python virtual environment path (e.g., '/home/username/.venv/hpc-qsp'). "
+                "Run 'qsp-hpc setup' to configure."
             )
 
         return BatchConfig(
@@ -181,10 +169,10 @@ class HPCJobManager:
             simulation_pool_path=simulation_pool_path,
             hpc_venv_path=hpc_venv_path,
             ssh_key=ssh.get('key', ''),
-            remote_project_path=ssh.get('remote_project_path', ''),
-            partition=cluster.get('partition', 'shared'),
-            time_limit=cluster.get('time_limit', '01:00:00'),  # Default 1 hour
-            memory_per_job=cluster.get('memory_per_job', '4G'),  # Default 4G
+            remote_project_path=paths.get('remote_base_dir', ''),
+            partition=slurm.get('partition', 'shared'),
+            time_limit=slurm.get('time_limit', '01:00:00'),  # Default 1 hour
+            memory_per_job=slurm.get('mem_per_cpu', '4G'),  # Default 4G
             matlab_module=cluster.get('matlab_module', 'matlab/R2024a')
         )
 
@@ -1436,12 +1424,12 @@ echo "Derivation completed at $(date)"
 
 
 # Convenience function
-def create_hpc_manager(config_file: str = 'batch_credentials.yaml') -> HPCJobManager:
+def create_hpc_manager() -> HPCJobManager:
     """
-    Create HPC job manager from config file.
+    Create HPC job manager using global configuration.
 
-    Args:
-        config_file: Path to batch credentials YAML
+    Configuration is loaded from ~/.config/qsp-hpc/credentials.yaml
+    Run 'qsp-hpc setup' to configure.
 
     Returns:
         HPCJobManager instance

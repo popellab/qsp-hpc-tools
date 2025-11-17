@@ -126,8 +126,9 @@ class SimulationPoolManager:
 
         # Batch filename pattern for parsing
         # Format: batch_{timestamp}_{scenario}_{n_sims}sims_seed{seed}.mat
+        # Note: scenario can contain underscores, so we use non-greedy match
         self.batch_pattern = re.compile(
-            r'batch_(\d{8}_\d{6})_([^_]+)_(\d+)sims_seed(\d+)\.mat'
+            r'batch_(\d{8}_\d{6})_(.+?)_(\d+)sims_seed(\d+)\.mat'
         )
 
     def _compute_config_hash(self) -> str:

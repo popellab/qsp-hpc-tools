@@ -128,9 +128,12 @@ echo "Job ID: $SLURM_JOB_ID"
 export HPC_VENV_PATH="{self.config.hpc_venv_path}"
 export SIMULATION_POOL_PATH="{self.config.simulation_pool_path}"
 
+# Get MATLAB scripts path from installed qsp-hpc-tools package
+MATLAB_PATH=$("{self.config.hpc_venv_path}/bin/python" -c "import qsp_hpc.matlab; print(qsp_hpc.matlab.get_matlab_path())")
+
 module load {self.config.matlab_module}
 cd "{project_path}"
-matlab -nodisplay -nodesktop -nosplash -r "batch_worker('{project_name}'); exit"
+matlab -nodisplay -nodesktop -nosplash -r "addpath('$MATLAB_PATH'); batch_worker('{project_name}'); exit"
 echo "Job completed at $(date)"
 """
         return script

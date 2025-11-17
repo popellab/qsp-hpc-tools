@@ -42,6 +42,13 @@ from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
 import numpy as np
 from qsp_hpc.utils.logging_config import setup_logger
+from qsp_hpc.utils.security import (
+    validate_project_name,
+    validate_safe_path,
+    build_safe_ssh_command,
+    validate_pool_path,
+    SecurityError
+)
 from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter, SubmissionError
 from qsp_hpc.batch.hpc_file_transfer import HPCFileTransfer
 from qsp_hpc.batch.result_collector import ResultCollector, MissingOutputError
@@ -111,6 +118,23 @@ class SSHTransport:
             self._warned_about_host_key_checking = True
 
     def exec(self, command: str, timeout: Optional[int] = 30) -> Tuple[int, str]:
+        """
+        Execute command on remote host via SSH.
+
+        Args:
+            command: Shell command to execute (should be pre-escaped if needed)
+            timeout: Timeout in seconds
+
+        Returns:
+            Tuple of (return_code, combined_output)
+
+        Raises:
+            subprocess.TimeoutExpired: If command exceeds timeout
+
+        Note:
+            This method does not automatically escape arguments. Use build_safe_ssh_command()
+            from qsp_hpc.utils.security for safe command construction.
+        """
         self._warn_insecure_ssh()
 
         ssh_cmd = ['ssh']
@@ -138,6 +162,16 @@ class SSHTransport:
         return result.returncode, result.stdout + result.stderr
 
     def upload(self, local_path: str, remote_path: str) -> None:
+        """
+        Upload file to remote host via SCP.
+
+        Args:
+            local_path: Local file path
+            remote_path: Remote destination path
+
+        Raises:
+            subprocess.CalledProcessError: If upload fails
+        """
         self._warn_insecure_ssh()
 
         scp_cmd = ['scp']
@@ -154,9 +188,26 @@ class SSHTransport:
             remote_target
         ])
 
-        subprocess.run(scp_cmd, check=True, capture_output=True)
+        try:
+            subprocess.run(scp_cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            raise RemoteCommandError(
+                f"scp upload to {remote_path}",
+                exc.returncode,
+                exc.stderr or str(exc)
+            ) from exc
 
     def download(self, remote_path: str, local_dir: str) -> None:
+        """
+        Download file from remote host via SCP.
+
+        Args:
+            remote_path: Remote file path
+            local_dir: Local destination directory
+
+        Raises:
+            subprocess.CalledProcessError: If download fails
+        """
         self._warn_insecure_ssh()
 
         scp_cmd = ['scp']
@@ -172,7 +223,14 @@ class SSHTransport:
             local_dir
         ])
 
-        subprocess.run(scp_cmd, check=True, capture_output=True)
+        try:
+            subprocess.run(scp_cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            raise RemoteCommandError(
+                f"scp download {remote_path}",
+                exc.returncode,
+                exc.stderr or str(exc)
+            ) from exc
 
 
 class HPCJobManager:
@@ -237,7 +295,7 @@ class HPCJobManager:
         return self._parse_config_dict(yaml_config, source=global_config_file)
 
     @staticmethod
-    def _parse_config_dict(cfg: Dict, source: Path = None) -> BatchConfig:
+    def _parse_config_dict(cfg: Dict, source: Optional[Path] = None) -> BatchConfig:
         """Parse and validate a credentials dict into BatchConfig."""
         if not cfg:
             raise ValueError(
@@ -344,45 +402,18 @@ class HPCJobManager:
         """
 
         try:
-            status, output = self._ssh_exec('echo "SSH_OK"', timeout=timeout)
+            status, output = self.transport.exec('echo "SSH_OK"', timeout=timeout)
 
             if status == 0 and 'SSH_OK' in output:
                 return True
             else:
                 raise RuntimeError(f"SSH connection failed: {output}")
 
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"SSH connection timeout after {timeout}s")
-        except Exception as e:
-            raise RuntimeError(f"SSH connection error: {e}")
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"SSH connection timeout after {timeout}s") from exc
+        except Exception as exc:
+            raise RuntimeError(f"SSH connection error: {exc}") from exc
 
-    def _ssh_exec(self, command: str, timeout: Optional[int] = 30) -> Tuple[int, str]:
-        """
-        Execute command on HPC cluster via SSH.
-
-        Args:
-            command: Shell command to execute
-            timeout: Timeout in seconds
-
-        Returns:
-            Tuple of (return_code, output)
-        """
-        rc, out = self.transport.exec(command, timeout=timeout)
-        return rc, out
-
-    def _ssh_upload(self, local_path: str, remote_path: str) -> None:
-        """Upload file to HPC cluster via SCP."""
-        try:
-            self.transport.upload(local_path, remote_path)
-        except subprocess.CalledProcessError as exc:  # pragma: no cover - mocked in tests
-            raise RemoteCommandError(f"scp upload to {remote_path}", exc.returncode, exc.stderr or str(exc)) from exc
-
-    def _ssh_download(self, remote_path: str, local_dir: str) -> None:
-        """Download file from HPC cluster via SCP."""
-        try:
-            self.transport.download(remote_path, local_dir)
-        except subprocess.CalledProcessError as exc:  # pragma: no cover - mocked in tests
-            raise RemoteCommandError(f"scp download {remote_path}", exc.returncode, exc.stderr or str(exc)) from exc
 
     def ensure_hpc_venv(self) -> None:
         """
@@ -430,7 +461,13 @@ class HPCJobManager:
 
         Returns:
             JobInfo object with job IDs and state file
+
+        Raises:
+            SecurityError: If project_name contains invalid characters
         """
+        # Validate project name for security (prevent path traversal/command injection)
+        project_name = validate_project_name(project_name)
+
         if jobs_per_chunk is None:
             jobs_per_chunk = self.config.jobs_per_chunk
 
@@ -527,7 +564,12 @@ class HPCJobManager:
 
     def _save_job_state(self, job_info: JobInfo, project_name: str) -> str:
         """Save job state to file."""
-        base_dir = Path(self.config.remote_project_path or Path.cwd()) / f"projects/{project_name}/batch_jobs"
+        # Prefer local storage for state to avoid writing to remote-only paths
+        state_root = Path(self.config.remote_project_path) if (
+            self.config.remote_project_path and Path(self.config.remote_project_path).exists()
+        ) else Path.cwd()
+
+        base_dir = state_root / f"projects/{project_name}/batch_jobs"
         base_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = time.strftime('%Y%m%d_%H%M%S')
@@ -570,11 +612,17 @@ class HPCJobManager:
 
     def _combine_chunks_remotely(self, project_name: str) -> None:
         """Combine chunk CSV files on HPC."""
+        # Validate project name for security
+        project_name = validate_project_name(project_name)
+
         remote_output = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/output"
 
-        # Check that chunk files exist
-        check_cmd = f'cd "{remote_output}" && ls chunk_*_test_stats.csv 2>/dev/null | wc -l'
-        status, output = self._ssh_exec(check_cmd)
+        # Check that chunk files exist - using safe command construction
+        check_cmd = build_safe_ssh_command(
+            ['sh', '-c', 'ls chunk_*_test_stats.csv 2>/dev/null | wc -l'],
+            cwd=remote_output
+        )
+        status, output = self.transport.exec(check_cmd)
         num_chunks = int(output.strip()) if output.strip().isdigit() else 0
 
         if num_chunks == 0:
@@ -583,9 +631,12 @@ class HPCJobManager:
                 "Jobs may have failed or not produced output files."
             )
 
-        # Combine test stats
-        combine_cmd = f'cd "{remote_output}" && cat chunk_*_test_stats.csv > combined_test_stats.csv'
-        status, output = self._ssh_exec(combine_cmd)
+        # Combine test stats - using safe command construction
+        combine_cmd = build_safe_ssh_command(
+            ['sh', '-c', 'cat chunk_*_test_stats.csv > combined_test_stats.csv'],
+            cwd=remote_output
+        )
+        status, output = self.transport.exec(combine_cmd)
 
         if status != 0:
             raise RemoteCommandError(combine_cmd, status, output)
@@ -600,7 +651,7 @@ class HPCJobManager:
         try:
             # Download combined CSV
             remote_file = f"{remote_output}/combined_test_stats.csv"
-            self._ssh_download(remote_file, str(temp_dir))
+            self.transport.download(remote_file, str(temp_dir))
 
             # Load CSV
             local_file = temp_dir / "combined_test_stats.csv"
@@ -649,21 +700,21 @@ class HPCJobManager:
     def _combine_chunks_on_hpc(self, test_stats_dir: str) -> None:
         """Combine test statistics chunks on HPC using Python script."""
         if self.verbose:
-            print(f"Combining chunk files on HPC...")
+            self.logger.info(f"Combining chunk files on HPC...")
 
         # Upload combine script (small file, quick to upload)
         local_script = Path('metadata/combine_test_stats_chunks.py')
         remote_script = f"{test_stats_dir}/combine_chunks.py"
-        self._ssh_upload(str(local_script), remote_script)
+        self.transport.upload(str(local_script), remote_script)
 
         # Run combine script using HPC venv
         combine_cmd = f'{self.config.hpc_venv_path}/bin/python "{remote_script}" "{test_stats_dir}"'
-        status, output = self._ssh_exec(combine_cmd, timeout=60)
+        status, output = self.transport.exec(combine_cmd, timeout=60)
 
         if self.verbose:
-            print(f"HPC combine output:")
+            self.logger.info(f"HPC combine output:")
             for line in output.strip().split('\n'):
-                print(f"  {line}")
+                self.logger.info(f"  {line}")
 
         if status != 0:
             raise RuntimeError(f"Failed to combine chunks on HPC: {output}")
@@ -679,20 +730,20 @@ class HPCJobManager:
         # Download test stats
         remote_test_stats_file = f"{test_stats_dir}/combined_test_stats.csv"
         if self.verbose:
-            print(f"Downloading combined test stats...")
-        self._ssh_download(remote_test_stats_file, str(local_dest))
+            self.logger.info(f"Downloading combined test stats...")
+        self.transport.download(remote_test_stats_file, str(local_dest))
 
         # Check for combined params
         check_params_cmd = f'test -f "{test_stats_dir}/combined_params.csv" && echo "exists"'
-        status_params, output_params = self._ssh_exec(check_params_cmd)
+        status_params, output_params = self.transport.exec(check_params_cmd)
         has_params = (status_params == 0 and 'exists' in output_params)
 
         params = None
         if has_params:
             remote_params_file = f"{test_stats_dir}/combined_params.csv"
             if self.verbose:
-                print(f"Downloading combined params...")
-            self._ssh_download(remote_params_file, str(local_dest))
+                self.logger.info(f"Downloading combined params...")
+            self.transport.download(remote_params_file, str(local_dest))
 
         # Rename downloaded files
         downloaded_test_stats = local_dest / "combined_test_stats.csv"
@@ -718,7 +769,7 @@ class HPCJobManager:
                     params = params.reshape(1, -1)
 
                 if self.verbose:
-                    print(f"Downloaded parameters: {params.shape}")
+                    self.logger.info(f"Downloaded parameters: {params.shape}")
 
         # Load test stats using pandas (handles NaN/empty values properly)
         import pandas as pd
@@ -730,7 +781,7 @@ class HPCJobManager:
             test_stats = test_stats.reshape(1, -1)
 
         if self.verbose:
-            print(f"Downloaded test statistics: {test_stats.shape}")
+            self.logger.info(f"Downloaded test statistics: {test_stats.shape}")
 
         return params, test_stats
 
@@ -760,7 +811,7 @@ class HPCJobManager:
             echo "TEST_STATS_CHUNKS:$(ls "{test_stats_dir}"/chunk_*_test_stats.csv 2>/dev/null | wc -l)"
             echo "PARAMS_CHUNKS:$(ls "{test_stats_dir}"/chunk_*_params.csv 2>/dev/null | wc -l)"
         '''
-        status, output = self._ssh_exec(check_cmd)
+        status, output = self.transport.exec(check_cmd)
 
         if status != 0:
             return False
@@ -777,17 +828,17 @@ class HPCJobManager:
 
             # Both must have at least one chunk
             if n_test_stats_chunks == 0:
-                print(f"   No test stats chunks found")
+                self.logger.info(f"   No test stats chunks found")
                 return False
 
             # Params chunks may not exist for older datasets (backward compatibility)
             if n_params_chunks == 0:
-                print(f"  Warning:  No params chunks found (older format without parameters)")
+                self.logger.info(f"  Warning:  No params chunks found (older format without parameters)")
             else:
-                print(f"   Found {n_test_stats_chunks} test stats chunks and {n_params_chunks} params chunks")
+                self.logger.info(f"   Found {n_test_stats_chunks} test stats chunks and {n_params_chunks} params chunks")
 
         except Exception as e:
-            print(f"   Error parsing chunk counts: {e}")
+            self.logger.info(f"   Error parsing chunk counts: {e}")
             return False
 
         # If expected count provided, validate that derived test stats match pool size
@@ -808,19 +859,19 @@ class HPCJobManager:
                     echo "0"
                 fi
             '''
-            status, output = self._ssh_exec(count_cmd)
+            status, output = self.transport.exec(count_cmd)
 
             if status == 0:
                 try:
                     n_derived = int(output.strip())
                     if n_derived != expected_n_sims:
-                        print(f"  Warning:  Derived test stats count mismatch: {n_derived} vs {expected_n_sims} expected")
-                        print(f"   Will re-derive from complete pool")
+                        self.logger.info(f"  Warning:  Derived test stats count mismatch: {n_derived} vs {expected_n_sims} expected")
+                        self.logger.info(f"   Will re-derive from complete pool")
                         # Delete old derived test stats so they get re-derived
-                        self._ssh_exec(f'rm -rf "{test_stats_dir}"')
+                        self.transport.exec(f'rm -rf "{test_stats_dir}"')
                         return False
                     else:
-                        print(f"   Derived test stats count matches: {n_derived} simulations")
+                        self.logger.info(f"   Derived test stats count matches: {n_derived} simulations")
                 except ValueError:
                     pass
 
@@ -845,31 +896,31 @@ class HPCJobManager:
         Returns:
             SLURM job ID
         """
-        print(f"   Submitting test statistics derivation job...")
+        self.logger.info(f"   Submitting test statistics derivation job...")
 
         # Ensure Python venv is set up
         self.ensure_hpc_venv()
 
         # Create persistent directory for derivation inputs (in batch_jobs)
         derivation_dir = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/derivation"
-        self._ssh_exec(f'mkdir -p "{derivation_dir}"')
+        self.transport.exec(f'mkdir -p "{derivation_dir}"')
 
         # Upload test statistics CSV
         remote_test_stats_csv = f"{derivation_dir}/test_stats_{test_stats_hash[:8]}.csv"
-        self._ssh_upload(test_stats_csv, remote_test_stats_csv)
+        self.transport.upload(test_stats_csv, remote_test_stats_csv)
 
         # Upload test_stat_functions.py
         local_test_stat_funcs = Path('metadata/test_stat_functions.py')
         remote_test_stat_funcs = f"{derivation_dir}/test_stat_functions.py"
-        self._ssh_upload(str(local_test_stat_funcs), remote_test_stat_funcs)
+        self.transport.upload(str(local_test_stat_funcs), remote_test_stat_funcs)
 
         # Expand $HOME in pool_path (Python won't expand shell variables)
         # Get the actual home directory from HPC
-        status, home_dir = self._ssh_exec('echo $HOME')
+        status, home_dir = self.transport.exec('echo $HOME')
         home_dir = home_dir.strip()
         expanded_pool_path = pool_path.replace('$HOME', home_dir)
 
-        print(f"   Expanded pool path: {expanded_pool_path}")
+        self.logger.info(f"   Expanded pool path: {expanded_pool_path}")
 
         # Create derivation config JSON
         config = {
@@ -887,11 +938,11 @@ class HPCJobManager:
             temp_config = f.name
 
         remote_config = f"{derivation_dir}/derive_config_{test_stats_hash[:8]}.json"
-        self._ssh_upload(temp_config, remote_config)
+        self.transport.upload(temp_config, remote_config)
         Path(temp_config).unlink()
 
         # Count number of Parquet files (one job per file)
-        status, output = self._ssh_exec(f'ls "{pool_path}"/batch_*.parquet | wc -l')
+        status, output = self.transport.exec(f'ls "{pool_path}"/batch_*.parquet | wc -l')
         n_batches = int(output.strip()) if output.strip().isdigit() else 1
 
         # Log SLURM configuration for derivation job
@@ -912,11 +963,11 @@ class HPCJobManager:
             temp_slurm = f.name
 
         remote_slurm = f"{derivation_dir}/derive_job_{test_stats_hash[:8]}.sh"
-        self._ssh_upload(temp_slurm, remote_slurm)
+        self.transport.upload(temp_slurm, remote_slurm)
         Path(temp_slurm).unlink()
 
         # Submit SLURM job
-        status, output = self._ssh_exec(f'sbatch "{remote_slurm}"')
+        status, output = self.transport.exec(f'sbatch "{remote_slurm}"')
 
         if status != 0:
             raise RuntimeError(f"SLURM derivation job submission failed: {output}")
@@ -928,7 +979,7 @@ class HPCJobManager:
             raise RuntimeError(f"Could not parse job ID from: {output}")
 
         job_id = match.group(1)
-        print(f"   🚀 Derivation job {job_id} ({n_batches} tasks)")
+        self.logger.info(f"   🚀 Derivation job {job_id} ({n_batches} tasks)")
 
         return job_id
 
@@ -999,24 +1050,24 @@ echo "Derivation completed at $(date)"
         """
         # Expand $HOME if present (needed for scp)
         if '$HOME' in pool_path:
-            status, home_dir = self._ssh_exec('echo $HOME')
+            status, home_dir = self.transport.exec('echo $HOME')
             pool_path = pool_path.replace('$HOME', home_dir.strip())
             if self.verbose:
-                print(f"Expanded pool path: {pool_path}")
+                self.logger.info(f"Expanded pool path: {pool_path}")
 
         test_stats_dir = f"{pool_path}/test_stats/{test_stats_hash}"
 
         if self.verbose:
-            print(f"Test stats directory: {test_stats_dir}")
+            self.logger.info(f"Test stats directory: {test_stats_dir}")
 
         # Check directory exists
         check_cmd = f'test -d "{test_stats_dir}" && ls -la "{test_stats_dir}" || echo "DIRECTORY_NOT_FOUND"'
-        status, output = self._ssh_exec(check_cmd)
+        status, output = self.transport.exec(check_cmd)
 
         if self.verbose:
-            print(f"Directory listing:")
+            self.logger.info(f"Directory listing:")
             for line in output.strip().split('\n')[:10]:  # Show first 10 lines
-                print(f"  {line}")
+                self.logger.info(f"  {line}")
 
         if 'DIRECTORY_NOT_FOUND' in output:
             # Determine likely project name for better error message
@@ -1054,21 +1105,21 @@ echo "Derivation completed at $(date)"
         """
         # Expand $HOME if present
         if '$HOME' in pool_path:
-            status, home_dir = self._ssh_exec('echo $HOME')
+            status, home_dir = self.transport.exec('echo $HOME')
             pool_path = pool_path.replace('$HOME', home_dir.strip())
 
-        print(f"   Downloading {n_files} most recent Parquet batch(es) from HPC...")
-        print(f"   Pool path: {pool_path}")
+        self.logger.info(f"   Downloading {n_files} most recent Parquet batch(es) from HPC...")
+        self.logger.info(f"   Pool path: {pool_path}")
 
         # List Parquet files sorted by modification time (most recent first)
         list_cmd = f'ls -t "{pool_path}"/batch_*.parquet 2>/dev/null | head -{n_files}'
-        status, output = self._ssh_exec(list_cmd)
+        status, output = self.transport.exec(list_cmd)
 
         if status != 0 or not output.strip():
             raise RuntimeError(f"No Parquet files found in {pool_path}")
 
         parquet_files = output.strip().split('\n')
-        print(f"   Found {len(parquet_files)} recent file(s)")
+        self.logger.info(f"   Found {len(parquet_files)} recent file(s)")
 
         # Create local destination
         local_dest.mkdir(parents=True, exist_ok=True)
@@ -1081,13 +1132,13 @@ echo "Derivation completed at $(date)"
                 continue
 
             filename = Path(remote_file).name
-            print(f"   Downloading {filename}...")
+            self.logger.info(f"   Downloading {filename}...")
 
-            self._ssh_download(remote_file, str(local_dest))
+            self.transport.download(remote_file, str(local_dest))
             local_file = local_dest / filename
             downloaded_files.append(local_file)
 
-        print(f"   Downloaded {len(downloaded_files)} Parquet file(s)")
+        self.logger.info(f"   Downloaded {len(downloaded_files)} Parquet file(s)")
 
         return downloaded_files
 
@@ -1114,7 +1165,7 @@ echo "Derivation completed at $(date)"
             - 'simulation_ids': Array of simulation IDs
             - 'statuses': Array of simulation statuses
         """
-        print(f"   Parsing Parquet file: {parquet_file.name}")
+        self.logger.info(f"   Parsing Parquet file: {parquet_file.name}")
 
         try:
             import pandas as pd
@@ -1124,8 +1175,8 @@ echo "Derivation completed at $(date)"
         # Read Parquet file
         df = pd.read_parquet(parquet_file)
 
-        print(f"   Loaded {len(df)} simulations")
-        print(f"   Columns: {len(df.columns)} ({df.columns[0]}, {df.columns[1]}, ...)")
+        self.logger.info(f"   Loaded {len(df)} simulations")
+        self.logger.info(f"   Columns: {len(df.columns)} ({df.columns[0]}, {df.columns[1]}, ...)")
 
         # Extract metadata columns
         simulation_ids = df['simulation_id'].values
@@ -1138,11 +1189,11 @@ echo "Derivation completed at $(date)"
         if n_successful == 0:
             raise ValueError(f"No successful simulations found in {parquet_file}")
 
-        print(f"   {n_successful}/{len(df)} simulations successful")
+        self.logger.info(f"   {n_successful}/{len(df)} simulations successful")
 
         # Apply max_simulations limit
         if max_simulations is not None and n_successful > max_simulations:
-            print(f"   Limiting to first {max_simulations} successful simulations")
+            self.logger.info(f"   Limiting to first {max_simulations} successful simulations")
             # Get indices of successful simulations
             success_indices = np.where(success_mask)[0]
             selected_indices = success_indices[:max_simulations]
@@ -1154,13 +1205,13 @@ echo "Derivation completed at $(date)"
         first_success_idx = np.where(success_mask)[0][0]
         time = np.array(df.iloc[first_success_idx]['time'])
 
-        print(f"   Time points: {len(time)} ({time[0]:.1f} to {time[-1]:.1f})")
+        self.logger.info(f"   Time points: {len(time)} ({time[0]:.1f} to {time[-1]:.1f})")
 
         # Get species columns (exclude metadata: simulation_id, status, time)
         metadata_cols = {'simulation_id', 'status', 'time'}
         species_names = [col for col in df.columns if col not in metadata_cols]
 
-        print(f"   Species: {len(species_names)} total")
+        self.logger.info(f"   Species: {len(species_names)} total")
 
         # Filter species if requested
         if species_of_interest is not None:
@@ -1176,13 +1227,13 @@ echo "Derivation completed at $(date)"
                 elif requested_species in species_map:
                     selected_species.append(species_map[requested_species])
                 else:
-                    print(f"  Warning:  Warning: Species '{requested_species}' not found")
+                    self.logger.info(f"  Warning:  Warning: Species '{requested_species}' not found")
 
             if not selected_species:
                 raise ValueError(f"None of the requested species found in Parquet file")
 
             species_names = selected_species
-            print(f"   Selected {len(species_names)} species")
+            self.logger.info(f"   Selected {len(species_names)} species")
 
         # Extract simulation data for each species
         simulations = {}
@@ -1198,7 +1249,7 @@ echo "Derivation completed at $(date)"
             species_array = np.array(species_data)
             simulations[species_name] = species_array
 
-        print(f"   Extracted {len(species_names)} species x {n_successful} simulations")
+        self.logger.info(f"   Extracted {len(species_names)} species x {n_successful} simulations")
 
         return {
             'n_simulations': n_successful,

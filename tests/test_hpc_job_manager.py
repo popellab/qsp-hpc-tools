@@ -214,6 +214,27 @@ class TestHPCConfigLoading:
         manager = HPCJobManager(config=custom_cfg)
         assert manager.config.ssh_key == str(Path('~/.ssh/id_rsa').expanduser())
 
+    def test_save_job_state_uses_local_path_when_remote_missing(self, tmp_path, mock_hpc_config):
+        job_info = JobInfo(
+            job_ids=["1"],
+            state_file="",
+            n_jobs=1,
+            n_simulations=10,
+            project_name="proj",
+            submission_time="now",
+        )
+
+        # Point remote_project_path to a non-existent location
+        cfg = mock_hpc_config
+        cfg.remote_project_path = "/definitely/not/present"
+
+        with patch.object(Path, "cwd", return_value=tmp_path):
+            manager = HPCJobManager(config=cfg)
+            state_path = Path(manager._save_job_state(job_info, "proj"))
+
+        assert state_path.parent == tmp_path / "projects/proj/batch_jobs"
+        assert state_path.exists()
+
 
 class TestSLURMScriptGeneration:
     """Test SLURM batch script generation."""
@@ -284,6 +305,7 @@ class TestJobStateManagement:
             project_name='proj',
             submission_time='2025-01-01'
         )
+        # Point remote path to a non-existent location; manager should fall back to cwd
         manager = HPCJobManager(config={
             'ssh_host': 'example', 'ssh_user': 'user', 'simulation_pool_path': '/pool', 'hpc_venv_path': '/venv', 'remote_project_path': str(tmp_path / 'remote')
         })
@@ -296,7 +318,7 @@ class TestJobStateManagement:
         assert saved['job_ids'] == ['1']
         assert saved['n_simulations'] == 10
         assert Path(state_file).parent.name == 'batch_jobs'
-        assert str(tmp_path / 'remote') in state_file
+        assert str(tmp_path / 'projects/proj') in state_file
 
     def test_job_state_deserialization(self, tmp_path):
         """Test loading job state from pickle file."""
@@ -342,7 +364,8 @@ class TestJobStateManagement:
 
         assert 'job_state_' in Path(state_file).name
         assert Path(state_file).parent.name == 'batch_jobs'
-        assert state_file.startswith(str(tmp_path / 'remote'))
+        # Should fall back to cwd when remote path is missing
+        assert state_file.startswith(str(tmp_path / 'projects/proj'))
 
 
 class TestPathConstruction:
@@ -351,7 +374,7 @@ class TestPathConstruction:
     def test_remote_project_path(self, mock_hpc_config):
         """Test construction of remote project path."""
         manager = HPCJobManager(config=mock_hpc_config)
-        with patch.object(manager, '_ssh_exec', return_value=(0, '')) as mock_exec:
+        with patch.object(manager.transport, 'exec', return_value=(0, '')) as mock_exec:
             manager._setup_remote_directories('proj')
 
         # All calls should include the remote base directory
@@ -378,6 +401,10 @@ class TestSyncCodebase:
         manager = HPCJobManager(config=mock_hpc_config)
         # Mock ssh exec for mkdir
         manager._ssh_exec = Mock(return_value=(0, ""))
+
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = ""
+        mock_run.return_value.stderr = ""
 
         manager.sync_codebase(skip_sync=False)
 
@@ -430,7 +457,7 @@ class TestCommandExecutionBehaviors:
     def test_combine_chunks_command_failure(self, mock_hpc_config):
         manager = HPCJobManager(config=mock_hpc_config)
         # First call: chunks exist; Second call: combine fails
-        manager._ssh_exec = Mock(side_effect=[(0, "1"), (1, "bad")])
+        manager.transport.exec = Mock(side_effect=[(0, "1"), (1, "bad")])
 
         with pytest.raises(RemoteCommandError):
             manager._combine_chunks_remotely("proj")
@@ -438,7 +465,7 @@ class TestCommandExecutionBehaviors:
     def test_download_combined_missing_local(self, mock_hpc_config, tmp_path, monkeypatch):
         manager = HPCJobManager(config=mock_hpc_config)
         # Prevent actual download
-        monkeypatch.setattr(manager, "_ssh_download", lambda remote, local: None)
+        monkeypatch.setattr(manager.transport, "download", lambda remote, local: None)
 
         # Point tempdir to controlled path
         monkeypatch.setenv("TMPDIR", str(tmp_path))
@@ -447,18 +474,22 @@ class TestCommandExecutionBehaviors:
             manager._download_combined_results("proj")
 
     def test_scp_upload_wrapped_error(self, mock_hpc_config):
+        """Test that SCP upload errors are wrapped in RemoteCommandError."""
         manager = HPCJobManager(config=mock_hpc_config)
-        manager.transport.upload = Mock(side_effect=subprocess.CalledProcessError(1, "scp", "err"))
-
-        with pytest.raises(RemoteCommandError):
-            manager._ssh_upload("/tmp/file", "/remote/path")
+        # Mock subprocess.run to raise CalledProcessError
+        with patch('subprocess.run', side_effect=subprocess.CalledProcessError(1, "scp", stderr="upload failed")):
+            with pytest.raises(RemoteCommandError) as exc_info:
+                manager.transport.upload("/tmp/file", "/remote/path")
+            assert "scp upload" in str(exc_info.value)
 
     def test_scp_download_wrapped_error(self, mock_hpc_config):
+        """Test that SCP download errors are wrapped in RemoteCommandError."""
         manager = HPCJobManager(config=mock_hpc_config)
-        manager.transport.download = Mock(side_effect=subprocess.CalledProcessError(1, "scp", "err"))
-
-        with pytest.raises(RemoteCommandError):
-            manager._ssh_download("/remote/file", "/tmp")
+        # Mock subprocess.run to raise CalledProcessError
+        with patch('subprocess.run', side_effect=subprocess.CalledProcessError(1, "scp", stderr="download failed")):
+            with pytest.raises(RemoteCommandError) as exc_info:
+                manager.transport.download("/remote/file", "/tmp")
+            assert "scp download" in str(exc_info.value)
 
 
 # ============================================================================

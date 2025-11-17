@@ -13,7 +13,7 @@ import time
 import shutil
 import tarfile
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from qsp_hpc.utils.logging_config import setup_logger
 
 
@@ -90,6 +90,11 @@ class HPCFileTransfer:
         # Execute rsync
         result = subprocess.run(rsync_cmd, capture_output=True, text=True)
 
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"rsync failed (rc={result.returncode}): {result.stderr or result.stdout}"
+            )
+
         elapsed = time.time() - start_time
         if self.verbose:
             self.logger.info(f"Codebase synced ({elapsed:.1f}s)")
@@ -130,7 +135,11 @@ bash scripts/hpc/setup_hpc_venv.sh
 
     def setup_remote_directories(self, project_name: str) -> None:
         """Create necessary directories on remote cluster and clean old files."""
-        remote_base = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs"
+        remote_root = (self.config.remote_project_path or "").strip()
+        if not remote_root or remote_root in {"/", ".", "//"}:
+            raise ValueError("remote_project_path must be set to a non-root directory before deleting files")
+
+        remote_base = f"{remote_root}/projects/{project_name}/batch_jobs"
         dirs = ['input', 'output', 'scripts', 'logs']
 
         for d in dirs:
@@ -147,7 +156,7 @@ bash scripts/hpc/setup_hpc_venv.sh
         jobs_per_chunk: int,
         project_name: str,
         save_full_simulations: bool = True,
-        simulation_pool_id: str = None
+        simulation_pool_id: Optional[str] = None
     ) -> None:
         """Create and upload job configuration as JSON."""
         start_time = time.time()

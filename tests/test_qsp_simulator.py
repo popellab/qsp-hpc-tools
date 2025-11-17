@@ -207,6 +207,24 @@ class TestQSPSimulatorInitialization:
         assert 'default' in repr_str
 
 
+class TestParameterGeneration:
+    """Tests for parameter sampling behavior."""
+
+    def test_generate_parameters_varies_across_calls(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        simulator = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_version='v1',
+            cache_dir=temp_dir / "cache",
+            seed=7,
+        )
+
+        first = simulator._generate_parameters(5)
+        second = simulator._generate_parameters(5)
+
+        assert not np.allclose(first, second)
+
+
 # ============================================================================
 # Hash Computation Tests
 # ============================================================================

@@ -164,6 +164,8 @@ class QSPSimulator:
 
         # Random number generator for sampling from pool (use fixed seed for reproducibility)
         self.rng = np.random.default_rng(self.cache_sampling_seed)
+        # RNG for parameter generation; seeded once so successive batches differ
+        self.param_rng = np.random.default_rng(self.seed)
 
     def __repr__(self) -> str:
         """Return string representation of simulator."""
@@ -216,14 +218,11 @@ class QSPSimulator:
         dist_param1 = priors_df['dist_param1'].values
         dist_param2 = priors_df['dist_param2'].values
 
-        # Create RNG for parameter generation (use self.seed for new simulations)
-        rng = np.random.default_rng(self.seed)
-
         # Generate samples
         samples = np.zeros((n_samples, len(param_names)))
         for i in range(len(param_names)):
             if dist_types[i] == 'lognormal':
-                samples[:, i] = rng.lognormal(
+                samples[:, i] = self.param_rng.lognormal(
                     mean=dist_param1[i],
                     sigma=dist_param2[i],
                     size=n_samples

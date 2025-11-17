@@ -20,6 +20,7 @@ import sys
 import json
 import os
 import hashlib
+import logging
 from pathlib import Path
 from typing import Dict, List, Tuple
 import numpy as np
@@ -30,6 +31,10 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from qsp_hpc.data.test_stat_functions import get_test_stat_function
+from qsp_hpc.utils.logging_config import setup_logger
+
+# Setup logger
+logger = setup_logger(__name__, verbose=True)
 
 
 def compute_test_statistics_batch(
@@ -53,7 +58,7 @@ def compute_test_statistics_batch(
 
     test_stats_matrix = np.full((n_sims, n_test_stats), np.nan, dtype=float)
 
-    print(f"   Computing {n_test_stats} test statistics for {n_sims} simulations...")
+    logger.info(f"Computing {n_test_stats} test statistics for {n_sims} simulations...")
 
     for j, row in test_stats_df.iterrows():
         test_stat_id = row['test_statistic_id']
@@ -67,7 +72,7 @@ def compute_test_statistics_batch(
         try:
             test_stat_func = get_test_stat_function(test_stat_id)
         except KeyError as e:
-            print(f"     ⚠️  Warning: {e}")
+            logger.warning(f"Skipping test statistic: {e}")
             continue
 
         # Apply function to each simulation
@@ -93,12 +98,12 @@ def compute_test_statistics_batch(
                 test_stats_matrix[i, j] = test_stat_value
 
             except Exception as e:
-                print(f"     ⚠️  Error computing {test_stat_id} for simulation {i}: {e}")
+                logger.warning(f"Error computing {test_stat_id} for simulation {i}: {e}")
                 test_stats_matrix[i, j] = np.nan
 
     n_computed = np.sum(~np.isnan(test_stats_matrix))
     n_total = test_stats_matrix.size
-    print(f"   Computed {n_computed}/{n_total} test statistic values ({100*n_computed/n_total:.1f}%)")
+    logger.info(f"Computed {n_computed}/{n_total} test statistic values ({100*n_computed/n_total:.1f}%)")
 
     return test_stats_matrix
 
@@ -106,15 +111,15 @@ def compute_test_statistics_batch(
 def main():
     """Main entry point for derivation worker."""
     if len(sys.argv) != 2:
-        print("Usage: python derive_test_stats_worker.py <config_json>")
+        logger.error("Usage: python derive_test_stats_worker.py <config_json>")
         sys.exit(1)
 
     config_file = sys.argv[1]
 
-    print("🔬 Test Statistics Derivation Worker")
-    print(f"   Node: {os.getenv('SLURMD_NODENAME', 'localhost')}")
-    print(f"   Job ID: {os.getenv('SLURM_JOB_ID', 'local')}")
-    print(f"   Array Task ID: {os.getenv('SLURM_ARRAY_TASK_ID', '0')}")
+    logger.info("🔬 Test Statistics Derivation Worker")
+    logger.info(f"Node: {os.getenv('SLURMD_NODENAME', 'localhost')}")
+    logger.info(f"Job ID: {os.getenv('SLURM_JOB_ID', 'local')}")
+    logger.info(f"Array Task ID: {os.getenv('SLURM_ARRAY_TASK_ID', '0')}")
 
     # Load configuration
     with open(config_file, 'r') as f:
@@ -125,42 +130,42 @@ def main():
     output_dir = Path(config['output_dir'])
     test_stats_hash = config['test_stats_hash']
 
-    print(f"   Simulation pool: {simulation_pool_dir}")
-    print(f"   Test stats CSV: {test_stats_csv}")
-    print(f"   Output dir: {output_dir}")
+    logger.info(f"Simulation pool: {simulation_pool_dir}")
+    logger.info(f"Test stats CSV: {test_stats_csv}")
+    logger.info(f"Output dir: {output_dir}")
 
     # Create output directory for this test stats hash
     test_stats_output_dir = output_dir / 'test_stats' / test_stats_hash
     test_stats_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load test statistics configuration
-    print("   Loading test statistics configuration...")
+    logger.info("Loading test statistics configuration...")
     test_stats_df = pd.read_csv(test_stats_csv)
-    print(f"   Found {len(test_stats_df)} test statistics")
+    logger.info(f"Found {len(test_stats_df)} test statistics")
 
     # Find all Parquet files in simulation pool
     parquet_files = sorted(simulation_pool_dir.glob('batch_*.parquet'))
     if not parquet_files:
-        print(f"   ⚠️  No simulation batches found in {simulation_pool_dir}")
+        logger.error(f"No simulation batches found in {simulation_pool_dir}")
         sys.exit(1)
 
-    print(f"   Found {len(parquet_files)} simulation batches")
+    logger.info(f"Found {len(parquet_files)} simulation batches")
 
     # For array jobs, process only assigned batch
     array_task_id = int(os.getenv('SLURM_ARRAY_TASK_ID', '0'))
     if array_task_id >= len(parquet_files):
-        print(f"   ⚠️  Array task {array_task_id} exceeds number of batches {len(parquet_files)}")
+        logger.error(f"Array task {array_task_id} exceeds number of batches {len(parquet_files)}")
         sys.exit(1)
 
     parquet_file = parquet_files[array_task_id]
-    print(f"   Processing batch {array_task_id}: {parquet_file.name}")
+    logger.info(f"Processing batch {array_task_id}: {parquet_file.name}")
 
     # Load simulation batch
-    print("   Loading simulation data...")
+    logger.info("Loading simulation data...")
     sim_df = pd.read_parquet(parquet_file)
     n_sims = len(sim_df)
-    print(f"   Loaded {n_sims} simulations")
-    print(f"   DataFrame columns ({len(sim_df.columns)}): {list(sim_df.columns)[:10]}...")  # Show first 10 columns
+    logger.info(f"Loaded {n_sims} simulations")
+    logger.debug(f"DataFrame columns ({len(sim_df.columns)}): {list(sim_df.columns)[:10]}...")
 
     # Extract parameter columns
     # Parameters are scalar columns (not lists) that are not metadata columns
@@ -174,32 +179,32 @@ def main():
                 param_cols.append(col)
 
     if param_cols:
-        print(f"   Found {len(param_cols)} parameter columns: {param_cols[:5]}{'...' if len(param_cols) > 5 else ''}")
+        logger.debug(f"Found {len(param_cols)} parameter columns: {param_cols[:5]}{'...' if len(param_cols) > 5 else ''}")
 
         # Save parameters to chunk_XXX_params.csv
         params_output_file = test_stats_output_dir / f"chunk_{array_task_id:03d}_params.csv"
-        print(f"   Saving parameters to {params_output_file}...")
+        logger.debug(f"Saving parameters to {params_output_file}...")
 
         # Extract parameter values (n_sims x n_params)
         params_df = sim_df[param_cols]
         params_df.to_csv(params_output_file, index=False, float_format='%.12e')
 
-        print(f"   ✓ Parameters saved: {params_output_file}")
+        logger.info(f"   ✓ Parameters saved: {params_output_file}")
     else:
-        print("   No parameter columns found in Parquet file (may be older format)")
+        logger.info("   No parameter columns found in Parquet file (may be older format)")
 
     # Compute test statistics
     test_stats_matrix = compute_test_statistics_batch(sim_df, test_stats_df)
 
     # Save results
     output_file = test_stats_output_dir / f"chunk_{array_task_id:03d}_test_stats.csv"
-    print(f"   Saving results to {output_file}...")
+    logger.info(f"   Saving results to {output_file}...")
 
     # Save as CSV (n_sims x n_test_stats)
     np.savetxt(output_file, test_stats_matrix, delimiter=',', fmt='%.12e')
 
-    print(f"   ✓ Test statistics saved: {output_file}")
-    print(f"   Derivation complete!")
+    logger.info(f"   ✓ Test statistics saved: {output_file}")
+    logger.info(f"   Derivation complete!")
 
 
 if __name__ == '__main__':

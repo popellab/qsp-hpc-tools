@@ -20,9 +20,11 @@ Usage:
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 from qsp_hpc.batch.hpc_job_manager import HPCJobManager
+from qsp_hpc.utils.security import validate_project_name, build_safe_ssh_command
 
 
 def show_logs(
@@ -38,6 +40,9 @@ def show_logs(
         lines: Number of lines to show from end of log (default: 50)
         project: Project name (default: 'pdac_2025')
     """
+    # Validate project name for security
+    project = validate_project_name(project)
+
     print(f"📋 Fetching HPC derivation logs...")
     print(f"   Project: {project}")
     print(f"   Task: {array_task_id}")
@@ -51,11 +56,12 @@ def show_logs(
     # Find the latest derivation log file
     print(f"   → Finding latest qsp_derive logs...")
 
-    list_cmd = f'''
-        cd "{log_dir}" 2>/dev/null || exit 1
-        ls -t qsp_derive_*.out 2>/dev/null | head -1
-    '''
-    status, output = job_manager._ssh_exec(list_cmd)
+    # Use safe command construction
+    list_cmd = build_safe_ssh_command(
+        ['sh', '-c', 'ls -t qsp_derive_*.out 2>/dev/null | head -1'],
+        cwd=log_dir
+    )
+    status, output = job_manager.transport.exec(list_cmd)
 
     if status != 0 or not output.strip():
         print(f"   ✗ No qsp_derive logs found in {log_dir}")
@@ -81,15 +87,12 @@ def show_logs(
     print(f"📄 STDOUT: {out_log}")
     print(f"{'='*80}")
 
-    tail_cmd = f'''
-        cd "{log_dir}" 2>/dev/null || exit 1
-        if [ -f "{out_log}" ]; then
-            tail -{lines} "{out_log}"
-        else
-            echo "(Log file not found)"
-        fi
-    '''
-    status, output = job_manager._ssh_exec(tail_cmd)
+    # Use safe command construction
+    tail_cmd = build_safe_ssh_command(
+        ['sh', '-c', f'if [ -f {out_log} ]; then tail -{lines} {out_log}; else echo "(Log file not found)"; fi'],
+        cwd=log_dir
+    )
+    status, output = job_manager.transport.exec(tail_cmd)
 
     if status == 0:
         print(output)
@@ -101,19 +104,12 @@ def show_logs(
     print(f"📄 STDERR: {err_log}")
     print(f"{'='*80}")
 
-    tail_cmd = f'''
-        cd "{log_dir}" 2>/dev/null || exit 1
-        if [ -f "{err_log}" ]; then
-            if [ -s "{err_log}" ]; then
-                tail -{lines} "{err_log}"
-            else
-                echo "(Empty - no errors)"
-            fi
-        else
-            echo "(Log file not found)"
-        fi
-    '''
-    status, output = job_manager._ssh_exec(tail_cmd)
+    # Use safe command construction
+    tail_cmd = build_safe_ssh_command(
+        ['sh', '-c', f'if [ -f {err_log} ]; then if [ -s {err_log} ]; then tail -{lines} {err_log}; else echo "(Empty - no errors)"; fi; else echo "(Log file not found)"; fi'],
+        cwd=log_dir
+    )
+    status, output = job_manager.transport.exec(tail_cmd)
 
     if status == 0:
         print(output)
@@ -125,14 +121,12 @@ def show_logs(
     print(f"📊 All tasks for job {job_id}:")
     print(f"{'='*80}")
 
-    summary_cmd = f'''
-        cd "{log_dir}" 2>/dev/null || exit 1
-        echo "Available tasks:"
-        ls qsp_derive_{job_id}_*.out 2>/dev/null | sed 's/.*_{job_id}_//;s/.out$//' | sort -n | head -20
-        echo ""
-        echo "Task count: $(ls qsp_derive_{job_id}_*.out 2>/dev/null | wc -l)"
-    '''
-    status, output = job_manager._ssh_exec(summary_cmd)
+    # Use safe command construction
+    summary_cmd = build_safe_ssh_command(
+        ['sh', '-c', f'echo "Available tasks:"; ls qsp_derive_{job_id}_*.out 2>/dev/null | sed "s/.*_{job_id}_//;s/.out$//" | sort -n | head -20; echo ""; echo "Task count: $(ls qsp_derive_{job_id}_*.out 2>/dev/null | wc -l)"'],
+        cwd=log_dir
+    )
+    status, output = job_manager.transport.exec(summary_cmd)
 
     if status == 0:
         print(output)

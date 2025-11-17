@@ -52,8 +52,11 @@ Issues = "https://github.com/jeliason/qsp-hpc-tools/issues"
 qsp-hpc = "qsp_hpc.cli:cli"
 
 [tool.setuptools]
-packages = ["qsp_hpc", "qsp_hpc.simulation", "qsp_hpc.batch", "qsp_hpc.utils"]
+packages = ["qsp_hpc", "qsp_hpc.simulation", "qsp_hpc.batch", "qsp_hpc.utils", "qsp_hpc.matlab"]
 include-package-data = true
+
+[tool.setuptools.package-data]
+"qsp_hpc.matlab" = ["*.m"]
 
 [tool.black]
 line-length = 100

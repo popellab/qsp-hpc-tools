@@ -73,13 +73,18 @@ class HPCFileTransfer:
 
         # Build rsync command
         local_root = Path.cwd()
-        remote_target = f"{self.config.ssh_user}@{self.config.ssh_host}:{self.config.remote_project_path}"
+
+        # Build remote target (handle SSH config aliases where user is optional)
+        if self.config.ssh_user:
+            remote_target = f"{self.config.ssh_user}@{self.config.ssh_host}:{self.config.remote_project_path}"
+        else:
+            remote_target = f"{self.config.ssh_host}:{self.config.remote_project_path}"
 
         rsync_cmd = ['rsync', '-avz', '--delete']
 
-        # Add SSH key if specified
+        # Add SSH key if specified (with proper quoting)
         if self.config.ssh_key:
-            rsync_cmd.extend(['-e', f'ssh -i {self.config.ssh_key}'])
+            rsync_cmd.extend(['-e', f'ssh -i "{self.config.ssh_key}"'])
 
         # Add exclusion patterns
         for pattern in self.rsync_exclude_patterns:

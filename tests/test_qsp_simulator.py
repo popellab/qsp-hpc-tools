@@ -479,8 +479,9 @@ class TestParameterGeneration:
 class TestPoolIntegration:
     """Test integration with SimulationPoolManager."""
 
-    @patch('qsp_hpc.simulation.simulation_pool.SimulationPoolManager')
-    def test_initializes_pool_manager(self, mock_pool_class, sample_test_stats_csv, sample_priors_csv, temp_dir):
+    @patch('qsp_hpc.simulation.qsp_simulator.SimulationPoolManager')  # Patch where it's used
+    @patch('qsp_hpc.simulation.qsp_simulator.HPCJobManager')  # Mock HPCJobManager
+    def test_initializes_pool_manager(self, mock_hpc_manager, mock_pool_class, sample_test_stats_csv, sample_priors_csv, temp_dir):
         """Test that SimulationPoolManager is initialized correctly."""
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -1016,20 +1017,17 @@ class TestConfigurationErrors:
         fake_pool = Mock()
         fake_pool.get_available_simulations.return_value = 0
 
-        sim = QSPSimulator(
-            test_stats_csv=sample_test_stats_csv,
-            priors_csv=sample_priors_csv,
-            project_name='test_project',
-            model_version='v1',
-            cache_dir=temp_dir / 'cache',
-            pool=fake_pool,
-            # job_manager will be created internally and may fail
-        )
-
-        # When job_manager is None and HPC is needed, should handle gracefully
-        with patch('qsp_hpc.batch.hpc_job_manager.HPCJobManager', side_effect=FileNotFoundError("No credentials")):
-            with pytest.raises((QSPSimulatorError, FileNotFoundError)):
-                sim(1)
+        # Patch HPCJobManager BEFORE creating simulator since it's now created in __init__
+        with patch('qsp_hpc.simulation.qsp_simulator.HPCJobManager', side_effect=FileNotFoundError("No credentials")):
+            with pytest.raises(FileNotFoundError, match="No credentials"):
+                sim = QSPSimulator(
+                    test_stats_csv=sample_test_stats_csv,
+                    priors_csv=sample_priors_csv,
+                    project_name='test_project',
+                    model_version='v1',
+                    cache_dir=temp_dir / 'cache',
+                    pool=fake_pool,
+                )
 
     def test_invalid_model_script_path(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
         """Test that invalid model script is handled."""
@@ -1247,3 +1245,842 @@ class TestEdgeCases:
         )
 
         assert sim.poll_interval == 60
+
+
+# ============================================================================
+# Integration Tests - Caching Strategy (Phase 1)
+# ============================================================================
+
+class TestThreeTierCachingStrategy:
+    """Test the 3-tier caching strategy with realistic scenarios."""
+
+    def test_tier1_local_cache_hit(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that local cache is used when sufficient simulations available."""
+        # Setup real pool with actual data
+        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+
+        pool = SimulationPoolManager(
+            cache_dir=temp_dir / 'cache',
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        # Add real simulations to pool
+        params = np.random.randn(100, 3)
+        obs = np.random.randn(100, 3)
+        pool.add_batch(params, obs, seed=42, scenario='default')
+
+        # Create simulator with this pool
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=pool,
+            local_only=True  # Force local-only to test tier 1
+        )
+
+        # Should use local cache
+        result_params, result_obs = sim(50)
+
+        assert result_params.shape == (50, 3)
+        assert result_obs.shape == (50, 3)
+        # Verify data came from pool (should be subset of original)
+        assert pool.get_available_simulations(scenario='default') == 100
+
+    def test_tier1_insufficient_raises_in_local_only_mode(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that local-only mode raises error when cache insufficient."""
+        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+
+        pool = SimulationPoolManager(
+            cache_dir=temp_dir / 'cache',
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        # Only add 10 simulations
+        params = np.random.randn(10, 3)
+        obs = np.random.randn(10, 3)
+        pool.add_batch(params, obs, seed=42, scenario='default')
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=pool,
+            local_only=True
+        )
+
+        # Should raise when requesting more than available
+        with pytest.raises(QSPSimulatorError, match="Local-only mode"):
+            sim(50)
+
+    def test_tier2_hpc_test_stats_download(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test downloading test statistics from HPC when available."""
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0  # Empty local cache
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = True  # Test stats available
+
+        # Mock successful download
+        downloaded_params = np.random.randn(50, 3)
+        downloaded_obs = np.random.randn(50, 3)
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        with patch.object(sim, '_download_and_add_to_pool', return_value=(downloaded_params, downloaded_obs)) as mock_download:
+            params, obs = sim(50)
+
+            # Verify download was called
+            mock_download.assert_called_once()
+            assert params.shape == (50, 3)
+            assert obs.shape == (50, 3)
+
+    def test_tier3_full_simulations_derivation(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test deriving test statistics from full HPC simulations."""
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = False  # No test stats
+        fake_job_mgr.check_hpc_full_simulations.return_value = (True, '/hpc/pool/path', 50)  # Full sims available
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        # Mock derivation and download
+        result_params = np.random.randn(50, 3)
+        result_obs = np.random.randn(50, 3)
+
+        with patch.object(sim, '_derive_test_statistics') as mock_derive:
+            with patch.object(sim, '_download_and_add_to_pool', return_value=(result_params, result_obs)) as mock_download:
+                params, obs = sim(50)
+
+                # Verify derivation was called
+                mock_derive.assert_called_once()
+                mock_download.assert_called_once()
+                assert params.shape == (50, 3)
+
+    def test_tier4_run_new_simulations(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test running new simulations when nothing is cached."""
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = False
+        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '/hpc/pool/path', 0)  # Nothing available
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        # Mock running new simulations
+        new_params = np.random.randn(50, 3)
+        new_obs = np.random.randn(50, 3)
+
+        with patch.object(sim, '_run_new_simulations', return_value=(new_params, new_obs)) as mock_run:
+            params, obs = sim(50)
+
+            # Verify new simulations were run
+            mock_run.assert_called_once_with(50)
+            assert params.shape == (50, 3)
+
+
+class TestParameterGenerationIntegration:
+    """Test parameter generation with various pool states."""
+
+    def test_parameter_generation_respects_pool_state(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that new parameters are generated when pool is empty."""
+        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+
+        pool = SimulationPoolManager(
+            cache_dir=temp_dir / 'cache',
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=pool,
+            seed=42
+        )
+
+        # Generate parameters when pool is empty
+        params1 = sim._generate_parameters(20)
+        assert params1.shape == (20, 3)
+
+        # Generate again - should be different (RNG state advanced)
+        params2 = sim._generate_parameters(20)
+        assert not np.allclose(params1, params2)
+
+    def test_parameter_sampling_from_pool(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that parameters are sampled from pool when available."""
+        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+
+        pool = SimulationPoolManager(
+            cache_dir=temp_dir / 'cache',
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        # Add known parameters to pool
+        known_params = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+        obs = np.random.randn(3, 3)
+        pool.add_batch(known_params, obs, seed=42, scenario='default')
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=pool,
+            local_only=True
+        )
+
+        # Load from pool
+        params, _ = sim(2)
+
+        # Should be subset of known params
+        assert params.shape == (2, 3)
+        for row in params:
+            # Each row should match one of the known params
+            matches = np.any([np.allclose(row, known_row) for known_row in known_params])
+            assert matches
+
+    def test_large_batch_parameter_generation(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test parameter generation for large batches."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            seed=42
+        )
+
+        # Generate large batch
+        params = sim._generate_parameters(10000)
+
+        assert params.shape == (10000, 3)
+        # Verify lognormal properties (positive values)
+        assert np.all(params > 0)
+
+
+class TestScenarioWorkflows:
+    """Test scenario-specific simulation workflows."""
+
+    def test_scenario_pool_isolation(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that different scenarios use separate pool storage."""
+        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+
+        # Create pool for 'gvax' scenario
+        pool = SimulationPoolManager(
+            cache_dir=temp_dir / 'cache',
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        # Add simulations for 'gvax' scenario
+        params_gvax = np.random.randn(50, 3)
+        obs_gvax = np.random.randn(50, 3)
+        pool.add_batch(params_gvax, obs_gvax, seed=42, scenario='gvax')
+
+        # Add simulations for 'control' scenario
+        params_control = np.random.randn(30, 3)
+        obs_control = np.random.randn(30, 3)
+        pool.add_batch(params_control, obs_control, seed=42, scenario='control')
+
+        # Check that scenarios are isolated
+        assert pool.get_available_simulations(scenario='gvax') == 50
+        assert pool.get_available_simulations(scenario='control') == 30
+        assert pool.get_available_simulations(scenario='anti_pd1') == 0
+
+    def test_multi_scenario_simulation(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test running simulations for multiple scenarios."""
+        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+
+        pool = SimulationPoolManager(
+            cache_dir=temp_dir / 'cache',
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        # Create simulators for different scenarios
+        sim_gvax = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            scenario='gvax',
+            cache_dir=temp_dir / 'cache',
+            pool=pool
+        )
+
+        sim_control = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            scenario='control',
+            cache_dir=temp_dir / 'cache',
+            pool=pool
+        )
+
+        # Verify scenarios are different
+        assert sim_gvax.scenario == 'gvax'
+        assert sim_control.scenario == 'control'
+
+
+class TestHashComputationIntegration:
+    """Test hash computation in realistic scenarios."""
+
+    def test_hash_changes_invalidate_cache(self, sample_test_stats_csv, temp_dir):
+        """Test that changing priors invalidates HPC cache lookups."""
+        # Create two different priors files
+        priors1 = temp_dir / 'priors_v1.csv'
+        pd.DataFrame({
+            'name': ['param1', 'param2'],
+            'distribution': ['lognormal', 'lognormal'],
+            'dist_param1': [0.0, 0.0],
+            'dist_param2': [1.0, 1.0]
+        }).to_csv(priors1, index=False)
+
+        priors2 = temp_dir / 'priors_v2.csv'
+        pd.DataFrame({
+            'name': ['param1', 'param2'],
+            'distribution': ['lognormal', 'lognormal'],
+            'dist_param1': [0.5, 0.5],  # Different values
+            'dist_param2': [1.0, 1.0]
+        }).to_csv(priors2, index=False)
+
+        sim1 = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=priors1,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache1'
+        )
+
+        sim2 = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=priors2,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache2'
+        )
+
+        # Hashes should differ
+        hash1 = sim1._compute_priors_hash()
+        hash2 = sim2._compute_priors_hash()
+        assert hash1 != hash2
+
+        # Pool IDs should also differ
+        from qsp_hpc.constants import HASH_PREFIX_LENGTH
+        pool_id1 = f"v1_{hash1[:HASH_PREFIX_LENGTH]}"
+        pool_id2 = f"v1_{hash2[:HASH_PREFIX_LENGTH]}"
+        assert pool_id1 != pool_id2
+
+    def test_hash_includes_model_script(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that model_script is included in priors hash."""
+        sim1 = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_script='model_v1',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache1'
+        )
+
+        sim2 = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_script='model_v2',  # Different model script
+            model_version='v1',
+            cache_dir=temp_dir / 'cache2'
+        )
+
+        # Hashes should differ
+        assert sim1._compute_priors_hash() != sim2._compute_priors_hash()
+
+
+class TestEndToEndIntegration:
+    """End-to-end integration tests with real file I/O."""
+
+    def test_complete_local_workflow(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test complete workflow from empty cache to loaded results."""
+        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+
+        cache_dir = temp_dir / 'e2e_cache'
+
+        # Create simulator with fresh cache
+        pool = SimulationPoolManager(
+            cache_dir=cache_dir,
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=cache_dir,
+            pool=pool,
+            seed=42
+        )
+
+        # Verify pool is empty
+        assert pool.get_available_simulations(scenario='default') == 0
+
+        # Add simulations manually (simulating HPC results)
+        params = sim._generate_parameters(100)
+        obs = np.random.randn(100, 3)
+        pool.add_batch(params, obs, seed=42, scenario='default')
+
+        # Now request simulations - should use cache
+        result_params, result_obs = sim(50)
+
+        assert result_params.shape == (50, 3)
+        assert result_obs.shape == (50, 3)
+
+        # Verify pool still has all simulations
+        assert pool.get_available_simulations(scenario='default') == 100
+
+    def test_cache_persistence_across_instances(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that cache persists across simulator instances."""
+        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+
+        cache_dir = temp_dir / 'persistent_cache'
+
+        # First instance: add to cache
+        pool1 = SimulationPoolManager(
+            cache_dir=cache_dir,
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        params = np.random.randn(100, 3)
+        obs = np.random.randn(100, 3)
+        pool1.add_batch(params, obs, seed=42, scenario='default')
+
+        # Second instance: should see cached data
+        pool2 = SimulationPoolManager(
+            cache_dir=cache_dir,
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        # Should find the cached simulations
+        assert pool2.get_available_simulations(scenario='default') == 100
+
+
+# ============================================================================
+# Additional Coverage Tests - Methods Without Heavy Mocking
+# ============================================================================
+
+class TestHashAndConfigMethods:
+    """Test hash computation and configuration methods with real execution."""
+
+    def test_compute_priors_hash_with_different_model_versions(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that model_version affects priors hash."""
+        sim1 = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_script='script',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache1'
+        )
+
+        sim2 = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_script='script',
+            model_version='v2',  # Different version
+            cache_dir=temp_dir / 'cache2'
+        )
+
+        # Different model versions should produce different hashes
+        assert sim1._compute_priors_hash() != sim2._compute_priors_hash()
+
+    def test_compute_test_stats_hash_consistency(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that test stats hash is consistent across multiple calls."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache'
+        )
+
+        hash1 = sim._compute_test_stats_hash()
+        hash2 = sim._compute_test_stats_hash()
+        hash3 = sim._compute_test_stats_hash()
+
+        # Should be identical
+        assert hash1 == hash2 == hash3
+        # Should be valid hex string
+        assert len(hash1) == 64  # SHA256 produces 64 hex characters
+
+
+class TestCallableInterface:
+    """Test the __call__ method integration paths."""
+
+    def test_call_with_tuple_batch_size(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that __call__ handles tuple batch sizes (BayesFlow format)."""
+        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+
+        pool = SimulationPoolManager(
+            cache_dir=temp_dir / 'cache',
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        # Add simulations
+        params = np.random.randn(100, 3)
+        obs = np.random.randn(100, 3)
+        pool.add_batch(params, obs, seed=42, scenario='default')
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=pool,
+            local_only=True
+        )
+
+        # Call with tuple (BayesFlow format: (10,) means 10 simulations)
+        result_params, result_obs = sim((10,))
+
+        assert result_params.shape == (10, 3)
+        assert result_obs.shape == (10, 3)
+
+    def test_call_with_multidimensional_tuple(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that __call__ handles multi-dimensional tuple batch sizes."""
+        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+
+        pool = SimulationPoolManager(
+            cache_dir=temp_dir / 'cache',
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        # Add simulations
+        params = np.random.randn(100, 3)
+        obs = np.random.randn(100, 3)
+        pool.add_batch(params, obs, seed=42, scenario='default')
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=pool,
+            local_only=True
+        )
+
+        # Call with multi-dimensional tuple: (5, 2) = 10 simulations
+        result_params, result_obs = sim((5, 2))
+
+        assert result_params.shape == (10, 3)
+        assert result_obs.shape == (10, 3)
+
+
+class TestHelperMethodsRealExecution:
+    """Test helper methods with real execution."""
+
+    def test_stage_parameters_creates_valid_csv(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that _stage_parameters_to_csv creates a valid CSV file."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            seed=42
+        )
+
+        # Stage 50 parameters
+        params, csv_path = sim._stage_parameters_to_csv(50)
+
+        # Verify parameters shape
+        assert params.shape == (50, 3)
+
+        # Verify CSV exists and is valid
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        assert df.shape == (50, 3)
+        assert list(df.columns) == sim.param_names
+
+        # Cleanup
+        Path(csv_path).unlink()
+
+    def test_update_pool_adds_to_cache(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that _update_pool_with_results actually adds to pool."""
+        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+
+        pool = SimulationPoolManager(
+            cache_dir=temp_dir / 'cache',
+            model_version='v1',
+            model_description='Test model',
+            model_script='test_script',
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv
+        )
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=pool
+        )
+
+        # Initially empty
+        assert pool.get_available_simulations(scenario='default') == 0
+
+        # Add results
+        params = np.random.randn(25, 3)
+        obs = np.random.randn(25, 3)
+        sim._update_pool_with_results(params, obs)
+
+        # Should now have 25 simulations
+        assert pool.get_available_simulations(scenario='default') == 25
+
+
+class TestLoggingAndVerbosity:
+    """Test logging configuration and verbosity."""
+
+    def test_verbose_mode_creates_logger(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that verbose mode properly configures logger."""
+        sim_verbose = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            verbose=True
+        )
+
+        # Logger should be configured
+        assert sim_verbose.logger is not None
+        assert sim_verbose.verbose is True
+
+    def test_logging_methods_execute_without_error(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that logging helper methods execute without error."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            verbose=True
+        )
+
+        # These should not raise errors
+        sim._info("Test info message")
+        sim._debug("Test debug message")
+        sim._warning("Test warning message")
+        sim._error("Test error message")
+
+
+class TestParameterNames:
+    """Test parameter name loading and handling."""
+
+    def test_param_names_loaded_from_priors_csv(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that parameter names are correctly loaded from priors CSV."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache'
+        )
+
+        # From fixture: ['k_abs', 'k_elim', 'V_d']
+        assert len(sim.param_names) == 3
+        assert 'k_abs' in sim.param_names
+        assert 'k_elim' in sim.param_names
+        assert 'V_d' in sim.param_names
+
+    def test_param_names_order_matches_csv(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that parameter names maintain CSV order."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache'
+        )
+
+        # Order should match CSV
+        assert sim.param_names[0] == 'k_abs'
+        assert sim.param_names[1] == 'k_elim'
+        assert sim.param_names[2] == 'V_d'
+
+
+class TestRNGState:
+    """Test random number generator state management."""
+
+    def test_cache_sampling_seed_independence(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that cache_sampling_seed is independent of param generation seed."""
+        sim1 = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            seed=42,
+            cache_sampling_seed=999
+        )
+
+        sim2 = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            seed=42,
+            cache_sampling_seed=999
+        )
+
+        # Both should have same cache_sampling_seed
+        assert sim1.cache_sampling_seed == sim2.cache_sampling_seed == 999
+
+        # But different from main seed
+        assert sim1.cache_sampling_seed != sim1.seed
+
+    def test_param_rng_state_advances(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that parameter RNG state advances with each call."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            seed=42
+        )
+
+        # Generate parameters three times
+        params1 = sim._generate_parameters(10)
+        params2 = sim._generate_parameters(10)
+        params3 = sim._generate_parameters(10)
+
+        # All should be different (RNG state advancing)
+        assert not np.allclose(params1, params2)
+        assert not np.allclose(params2, params3)
+        assert not np.allclose(params1, params3)
+
+
+class TestProjectConfiguration:
+    """Test project-specific configuration."""
+
+    def test_project_name_stored(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that project_name is stored correctly."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='my_custom_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache'
+        )
+
+        assert sim.project_name == 'my_custom_project'
+
+    def test_model_description_stored(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that model_description is stored."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            model_description='My test model description',
+            cache_dir=temp_dir / 'cache'
+        )
+
+        assert sim.model_description == 'My test model description'
+
+    def test_max_tasks_configuration(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """Test that max_tasks is configurable."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            max_tasks=50
+        )
+
+        assert sim.max_tasks == 50

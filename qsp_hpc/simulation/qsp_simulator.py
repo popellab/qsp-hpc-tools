@@ -21,23 +21,22 @@ Usage:
 """
 
 import csv
-import logging
-import tempfile
-import subprocess
-import numpy as np
-import time
-import re
-import yaml
 import hashlib
+import logging
+import re
+import tempfile
+import time
 from pathlib import Path
-from typing import Union, Tuple, Optional, Dict, List, Any, Callable, TYPE_CHECKING
+from typing import Union, Tuple, Optional, Dict, List, Any, Callable
 
-if TYPE_CHECKING:
-    from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+import numpy as np
 from scipy.io import loadmat
-from qsp_hpc.batch.hpc_job_manager import MissingOutputError, RemoteCommandError, SubmissionError
-from qsp_hpc.utils.logging_config import setup_logger
+
+from qsp_hpc.batch.batch_utils import calculate_batch_split
+from qsp_hpc.batch.hpc_job_manager import HPCJobManager, MissingOutputError, RemoteCommandError, SubmissionError
 from qsp_hpc.constants import SLURM_REGISTRATION_DELAY, JOB_QUEUE_TIMEOUT, HASH_PREFIX_LENGTH
+from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
+from qsp_hpc.utils.logging_config import setup_logger
 
 
 class QSPSimulatorError(RuntimeError):
@@ -118,7 +117,6 @@ class QSPSimulator:
         self.poll_interval = poll_interval
         self.max_wait_time = max_wait_time
         self.verbose = verbose
-        self.batch_config: Optional[Dict[str, Any]] = None  # Loaded lazily when needed
         self.local_only = local_only
         self.project_name = project_name
 
@@ -129,14 +127,11 @@ class QSPSimulator:
             raise FileNotFoundError(f"Priors CSV not found: {self.priors_csv}")
 
         # Load parameter names from priors CSV
-        # Load parameter names from priors CSV (inline to avoid dependencies)
-        import csv
         with open(self.priors_csv, 'r') as f:
             reader = csv.DictReader(f)
             self.param_names = [row['name'] for row in reader]
 
         # Initialize SimulationPoolManager for local caching
-        from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
         self.pool = pool or SimulationPoolManager(
             cache_dir=cache_dir,
             model_version=model_version,
@@ -146,8 +141,13 @@ class QSPSimulator:
             model_script=model_script
         )
 
-        # Optional injected dependencies for testing/mocking
-        self.job_manager = job_manager
+        # Create HPCJobManager once (unless injected for testing or local_only mode)
+        if job_manager is None and not local_only:
+            self.job_manager = HPCJobManager(verbose=verbose)
+        else:
+            self.job_manager = job_manager
+
+        # Optional injected MATLAB runner for testing/mocking
         self._matlab_runner = matlab_runner
 
         # Set up logging
@@ -240,17 +240,13 @@ class QSPSimulator:
         Returns:
             Tuple of (params, observables)
         """
-        from qsp_hpc.batch.hpc_job_manager import HPCJobManager, MissingOutputError, RemoteCommandError
-        job_manager = self.job_manager or HPCJobManager()
-
         # Create temporary directory for download
-        import tempfile
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_cache_dir = Path(temp_dir)
 
             self._info("Downloading test statistics from HPC...")
             try:
-                params, test_stats = job_manager.download_test_stats(
+                params, test_stats = self.job_manager.download_test_stats(
                     hpc_pool_path, test_stats_hash, temp_cache_dir
                 )
             except (MissingOutputError, RemoteCommandError) as exc:
@@ -289,13 +285,10 @@ class QSPSimulator:
         verbose: bool = False
     ) -> Tuple[bool, str, int]:
         """Check HPC for existing full simulations."""
-        from qsp_hpc.batch.hpc_job_manager import HPCJobManager, SubmissionError, RemoteCommandError, MissingOutputError
-        job_manager = self.job_manager or HPCJobManager()
-
         hpc_pool_id = f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}"
         self._debug(f"HPC pool: {hpc_pool_id}")
 
-        has_full_sims, hpc_pool_path, n_available = job_manager.check_hpc_full_simulations(
+        has_full_sims, hpc_pool_path, n_available = self.job_manager.check_hpc_full_simulations(
             self.model_version, priors_hash, num_simulations
         )
 
@@ -318,12 +311,9 @@ class QSPSimulator:
         verbose: bool = False
     ) -> None:
         """Derive test statistics from full simulations on HPC."""
-        from qsp_hpc.batch.hpc_job_manager import HPCJobManager
-        job_manager = self.job_manager or HPCJobManager()
-
         # Validate that derived test stats match requested simulation count
         try:
-            has_test_stats = job_manager.check_hpc_test_stats(
+            has_test_stats = self.job_manager.check_hpc_test_stats(
                 hpc_pool_path, test_stats_hash, expected_n_sims=num_simulations
             )
         except (RemoteCommandError, MissingOutputError) as exc:
@@ -337,7 +327,7 @@ class QSPSimulator:
         self._info("Deriving test statistics from full simulations...")
 
         # Launch derivation job
-        job_id = job_manager.submit_derivation_job(
+        job_id = self.job_manager.submit_derivation_job(
             hpc_pool_path,
             str(self.test_stats_csv),
             test_stats_hash,
@@ -350,13 +340,13 @@ class QSPSimulator:
         self._info("Derivation complete")
 
         # Verify that test stats were actually created
-        has_test_stats_now = job_manager.check_hpc_test_stats(hpc_pool_path, test_stats_hash)
+        has_test_stats_now = self.job_manager.check_hpc_test_stats(hpc_pool_path, test_stats_hash)
 
         if not has_test_stats_now:
             # Derivation failed - check logs
-            log_path = f"{job_manager.config.remote_project_path}/projects/{self.project_name}/batch_jobs/logs"
+            log_path = f"{self.job_manager.config.remote_project_path}/projects/{self.project_name}/batch_jobs/logs"
             log_cmd = f'ls -lt "{log_path}"/qsp_derive_*.err 2>/dev/null | head -3'
-            status, log_output = job_manager.transport.exec(log_cmd)
+            status, log_output = self.job_manager.transport.exec(log_cmd)
 
             if status == 0 and log_output.strip():
                 self._error("Recent derivation error logs:")
@@ -467,13 +457,11 @@ class QSPSimulator:
         test_stats_hash = self._compute_test_stats_hash()
 
         # Get HPC pool path (scenario-specific)
-        from qsp_hpc.batch.hpc_job_manager import HPCJobManager
-        job_manager = self.job_manager or HPCJobManager()
-        hpc_pool_path = f"{job_manager.config.simulation_pool_path}/{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
+        hpc_pool_path = f"{self.job_manager.config.simulation_pool_path}/{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
 
         # 2. Check HPC for derived test statistics
         try:
-            has_test_stats = job_manager.check_hpc_test_stats(
+            has_test_stats = self.job_manager.check_hpc_test_stats(
                 hpc_pool_path, test_stats_hash, expected_n_sims=num_simulations
             )
         except (RemoteCommandError, MissingOutputError) as exc:
@@ -488,7 +476,7 @@ class QSPSimulator:
 
         # 3. Check HPC for full simulations
         try:
-            has_full_sims, _, n_hpc_available = job_manager.check_hpc_full_simulations(
+            has_full_sims, _, n_hpc_available = self.job_manager.check_hpc_full_simulations(
                 f"{self.model_version}_{self.scenario}", priors_hash, num_simulations
             )
         except (RemoteCommandError, MissingOutputError) as exc:
@@ -565,11 +553,8 @@ class QSPSimulator:
 
 
         # 2. Check HPC for existing simulations
-        from qsp_hpc.batch.hpc_job_manager import HPCJobManager
-        job_manager = self.job_manager or HPCJobManager()
-
-        pool_path = f"{job_manager.config.simulation_pool_path}/{pool_id_base}"
-        has_full_sims, _, n_available = job_manager.check_hpc_full_simulations(
+        pool_path = f"{self.job_manager.config.simulation_pool_path}/{pool_id_base}"
+        has_full_sims, _, n_available = self.job_manager.check_hpc_full_simulations(
             self.model_version + f"_{pool_suffix}", priors_hash, n_samples
         )
 
@@ -578,20 +563,20 @@ class QSPSimulator:
                 self._info(f"HPC has {n_available} simulations (sufficient)")
 
             # Check/derive test statistics
-            has_test_stats = job_manager.check_hpc_test_stats(
+            has_test_stats = self.job_manager.check_hpc_test_stats(
                 pool_path, test_stats_hash, expected_n_sims=n_samples
             )
 
             if not has_test_stats:
                 self._info("Deriving test statistics from full simulations...")
-                job_id = job_manager.submit_derivation_job(
+                job_id = self.job_manager.submit_derivation_job(
                     pool_path, str(self.test_stats_csv), test_stats_hash
                 )
                 self._wait_for_completion([job_id], n_samples)
 
             # Download test stats
             self._info("Downloading from HPC...")
-            params, test_stats = job_manager.download_test_stats(
+            params, test_stats = self.job_manager.download_test_stats(
                 pool_path, test_stats_hash, local_cache_dir
             )
 
@@ -688,11 +673,6 @@ class QSPSimulator:
         self._validate_hpc_connection()
 
         # Import HPC job manager
-        from qsp_hpc.batch.hpc_job_manager import HPCJobManager
-
-        # Create job manager (loads from global config)
-        job_manager = self.job_manager or HPCJobManager()
-
         # Compute simulation pool ID for full simulations (scenario-specific)
         priors_hash = self._compute_priors_hash()
         simulation_pool_id = f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
@@ -700,16 +680,15 @@ class QSPSimulator:
             simulation_pool_id = f"{simulation_pool_id}_{pool_suffix}"
 
         # Log HPC save path
-        hpc_save_path = f"{job_manager.config.simulation_pool_path}/{simulation_pool_id}"
+        hpc_save_path = f"{self.job_manager.config.simulation_pool_path}/{simulation_pool_id}"
         self.logger.info(f"   → HPC save path: {hpc_save_path} (scenario='{self.scenario}')")
 
         # Calculate optimal split across tasks
-        from qsp_hpc.batch.batch_utils import calculate_batch_split
         jobs_per_chunk, n_tasks = calculate_batch_split(num_simulations, self.max_tasks)
         self.logger.info(f"   → Splitting {num_simulations} simulations into {n_tasks} tasks ({jobs_per_chunk} sims/task)")
 
         # Submit jobs via Python (no MATLAB startup!)
-        job_info = job_manager.submit_jobs(
+        job_info = self.job_manager.submit_jobs(
             samples_csv=samples_csv,
             test_stats_csv=str(self.test_stats_csv),
             model_script=self.model_script,
@@ -726,48 +705,11 @@ class QSPSimulator:
         self._wait_for_completion(job_info.job_ids, num_simulations)
 
         # Collect results via Python (no MATLAB needed!)
-        observables_matrix = job_manager.collect_results(
+        observables_matrix = self.job_manager.collect_results(
             state_file=job_info.state_file
         )
 
         return observables_matrix
-
-    def _load_batch_config(self) -> Dict:
-        """
-        Load batch configuration from ~/.config/qsp-hpc/credentials.yaml.
-
-        Returns:
-            Dictionary with SSH and cluster configuration
-        """
-        if self.batch_config is not None:
-            return self.batch_config
-
-        config_file = Path.home() / '.config' / 'qsp-hpc' / 'credentials.yaml'
-        if not config_file.exists():
-            raise FileNotFoundError(
-                f"Configuration not found at {config_file}\n"
-                "Please run 'qsp-hpc setup' to configure HPC connection."
-            )
-
-        with open(config_file, 'r') as f:
-            config = yaml.safe_load(f)
-
-        # Extract SSH settings
-        ssh_config = config.get('ssh', {})
-        self.batch_config = {
-            'ssh_host': ssh_config.get('host', ''),
-            'ssh_user': ssh_config.get('user', ''),
-            'ssh_key': ssh_config.get('key', ''),
-            'strict_host_key_checking': ssh_config.get('strict_host_key_checking', True),
-        }
-
-        if not self.batch_config['ssh_host']:
-            raise ValueError(
-                "SSH host not configured in credentials.yaml\n"
-                "Please run 'qsp-hpc setup' to configure HPC connection."
-            )
-
-        return self.batch_config
 
     def _validate_hpc_connection(self) -> None:
         """
@@ -777,118 +719,13 @@ class QSPSimulator:
             RuntimeError: If SSH connection cannot be established
         """
         try:
-            # Import HPC job manager
-            from qsp_hpc.batch.hpc_job_manager import HPCJobManager
-
-            # Create job manager (loads from global config)
-            job_manager = self.job_manager or HPCJobManager()
-
             # Validate SSH connection (fast - should return in 1-2s)
-            job_manager.validate_ssh_connection(timeout=5)
+            self.job_manager.validate_ssh_connection(timeout=5)
 
         except FileNotFoundError as e:
             raise FileNotFoundError(str(e))
         except Exception as e:
             raise RuntimeError(f"HPC connection validation failed: {e}")
-
-    def _check_job_status(self, job_id: str) -> Dict[str, int]:
-        """
-        Check status of SLURM job array via SSH.
-
-        Args:
-            job_id: SLURM job ID
-
-        Returns:
-            Dictionary with counts: {' completed': N, 'running': N, 'pending': N, 'failed': N}
-        """
-        config = self._load_batch_config()
-
-        # Build SSH command base
-        ssh_base = ['ssh']
-        if config['ssh_key']:
-            ssh_base.extend(['-i', config['ssh_key']])
-        ssh_base.extend([
-            '-o', 'BatchMode=yes',
-            '-o', f'StrictHostKeyChecking={"yes" if config["strict_host_key_checking"] else "no"}'
-        ])
-        # Handle SSH config alias (user is empty) vs direct connection (user@host)
-        if config['ssh_user']:
-            ssh_base.append(f"{config['ssh_user']}@{config['ssh_host']}")
-        else:
-            ssh_base.append(config['ssh_host'])
-
-        # Initialize status
-        status = {
-            'completed': 0,
-            'running': 0,
-            'pending': 0,
-            'failed': 0
-        }
-
-        try:
-            # First check squeue for active jobs (most reliable for running/pending)
-            # Use --array flag to get one entry per array task
-            ssh_cmd = ssh_base + [f'squeue -j {job_id} --array --format="%i %T" --noheader 2>/dev/null']
-            result = subprocess.run(
-                ssh_cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            # Parse squeue output (active jobs only)
-            # Each line is "job_id state"
-            if result.returncode == 0 and result.stdout.strip():
-                lines = [line.strip() for line in result.stdout.split('\n') if line.strip()]
-                for line in lines:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        state_upper = parts[1].upper()
-                        if 'RUNNING' in state_upper:
-                            status['running'] += 1
-                        elif 'PENDING' in state_upper:
-                            status['pending'] += 1
-
-            # Always check sacct for completed/failed jobs (not just when queue is empty)
-            # Completed jobs disappear from squeue, so we need to check sacct in parallel
-            # Use simple sacct query without time filter (job ID is enough to limit scope)
-            ssh_cmd = ssh_base + [
-                f'sacct -j {job_id} --format=JobID,State --noheader --parsable2'
-            ]
-            result = subprocess.run(
-                ssh_cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0 and result.stdout.strip():
-                lines = [line.strip() for line in result.stdout.split('\n') if line.strip()]
-
-                # Parse "jobid|state" format
-                for line in lines:
-                    parts = line.split('|')
-                    if len(parts) >= 2:
-                        job_part = parts[0]
-                        state = parts[1]
-
-                        # Only count main array tasks (format: 12345_0, 12345_1, ...)
-                        # Skip: main job (12345), sub-steps (12345_0.batch, 12345_0.extern)
-                        if '_' in job_part and '.' not in job_part:
-                            state_upper = state.upper()
-                            if 'COMPLETED' in state_upper:
-                                status['completed'] += 1
-                            elif 'FAILED' in state_upper or 'CANCELLED' in state_upper or 'TIMEOUT' in state_upper:
-                                status['failed'] += 1
-                            # Don't double-count running/pending from sacct if already counted in squeue
-                            # (sacct may show them in RUNNING state even if not in squeue yet)
-
-            return status
-
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("SSH connection timeout while checking job status")
-        except Exception as e:
-            raise RuntimeError(f"Failed to check job status: {e}")
 
     def _wait_for_completion(self, job_ids: List[str], num_simulations: int):
         """

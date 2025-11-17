@@ -160,8 +160,8 @@ def setup(global_only):
             if returncode == 0:
                 remote_username = output.strip()
                 click.echo(f"  Detected remote user: {remote_username}")
-        except (OSError, RuntimeError, TimeoutError):
-            # Could not detect remote username
+        except Exception:
+            # Could not detect remote username (timeout, connection failure, etc.)
             remote_username = None
 
     # Prompt for data base directory

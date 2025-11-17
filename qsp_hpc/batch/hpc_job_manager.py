@@ -34,12 +34,14 @@ import subprocess
 import yaml
 import pickle
 import json
+import logging
 import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
 import numpy as np
+from qsp_hpc.utils.logging_config import setup_logger
 
 
 @dataclass
@@ -211,6 +213,7 @@ class HPCJobManager:
 
         self.config = config
         self.verbose = verbose
+        self.logger = setup_logger(__name__, verbose=verbose)
         self.transport = transport or SSHTransport(self.config)
 
         # Rsync exclusion patterns (from batch_execute.m)
@@ -419,17 +422,17 @@ class HPCJobManager:
         required packages for Parquet I/O and test statistics derivation.
         """
         if self.verbose:
-            print(f"Checking HPC Python environment at {self.config.hpc_venv_path}...")
+            self.logger.info(f"Checking HPC Python environment at {self.config.hpc_venv_path}...")
 
         # Check if venv exists
         status, _ = self._ssh_exec(f'test -d "{self.config.hpc_venv_path}" && echo "exists"')
 
         if status == 0:
             if self.verbose:
-                print(f"HPC venv already configured")
+                self.logger.info("HPC venv already configured")
             return
 
-        print(f"Setting up HPC Python environment (first time only)...")
+        self.logger.info("Setting up HPC Python environment (first time only)...")
 
         # Run setup script on HPC
         setup_script = f"""
@@ -439,11 +442,11 @@ bash scripts/setup_hpc_venv.sh
         status, output = self._ssh_exec(setup_script, timeout=300)  # 5 min timeout
 
         if status != 0:
-            print(f"Warning: venv setup had issues (but may still work)")
+            self.logger.warning("venv setup had issues (but may still work)")
             if self.verbose:
-                print(f"Output: {output}")
+                self.logger.debug(f"Output: {output}")
         else:
-            print(f"HPC Python environment configured")
+            self.logger.info("HPC Python environment configured")
 
     def sync_codebase(self, skip_sync: bool = False) -> None:
         """
@@ -495,7 +498,7 @@ bash scripts/setup_hpc_venv.sh
 
         elapsed = time.time() - start_time
         if self.verbose:
-            print(f"Codebase synced ({elapsed:.1f}s)")
+            self.logger.info(f"Codebase synced ({elapsed:.1f}s)")
 
     def submit_jobs(
         self,
@@ -626,7 +629,7 @@ bash scripts/setup_hpc_venv.sh
             self._ssh_upload(temp_file, remote_file)
             if self.verbose:
                 elapsed = time.time() - start_time
-                print(f"Job config uploaded ({elapsed:.1f}s)")
+                self.logger.debug(f"Job config uploaded ({elapsed:.1f}s)")
         finally:
             Path(temp_file).unlink()
 
@@ -640,7 +643,7 @@ bash scripts/setup_hpc_venv.sh
         self._ssh_upload(csv_path, remote_file)
         if self.verbose:
             elapsed = time.time() - start_time
-            print(f"Parameters uploaded ({elapsed:.1f}s)")
+            self.logger.debug(f"Parameters uploaded ({elapsed:.1f}s)")
 
     def _upload_test_statistics(self, test_stats_csv: str, project_name: str) -> None:
         """Upload test statistics CSV and extract embedded functions as tarball."""
@@ -692,7 +695,7 @@ bash scripts/setup_hpc_venv.sh
 
                     if self.verbose:
                         elapsed = time.time() - start_time
-                        print(f"Test statistics uploaded ({n_functions} functions, {elapsed:.1f}s)")
+                        self.logger.debug(f"Test statistics uploaded ({n_functions} functions, {elapsed:.1f}s)")
 
                 finally:
                     # Clean up temp directory
@@ -700,23 +703,24 @@ bash scripts/setup_hpc_venv.sh
             else:
                 if self.verbose:
                     elapsed = time.time() - start_time
-                    print(f"Test statistics uploaded ({elapsed:.1f}s)")
+                    self.logger.debug(f"Test statistics uploaded ({elapsed:.1f}s)")
 
         except Exception as e:
-            if self.verbose:
-                elapsed = time.time() - start_time
-                print(f"Test statistics uploaded ({elapsed:.1f}s)")
+            elapsed = time.time() - start_time
+            self.logger.error(f"Failed to upload test statistics: {e}")
+            self.logger.debug(f"Time elapsed before error: {elapsed:.1f}s")
+            raise  # Re-raise the exception after logging
 
     def _submit_slurm_job(self, n_jobs: int, project_name: str) -> str:
         """Generate and submit SLURM array job."""
         start_time = time.time()
 
         # Log SLURM configuration
-        print(f"   SLURM Configuration:")
-        print(f"     Partition: {self.config.partition}")
-        print(f"     Time limit: {self.config.time_limit}")
-        print(f"     Memory per job: {self.config.memory_per_job}")
-        print(f"     Array size: {n_jobs} tasks")
+        self.logger.info("SLURM Configuration:")
+        self.logger.info(f"  Partition: {self.config.partition}")
+        self.logger.info(f"  Time limit: {self.config.time_limit}")
+        self.logger.info(f"  Memory per job: {self.config.memory_per_job}")
+        self.logger.info(f"  Array size: {n_jobs} tasks")
 
         # Generate SLURM script
         script_content = self._generate_slurm_script(n_jobs, project_name)
@@ -747,7 +751,7 @@ bash scripts/setup_hpc_venv.sh
 
             job_id = match.group(1)
             elapsed = time.time() - start_time
-            print(f"   🚀 Job {job_id} ({n_jobs} tasks, {elapsed:.1f}s)")
+            self.logger.info(f"🚀 Job {job_id} ({n_jobs} tasks, {elapsed:.1f}s)")
 
             return job_id
 
@@ -937,17 +941,19 @@ echo "Job completed at $(date)"
                 for line in output.split('\n'):
                     if line.startswith('N_SIMS:'):
                         n_available = int(line.split(':')[1].strip())
-                        if self.verbose:
-                            print(f"Counted from filenames: {n_available} simulations")
+                        self.logger.debug(f"Counted from filenames: {n_available} simulations")
                         break
             else:
-                if self.verbose:
-                    print(f"Could not parse output format")
+                self.logger.debug("Could not parse output format")
 
-        except Exception as e:
-            if self.verbose:
-                print(f"Error parsing count: {e}")
+        except (ValueError, IndexError, KeyError) as e:
+            # Handle parsing errors gracefully - likely means no valid simulations
+            self.logger.warning(f"Error parsing simulation count: {e}")
             n_available = 0
+        except Exception as e:
+            # Unexpected error - log and re-raise
+            self.logger.error(f"Unexpected error checking HPC pool: {e}")
+            raise
 
         return n_available
 
@@ -1239,11 +1245,11 @@ echo "Job completed at $(date)"
         n_batches = int(output.strip()) if output.strip().isdigit() else 1
 
         # Log SLURM configuration for derivation job
-        print(f"   SLURM Derivation Configuration:")
-        print(f"     Partition: {self.config.partition}")
-        print(f"     Time limit: 01:00:00 (fixed for derivation)")
-        print(f"     Memory per job: 4G (fixed for derivation)")
-        print(f"     Array size: {n_batches} tasks")
+        self.logger.info("SLURM Derivation Configuration:")
+        self.logger.info(f"  Partition: {self.config.partition}")
+        self.logger.info("  Time limit: 01:00:00 (fixed for derivation)")
+        self.logger.info("  Memory per job: 4G (fixed for derivation)")
+        self.logger.info(f"  Array size: {n_batches} tasks")
 
         # Generate SLURM script
         slurm_script = self._generate_derivation_slurm_script(

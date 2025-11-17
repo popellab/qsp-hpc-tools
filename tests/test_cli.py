@@ -68,7 +68,7 @@ class TestSetupCommand:
         with patch('qsp_hpc.batch.hpc_job_manager.HPCJobManager') as MockManager:
             mock_manager = Mock()
             mock_manager.validate_ssh_connection = Mock()
-            mock_manager._ssh_exec = Mock(return_value=(0, "slurm 23.02.1"))
+            mock_manager.transport.exec = Mock(return_value=(0, "slurm 23.02.1"))
             MockManager.return_value = mock_manager
 
             # Provide input for all prompts
@@ -153,7 +153,7 @@ Host other-host
         with patch('qsp_hpc.batch.hpc_job_manager.HPCJobManager') as MockManager:
             mock_manager = Mock()
             mock_manager.validate_ssh_connection = Mock()
-            mock_manager._ssh_exec = Mock(return_value=(0, "slurm 23.02.1"))
+            mock_manager.transport.exec = Mock(return_value=(0, "slurm 23.02.1"))
             MockManager.return_value = mock_manager
 
             result = cli_runner.invoke(setup, input=(
@@ -181,7 +181,7 @@ Host other-host
             mock_manager = Mock()
             mock_manager.validate_ssh_connection = Mock()
             # First _ssh_exec is SLURM check, then whoami, then dir checks, then mkdir
-            mock_manager._ssh_exec = Mock(side_effect=[
+            mock_manager.transport.exec = Mock(side_effect=[
                 (0, "slurm 23.02.1"),  # SLURM version check
                 (0, "testuser"),        # whoami
                 (1, ""),                # Base dir doesn't exist
@@ -246,7 +246,7 @@ class TestTestCommand:
                 matlab_module='matlab/R2024a'
             )
             mock_manager.validate_ssh_connection = Mock()
-            mock_manager._ssh_exec = Mock(side_effect=[
+            mock_manager.transport.exec = Mock(side_effect=[
                 (0, "testuser"),            # whoami
                 (0, "slurm 23.02.1"),       # scontrol --version
                 (0, "PARTITION\nnormal\n"), # sinfo partitions
@@ -305,7 +305,7 @@ class TestTestCommand:
                 matlab_module='matlab/R2024a'
             )
             mock_manager.validate_ssh_connection = Mock()
-            mock_manager._ssh_exec = Mock(side_effect=[
+            mock_manager.transport.exec = Mock(side_effect=[
                 (0, "testuser"),                  # whoami
                 (0, "slurm 23.02.1"),             # scontrol --version
                 (0, "PARTITION\nnormal\nshort\n"), # sinfo (no 'nonexistent')
@@ -448,7 +448,7 @@ class TestLogsCommand:
             mock_manager = Mock()
             mock_manager.config = Mock()
             mock_manager.config.remote_project_path = '/home/testuser/qsp-projects'
-            mock_manager._ssh_exec = Mock(side_effect=[
+            mock_manager.transport.exec = Mock(side_effect=[
                 (0, "/home/testuser/qsp-projects/job123/slurm-12345.out"),  # find log file
                 (0, "Task 1 completed\nTask 2 running\n"),  # tail log content
             ])
@@ -468,7 +468,7 @@ class TestLogsCommand:
             mock_manager = Mock()
             mock_manager.config = Mock()
             mock_manager.config.remote_project_path = '/home/testuser/qsp-projects'
-            mock_manager._ssh_exec = Mock(side_effect=[
+            mock_manager.transport.exec = Mock(side_effect=[
                 (0, "/home/testuser/qsp-projects/job123/slurm-12345_3.out"),  # find log with task ID
                 (0, "Array task 3 output\n"),  # tail log content
             ])
@@ -487,7 +487,7 @@ class TestLogsCommand:
             mock_manager = Mock()
             mock_manager.config = Mock()
             mock_manager.config.remote_project_path = '/home/testuser/qsp-projects'
-            mock_manager._ssh_exec = Mock(return_value=(0, ""))  # No log file found
+            mock_manager.transport.exec = Mock(return_value=(0, ""))  # No log file found
             MockManager.return_value = mock_manager
 
             result = cli_runner.invoke(logs, ['--job-id', '99999'])

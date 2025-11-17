@@ -136,7 +136,7 @@ def setup(global_only):
     click.echo("Checking SLURM access...", nl=False)
 
     try:
-        returncode, output = test_manager._ssh_exec("scontrol --version", timeout=10)
+        returncode, output = test_manager.transport.exec("scontrol --version", timeout=10)
         if returncode == 0 and 'slurm' in output.lower():
             # Extract version
             version = output.strip().split()[-1] if output.strip() else "unknown"
@@ -156,7 +156,7 @@ def setup(global_only):
     remote_username = ssh_user
     if not remote_username:
         try:
-            returncode, output = test_manager._ssh_exec("whoami", timeout=10)
+            returncode, output = test_manager.transport.exec("whoami", timeout=10)
             if returncode == 0:
                 remote_username = output.strip()
                 click.echo(f"  Detected remote user: {remote_username}")
@@ -209,7 +209,7 @@ def setup(global_only):
     for dir_name, dir_path in dirs_to_check:
         click.echo(f"  Checking {dir_name}: {dir_path}...", nl=False)
         try:
-            returncode, _ = test_manager._ssh_exec(f"test -d {dir_path}", timeout=10)
+            returncode, _ = test_manager.transport.exec(f"test -d {dir_path}", timeout=10)
             if returncode == 0:
                 click.secho(" ✓ exists", fg='green')
             else:
@@ -229,7 +229,7 @@ def setup(global_only):
             for dir_name, dir_path in dirs_need_creation:
                 click.echo(f"  Creating {dir_name}: {dir_path}...", nl=False)
                 try:
-                    returncode, output = test_manager._ssh_exec(f"mkdir -p {dir_path}", timeout=10)
+                    returncode, output = test_manager.transport.exec(f"mkdir -p {dir_path}", timeout=10)
                     if returncode == 0:
                         click.secho(" ✓", fg='green')
                     else:
@@ -284,7 +284,7 @@ echo "Python venv setup complete!"
 """
 
             try:
-                returncode, output = test_manager._ssh_exec(setup_cmd.strip(), timeout=300)
+                returncode, output = test_manager.transport.exec(setup_cmd.strip(), timeout=300)
                 click.echo()
                 click.echo("  Output:")
                 for line in output.split('\n')[-10:]:  # Show last 10 lines
@@ -325,7 +325,7 @@ echo "Python venv setup complete!"
 
     try:
         # First just try to load the module
-        returncode, output = test_manager._ssh_exec(
+        returncode, output = test_manager.transport.exec(
             f"module load {matlab_module} 2>&1 && echo 'MODULE_OK'",
             timeout=15
         )
@@ -421,7 +421,7 @@ def test(timeout):
     # Test whoami
     click.echo(f"Checking remote user...", nl=False)
     try:
-        returncode, output = manager._ssh_exec("whoami", timeout=timeout)
+        returncode, output = manager.transport.exec("whoami", timeout=timeout)
         if returncode == 0:
             username = output.strip()
             click.secho(f" ✓ {username}", fg='green')
@@ -433,7 +433,7 @@ def test(timeout):
     # Test SLURM
     click.echo(f"Checking SLURM availability...", nl=False)
     try:
-        returncode, output = manager._ssh_exec("scontrol --version", timeout=timeout)
+        returncode, output = manager.transport.exec("scontrol --version", timeout=timeout)
         if returncode == 0 and 'slurm' in output.lower():
             version = output.strip().split()[-1] if output.strip() else "unknown"
             click.secho(f" ✓ v{version}", fg='green')
@@ -446,7 +446,7 @@ def test(timeout):
     if config.partition:
         click.echo(f"Checking partition '{config.partition}'...", nl=False)
         try:
-            returncode, output = manager._ssh_exec("sinfo -o '%P'", timeout=timeout)
+            returncode, output = manager.transport.exec("sinfo -o '%P'", timeout=timeout)
             if returncode == 0:
                 partitions = [line.strip().replace('*', '') for line in output.split('\n')]
                 if config.partition in partitions:
@@ -462,7 +462,7 @@ def test(timeout):
     # Test MATLAB
     click.echo(f"Checking MATLAB module '{config.matlab_module}'...", nl=False)
     try:
-        returncode, output = manager._ssh_exec(
+        returncode, output = manager.transport.exec(
             f"module load {config.matlab_module} 2>&1 && echo 'OK'",
             timeout=timeout
         )
@@ -482,7 +482,7 @@ def test(timeout):
         ('simulation pool', config.simulation_pool_path)
     ]:
         try:
-            returncode, _ = manager._ssh_exec(f"test -d {path}", timeout=timeout)
+            returncode, _ = manager.transport.exec(f"test -d {path}", timeout=timeout)
             if returncode != 0:
                 all_paths_ok = False
         except (OSError, RuntimeError, TimeoutError):
@@ -601,14 +601,14 @@ def logs(project_name, task_id, lines, job_id):
         log_pattern = f"slurm-{job_id}{task_suffix}.out"
 
         # Try to find the log file
-        returncode, output = manager._ssh_exec(
+        returncode, output = manager.transport.exec(
             f"find {manager.config.remote_project_path} -name '{log_pattern}' 2>/dev/null | head -1",
             timeout=10
         )
 
         if returncode == 0 and output.strip():
             log_file = output.strip()
-            returncode, log_content = manager._ssh_exec(f"tail -n {lines} {log_file}", timeout=10)
+            returncode, log_content = manager.transport.exec(f"tail -n {lines} {log_file}", timeout=10)
 
             if returncode == 0:
                 click.echo()

@@ -366,7 +366,7 @@ class QSPSimulator:
             # Derivation failed - check logs
             log_path = f"{job_manager.config.remote_project_path}/projects/{self.project_name}/batch_jobs/logs"
             log_cmd = f'ls -lt "{log_path}"/qsp_derive_*.err 2>/dev/null | head -3'
-            status, log_output = job_manager._ssh_exec(log_cmd)
+            status, log_output = job_manager.transport.exec(log_cmd)
 
             if status == 0 and log_output.strip():
                 self._error("Recent derivation error logs:")

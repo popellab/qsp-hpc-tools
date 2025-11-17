@@ -42,6 +42,9 @@ from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
 import numpy as np
 from qsp_hpc.utils.logging_config import setup_logger
+from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter, SubmissionError
+from qsp_hpc.batch.hpc_file_transfer import HPCFileTransfer
+from qsp_hpc.batch.result_collector import ResultCollector, MissingOutputError
 
 
 @dataclass
@@ -80,20 +83,6 @@ class RemoteCommandError(RuntimeError):
         self.returncode = returncode
         self.output = output
         super().__init__(f"Command failed (rc={returncode}): {command}\n{output}")
-
-
-class MissingOutputError(RuntimeError):
-    """Raised when expected remote output artifacts are missing."""
-
-    def __init__(self, message: str):
-        super().__init__(message)
-
-
-class SubmissionError(RuntimeError):
-    """Raised when SLURM submission cannot be parsed or accepted."""
-
-    def __init__(self, message: str):
-        super().__init__(message)
 
 
 class SSHTransport:
@@ -216,29 +205,10 @@ class HPCJobManager:
         self.logger = setup_logger(__name__, verbose=verbose)
         self.transport = transport or SSHTransport(self.config)
 
-        # Rsync exclusion patterns (from batch_execute.m)
-        self.rsync_exclude_patterns = [
-            '.git',
-            '*.mat',
-            '*.asv',
-            '*.m~',
-            '*.pdf',
-            '*.xlsx',
-            'venv/',
-            'env/',
-            '.venv/',
-            'scratch/',
-            'projects/*/batch_jobs/',
-            'projects/*/cache/',
-            '.DS_Store',
-            '.vscode/',
-            '.idea/',
-            '*.swp',
-            '*.swo',
-            '__pycache__/',
-            'node_modules/',
-            'slurm_config.yaml'
-        ]
+        # Initialize component classes (Composition over inheritance)
+        self.slurm_submitter = SLURMJobSubmitter(self.config, self.transport, verbose)
+        self.file_transfer = HPCFileTransfer(self.config, self.transport, verbose)
+        self.result_collector = ResultCollector(self.config, self.transport, verbose)
 
     def _load_config_from_yaml(self) -> BatchConfig:
         """
@@ -421,32 +391,7 @@ class HPCJobManager:
         Creates venv at configured hpc_venv_path if it doesn't exist and installs
         required packages for Parquet I/O and test statistics derivation.
         """
-        if self.verbose:
-            self.logger.info(f"Checking HPC Python environment at {self.config.hpc_venv_path}...")
-
-        # Check if venv exists
-        status, _ = self._ssh_exec(f'test -d "{self.config.hpc_venv_path}" && echo "exists"')
-
-        if status == 0:
-            if self.verbose:
-                self.logger.info("HPC venv already configured")
-            return
-
-        self.logger.info("Setting up HPC Python environment (first time only)...")
-
-        # Run setup script on HPC
-        setup_script = f"""
-cd "{self.config.remote_project_path}"
-bash scripts/setup_hpc_venv.sh
-"""
-        status, output = self._ssh_exec(setup_script, timeout=300)  # 5 min timeout
-
-        if status != 0:
-            self.logger.warning("venv setup had issues (but may still work)")
-            if self.verbose:
-                self.logger.debug(f"Output: {output}")
-        else:
-            self.logger.info("HPC Python environment configured")
+        return self.file_transfer.ensure_hpc_venv()
 
     def sync_codebase(self, skip_sync: bool = False) -> None:
         """
@@ -455,50 +400,7 @@ bash scripts/setup_hpc_venv.sh
         Args:
             skip_sync: If True, skip syncing (for testing)
         """
-        if skip_sync:
-            return
-
-        start_time = time.time()
-
-        local_root = Path.cwd()
-        remote_path = self.config.remote_project_path
-
-        # Ensure remote directory exists
-        self._ssh_exec(f'mkdir -p {remote_path}')
-
-        # Build rsync command
-        rsync_cmd = [
-            'rsync', '-az', '--delete',
-            '-e'
-        ]
-
-        # SSH options
-        ssh_opts = 'ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=5'
-        if self.config.ssh_key:
-            ssh_opts = f'ssh -i {self.config.ssh_key} -o ServerAliveInterval=30 -o ServerAliveCountMax=5'
-
-        rsync_cmd.append(ssh_opts)
-
-        # Add exclusions
-        for pattern in self.rsync_exclude_patterns:
-            rsync_cmd.extend(['--exclude', pattern])
-
-        # Use SSH config alias if no user specified, otherwise use user@host
-        if self.config.ssh_user:
-            remote_target = f'{self.config.ssh_user}@{self.config.ssh_host}:{remote_path}/'
-        else:
-            remote_target = f'{self.config.ssh_host}:{remote_path}/'
-
-        # Add source and destination
-        rsync_cmd.append(f'{local_root}/')
-        rsync_cmd.append(remote_target)
-
-        # Execute rsync
-        result = subprocess.run(rsync_cmd, capture_output=True, text=True)
-
-        elapsed = time.time() - start_time
-        if self.verbose:
-            self.logger.info(f"Codebase synced ({elapsed:.1f}s)")
+        return self.file_transfer.sync_codebase(skip_sync)
 
     def submit_jobs(
         self,

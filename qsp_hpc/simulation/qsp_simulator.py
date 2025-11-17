@@ -65,12 +65,12 @@ class QSPSimulator:
         self,
         test_stats_csv: Union[str, Path],
         priors_csv: Union[str, Path],
+        project_name: str,
         model_script: str = '',
         model_version: str = 'v1',
         model_description: str = '',
         scenario: str = 'default',
         cache_dir: Union[str, Path] = 'cache/sbi_simulations',
-        project_name: Optional[str] = None,
         seed: int = 2025,
         cache_sampling_seed: Optional[int] = None,
         max_tasks: int = 10,
@@ -88,6 +88,7 @@ class QSPSimulator:
         Args:
             test_stats_csv: Path to test statistics CSV defining observables
             priors_csv: Path to priors CSV defining parameter names and distributions
+            project_name: Project identifier (e.g., 'pdac_2025') used for organizing HPC files
             model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
             model_version: Descriptive version name (e.g., 'baseline_gvax')
             model_description: Brief description of model configuration
@@ -119,21 +120,7 @@ class QSPSimulator:
         self.verbose = verbose
         self.batch_config: Optional[Dict[str, Any]] = None  # Loaded lazily when needed
         self.local_only = local_only
-
-        # Extract project name from test_stats_csv path if not provided
-        # Expected format: projects/{project_name}/...
-        if project_name is None:
-            test_stats_str = str(self.test_stats_csv)
-            if 'projects/' in test_stats_str:
-                parts = test_stats_str.split('projects/')[1].split('/')
-                if parts:
-                    self.project_name = parts[0]
-                else:
-                    self.project_name = 'default_project'
-            else:
-                self.project_name = 'default_project'
-        else:
-            self.project_name = project_name
+        self.project_name = project_name
 
         if not self.test_stats_csv.exists():
             raise FileNotFoundError(f"Test statistics CSV not found: {self.test_stats_csv}")

@@ -126,10 +126,21 @@ class HPCFileTransfer:
         self.logger.info("Setting up HPC Python environment (first time only)...")
         self.logger.info(f"Installing qsp-hpc-tools from: {self.config.qsp_hpc_tools_source}")
 
-        # Run setup script on HPC with package source
+        # Run inline setup commands
         setup_script = f"""
-cd "{self.config.remote_project_path}"
-bash scripts/hpc/setup_hpc_venv.sh "{self.config.qsp_hpc_tools_source}"
+set -e
+
+echo "Creating venv at {self.config.hpc_venv_path}..."
+uv venv --python 3.11 {self.config.hpc_venv_path}
+
+echo "Installing qsp-hpc-tools from {self.config.qsp_hpc_tools_source}..."
+uv pip install --python {self.config.hpc_venv_path}/bin/python "{self.config.qsp_hpc_tools_source}"
+
+echo "Verifying installation..."
+{self.config.hpc_venv_path}/bin/python -c "import qsp_hpc; print('✓ qsp-hpc-tools installed')"
+{self.config.hpc_venv_path}/bin/python -c "import numpy, pandas, pyarrow; print('✓ Dependencies available')"
+
+echo "Python venv setup complete!"
 """
         status, output = self.transport.exec(setup_script, timeout=300)  # 5 min timeout
 

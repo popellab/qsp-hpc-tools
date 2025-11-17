@@ -128,7 +128,7 @@ def setup(global_only):
     click.echo("-" * 70)
 
     partition = click.prompt("  Partition", default="normal", type=str)
-    time_limit = click.prompt("  Default time limit", default="04:00:00", type=str)
+    time_limit = click.prompt("  Default time limit", default="01:00:00", type=str)
     mem_per_cpu = click.prompt("  Memory per CPU", default="4G", type=str)
 
     # Check SLURM access
@@ -167,11 +167,9 @@ def setup(global_only):
     # Suggest paths based on remote username
     if remote_username and remote_username != "username":
         default_base = f"/home/{remote_username}/qsp-projects"
-        default_venv = f"/home/{remote_username}/.venv/hpc-qsp"
         default_pool = f"/scratch/{remote_username}/simulations"
     else:
         default_base = "/home/username/qsp-projects"
-        default_venv = "/home/username/.venv/hpc-qsp"
         default_pool = "/scratch/username/simulations"
 
     remote_base_dir = click.prompt(
@@ -180,6 +178,8 @@ def setup(global_only):
         type=str
     )
 
+    # Venv stored relative to remote base directory
+    default_venv = f"{remote_base_dir}/.venv/hpc-qsp"
     hpc_venv_path = click.prompt(
         "  Python virtual environment path",
         default=default_venv,
@@ -253,7 +253,7 @@ def setup(global_only):
         click.echo("    2. Set it up manually later")
         click.echo()
 
-        if click.confirm("  Run Python venv setup script now?", default=True):
+        if click.confirm("  Run Python venv setup now?", default=True):
             click.echo()
             click.echo("  Setting up Python environment on HPC...")
             click.echo("  This will:")
@@ -263,14 +263,26 @@ def setup(global_only):
             click.echo("  This may take a few minutes...")
             click.echo()
 
-            # Use the proper setup script with package source from config
+            # Get package source from config
             qsp_hpc_tools_source = config.get('package', {}).get(
                 'qsp_hpc_tools_source',
                 'git+https://github.com/jeliason/qsp-hpc-tools.git@main'
             )
+
             setup_cmd = f"""
-cd "{remote_base_dir}"
-bash scripts/hpc/setup_hpc_venv.sh "{qsp_hpc_tools_source}"
+set -e
+
+echo "Creating venv at {hpc_venv_path}..."
+uv venv --python 3.11 {hpc_venv_path}
+
+echo "Installing qsp-hpc-tools from {qsp_hpc_tools_source}..."
+uv pip install --python {hpc_venv_path}/bin/python "{qsp_hpc_tools_source}"
+
+echo "Verifying installation..."
+{hpc_venv_path}/bin/python -c "import qsp_hpc; print('✓ qsp-hpc-tools installed')"
+{hpc_venv_path}/bin/python -c "import numpy, pandas, pyarrow; print('✓ Dependencies available')"
+
+echo "Python venv setup complete!"
 """
 
             try:
@@ -298,8 +310,8 @@ bash scripts/hpc/setup_hpc_venv.sh "{qsp_hpc_tools_source}"
             click.echo()
             click.secho("  ℹ️  Remember to set up the Python venv before submitting jobs:", fg='cyan')
             click.echo(f"    ssh {ssh_host}")
-            click.echo(f"    cd {remote_base_dir}")
-            click.echo(f"    bash scripts/hpc/setup_hpc_venv.sh")
+            click.echo(f"    uv venv --python 3.11 {hpc_venv_path}")
+            click.echo(f"    uv pip install --python {hpc_venv_path}/bin/python git+https://github.com/jeliason/qsp-hpc-tools.git@main")
 
     click.echo()
 

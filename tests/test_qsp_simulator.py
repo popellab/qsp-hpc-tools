@@ -473,8 +473,7 @@ class TestPoolIntegration:
             model_version='v1',
             cache_dir=temp_dir / 'cache',
             pool=fake_pool,
-            job_manager=fake_job_mgr,
-            logger=lambda msg: None,
+            job_manager=fake_job_mgr
         )
 
         assert sim.pool is fake_pool
@@ -494,8 +493,7 @@ class TestFlowDecisions:
             priors_csv=sample_priors_csv,
             model_version='v1',
             cache_dir=temp_dir / 'cache',
-            pool=fake_pool,
-            logger=lambda msg: None,
+            pool=fake_pool
         )
 
         params, obs = sim(2)
@@ -521,8 +519,7 @@ class TestFlowDecisions:
             model_version='v1',
             cache_dir=temp_dir / 'cache',
             pool=fake_pool,
-            job_manager=fake_job_mgr,
-            logger=lambda msg: None,
+            job_manager=fake_job_mgr
         )
 
         with patch.object(sim, '_download_and_add_to_pool', return_value=(np.ones((1, 1)), np.ones((1, 1)))) as downloader:
@@ -547,8 +544,7 @@ class TestFlowDecisions:
             model_version='v1',
             cache_dir=temp_dir / 'cache',
             pool=fake_pool,
-            job_manager=fake_job_mgr,
-            logger=lambda msg: None,
+            job_manager=fake_job_mgr
         )
 
         with patch.object(sim, '_run_new_simulations', return_value=(np.ones((1, 1)), np.ones((1, 1)))) as runner:
@@ -570,8 +566,7 @@ class TestFlowDecisions:
             model_version='v1',
             cache_dir=temp_dir / 'cache',
             pool=fake_pool,
-            job_manager=fake_job_mgr,
-            logger=lambda msg: None,
+            job_manager=fake_job_mgr
         )
 
         with pytest.raises(QSPSimulatorError):
@@ -587,8 +582,7 @@ class TestFlowDecisions:
             model_version='v1',
             cache_dir=temp_dir / 'cache',
             pool=fake_pool,
-            local_only=True,
-            logger=lambda msg: None,
+            local_only=True
         )
 
         with pytest.raises(QSPSimulatorError):
@@ -603,8 +597,7 @@ class TestHelperFunctions:
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
             model_version='v1',
-            cache_dir=temp_dir / 'cache',
-            logger=lambda msg: None,
+            cache_dir=temp_dir / 'cache'
         )
 
         params, csv_path = sim._stage_parameters_to_csv(3)
@@ -625,8 +618,7 @@ class TestHelperFunctions:
             priors_csv=sample_priors_csv,
             model_version='v1',
             cache_dir=temp_dir / 'cache',
-            pool=fake_pool,
-            logger=lambda msg: None,
+            pool=fake_pool
         )
 
         params = np.ones((2, 1))
@@ -654,8 +646,7 @@ class TestHelperFunctions:
             model_version='v1',
             cache_dir=temp_dir / 'cache',
             pool=fake_pool,
-            job_manager=fake_job_mgr,
-            logger=lambda msg: None,
+            job_manager=fake_job_mgr
         )
 
         with patch.object(sim, '_run_new_simulations', side_effect=SubmissionError("fail")):

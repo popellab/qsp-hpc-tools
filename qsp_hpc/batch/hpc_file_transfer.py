@@ -124,8 +124,21 @@ class HPCFileTransfer:
         status, output = self.transport.exec(check_cmd)
 
         if status == 0 and 'VENV_OK' in output:
+            # Venv exists - upgrade qsp-hpc-tools to latest version from GitHub
             if self.verbose:
-                self.logger.info("HPC venv already configured")
+                self.logger.info("HPC venv configured - upgrading qsp-hpc-tools to latest version...")
+
+            upgrade_cmd = f'''
+                uv pip install --upgrade --python {self.config.hpc_venv_path}/bin/python "{self.config.qsp_hpc_tools_source}"
+            '''
+            status, output = self.transport.exec(upgrade_cmd, timeout=120)
+
+            if status == 0:
+                if self.verbose:
+                    self.logger.info("qsp-hpc-tools upgraded successfully")
+            else:
+                self.logger.warning(f"Failed to upgrade qsp-hpc-tools: {output}")
+
             return
 
         self.logger.info("Setting up HPC Python environment (first time only)...")

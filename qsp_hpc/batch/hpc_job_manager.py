@@ -532,7 +532,7 @@ class HPCJobManager:
         jobs_per_chunk: int,
         project_name: str,
         save_full_simulations: bool = True,
-        simulation_pool_id: str = None
+        simulation_pool_id: Optional[str] = None
     ) -> None:
         """Create and upload job configuration as JSON."""
         return self.file_transfer.upload_job_config(
@@ -663,7 +663,7 @@ class HPCJobManager:
             if observables.ndim == 1:
                 observables = observables.reshape(1, -1)
 
-            return observables
+            return observables  # type: ignore[no-any-return]
 
         finally:
             # Clean up temp directory
@@ -1112,7 +1112,7 @@ class HPCJobManager:
 
         # Filter to successful simulations only
         success_mask = (statuses == 1)
-        n_successful = np.sum(success_mask)
+        n_successful: int = int(np.sum(success_mask))
 
         if n_successful == 0:
             raise ValueError(f"No successful simulations found in {parquet_file}")

@@ -30,7 +30,10 @@ import re
 import yaml
 import hashlib
 from pathlib import Path
-from typing import Union, Tuple, Optional, Dict, List, Any, Callable
+from typing import Union, Tuple, Optional, Dict, List, Any, Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
 from scipy.io import loadmat
 from qsp_hpc.batch.hpc_job_manager import MissingOutputError, RemoteCommandError, SubmissionError
 from qsp_hpc.utils.logging_config import setup_logger
@@ -74,7 +77,7 @@ class QSPSimulator:
         poll_interval: int = 30,
         max_wait_time: Optional[int] = None,
         verbose: bool = False,
-        pool: "SimulationPoolManager" = None,
+        pool: Optional["SimulationPoolManager"] = None,
         job_manager: Any = None,
         matlab_runner: Optional[Callable[..., np.ndarray]] = None,
         local_only: bool = False,
@@ -114,7 +117,7 @@ class QSPSimulator:
         self.poll_interval = poll_interval
         self.max_wait_time = max_wait_time
         self.verbose = verbose
-        self.batch_config = None  # Loaded lazily when needed
+        self.batch_config: Optional[Dict[str, Any]] = None  # Loaded lazily when needed
         self.local_only = local_only
 
         # Extract project name from test_stats_csv path if not provided
@@ -231,7 +234,7 @@ class QSPSimulator:
             else:
                 raise ValueError(f"Unsupported distribution: {dist_types[i]}")
 
-        return samples
+        return samples  # type: ignore[no-any-return]
 
     def _download_and_add_to_pool(
         self,
@@ -462,7 +465,6 @@ class QSPSimulator:
                 scenario=self.scenario,
                 random_state=self.rng
             )
-            self._info(f"Using {num_simulations} cached samples from pool")
             return params, observables
 
         if self.local_only:
@@ -573,15 +575,7 @@ class QSPSimulator:
             (priors_hash + test_stats_hash + self.model_version + pool_suffix).encode()
         ).hexdigest()[:16]
         local_cache_dir = self.cache_dir / f"{pool_id_base}_{local_cache_key}"
-        local_cache_file = local_cache_dir / "test_stats.npy"
-        local_params_file = local_cache_dir / "params.npy"
 
-        # Check local cache using helper (returns only test stats, not params)
-        cached = self._check_local_cache(n_samples, local_cache_file, local_params_file, self.verbose)
-        if cached is not None:
-            _, cached_test_stats = cached  # Unpack (params, test_stats)
-            self._info(f"Using {n_samples} cached samples")
-            return cached_test_stats
 
         # 2. Check HPC for existing simulations
         from qsp_hpc.batch.hpc_job_manager import HPCJobManager
@@ -614,8 +608,7 @@ class QSPSimulator:
                 pool_path, test_stats_hash, local_cache_dir
             )
 
-            # Cache locally
-            self._save_to_cache(params, test_stats, local_cache_dir, self.verbose)
+            # Caching handled by SimulationPoolManager
 
             # Sample if needed
             if test_stats.shape[0] > n_samples:
@@ -642,8 +635,7 @@ class QSPSimulator:
             # Run MATLAB simulations with pooling enabled
             observables = self._run_matlab_simulation(samples_csv, n_samples, pool_suffix=pool_suffix)
 
-            # Cache locally
-            self._save_to_cache(theta, observables, local_cache_dir, self.verbose)
+            # Caching handled by SimulationPoolManager
 
             self._info(f"Complete: {observables.shape[0]} simulations finished")
             return observables

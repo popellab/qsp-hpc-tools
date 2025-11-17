@@ -101,11 +101,11 @@ def compute_test_statistics_batch(
                 logger.warning(f"Error computing {test_stat_id} for simulation {i}: {e}")
                 test_stats_matrix[i, j] = np.nan
 
-    n_computed = np.sum(~np.isnan(test_stats_matrix))
+    n_computed: int = int(np.sum(~np.isnan(test_stats_matrix)))
     n_total = test_stats_matrix.size
     logger.info(f"Computed {n_computed}/{n_total} test statistic values ({100*n_computed/n_total:.1f}%)")
 
-    return test_stats_matrix
+    return test_stats_matrix  # type: ignore[no-any-return]
 
 
 def main():

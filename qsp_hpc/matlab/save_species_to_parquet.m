@@ -80,9 +80,6 @@ try
     fprintf(fid, '%s', json_str);
     fclose(fid);
 
-    % Call Python script to write Parquet
-    python_script = fullfile(project_root, 'metadata', 'write_species_parquet.py');
-
     % Try to use HPC venv Python from environment variable first
     hpc_venv_path = getenv('HPC_VENV_PATH');
     if ~isempty(hpc_venv_path)
@@ -92,6 +89,14 @@ try
         home_dir = getenv('HOME');
         venv_python = fullfile(home_dir, 'qspio_venv', 'bin', 'python');
     end
+
+    % Get Python script path from installed qsp-hpc-tools package
+    cmd = sprintf('%s -c "import qsp_hpc.simulation; import os; print(os.path.join(os.path.dirname(qsp_hpc.simulation.__file__), ''write_species_parquet.py''))"', venv_python);
+    [status, python_script] = system(cmd);
+    if status ~= 0
+        error('Failed to locate write_species_parquet.py from qsp-hpc-tools package');
+    end
+    python_script = strtrim(python_script);
 
     if exist(venv_python, 'file')
         % Use venv Python (HPC)

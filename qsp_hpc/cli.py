@@ -127,7 +127,7 @@ def setup(global_only):
     click.secho("SLURM Configuration", fg='green', bold=True)
     click.echo("-" * 70)
 
-    partition = click.prompt("  Partition", default="normal", type=str)
+    partition = click.prompt("  Partition", default="parallel", type=str)
     time_limit = click.prompt("  Default time limit", default="01:00:00", type=str)
     mem_per_cpu = click.prompt("  Memory per CPU", default="4G", type=str)
 
@@ -199,6 +199,64 @@ def setup(global_only):
         default=default_pool if default_pool else f"/home/your-username/{data_base_dir}/your-username/qsp_simulations",
         type=str
     )
+
+    click.echo()
+
+    # MATLAB Configuration
+    click.secho("MATLAB Configuration", fg='green', bold=True)
+    click.echo("-" * 70)
+
+    matlab_module = click.prompt("  MATLAB module name", default="matlab/R2024a", type=str)
+
+    # Test MATLAB availability
+    click.echo()
+    click.echo("Testing MATLAB module...", nl=False)
+
+    try:
+        # First just try to load the module
+        returncode, output = test_manager.transport.exec(
+            f"module load {matlab_module} 2>&1 && echo 'MODULE_OK'",
+            timeout=15
+        )
+
+        if returncode == 0 and 'MODULE_OK' in output:
+            click.secho(f" ✓ {matlab_module} available", fg='green')
+        else:
+            click.secho(f" ⚠ could not load module", fg='yellow')
+            click.echo(f"  Note: Check available modules with: module avail matlab")
+            if output.strip():
+                click.echo(f"  Error: {output[:200]}")
+    except Exception as e:
+        click.secho(" ⚠ could not test", fg='yellow')
+        click.echo(f"  Note: This is optional - you can update the module name later")
+        click.echo(f"  Error: {str(e)[:100]}")
+
+    click.echo()
+
+    # Build config dictionary (needed for venv setup)
+    config = {
+        'ssh': {
+            'host': ssh_host,
+            'user': ssh_user,
+            'key': ssh_key,
+        },
+        'cluster': {
+            'matlab_module': matlab_module,
+        },
+        'paths': {
+            'remote_base_dir': remote_base_dir,
+            'hpc_venv_path': hpc_venv_path,
+            'simulation_pool_path': simulation_pool_path,
+        },
+        'slurm': {
+            'partition': partition,
+            'time_limit': time_limit,
+            'mem_per_cpu': mem_per_cpu,
+        },
+        'package': {
+            'qsp_hpc_tools_source': 'git+https://github.com/jeliason/qsp-hpc-tools.git@main',
+        }
+    }
 
     click.echo()
 
@@ -320,64 +378,6 @@ echo "Python venv setup complete!"
             click.echo(f"    ssh {ssh_host}")
             click.echo(f"    uv venv --python 3.11 {hpc_venv_path}")
             click.echo(f"    uv pip install --python {hpc_venv_path}/bin/python git+https://github.com/jeliason/qsp-hpc-tools.git@main")
-
-    click.echo()
-
-    # MATLAB Configuration
-    click.secho("MATLAB Configuration", fg='green', bold=True)
-    click.echo("-" * 70)
-
-    matlab_module = click.prompt("  MATLAB module name", default="matlab/R2024a", type=str)
-
-    # Test MATLAB availability
-    click.echo()
-    click.echo("Testing MATLAB module...", nl=False)
-
-    try:
-        # First just try to load the module
-        returncode, output = test_manager.transport.exec(
-            f"module load {matlab_module} 2>&1 && echo 'MODULE_OK'",
-            timeout=15
-        )
-
-        if returncode == 0 and 'MODULE_OK' in output:
-            click.secho(f" ✓ {matlab_module} available", fg='green')
-        else:
-            click.secho(f" ⚠ could not load module", fg='yellow')
-            click.echo(f"  Note: Check available modules with: module avail matlab")
-            if output.strip():
-                click.echo(f"  Error: {output[:200]}")
-    except Exception as e:
-        click.secho(" ⚠ could not test", fg='yellow')
-        click.echo(f"  Note: This is optional - you can update the module name later")
-        click.echo(f"  Error: {str(e)[:100]}")
-
-    click.echo()
-
-    # Build config
-    config = {
-        'ssh': {
-            'host': ssh_host,
-            'user': ssh_user,
-            'key': ssh_key,
-        },
-        'cluster': {
-            'matlab_module': matlab_module,
-        },
-        'paths': {
-            'remote_base_dir': remote_base_dir,
-            'hpc_venv_path': hpc_venv_path,
-            'simulation_pool_path': simulation_pool_path,
-        },
-        'slurm': {
-            'partition': partition,
-            'time_limit': time_limit,
-            'mem_per_cpu': mem_per_cpu,
-        },
-        'package': {
-            'qsp_hpc_tools_source': 'git+https://github.com/jeliason/qsp-hpc-tools.git@main',
-        }
-    }
 
     # Save configuration
     config_dir.mkdir(parents=True, exist_ok=True)

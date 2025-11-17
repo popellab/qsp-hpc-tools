@@ -67,6 +67,7 @@ class BatchConfig:
     memory_per_job: str = '2G'
     matlab_module: str = 'matlab/R2024a'
     jobs_per_chunk: int = 20
+    strict_host_key_checking: bool = True  # Security: verify SSH host keys by default
 
 
 class RemoteCommandError(RuntimeError):
@@ -98,13 +99,29 @@ class SSHTransport:
 
     def __init__(self, config: BatchConfig):
         self.config = config
+        self._warned_about_host_key_checking = False
 
     def _build_ssh_target(self) -> str:
         if self.config.ssh_user:
             return f"{self.config.ssh_user}@{self.config.ssh_host}"
         return self.config.ssh_host
 
+    def _warn_insecure_ssh(self):
+        """Warn user once about disabled host key checking."""
+        if not self._warned_about_host_key_checking and not self.config.strict_host_key_checking:
+            import warnings
+            warnings.warn(
+                "SSH host key verification is DISABLED. This makes connections vulnerable to "
+                "man-in-the-middle attacks. Set 'strict_host_key_checking: true' in credentials.yaml "
+                "and add the host key to ~/.ssh/known_hosts for better security.",
+                category=UserWarning,
+                stacklevel=3
+            )
+            self._warned_about_host_key_checking = True
+
     def exec(self, command: str, timeout: Optional[int] = 30) -> Tuple[int, str]:
+        self._warn_insecure_ssh()
+
         ssh_cmd = ['ssh']
 
         if self.config.ssh_key:
@@ -113,7 +130,7 @@ class SSHTransport:
         ssh_cmd.extend([
             '-o', 'ServerAliveInterval=30',
             '-o', 'ServerAliveCountMax=5',
-            '-o', 'StrictHostKeyChecking=no',
+            '-o', f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
             '-o', 'BatchMode=yes'
         ])
 
@@ -130,6 +147,8 @@ class SSHTransport:
         return result.returncode, result.stdout + result.stderr
 
     def upload(self, local_path: str, remote_path: str) -> None:
+        self._warn_insecure_ssh()
+
         scp_cmd = ['scp']
 
         if self.config.ssh_key:
@@ -138,7 +157,7 @@ class SSHTransport:
         remote_target = f"{self._build_ssh_target()}:{remote_path}"
 
         scp_cmd.extend([
-            '-o', 'StrictHostKeyChecking=no',
+            '-o', f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
             '-o', 'BatchMode=yes',
             local_path,
             remote_target
@@ -147,6 +166,8 @@ class SSHTransport:
         subprocess.run(scp_cmd, check=True, capture_output=True)
 
     def download(self, remote_path: str, local_dir: str) -> None:
+        self._warn_insecure_ssh()
+
         scp_cmd = ['scp']
 
         if self.config.ssh_key:
@@ -155,7 +176,7 @@ class SSHTransport:
         remote_source = f"{self._build_ssh_target()}:{remote_path}"
 
         scp_cmd.extend([
-            '-o', 'StrictHostKeyChecking=no',
+            '-o', f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
             remote_source,
             local_dir
         ])
@@ -256,29 +277,69 @@ class HPCJobManager:
         paths = cfg.get('paths', {})
         slurm = cfg.get('slurm', {})
 
-        simulation_pool_path = paths.get('simulation_pool_path')
-        hpc_venv_path = paths.get('hpc_venv_path')
+        # Validate required SSH fields
+        ssh_host = ssh.get('host', '').strip()
+        if not ssh_host:
+            raise ValueError(
+                "ssh.host must be specified in credentials.yaml\n"
+                "Please run 'qsp-hpc setup' to configure HPC connection."
+            )
+
+        # Validate required paths
+        simulation_pool_path = paths.get('simulation_pool_path', '').strip()
+        hpc_venv_path = paths.get('hpc_venv_path', '').strip()
 
         if not simulation_pool_path:
-            raise ValueError("paths.simulation_pool_path must be specified in credentials.yaml")
+            raise ValueError(
+                "paths.simulation_pool_path must be specified in credentials.yaml\n"
+                "Please run 'qsp-hpc setup' to configure HPC connection."
+            )
         if not hpc_venv_path:
-            raise ValueError("paths.hpc_venv_path must be specified in credentials.yaml")
+            raise ValueError(
+                "paths.hpc_venv_path must be specified in credentials.yaml\n"
+                "Please run 'qsp-hpc setup' to configure HPC connection."
+            )
 
-        ssh_key = ssh.get('key', '')
+        # Validate and expand SSH key path
+        ssh_key = ssh.get('key', '').strip()
         if ssh_key:
-            ssh_key = str(Path(ssh_key).expanduser())
+            ssh_key_path = Path(ssh_key).expanduser()
+            # Only validate if file should exist (not empty string)
+            if not ssh_key_path.exists():
+                raise ValueError(
+                    f"SSH key file not found: {ssh_key_path}\n"
+                    f"Please check ssh.key in credentials.yaml or run 'qsp-hpc setup'."
+                )
+            ssh_key = str(ssh_key_path)
+
+        # Validate SLURM time limit format (HH:MM:SS or DD-HH:MM:SS)
+        time_limit = slurm.get('time_limit', '01:00:00')
+        if not isinstance(time_limit, str) or not time_limit.replace('-', '').replace(':', '').isdigit():
+            raise ValueError(
+                f"Invalid SLURM time_limit format: {time_limit}\n"
+                "Expected format: HH:MM:SS or DD-HH:MM:SS"
+            )
+
+        # Validate memory format (e.g., '4G', '512M')
+        memory_per_job = slurm.get('mem_per_cpu', '4G')
+        if not isinstance(memory_per_job, str) or not memory_per_job[-1].upper() in ['K', 'M', 'G', 'T']:
+            raise ValueError(
+                f"Invalid memory format: {memory_per_job}\n"
+                "Expected format: <number><unit> (e.g., '4G', '512M')"
+            )
 
         return BatchConfig(
-            ssh_host=ssh.get('host', ''),
-            ssh_user=ssh.get('user', ''),
+            ssh_host=ssh_host,
+            ssh_user=ssh.get('user', '').strip(),
             simulation_pool_path=simulation_pool_path,
             hpc_venv_path=hpc_venv_path,
             ssh_key=ssh_key,
-            remote_project_path=paths.get('remote_base_dir', ''),
-            partition=slurm.get('partition', 'shared'),
-            time_limit=slurm.get('time_limit', '01:00:00'),
-            memory_per_job=slurm.get('mem_per_cpu', '4G'),
-            matlab_module=cluster.get('matlab_module', 'matlab/R2024a')
+            remote_project_path=paths.get('remote_base_dir', '').strip(),
+            partition=slurm.get('partition', 'shared').strip(),
+            time_limit=time_limit,
+            memory_per_job=memory_per_job,
+            matlab_module=cluster.get('matlab_module', 'matlab/R2024a').strip(),
+            strict_host_key_checking=ssh.get('strict_host_key_checking', False)  # False for backward compatibility
         )
 
     @staticmethod

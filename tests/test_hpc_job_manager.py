@@ -113,10 +113,16 @@ class TestHPCConfigLoading:
         creds_dir = tmp_home / '.config' / 'qsp-hpc'
         creds_dir.mkdir(parents=True)
 
+        # Create SSH key file for validation
+        ssh_dir = tmp_home / '.ssh'
+        ssh_dir.mkdir(parents=True)
+        ssh_key = ssh_dir / 'id_rsa'
+        ssh_key.write_text('fake-ssh-key-for-testing')
+
         creds_path = creds_dir / 'credentials.yaml'
         with open(creds_path, 'w') as fh:
             yaml.safe_dump({
-                'ssh': {'host': 'test-hpc.example.com', 'user': 'testuser', 'key': str(tmp_home / '.ssh/id_rsa')},
+                'ssh': {'host': 'test-hpc.example.com', 'user': 'testuser', 'key': str(ssh_key)},
                 'paths': {
                     'remote_base_dir': '/home/testuser/qsp-hpc',
                     'simulation_pool_path': '/scratch/testuser/simulations',
@@ -146,8 +152,14 @@ class TestHPCConfigLoading:
         global_dir.mkdir(parents=True)
         (project_dir / '.qsp-hpc').mkdir(parents=True)
 
+        # Create SSH key file for validation
+        ssh_dir = tmp_home / '.ssh'
+        ssh_dir.mkdir(parents=True)
+        ssh_key = ssh_dir / 'id_rsa'
+        ssh_key.write_text('fake-ssh-key-for-testing')
+
         global_cfg = {
-            'ssh': {'host': 'global-host', 'user': 'global', 'key': str(tmp_home / '.ssh/id_rsa')},
+            'ssh': {'host': 'global-host', 'user': 'global', 'key': str(ssh_key)},
             'paths': {
                 'remote_base_dir': '/global/base',
                 'simulation_pool_path': '/global/pool',

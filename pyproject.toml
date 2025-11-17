@@ -39,6 +39,7 @@ dev = [
     "pytest-cov>=3.0",
     "black>=22.0",
     "ruff>=0.0.270",
+    "mypy>=1.0",
 ]
 
 [project.urls]

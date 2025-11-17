@@ -45,12 +45,6 @@ def write_species_parquet(json_file: str, output_file: str) -> None:
     species_arrays = data['species_arrays']
     status = data['status']
 
-    # Debug: print types to diagnose issue
-    print(f"DEBUG: n_sims={n_sims}, type={type(n_sims)}", file=sys.stderr)
-    print(f"DEBUG: status type={type(status)}, value={status}", file=sys.stderr)
-    print(f"DEBUG: time_arrays type={type(time_arrays)}", file=sys.stderr)
-    print(f"DEBUG: species_arrays type={type(species_arrays)}", file=sys.stderr)
-
     # Ensure arrays are lists (MATLAB jsonencode may create scalars for n_sims=1)
     if not isinstance(status, list):
         status = [status]

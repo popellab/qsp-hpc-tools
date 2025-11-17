@@ -63,7 +63,8 @@ class QSPSimulator:
         model_version: str = 'v1',
         model_description: str = '',
         scenario: str = 'default',
-        cache_dir: Union[str, Path] = 'projects/pdac_2025/cache/sbi_simulations',
+        cache_dir: Union[str, Path] = 'cache/sbi_simulations',
+        project_name: Optional[str] = None,
         seed: int = 2025,
         cache_sampling_seed: Optional[int] = None,
         max_tasks: int = 10,
@@ -113,6 +114,21 @@ class QSPSimulator:
         self.verbose = verbose
         self.batch_config = None  # Loaded lazily when needed
         self.local_only = local_only
+
+        # Extract project name from test_stats_csv path if not provided
+        # Expected format: projects/{project_name}/...
+        if project_name is None:
+            test_stats_str = str(self.test_stats_csv)
+            if 'projects/' in test_stats_str:
+                parts = test_stats_str.split('projects/')[1].split('/')
+                if parts:
+                    self.project_name = parts[0]
+                else:
+                    self.project_name = 'default_project'
+            else:
+                self.project_name = 'default_project'
+        else:
+            self.project_name = project_name
 
         if not self.test_stats_csv.exists():
             raise FileNotFoundError(f"Test statistics CSV not found: {self.test_stats_csv}")
@@ -315,7 +331,8 @@ class QSPSimulator:
         job_id = job_manager.submit_derivation_job(
             hpc_pool_path,
             str(self.test_stats_csv),
-            test_stats_hash
+            test_stats_hash,
+            project_name=self.project_name
         )
 
         # Wait for derivation job to complete
@@ -328,8 +345,7 @@ class QSPSimulator:
 
         if not has_test_stats_now:
             # Derivation failed - check logs
-            project_name = 'pdac_2025'  # Extract from self if needed
-            log_path = f"{job_manager.config.remote_project_path}/projects/{project_name}/batch_jobs/logs"
+            log_path = f"{job_manager.config.remote_project_path}/projects/{self.project_name}/batch_jobs/logs"
             log_cmd = f'ls -lt "{log_path}"/qsp_derive_*.err 2>/dev/null | head -3'
             status, log_output = job_manager._ssh_exec(log_cmd)
 
@@ -676,15 +692,6 @@ class QSPSimulator:
         # Create job manager (loads from global config)
         job_manager = HPCJobManager()
 
-        # Extract project name from test_stats_csv path
-        # Expected format: projects/{project_name}/...
-        project_name = 'pdac_2025'  # Default
-        test_stats_str = str(self.test_stats_csv)
-        if 'projects/' in test_stats_str:
-            parts = test_stats_str.split('projects/')[1].split('/')
-            if parts:
-                project_name = parts[0]
-
         # Compute simulation pool ID for full simulations (scenario-specific)
         priors_hash = self._compute_priors_hash()
         simulation_pool_id = f"{self.model_version}_{priors_hash[:8]}_{self.scenario}"
@@ -706,7 +713,7 @@ class QSPSimulator:
             test_stats_csv=str(self.test_stats_csv),
             model_script=self.model_script,
             num_simulations=num_simulations,
-            project_name=project_name,
+            project_name=self.project_name,
             seed=self.seed,
             jobs_per_chunk=jobs_per_chunk,
             skip_sync=False,  # Sync codebase first
@@ -1019,7 +1026,8 @@ def qsp_simulator(
     model_version: str = 'v1',
     model_description: str = '',
     scenario: str = 'default',
-    cache_dir: Union[str, Path] = 'projects/pdac_2025/cache/sbi_simulations',
+    cache_dir: Union[str, Path] = 'cache/sbi_simulations',
+    project_name: Optional[str] = None,
     seed: int = 2025,
     cache_sampling_seed: Optional[int] = None,
     max_tasks: int = 10,
@@ -1088,6 +1096,7 @@ def qsp_simulator(
         model_description=model_description,
         scenario=scenario,
         cache_dir=cache_dir,
+        project_name=project_name,
         seed=seed,
         cache_sampling_seed=cache_sampling_seed,
         max_tasks=max_tasks,

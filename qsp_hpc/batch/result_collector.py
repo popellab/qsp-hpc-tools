@@ -44,39 +44,59 @@ class ResultCollector:
 
     def check_pool_directory_exists(self, pool_path: str) -> bool:
         """Check if simulation pool directory exists on HPC."""
-        status, _ = self.transport.exec(f'test -d "{pool_path}" && echo "exists"')
-        return status == 0
+        check_dir_cmd = f'test -d "{pool_path}" && echo "exists" || echo "not_found"'
+        status, output = self.transport.exec(check_dir_cmd)
+
+        if self.verbose:
+            self.logger.debug(f"Directory check result: {output.strip()}")
+
+        return 'not_found' not in output
 
     def count_pool_simulations(self, pool_path: str) -> int:
-        """
-        Count number of simulations in an HPC pool directory.
+        """Count number of simulations in pool from manifest or filenames."""
+        count_cmd = f'''
+            cd "{pool_path}" 2>/dev/null || exit 1
 
-        Counts Parquet files and sums their simulation counts from metadata.
-        """
-        if not self.check_pool_directory_exists(pool_path):
+            if [ -f manifest.json ]; then
+                echo "MANIFEST_FOUND"
+                cat manifest.json
+            else
+                echo "COUNTING_FILES"
+                ls batch_*.parquet 2>/dev/null | wc -l | awk '{{print "N_FILES:" $1}}'
+                ls batch_*.parquet 2>/dev/null | \
+                grep -oE '[0-9]+sims' | \
+                sed 's/sims//' | \
+                awk '{{sum+=$1}} END {{print "N_SIMS:" sum}}'
+            fi
+        '''
+        status, output = self.transport.exec(count_cmd)
+
+        if self.verbose:
+            self.logger.debug("Count command output:")
+            for line in output.strip().split('\n'):
+                self.logger.debug(f"  {line}")
+
+        if status != 0:
+            if self.verbose:
+                self.logger.debug(f"Failed to count simulations (status={status})")
             return 0
 
-        # List Parquet files and count simulations
-        count_script = f"""
-cd "{pool_path}" || exit 1
-
-# Count from filenames (batch_TIMESTAMP_SCENARIO_NNNsims_seedSSS.parquet)
-total=0
-for f in batch_*.parquet; do
-    if [[ "$f" =~ batch_[0-9]+_[0-9]+_[^_]+_([0-9]+)sims_seed[0-9]+\\.parquet ]]; then
-        n="${{BASH_REMATCH[1]}}"
-        total=$((total + n))
-    fi
-done
-
-echo "N_SIMS:$total"
-"""
-
-        status, output = self.transport.exec(count_script)
-
         n_available = 0
+
         try:
-            if status == 0 and output.strip():
+            # Check if we got manifest
+            if 'MANIFEST_FOUND' in output:
+                # Extract JSON (everything after MANIFEST_FOUND line)
+                lines = output.split('\n')
+                manifest_start = lines.index('MANIFEST_FOUND') + 1
+                manifest_json = '\n'.join(lines[manifest_start:])
+
+                manifest = json.loads(manifest_json)
+                n_available = manifest.get('total_simulations', 0)
+                if self.verbose:
+                    self.logger.debug(f"Parsed manifest: {n_available} simulations")
+
+            elif 'COUNTING_FILES' in output:
                 # Extract N_SIMS value
                 for line in output.split('\n'):
                     if line.startswith('N_SIMS:'):
@@ -101,27 +121,40 @@ echo "N_SIMS:$total"
         self,
         model_version: str,
         priors_hash: str,
-        num_simulations: int
+        n_requested: int
     ) -> Tuple[bool, str, int]:
         """
         Check HPC for existing full simulation results.
 
-        Returns:
-            Tuple of (has_sufficient, pool_path, n_available)
-        """
-        # Construct pool path
-        pool_id = f"{model_version}_{priors_hash[:8]}"
-        pool_path = f"{self.config.simulation_pool_path}/{pool_id}"
+        Args:
+            model_version: Model version string (e.g., 'baseline_pdac')
+            priors_hash: Hash of priors + model script + model version
+            n_requested: Number of simulations requested
 
-        # Check if directory exists
+        Returns:
+            Tuple of (has_enough, pool_path, n_available)
+        """
+        pool_name = f"{model_version}_{priors_hash[:8]}"
+        pool_path = f"{self.config.simulation_pool_path}/{pool_name}"
+
+        if self.verbose:
+            self.logger.debug(f"Checking pool directory: {pool_path}")
+
+        # Check if pool directory exists
         if not self.check_pool_directory_exists(pool_path):
+            if self.verbose:
+                self.logger.debug("Pool directory does not exist on HPC")
             return False, pool_path, 0
 
-        # Count available simulations
+        # Count simulations in pool
         n_available = self.count_pool_simulations(pool_path)
 
-        has_sufficient = n_available >= num_simulations
-        return has_sufficient, pool_path, n_available
+        has_enough = n_available >= n_requested
+
+        if self.verbose:
+            self.logger.debug(f"Found {n_available} simulations, need {n_requested}: {'sufficient' if has_enough else 'insufficient'}")
+
+        return has_enough, pool_path, n_available
 
     def check_hpc_test_stats(
         self,

@@ -484,13 +484,7 @@ class HPCJobManager:
 
     def _setup_remote_directories(self, project_name: str) -> None:
         """Create necessary directories on remote cluster and clean old files."""
-        remote_base = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs"
-        dirs = ['input', 'output', 'scripts', 'logs']
-
-        for d in dirs:
-            remote_dir = f"{remote_base}/{d}"
-            # Remove all files in directory, then recreate it
-            self._ssh_exec(f'rm -rf "{remote_dir}" && mkdir -p "{remote_dir}"')
+        return self.file_transfer.setup_remote_directories(project_name)
 
     def _upload_job_config(
         self,
@@ -504,190 +498,32 @@ class HPCJobManager:
         simulation_pool_id: str = None
     ) -> None:
         """Create and upload job configuration as JSON."""
-        start_time = time.time()
-
-        # Create job config dictionary
-        job_config = {
-            'project_name': project_name,
-            'n_simulations': num_simulations,
-            'seed': seed,
-            'jobs_per_chunk': jobs_per_chunk,
-            'model_script': model_script,
-            'test_stats_csv': f'projects/{project_name}/batch_jobs/input/test_stats.csv',  # Remote path
-            'param_csv': f'projects/{project_name}/batch_jobs/input/params.csv',  # Remote path
-            'save_full_simulations': save_full_simulations,
-            'simulation_pool_id': simulation_pool_id
-        }
-
-        # Write to temp file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(job_config, f, indent=2)
-            temp_file = f.name
-
-        try:
-            remote_input_dir = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
-            remote_file = f"{remote_input_dir}/job_config.json"
-
-            self._ssh_upload(temp_file, remote_file)
-            if self.verbose:
-                elapsed = time.time() - start_time
-                self.logger.debug(f"Job config uploaded ({elapsed:.1f}s)")
-        finally:
-            Path(temp_file).unlink()
+        return self.file_transfer.upload_job_config(
+            test_stats_csv,
+            model_script,
+            num_simulations,
+            seed,
+            jobs_per_chunk,
+            project_name,
+            save_full_simulations,
+            simulation_pool_id
+        )
 
     def _upload_parameter_csv(self, csv_path: str, project_name: str) -> None:
         """Upload parameter samples CSV."""
-        start_time = time.time()
-
-        remote_input_dir = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
-        remote_file = f"{remote_input_dir}/params.csv"
-
-        self._ssh_upload(csv_path, remote_file)
-        if self.verbose:
-            elapsed = time.time() - start_time
-            self.logger.debug(f"Parameters uploaded ({elapsed:.1f}s)")
+        return self.file_transfer.upload_parameter_csv(csv_path, project_name)
 
     def _upload_test_statistics(self, test_stats_csv: str, project_name: str) -> None:
         """Upload test statistics CSV and extract embedded functions as tarball."""
-        start_time = time.time()
-
-        remote_input_dir = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
-
-        # Upload CSV file
-        remote_csv = f"{remote_input_dir}/test_stats.csv"
-        self._ssh_upload(test_stats_csv, remote_csv)
-
-        # Load CSV to extract embedded functions
-        try:
-            import pandas as pd
-            import tarfile
-            import shutil
-
-            test_stats_df = pd.read_csv(test_stats_csv)
-
-            if 'model_output_code' in test_stats_df.columns and len(test_stats_df) > 0:
-                # Create temp directory for functions
-                temp_dir = Path(tempfile.mkdtemp())
-
-                try:
-                    # Extract all functions to temp directory
-                    n_functions = 0
-                    for idx, row in test_stats_df.iterrows():
-                        test_stat_id = row['test_statistic_id']
-                        func_code = row['model_output_code']
-
-                        # Write function to temp directory
-                        func_file = temp_dir / f"test_stat_{test_stat_id}.m"
-                        func_file.write_text(func_code)
-                        n_functions += 1
-
-                    # Create tarball of all functions
-                    tarball_path = temp_dir / "test_stat_functions.tar.gz"
-                    with tarfile.open(tarball_path, 'w:gz') as tar:
-                        for func_file in temp_dir.glob("test_stat_*.m"):
-                            tar.add(func_file, arcname=func_file.name)
-
-                    # Upload tarball
-                    remote_tarball = f"{remote_input_dir}/test_stat_functions.tar.gz"
-                    self._ssh_upload(str(tarball_path), remote_tarball)
-
-                    # Extract on remote
-                    extract_cmd = f'cd "{remote_input_dir}" && tar -xzf test_stat_functions.tar.gz && rm test_stat_functions.tar.gz'
-                    self._ssh_exec(extract_cmd)
-
-                    if self.verbose:
-                        elapsed = time.time() - start_time
-                        self.logger.debug(f"Test statistics uploaded ({n_functions} functions, {elapsed:.1f}s)")
-
-                finally:
-                    # Clean up temp directory
-                    shutil.rmtree(temp_dir)
-            else:
-                if self.verbose:
-                    elapsed = time.time() - start_time
-                    self.logger.debug(f"Test statistics uploaded ({elapsed:.1f}s)")
-
-        except Exception as e:
-            elapsed = time.time() - start_time
-            self.logger.error(f"Failed to upload test statistics: {e}")
-            self.logger.debug(f"Time elapsed before error: {elapsed:.1f}s")
-            raise  # Re-raise the exception after logging
+        return self.file_transfer.upload_test_statistics(test_stats_csv, project_name)
 
     def _submit_slurm_job(self, n_jobs: int, project_name: str) -> str:
         """Generate and submit SLURM array job."""
-        start_time = time.time()
-
-        # Log SLURM configuration
-        self.logger.info("SLURM Configuration:")
-        self.logger.info(f"  Partition: {self.config.partition}")
-        self.logger.info(f"  Time limit: {self.config.time_limit}")
-        self.logger.info(f"  Memory per job: {self.config.memory_per_job}")
-        self.logger.info(f"  Array size: {n_jobs} tasks")
-
-        # Generate SLURM script
-        script_content = self._generate_slurm_script(n_jobs, project_name)
-
-        # Write to temp file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-            f.write(script_content)
-            temp_script = f.name
-
-        try:
-            # Upload script
-            remote_script_dir = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/scripts"
-            remote_script = f"{remote_script_dir}/qsp_batch_job.sh"
-
-            self._ssh_upload(temp_script, remote_script)
-
-            # Submit job
-            status, output = self._ssh_exec(f'sbatch "{remote_script}"')
-
-            if status != 0:
-                raise SubmissionError(f"SLURM submission failed: {output}")
-
-            # Extract job ID
-            import re
-            match = re.search(r'Submitted batch job (\d+)', output)
-            if not match:
-                raise SubmissionError(f"Could not parse job ID from: {output}")
-
-            job_id = match.group(1)
-            elapsed = time.time() - start_time
-            self.logger.info(f"🚀 Job {job_id} ({n_jobs} tasks, {elapsed:.1f}s)")
-
-            return job_id
-
-        finally:
-            Path(temp_script).unlink()
+        return self.slurm_submitter.submit_job(n_jobs, project_name)
 
     def _generate_slurm_script(self, n_jobs: int, project_name: str) -> str:
         """Generate SLURM batch script."""
-        project_path = self.config.remote_project_path
-        log_dir = f"{project_path}/projects/{project_name}/batch_jobs/logs"
-
-        script = f"""#!/bin/bash
-#SBATCH --job-name=qsp_batch
-#SBATCH --partition={self.config.partition}
-#SBATCH --time={self.config.time_limit}
-#SBATCH --mem={self.config.memory_per_job}
-#SBATCH --array=0-{n_jobs-1}
-#SBATCH --output={log_dir}/qsp_batch_%A_%a.out
-#SBATCH --error={log_dir}/qsp_batch_%A_%a.err
-
-echo "Starting QSP batch job at $(date)"
-echo "Array task ID: $SLURM_ARRAY_TASK_ID"
-echo "Job ID: $SLURM_JOB_ID"
-
-# Export HPC paths for MATLAB scripts to use
-export HPC_VENV_PATH="{self.config.hpc_venv_path}"
-export SIMULATION_POOL_PATH="{self.config.simulation_pool_path}"
-
-module load {self.config.matlab_module}
-cd "{project_path}"
-matlab -nodisplay -nodesktop -nosplash -r "batch_worker('{project_name}'); exit"
-echo "Job completed at $(date)"
-"""
-        return script
+        return self.slurm_submitter._generate_slurm_script(n_jobs, project_name)
 
     def _save_job_state(self, job_info: JobInfo, project_name: str) -> str:
         """Save job state to file."""
@@ -785,79 +621,11 @@ echo "Job completed at $(date)"
 
     def _check_pool_directory_exists(self, pool_path: str) -> bool:
         """Check if simulation pool directory exists on HPC."""
-        check_dir_cmd = f'test -d "{pool_path}" && echo "exists" || echo "not_found"'
-        status, output = self._ssh_exec(check_dir_cmd)
-
-        if self.verbose:
-            print(f"Directory check result: {output.strip()}")
-
-        return 'not_found' not in output
+        return self.result_collector.check_pool_directory_exists(pool_path)
 
     def _count_pool_simulations(self, pool_path: str) -> int:
         """Count number of simulations in pool from manifest or filenames."""
-        count_cmd = f'''
-            cd "{pool_path}" 2>/dev/null || exit 1
-
-            if [ -f manifest.json ]; then
-                echo "MANIFEST_FOUND"
-                cat manifest.json
-            else
-                echo "COUNTING_FILES"
-                ls batch_*.parquet 2>/dev/null | wc -l | awk '{{print "N_FILES:" $1}}'
-                ls batch_*.parquet 2>/dev/null | \
-                grep -oE '[0-9]+sims' | \
-                sed 's/sims//' | \
-                awk '{{sum+=$1}} END {{print "N_SIMS:" sum}}'
-            fi
-        '''
-        status, output = self._ssh_exec(count_cmd)
-
-        if self.verbose:
-            print(f"Count command output:")
-            for line in output.strip().split('\n'):
-                print(f"  {line}")
-
-        if status != 0:
-            if self.verbose:
-                print(f"Failed to count simulations (status={status})")
-            return 0
-
-        n_available = 0
-
-        try:
-            # Check if we got manifest
-            if 'MANIFEST_FOUND' in output:
-                # Extract JSON (everything after MANIFEST_FOUND line)
-                lines = output.split('\n')
-                manifest_start = lines.index('MANIFEST_FOUND') + 1
-                manifest_json = '\n'.join(lines[manifest_start:])
-
-                import json
-                manifest = json.loads(manifest_json)
-                n_available = manifest.get('total_simulations', 0)
-                if self.verbose:
-                    print(f"Parsed manifest: {n_available} simulations")
-
-            elif 'COUNTING_FILES' in output:
-                # Extract N_SIMS value
-                for line in output.split('\n'):
-                    if line.startswith('N_SIMS:'):
-                        n_available = int(line.split(':')[1].strip())
-                        self.logger.debug(f"Counted from filenames: {n_available} simulations")
-                        break
-            else:
-                self.logger.debug("Could not parse output format")
-
-        except (ValueError, IndexError, KeyError) as e:
-            # Handle parsing errors gracefully - likely means no valid simulations
-            self.logger.warning(f"Error parsing simulation count: {e}")
-            n_available = 0
-        except Exception as e:
-            # Unexpected error - log and re-raise
-            self.logger.error(f"Unexpected error checking HPC pool: {e}")
-            raise
-
-        return n_available
+        return self.result_collector.count_pool_simulations(pool_path)
 
     def check_hpc_full_simulations(
         self,
@@ -876,27 +644,7 @@ echo "Job completed at $(date)"
         Returns:
             Tuple of (has_enough, pool_path, n_available)
         """
-        pool_name = f"{model_version}_{priors_hash[:8]}"
-        pool_path = f"{self.config.simulation_pool_path}/{pool_name}"
-
-        if self.verbose:
-            print(f"Checking pool directory: {pool_path}")
-
-        # Check if pool directory exists
-        if not self._check_pool_directory_exists(pool_path):
-            if self.verbose:
-                print(f"Pool directory does not exist on HPC")
-            return False, pool_path, 0
-
-        # Count simulations in pool
-        n_available = self._count_pool_simulations(pool_path)
-
-        has_enough = n_available >= n_requested
-
-        if self.verbose:
-            print(f"Found {n_available} simulations, need {n_requested}: {'sufficient' if has_enough else 'insufficient'}")
-
-        return has_enough, pool_path, n_available
+        return self.result_collector.check_hpc_full_simulations(model_version, priors_hash, n_requested)
 
     def _combine_chunks_on_hpc(self, test_stats_dir: str) -> None:
         """Combine test statistics chunks on HPC using Python script."""

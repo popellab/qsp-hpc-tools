@@ -129,42 +129,45 @@ bash scripts/hpc/setup_hpc_venv.sh
             self.logger.info("HPC Python environment configured")
 
     def setup_remote_directories(self, project_name: str) -> None:
-        """Create necessary directories on HPC for batch jobs."""
-        dirs = [
-            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input",
-            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/output",
-            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/logs",
-        ]
+        """Create necessary directories on remote cluster and clean old files."""
+        remote_base = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs"
+        dirs = ['input', 'output', 'scripts', 'logs']
 
-        for dir_path in dirs:
-            self.transport.exec(f'mkdir -p "{dir_path}"')
+        for d in dirs:
+            remote_dir = f"{remote_base}/{d}"
+            # Remove all files in directory, then recreate it
+            self.transport.exec(f'rm -rf "{remote_dir}" && mkdir -p "{remote_dir}"')
 
     def upload_job_config(
         self,
+        test_stats_csv: str,
         model_script: str,
         num_simulations: int,
         seed: int,
         jobs_per_chunk: int,
-        save_full_simulations: bool,
-        simulation_pool_id: str,
-        project_name: str
+        project_name: str,
+        save_full_simulations: bool = True,
+        simulation_pool_id: str = None
     ) -> None:
-        """Upload job configuration JSON."""
+        """Create and upload job configuration as JSON."""
         start_time = time.time()
 
-        config_data = {
-            'model_script': model_script,
-            'num_simulations': num_simulations,
+        # Create job config dictionary
+        job_config = {
+            'project_name': project_name,
+            'n_simulations': num_simulations,
             'seed': seed,
             'jobs_per_chunk': jobs_per_chunk,
+            'model_script': model_script,
+            'test_stats_csv': f'projects/{project_name}/batch_jobs/input/test_stats.csv',  # Remote path
+            'param_csv': f'projects/{project_name}/batch_jobs/input/params.csv',  # Remote path
             'save_full_simulations': save_full_simulations,
-            'simulation_pool_id': simulation_pool_id,
-            'simulation_pool_path': self.config.simulation_pool_path
+            'simulation_pool_id': simulation_pool_id
         }
 
         # Write to temp file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(config_data, f, indent=2)
+            json.dump(job_config, f, indent=2)
             temp_file = f.name
 
         try:
@@ -200,34 +203,35 @@ bash scripts/hpc/setup_hpc_venv.sh
         remote_csv = f"{remote_input_dir}/test_stats.csv"
         self.transport.upload(test_stats_csv, remote_csv)
 
-        # Check if CSV has embedded functions
-        import csv
+        # Load CSV to extract embedded functions
         try:
-            with open(test_stats_csv, 'r') as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
+            import pandas as pd
 
-            # Check if any row has a 'function_code' column
-            if rows and 'function_code' in rows[0]:
-                # Extract functions to temp directory
+            test_stats_df = pd.read_csv(test_stats_csv)
+
+            if 'model_output_code' in test_stats_df.columns and len(test_stats_df) > 0:
+                # Create temp directory for functions
                 temp_dir = Path(tempfile.mkdtemp())
-                functions_dir = temp_dir / 'test_stat_functions'
-                functions_dir.mkdir()
 
-                n_functions = 0
                 try:
-                    for i, row in enumerate(rows):
-                        if row.get('function_code'):
-                            func_file = functions_dir / f"test_stat_{i}.m"
-                            func_file.write_text(row['function_code'])
-                            n_functions += 1
+                    # Extract all functions to temp directory
+                    n_functions = 0
+                    for idx, row in test_stats_df.iterrows():
+                        test_stat_id = row['test_statistic_id']
+                        func_code = row['model_output_code']
 
-                    # Create tarball
-                    tarball_path = temp_dir / 'test_stat_functions.tar.gz'
+                        # Write function to temp directory
+                        func_file = temp_dir / f"test_stat_{test_stat_id}.m"
+                        func_file.write_text(func_code)
+                        n_functions += 1
+
+                    # Create tarball of all functions
+                    tarball_path = temp_dir / "test_stat_functions.tar.gz"
                     with tarfile.open(tarball_path, 'w:gz') as tar:
-                        tar.add(functions_dir, arcname='test_stat_functions')
+                        for func_file in temp_dir.glob("test_stat_*.m"):
+                            tar.add(func_file, arcname=func_file.name)
 
-                    # Upload and extract on HPC
+                    # Upload tarball
                     remote_tarball = f"{remote_input_dir}/test_stat_functions.tar.gz"
                     self.transport.upload(str(tarball_path), remote_tarball)
 

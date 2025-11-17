@@ -402,19 +402,19 @@ class TestCommandExecutionBehaviors:
 
     def test_submit_slurm_parsing_failure(self, mock_hpc_config):
         manager = HPCJobManager(config=mock_hpc_config)
-        manager._ssh_upload = Mock()
+        manager.transport.upload = Mock()
         manager._generate_slurm_script = Mock(return_value="#SBATCH")
         # Return successful status but without job id string
-        manager._ssh_exec = Mock(return_value=(0, "no job id here"))
+        manager.transport.exec = Mock(return_value=(0, "no job id here"))
 
         with pytest.raises(SubmissionError):
             manager._submit_slurm_job(1, "proj")
 
     def test_submit_slurm_nonzero_raises(self, mock_hpc_config):
         manager = HPCJobManager(config=mock_hpc_config)
-        manager._ssh_upload = Mock()
+        manager.transport.upload = Mock()
         manager._generate_slurm_script = Mock(return_value="#SBATCH")
-        manager._ssh_exec = Mock(return_value=(1, "error"))
+        manager.transport.exec = Mock(return_value=(1, "error"))
 
         with pytest.raises(SubmissionError):
             manager._submit_slurm_job(1, "proj")

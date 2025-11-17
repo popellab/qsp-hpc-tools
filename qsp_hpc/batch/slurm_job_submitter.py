@@ -76,16 +76,17 @@ class SLURMJobSubmitter:
             temp_script = f.name
 
         try:
-            # Upload script to HPC
-            remote_script = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/job_script.sh"
+            # Upload script
+            remote_script_dir = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/scripts"
+            remote_script = f"{remote_script_dir}/qsp_batch_job.sh"
+
             self.transport.upload(temp_script, remote_script)
 
             # Submit job
-            submit_cmd = f'cd "{self.config.remote_project_path}" && sbatch "{remote_script}"'
-            returncode, output = self.transport.exec(submit_cmd, timeout=30)
+            returncode, output = self.transport.exec(f'sbatch "{remote_script}"', timeout=30)
 
             if returncode != 0:
-                raise SubmissionError(f"sbatch failed (rc={returncode}): {output}")
+                raise SubmissionError(f"SLURM submission failed: {output}")
 
             # Extract job ID
             match = re.search(r'Submitted batch job (\d+)', output)
@@ -102,26 +103,33 @@ class SLURMJobSubmitter:
             Path(temp_script).unlink()
 
     def _generate_slurm_script(self, n_jobs: int, project_name: str) -> str:
-        """Generate SLURM batch script for simulation jobs."""
-        return f"""#!/bin/bash
+        """Generate SLURM batch script."""
+        project_path = self.config.remote_project_path
+        log_dir = f"{project_path}/projects/{project_name}/batch_jobs/logs"
+
+        script = f"""#!/bin/bash
 #SBATCH --job-name=qsp_batch
 #SBATCH --partition={self.config.partition}
 #SBATCH --time={self.config.time_limit}
-#SBATCH --mem-per-cpu={self.config.memory_per_job}
-#SBATCH --array=1-{n_jobs}
-#SBATCH --output={self.config.remote_project_path}/projects/{project_name}/batch_jobs/logs/qsp_%A_%a.out
-#SBATCH --error={self.config.remote_project_path}/projects/{project_name}/batch_jobs/logs/qsp_%A_%a.err
+#SBATCH --mem={self.config.memory_per_job}
+#SBATCH --array=0-{n_jobs-1}
+#SBATCH --output={log_dir}/qsp_batch_%A_%a.out
+#SBATCH --error={log_dir}/qsp_batch_%A_%a.err
 
-# Load MATLAB module
+echo "Starting QSP batch job at $(date)"
+echo "Array task ID: $SLURM_ARRAY_TASK_ID"
+echo "Job ID: $SLURM_JOB_ID"
+
+# Export HPC paths for MATLAB scripts to use
+export HPC_VENV_PATH="{self.config.hpc_venv_path}"
+export SIMULATION_POOL_PATH="{self.config.simulation_pool_path}"
+
 module load {self.config.matlab_module}
-
-# Activate Python virtual environment
-source {self.config.hpc_venv_path}/bin/activate
-
-# Run batch worker
-cd {self.config.remote_project_path}
-matlab -nodisplay -nosplash -batch "addpath('matlab'); batch_worker('$SLURM_ARRAY_TASK_ID', '{project_name}')"
+cd "{project_path}"
+matlab -nodisplay -nodesktop -nosplash -r "batch_worker('{project_name}'); exit"
+echo "Job completed at $(date)"
 """
+        return script
 
     def submit_derivation_job(
         self,

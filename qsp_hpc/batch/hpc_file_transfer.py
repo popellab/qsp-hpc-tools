@@ -115,10 +115,15 @@ class HPCFileTransfer:
         if self.verbose:
             self.logger.info(f"Checking HPC Python environment at {self.config.hpc_venv_path}...")
 
-        # Check if venv exists
-        status, _ = self.transport.exec(f'test -d "{self.config.hpc_venv_path}" && echo "exists"')
+        # Check if venv is properly configured with qsp-hpc-tools installed
+        check_cmd = f'''
+            test -f "{self.config.hpc_venv_path}/bin/python" && \
+            "{self.config.hpc_venv_path}/bin/python" -c "import qsp_hpc" 2>/dev/null && \
+            echo "VENV_OK"
+        '''
+        status, output = self.transport.exec(check_cmd)
 
-        if status == 0:
+        if status == 0 and 'VENV_OK' in output:
             if self.verbose:
                 self.logger.info("HPC venv already configured")
             return

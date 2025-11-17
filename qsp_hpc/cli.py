@@ -274,16 +274,38 @@ def setup(global_only):
 
     for dir_name, dir_path in dirs_to_check:
         click.echo(f"  Checking {dir_name}: {dir_path}...", nl=False)
-        try:
-            returncode, _ = test_manager.transport.exec(f"test -d {dir_path}", timeout=10)
-            if returncode == 0:
-                click.secho(" ✓ exists", fg='green')
-            else:
-                click.secho(" ✗ not found", fg='yellow')
+
+        # Special validation for Python venv
+        if dir_name == 'Python venv':
+            try:
+                # Check if venv is properly set up with qsp-hpc-tools installed
+                check_cmd = f'''
+                    test -f "{dir_path}/bin/python" && \
+                    "{dir_path}/bin/python" -c "import qsp_hpc" 2>/dev/null && \
+                    echo "VENV_OK"
+                '''
+                returncode, output = test_manager.transport.exec(check_cmd, timeout=10)
+
+                if returncode == 0 and 'VENV_OK' in output:
+                    click.secho(" ✓ configured", fg='green')
+                else:
+                    click.secho(" ✗ not configured", fg='yellow')
+                    dirs_need_creation.append((dir_name, dir_path))
+            except Exception:
+                click.secho(" ✗ error checking", fg='red')
                 dirs_need_creation.append((dir_name, dir_path))
-        except Exception as e:
-            click.secho(f" ✗ error checking", fg='red')
-            dirs_need_creation.append((dir_name, dir_path))
+        else:
+            # Standard directory check
+            try:
+                returncode, _ = test_manager.transport.exec(f"test -d {dir_path}", timeout=10)
+                if returncode == 0:
+                    click.secho(" ✓ exists", fg='green')
+                else:
+                    click.secho(" ✗ not found", fg='yellow')
+                    dirs_need_creation.append((dir_name, dir_path))
+            except Exception:
+                click.secho(" ✗ error checking", fg='red')
+                dirs_need_creation.append((dir_name, dir_path))
 
     # Offer to create missing directories
     if dirs_need_creation:

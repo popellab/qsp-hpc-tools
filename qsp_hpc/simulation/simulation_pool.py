@@ -263,8 +263,15 @@ class SimulationPoolManager:
                 print(f"  ⚠️  Warning: Batch file not found: {batch_file}")
                 continue
 
-            # Load batch data
-            mat_data = loadmat(batch_file)
+            # Load batch data with validation
+            try:
+                mat_data = loadmat(batch_file)
+            except Exception as exc:  # pragma: no cover - exercised in tests
+                raise ValueError(f"Failed to load batch file {batch_file}: {exc}") from exc
+
+            if 'params_matrix' not in mat_data or 'observables_matrix' not in mat_data:
+                raise ValueError(f"Batch file missing required keys: {batch_file}")
+
             params = mat_data['params_matrix']
             observables = mat_data['observables_matrix']
 
@@ -274,10 +281,19 @@ class SimulationPoolManager:
             if observables.ndim == 1:
                 observables = observables.reshape(1, -1)
 
+            if params.shape[0] != observables.shape[0]:
+                raise ValueError(
+                    f"Batch {batch_file} has mismatched rows: "
+                    f"params {params.shape[0]} vs obs {observables.shape[0]}"
+                )
+
             all_params.append(params)
             all_observables.append(observables)
 
         # Concatenate all batches
+        if not all_params:
+            raise ValueError(f"No readable simulations found for scenario '{scenario}'")
+
         params_all = np.vstack(all_params)
         observables_all = np.vstack(all_observables)
 
@@ -423,7 +439,7 @@ class SimulationPoolManager:
             return []
 
         pools = []
-        batch_pattern = re.compile(r'batch_(\d{8}_\d{6})_([^_]+)_(\d+)sims_seed(\d+)\.mat')
+        batch_pattern = re.compile(r'batch_(\d{8}_\d{6})_(.+?)_(\d+)sims_seed(\d+)\.mat')
 
         for pool_dir in sorted(cache_dir.iterdir()):
             if not pool_dir.is_dir():

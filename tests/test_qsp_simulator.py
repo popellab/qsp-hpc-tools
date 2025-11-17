@@ -13,7 +13,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 from scipy.io import savemat
 
-from qsp_hpc.simulation.qsp_simulator import QSPSimulator
+from qsp_hpc.simulation.qsp_simulator import QSPSimulator, QSPSimulatorError
+from qsp_hpc.batch.hpc_job_manager import MissingOutputError, RemoteCommandError, SubmissionError
 
 
 # ============================================================================
@@ -461,6 +462,205 @@ class TestPoolIntegration:
         assert call_kwargs['cache_dir'] == temp_dir / "cache"
         assert call_kwargs['priors_csv'] == sample_priors_csv
         assert call_kwargs['test_stats_csv'] == sample_test_stats_csv
+
+    def test_injected_pool_and_job_manager_used(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        fake_pool = Mock()
+        fake_job_mgr = Mock()
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr,
+            logger=lambda msg: None,
+        )
+
+        assert sim.pool is fake_pool
+        assert sim.job_manager is fake_job_mgr
+
+
+class TestFlowDecisions:
+    """Exercise __call__ decision branches with mocks."""
+
+    def test_uses_local_cache_when_sufficient(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 5
+        fake_pool.load_simulations.return_value = (np.ones((2, 1)), np.zeros((2, 1)))
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            logger=lambda msg: None,
+        )
+
+        params, obs = sim(2)
+
+        fake_pool.get_available_simulations.assert_called_once()
+        fake_pool.load_simulations.assert_called_once()
+        assert params.shape == (2, 1)
+        assert obs.shape == (2, 1)
+
+    def test_hpc_test_stats_path(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = True
+        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_script='model',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr,
+            logger=lambda msg: None,
+        )
+
+        with patch.object(sim, '_download_and_add_to_pool', return_value=(np.ones((1, 1)), np.ones((1, 1)))) as downloader:
+            sim(1)
+
+        fake_job_mgr.check_hpc_test_stats.assert_called()
+        downloader.assert_called()
+
+    def test_runs_new_simulations_when_needed(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = False
+        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_script='model',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr,
+            logger=lambda msg: None,
+        )
+
+        with patch.object(sim, '_run_new_simulations', return_value=(np.ones((1, 1)), np.ones((1, 1)))) as runner:
+            sim(1)
+
+        runner.assert_called_once()
+
+    def test_hpc_errors_are_wrapped(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/pool'
+        fake_job_mgr.check_hpc_test_stats.side_effect = MissingOutputError("boom")
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr,
+            logger=lambda msg: None,
+        )
+
+        with pytest.raises(QSPSimulatorError):
+            sim(1)
+
+    def test_local_only_raises_when_insufficient_cache(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            local_only=True,
+            logger=lambda msg: None,
+        )
+
+        with pytest.raises(QSPSimulatorError):
+            sim(1)
+
+
+class TestHelperFunctions:
+    """Unit tests for QSPSimulator helpers."""
+
+    def test_stage_parameters_to_csv(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            logger=lambda msg: None,
+        )
+
+        params, csv_path = sim._stage_parameters_to_csv(3)
+
+        assert params.shape == (3, len(sim.param_names))
+        assert Path(csv_path).exists()
+
+        # CSV should have header + rows
+        contents = Path(csv_path).read_text().strip().splitlines()
+        assert len(contents) == 4  # header + 3 rows
+
+        Path(csv_path).unlink()
+
+    def test_update_pool_with_results(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        fake_pool = Mock()
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            logger=lambda msg: None,
+        )
+
+        params = np.ones((2, 1))
+        obs = np.zeros((2, 1))
+
+        sim._update_pool_with_results(params, obs)
+
+        fake_pool.add_batch.assert_called_once()
+        call_kwargs = fake_pool.add_batch.call_args.kwargs
+        assert call_kwargs['params_matrix'].shape == (2, 1)
+        assert call_kwargs['observables_matrix'].shape == (2, 1)
+
+    def test_run_new_sim_errors_wrapped(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = False
+        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr,
+            logger=lambda msg: None,
+        )
+
+        with patch.object(sim, '_run_new_simulations', side_effect=SubmissionError("fail")):
+            with pytest.raises(QSPSimulatorError):
+                sim(1)
 
 
 # ============================================================================

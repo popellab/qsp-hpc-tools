@@ -397,3 +397,74 @@ class TestLoadAndAdd:
         assert set(result.keys()) == {"gvax", "control"}
         assert result["gvax"][0].shape[0] == 2
         assert result["control"][0].shape[0] == 2
+
+    def test_over_request_returns_available(self, pool_manager):
+        params = np.array([[1.0, 2.0], [3.0, 4.0]])
+        obs = np.array([[10.0], [20.0]])
+        pool_manager.add_batch(params, obs, seed=1, scenario="gvax")
+
+        loaded_params, loaded_obs = pool_manager.load_simulations(
+            n_requested=5, scenario="gvax", random_state=np.random.default_rng(0)
+        )
+
+        assert loaded_params.shape == (2, 2)
+        assert loaded_obs.shape == (2, 1)
+
+    def test_corrupt_batch_raises(self, pool_manager):
+        corrupt_file = pool_manager.pool_dir / "batch_20250114_120530_gvax_2sims_seed1.mat"
+        corrupt_file.write_text("not a mat file")
+
+        with pytest.raises(ValueError):
+            pool_manager.load_simulations(n_requested=1, scenario="gvax")
+
+    def test_missing_required_keys_raise(self, pool_manager):
+        # Write a .mat without required keys
+        bad_file = pool_manager.pool_dir / "batch_20250114_120531_gvax_2sims_seed1.mat"
+        savemat(bad_file, {"foo": np.array([1, 2])})
+
+        with pytest.raises(ValueError, match="required keys"):
+            pool_manager.load_simulations(n_requested=1, scenario="gvax")
+
+    def test_load_multi_scenario_requires_all(self, pool_manager):
+        params = np.array([[1.0], [2.0]])
+        obs = np.array([[10.0], [20.0]])
+        pool_manager.add_batch(params, obs, seed=1, scenario="gvax")
+
+        with pytest.raises(ValueError):
+            pool_manager.load_multi_scenario(["gvax", "missing"], n_requested=1)
+
+    def test_add_batch_metadata_and_shape_normalization(self, pool_manager):
+        params = np.array([1.0, 2.0])  # 1D arrays should be reshaped
+        obs = np.array([10.0, 20.0])
+
+        filename = pool_manager.add_batch(params, obs, seed=3, scenario="gvax")
+        data = loadmat(pool_manager.pool_dir / filename)
+
+        assert data['params_matrix'].shape == (1, 2)
+        assert data['observables_matrix'].shape == (1, 2)
+        metadata = data['metadata']
+        # metadata is stored as a numpy object; ensure keys exist
+        assert 'scenario' in metadata.dtype.names
+        assert 'seed' in metadata.dtype.names
+
+
+class TestListPools:
+    """Tests for listing pools with noisy cache directories."""
+
+    def test_list_pools_ignores_noise(self, pool_manager):
+        # Add a valid batch with underscored scenario
+        params = np.array([[1.0, 2.0]])
+        obs = np.array([[10.0]])
+        pool_manager.add_batch(params, obs, seed=5, scenario="gvax_pd1")
+
+        # Add noise: unrelated files/dirs
+        (pool_manager.cache_dir / "random.txt").write_text("noise")
+        (pool_manager.cache_dir / "not_a_pool").mkdir()
+
+        pools = SimulationPoolManager.list_pools(pool_manager.cache_dir)
+
+        assert len(pools) == 1
+        info = pools[0]
+        assert "gvax_pd1" in info['scenarios']
+        assert info['n_batches'] == 1
+        assert info['total_simulations'] == 1

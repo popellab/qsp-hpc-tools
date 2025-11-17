@@ -69,6 +69,100 @@ class BatchConfig:
     jobs_per_chunk: int = 20
 
 
+class RemoteCommandError(RuntimeError):
+    """Raised when a remote command fails."""
+
+    def __init__(self, command: str, returncode: int, output: str):
+        self.command = command
+        self.returncode = returncode
+        self.output = output
+        super().__init__(f"Command failed (rc={returncode}): {command}\n{output}")
+
+
+class MissingOutputError(RuntimeError):
+    """Raised when expected remote output artifacts are missing."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+class SubmissionError(RuntimeError):
+    """Raised when SLURM submission cannot be parsed or accepted."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+class SSHTransport:
+    """Thin SSH/SCP transport layer to allow swapping/mocking."""
+
+    def __init__(self, config: BatchConfig):
+        self.config = config
+
+    def _build_ssh_target(self) -> str:
+        if self.config.ssh_user:
+            return f"{self.config.ssh_user}@{self.config.ssh_host}"
+        return self.config.ssh_host
+
+    def exec(self, command: str, timeout: Optional[int] = 30) -> Tuple[int, str]:
+        ssh_cmd = ['ssh']
+
+        if self.config.ssh_key:
+            ssh_cmd.extend(['-i', self.config.ssh_key])
+
+        ssh_cmd.extend([
+            '-o', 'ServerAliveInterval=30',
+            '-o', 'ServerAliveCountMax=5',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'BatchMode=yes'
+        ])
+
+        ssh_cmd.append(self._build_ssh_target())
+        ssh_cmd.append(command)
+
+        result = subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+
+        return result.returncode, result.stdout + result.stderr
+
+    def upload(self, local_path: str, remote_path: str) -> None:
+        scp_cmd = ['scp']
+
+        if self.config.ssh_key:
+            scp_cmd.extend(['-i', self.config.ssh_key])
+
+        remote_target = f"{self._build_ssh_target()}:{remote_path}"
+
+        scp_cmd.extend([
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'BatchMode=yes',
+            local_path,
+            remote_target
+        ])
+
+        subprocess.run(scp_cmd, check=True, capture_output=True)
+
+    def download(self, remote_path: str, local_dir: str) -> None:
+        scp_cmd = ['scp']
+
+        if self.config.ssh_key:
+            scp_cmd.extend(['-i', self.config.ssh_key])
+
+        remote_source = f"{self._build_ssh_target()}:{remote_path}"
+
+        scp_cmd.extend([
+            '-o', 'StrictHostKeyChecking=no',
+            remote_source,
+            local_dir
+        ])
+
+        subprocess.run(scp_cmd, check=True, capture_output=True)
+
+
 class HPCJobManager:
     """
     Manages HPC job submission and result collection for QSP simulations.
@@ -77,7 +171,7 @@ class HPCJobManager:
     eliminating MATLAB startup overhead and enabling faster job submission.
     """
 
-    def __init__(self, config: Union[Dict, BatchConfig, None] = None, verbose: bool = False):
+    def __init__(self, config: Union[Dict, BatchConfig, None] = None, verbose: bool = False, transport: Optional[SSHTransport] = None):
         """
         Initialize HPC job manager.
 
@@ -88,10 +182,15 @@ class HPCJobManager:
         if config is None:
             config = self._load_config_from_yaml()
         elif isinstance(config, dict):
-            config = BatchConfig(**config)
+            # Normalize common fields (e.g., expand ssh_key)
+            cfg_copy = dict(config)
+            if cfg_copy.get('ssh_key'):
+                cfg_copy['ssh_key'] = str(Path(cfg_copy['ssh_key']).expanduser())
+            config = BatchConfig(**cfg_copy)
 
         self.config = config
         self.verbose = verbose
+        self.transport = transport or SSHTransport(self.config)
 
         # Rsync exclusion patterns (from batch_execute.m)
         self.rsync_exclude_patterns = [
@@ -124,6 +223,7 @@ class HPCJobManager:
         Run 'qsp-hpc setup' to create this configuration file.
         """
         global_config_file = Path.home() / '.config' / 'qsp-hpc' / 'credentials.yaml'
+        project_config_file = Path.cwd() / '.qsp-hpc' / 'credentials.yaml'
 
         if not global_config_file.exists():
             raise FileNotFoundError(
@@ -134,47 +234,66 @@ class HPCJobManager:
         with open(global_config_file, 'r') as f:
             yaml_config = yaml.safe_load(f) or {}
 
-        if not yaml_config:
+        # Layer project-specific overrides if present
+        if project_config_file.exists():
+            with open(project_config_file, 'r') as f:
+                project_cfg = yaml.safe_load(f) or {}
+            yaml_config = self._merge_config_dicts(yaml_config, project_cfg)
+
+        return self._parse_config_dict(yaml_config, source=global_config_file)
+
+    @staticmethod
+    def _parse_config_dict(cfg: Dict, source: Path = None) -> BatchConfig:
+        """Parse and validate a credentials dict into BatchConfig."""
+        if not cfg:
             raise ValueError(
-                f"Configuration file {global_config_file} is empty.\n"
+                f"Configuration file {source} is empty.\n"
                 "Please run 'qsp-hpc setup' to configure HPC connection."
             )
 
-        ssh = yaml_config.get('ssh', {})
-        cluster = yaml_config.get('cluster', {})
-        paths = yaml_config.get('paths', {})
-        slurm = yaml_config.get('slurm', {})
+        ssh = cfg.get('ssh', {})
+        cluster = cfg.get('cluster', {})
+        paths = cfg.get('paths', {})
+        slurm = cfg.get('slurm', {})
 
-        # Require simulation_pool_path (no fallback)
         simulation_pool_path = paths.get('simulation_pool_path')
-        if not simulation_pool_path:
-            raise ValueError(
-                "paths.simulation_pool_path must be specified in credentials.yaml. "
-                "This is the HPC path where simulation pools are stored (e.g., '/scratch/username/simulations'). "
-                "Run 'qsp-hpc setup' to configure."
-            )
-
-        # Require hpc_venv_path (no fallback)
         hpc_venv_path = paths.get('hpc_venv_path')
+
+        if not simulation_pool_path:
+            raise ValueError("paths.simulation_pool_path must be specified in credentials.yaml")
         if not hpc_venv_path:
-            raise ValueError(
-                "paths.hpc_venv_path must be specified in credentials.yaml. "
-                "This is the HPC Python virtual environment path (e.g., '/home/username/.venv/hpc-qsp'). "
-                "Run 'qsp-hpc setup' to configure."
-            )
+            raise ValueError("paths.hpc_venv_path must be specified in credentials.yaml")
+
+        ssh_key = ssh.get('key', '')
+        if ssh_key:
+            ssh_key = str(Path(ssh_key).expanduser())
 
         return BatchConfig(
             ssh_host=ssh.get('host', ''),
             ssh_user=ssh.get('user', ''),
             simulation_pool_path=simulation_pool_path,
             hpc_venv_path=hpc_venv_path,
-            ssh_key=ssh.get('key', ''),
+            ssh_key=ssh_key,
             remote_project_path=paths.get('remote_base_dir', ''),
             partition=slurm.get('partition', 'shared'),
-            time_limit=slurm.get('time_limit', '01:00:00'),  # Default 1 hour
-            memory_per_job=slurm.get('mem_per_cpu', '4G'),  # Default 4G
+            time_limit=slurm.get('time_limit', '01:00:00'),
+            memory_per_job=slurm.get('mem_per_cpu', '4G'),
             matlab_module=cluster.get('matlab_module', 'matlab/R2024a')
         )
+
+    @staticmethod
+    def _merge_config_dicts(base: Dict, override: Dict) -> Dict:
+        """Recursively merge override into base config dict."""
+        if not override:
+            return base
+
+        merged = dict(base)
+        for key, val in override.items():
+            if isinstance(val, dict) and isinstance(merged.get(key), dict):
+                merged[key] = HPCJobManager._merge_config_dicts(merged[key], val)
+            else:
+                merged[key] = val
+        return merged
 
     def validate_ssh_connection(self, timeout: int = 5) -> bool:
         """
@@ -214,77 +333,22 @@ class HPCJobManager:
         Returns:
             Tuple of (return_code, output)
         """
-        ssh_cmd = ['ssh']
-
-        if self.config.ssh_key:
-            ssh_cmd.extend(['-i', self.config.ssh_key])
-
-        # Add connection options
-        ssh_cmd.extend([
-            '-o', 'ServerAliveInterval=30',
-            '-o', 'ServerAliveCountMax=5',
-            '-o', 'StrictHostKeyChecking=no',  # Trust host keys automatically
-            '-o', 'BatchMode=yes'  # Prevent interactive prompts
-        ])
-
-        # Use SSH config alias if no user specified, otherwise use user@host
-        if self.config.ssh_user:
-            ssh_cmd.append(f"{self.config.ssh_user}@{self.config.ssh_host}")
-        else:
-            ssh_cmd.append(self.config.ssh_host)
-        ssh_cmd.append(command)
-
-        result = subprocess.run(
-            ssh_cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-
-        return result.returncode, result.stdout + result.stderr
+        rc, out = self.transport.exec(command, timeout=timeout)
+        return rc, out
 
     def _ssh_upload(self, local_path: str, remote_path: str) -> None:
         """Upload file to HPC cluster via SCP."""
-        scp_cmd = ['scp']
-
-        if self.config.ssh_key:
-            scp_cmd.extend(['-i', self.config.ssh_key])
-
-        # Use SSH config alias if no user specified, otherwise use user@host
-        if self.config.ssh_user:
-            remote_target = f"{self.config.ssh_user}@{self.config.ssh_host}:{remote_path}"
-        else:
-            remote_target = f"{self.config.ssh_host}:{remote_path}"
-
-        scp_cmd.extend([
-            '-o', 'StrictHostKeyChecking=no',
-            '-o', 'BatchMode=yes',
-            local_path,
-            remote_target
-        ])
-
-        subprocess.run(scp_cmd, check=True, capture_output=True)
+        try:
+            self.transport.upload(local_path, remote_path)
+        except subprocess.CalledProcessError as exc:  # pragma: no cover - mocked in tests
+            raise RemoteCommandError(f"scp upload to {remote_path}", exc.returncode, exc.stderr or str(exc)) from exc
 
     def _ssh_download(self, remote_path: str, local_dir: str) -> None:
         """Download file from HPC cluster via SCP."""
-        scp_cmd = ['scp']
-
-        if self.config.ssh_key:
-            scp_cmd.extend(['-i', self.config.ssh_key])
-
-        # Use SSH config alias if no user specified, otherwise use user@host
-        if self.config.ssh_user:
-            remote_source = f"{self.config.ssh_user}@{self.config.ssh_host}:{remote_path}"
-        else:
-            remote_source = f"{self.config.ssh_host}:{remote_path}"
-
-        scp_cmd.extend([
-            '-o', 'StrictHostKeyChecking=no',
-            remote_source,
-            local_dir
-        ])
-
-        subprocess.run(scp_cmd, check=True, capture_output=True)
+        try:
+            self.transport.download(remote_path, local_dir)
+        except subprocess.CalledProcessError as exc:  # pragma: no cover - mocked in tests
+            raise RemoteCommandError(f"scp download {remote_path}", exc.returncode, exc.stderr or str(exc)) from exc
 
     def ensure_hpc_venv(self) -> None:
         """
@@ -612,13 +676,13 @@ bash scripts/setup_hpc_venv.sh
             status, output = self._ssh_exec(f'sbatch "{remote_script}"')
 
             if status != 0:
-                raise RuntimeError(f"SLURM submission failed: {output}")
+                raise SubmissionError(f"SLURM submission failed: {output}")
 
             # Extract job ID
             import re
             match = re.search(r'Submitted batch job (\d+)', output)
             if not match:
-                raise RuntimeError(f"Could not parse job ID from: {output}")
+                raise SubmissionError(f"Could not parse job ID from: {output}")
 
             job_id = match.group(1)
             elapsed = time.time() - start_time
@@ -660,14 +724,17 @@ echo "Job completed at $(date)"
 
     def _save_job_state(self, job_info: JobInfo, project_name: str) -> str:
         """Save job state to file."""
-        state_dir = Path(f"projects/{project_name}/batch_jobs")
-        state_dir.mkdir(parents=True, exist_ok=True)
+        base_dir = Path(self.config.remote_project_path or Path.cwd()) / f"projects/{project_name}/batch_jobs"
+        base_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = time.strftime('%Y%m%d_%H%M%S')
-        state_file = state_dir / f"job_state_{timestamp}.pkl"
+        state_file = base_dir / f"job_state_{timestamp}.pkl"
 
-        with open(state_file, 'wb') as f:
-            pickle.dump(asdict(job_info), f)
+        try:
+            with open(state_file, 'wb') as f:
+                pickle.dump(asdict(job_info), f)
+        except OSError as exc:  # pragma: no cover - hard to trigger in tests
+            raise RuntimeError(f"Failed to write job state to {state_file}: {exc}") from exc
 
         return str(state_file)
 
@@ -708,7 +775,7 @@ echo "Job completed at $(date)"
         num_chunks = int(output.strip()) if output.strip().isdigit() else 0
 
         if num_chunks == 0:
-            raise RuntimeError(
+            raise MissingOutputError(
                 f"No chunk output files found in {remote_output}. "
                 "Jobs may have failed or not produced output files."
             )
@@ -718,7 +785,7 @@ echo "Job completed at $(date)"
         status, output = self._ssh_exec(combine_cmd)
 
         if status != 0:
-            raise RuntimeError(f"Failed to combine test stats: {output}")
+            raise RemoteCommandError(combine_cmd, status, output)
 
     def _download_combined_results(self, project_name: str) -> np.ndarray:
         """Download and load combined results."""
@@ -734,6 +801,9 @@ echo "Job completed at $(date)"
 
             # Load CSV
             local_file = temp_dir / "combined_test_stats.csv"
+            if not local_file.exists():
+                raise MissingOutputError(f"Combined results not found locally: {local_file}")
+
             observables = np.loadtxt(local_file, delimiter=',', ndmin=2)
             # Ensure 2D shape (num_simulations, num_observables)
             if observables.ndim == 1:

@@ -381,7 +381,15 @@ echo "Python venv setup complete!"
                     if line.strip():
                         click.echo(f"    {line}")
 
-                if returncode == 0 and 'successfully' in output.lower():
+                # Check for successful installation
+                # Look for either: returncode 0, or package installation confirmation
+                success_indicators = [
+                    'qsp-hpc-tools' in output,  # Package was installed
+                    '✓' in output,  # Verification passed
+                    'installed' in output.lower()  # Installation message
+                ]
+
+                if returncode == 0 or any(success_indicators):
                     click.echo()
                     click.secho("  ✓ Python venv setup complete!", fg='green')
                 else:

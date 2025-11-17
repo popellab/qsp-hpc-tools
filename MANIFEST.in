@@ -1,0 +1,4 @@
+include README.md
+include LICENSE
+recursive-include matlab *.m
+recursive-include scripts/hpc *.sh

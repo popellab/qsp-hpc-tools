@@ -80,6 +80,7 @@ class BatchConfig:
     matlab_module: str = 'matlab/R2024a'
     jobs_per_chunk: int = 20
     strict_host_key_checking: bool = True  # Security: verify SSH host keys by default
+    qsp_hpc_tools_source: str = 'git+https://github.com/jeliason/qsp-hpc-tools.git@main'
 
 
 class RemoteCommandError(RuntimeError):
@@ -307,6 +308,7 @@ class HPCJobManager:
         cluster = cfg.get('cluster', {})
         paths = cfg.get('paths', {})
         slurm = cfg.get('slurm', {})
+        package = cfg.get('package', {})
 
         # Validate required SSH fields
         ssh_host = ssh.get('host', '').strip()
@@ -370,7 +372,8 @@ class HPCJobManager:
             time_limit=time_limit,
             memory_per_job=memory_per_job,
             matlab_module=cluster.get('matlab_module', 'matlab/R2024a').strip(),
-            strict_host_key_checking=ssh.get('strict_host_key_checking', True)  # Default to True for security
+            strict_host_key_checking=ssh.get('strict_host_key_checking', True),  # Default to True for security
+            qsp_hpc_tools_source=package.get('qsp_hpc_tools_source', 'git+https://github.com/jeliason/qsp-hpc-tools.git@main').strip()
         )
 
     @staticmethod

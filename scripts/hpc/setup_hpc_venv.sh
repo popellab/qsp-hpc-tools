@@ -2,20 +2,25 @@
 # Setup Python virtual environment on HPC using uv
 #
 # This script uses uv to create a virtual environment with Python 3.11+
-# and installs required packages for Parquet I/O and test statistics derivation.
+# and installs qsp-hpc-tools package (which includes all dependencies).
 #
 # Prerequisites:
 #   - uv must be installed (curl -LsSf https://astral.sh/uv/install.sh | sh)
 #
 # Usage:
-#   bash scripts/setup_hpc_venv.sh
+#   bash scripts/hpc/setup_hpc_venv.sh [QSP_HPC_TOOLS_SOURCE]
+#
+# Arguments:
+#   QSP_HPC_TOOLS_SOURCE: Where to install qsp-hpc-tools from
+#                         Default: git+https://github.com/jeliason/qsp-hpc-tools.git@main
 
 set -e  # Exit on error
 
 VENV_DIR="$HOME/qspio_venv"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 PYTHON_VERSION="3.11"
+
+# Package source (from argument or default to GitHub main)
+QSP_HPC_TOOLS_SOURCE="${1:-git+https://github.com/jeliason/qsp-hpc-tools.git@main}"
 
 echo "🐍 Setting up Python virtual environment for QSP on HPC (using uv)"
 echo "   Location: $VENV_DIR"
@@ -45,21 +50,16 @@ else
     echo "   ✓ Virtual environment created"
 fi
 
-# Install/update packages using uv
-echo "   → Installing required packages with uv..."
-if [ -f "$PROJECT_ROOT/requirements_hpc.txt" ]; then
-    uv pip install --python "$VENV_DIR/bin/python" -r "$PROJECT_ROOT/requirements_hpc.txt"
-    echo "   ✓ Packages installed"
-else
-    echo "   ⚠️  requirements_hpc.txt not found, installing manually..."
-    uv pip install --python "$VENV_DIR/bin/python" numpy pandas pyarrow scipy
-    echo "   ✓ Packages installed"
-fi
+# Install qsp-hpc-tools (includes all dependencies)
+echo "   → Installing qsp-hpc-tools from: $QSP_HPC_TOOLS_SOURCE"
+uv pip install --python "$VENV_DIR/bin/python" "$QSP_HPC_TOOLS_SOURCE"
+echo "   ✓ qsp-hpc-tools installed"
 
 # Verify installation
 echo ""
 echo "🔍 Verifying installation..."
-"$VENV_DIR/bin/python" -c "import numpy, pandas, pyarrow, scipy; print('   ✓ All packages imported successfully')"
+"$VENV_DIR/bin/python" -c "import qsp_hpc; print('   ✓ qsp-hpc-tools imported successfully')"
+"$VENV_DIR/bin/python" -c "import numpy, pandas, pyarrow; print('   ✓ Dependencies available')"
 "$VENV_DIR/bin/python" --version | sed 's/^/   Python: /'
 
 echo ""

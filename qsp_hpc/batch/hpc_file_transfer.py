@@ -124,11 +124,12 @@ class HPCFileTransfer:
             return
 
         self.logger.info("Setting up HPC Python environment (first time only)...")
+        self.logger.info(f"Installing qsp-hpc-tools from: {self.config.qsp_hpc_tools_source}")
 
-        # Run setup script on HPC
+        # Run setup script on HPC with package source
         setup_script = f"""
 cd "{self.config.remote_project_path}"
-bash scripts/hpc/setup_hpc_venv.sh
+bash scripts/hpc/setup_hpc_venv.sh "{self.config.qsp_hpc_tools_source}"
 """
         status, output = self.transport.exec(setup_script, timeout=300)  # 5 min timeout
 

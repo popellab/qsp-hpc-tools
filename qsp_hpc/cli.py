@@ -363,6 +363,9 @@ echo "Python venv setup complete!"
             'partition': partition,
             'time_limit': time_limit,
             'mem_per_cpu': mem_per_cpu,
+        },
+        'package': {
+            'qsp_hpc_tools_source': 'git+https://github.com/jeliason/qsp-hpc-tools.git@main',
         }
     }
 

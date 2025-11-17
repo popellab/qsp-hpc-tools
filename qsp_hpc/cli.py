@@ -161,20 +161,28 @@ def setup(global_only):
                 remote_username = output.strip()
                 click.echo(f"  Detected remote user: {remote_username}")
         except (OSError, RuntimeError, TimeoutError):
-            # Fall back to generic username if SSH command fails
-            remote_username = "username"
+            # Could not detect remote username
+            remote_username = None
 
-    # Suggest paths based on remote username
-    if remote_username and remote_username != "username":
+    # Prompt for data base directory
+    data_base_dir = click.prompt(
+        "  Data base directory name (under your home)",
+        default="data",
+        type=str
+    )
+
+    # Suggest paths based on remote username (if detected)
+    if remote_username:
         default_base = f"/home/{remote_username}/qsp-projects"
-        default_pool = f"/scratch/{remote_username}/simulations"
+        default_pool = f"/home/{remote_username}/{data_base_dir}/{remote_username}/qsp_simulations"
     else:
-        default_base = "/home/username/qsp-projects"
-        default_pool = "/scratch/username/simulations"
+        # No specific defaults if username not detected
+        default_base = ""
+        default_pool = ""
 
     remote_base_dir = click.prompt(
         "  Base directory for projects",
-        default=default_base,
+        default=default_base if default_base else "/home/your-username/qsp-projects",
         type=str
     )
 
@@ -187,8 +195,8 @@ def setup(global_only):
     )
 
     simulation_pool_path = click.prompt(
-        "  Simulation pool directory",
-        default=default_pool,
+        "  Simulation pool directory (for cached full simulations)",
+        default=default_pool if default_pool else f"/home/your-username/{data_base_dir}/your-username/qsp_simulations",
         type=str
     )
 

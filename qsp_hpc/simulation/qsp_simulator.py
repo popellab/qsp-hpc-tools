@@ -34,6 +34,7 @@ from typing import Union, Tuple, Optional, Dict, List, Any, Callable
 from scipy.io import loadmat
 from qsp_hpc.batch.hpc_job_manager import MissingOutputError, RemoteCommandError, SubmissionError
 from qsp_hpc.utils.logging_config import setup_logger
+from qsp_hpc.constants import SLURM_REGISTRATION_DELAY, JOB_QUEUE_TIMEOUT, HASH_PREFIX_LENGTH
 
 
 class QSPSimulatorError(RuntimeError):
@@ -301,7 +302,7 @@ class QSPSimulator:
         from qsp_hpc.batch.hpc_job_manager import HPCJobManager, SubmissionError, RemoteCommandError, MissingOutputError
         job_manager = self.job_manager or HPCJobManager()
 
-        hpc_pool_id = f"{self.model_version}_{priors_hash[:8]}"
+        hpc_pool_id = f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}"
         self._debug(f"HPC pool: {hpc_pool_id}")
 
         has_full_sims, hpc_pool_path, n_available = job_manager.check_hpc_full_simulations(
@@ -325,10 +326,10 @@ class QSPSimulator:
         test_stats_hash: str,
         num_simulations: int,
         verbose: bool = False
-    ):
+    ) -> None:
         """Derive test statistics from full simulations on HPC."""
         from qsp_hpc.batch.hpc_job_manager import HPCJobManager
-        job_manager = HPCJobManager()
+        job_manager = self.job_manager or HPCJobManager()
 
         # Validate that derived test stats match requested simulation count
         try:
@@ -479,7 +480,7 @@ class QSPSimulator:
         # Get HPC pool path (scenario-specific)
         from qsp_hpc.batch.hpc_job_manager import HPCJobManager
         job_manager = self.job_manager or HPCJobManager()
-        hpc_pool_path = f"{job_manager.config.simulation_pool_path}/{self.model_version}_{priors_hash[:8]}_{self.scenario}"
+        hpc_pool_path = f"{job_manager.config.simulation_pool_path}/{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
 
         # 2. Check HPC for derived test statistics
         try:
@@ -491,7 +492,10 @@ class QSPSimulator:
 
         if has_test_stats:
             self._info(f"Found derived test statistics on HPC")
-            return self._download_and_add_to_pool(hpc_pool_path, test_stats_hash, num_simulations)
+            try:
+                return self._download_and_add_to_pool(hpc_pool_path, test_stats_hash, num_simulations)
+            except Exception as exc:
+                raise QSPSimulatorError(f"Failed downloading test stats from HPC: {exc}") from exc
 
         # 3. Check HPC for full simulations
         try:
@@ -562,7 +566,7 @@ class QSPSimulator:
         test_stats_hash = self._compute_test_stats_hash()
 
         # Create pool ID with suffix to separate posterior predictive from training
-        pool_id_base = f"{self.model_version}_{priors_hash[:8]}_{pool_suffix}"
+        pool_id_base = f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{pool_suffix}"
 
         # 1. Check local cache
         local_cache_key = hashlib.sha256(
@@ -581,7 +585,7 @@ class QSPSimulator:
 
         # 2. Check HPC for existing simulations
         from qsp_hpc.batch.hpc_job_manager import HPCJobManager
-        job_manager = HPCJobManager()
+        job_manager = self.job_manager or HPCJobManager()
 
         pool_path = f"{job_manager.config.simulation_pool_path}/{pool_id_base}"
         has_full_sims, _, n_available = job_manager.check_hpc_full_simulations(
@@ -708,22 +712,22 @@ class QSPSimulator:
         from qsp_hpc.batch.hpc_job_manager import HPCJobManager
 
         # Create job manager (loads from global config)
-        job_manager = HPCJobManager()
+        job_manager = self.job_manager or HPCJobManager()
 
         # Compute simulation pool ID for full simulations (scenario-specific)
         priors_hash = self._compute_priors_hash()
-        simulation_pool_id = f"{self.model_version}_{priors_hash[:8]}_{self.scenario}"
+        simulation_pool_id = f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
         if pool_suffix:
             simulation_pool_id = f"{simulation_pool_id}_{pool_suffix}"
 
-        # Print HPC save path
+        # Log HPC save path
         hpc_save_path = f"{job_manager.config.simulation_pool_path}/{simulation_pool_id}"
-        print(f"   → HPC save path: {hpc_save_path} (scenario='{self.scenario}')")
+        self.logger.info(f"   → HPC save path: {hpc_save_path} (scenario='{self.scenario}')")
 
         # Calculate optimal split across tasks
         from qsp_hpc.batch.batch_utils import calculate_batch_split
         jobs_per_chunk, n_tasks = calculate_batch_split(num_simulations, self.max_tasks)
-        print(f"   → Splitting {num_simulations} simulations into {n_tasks} tasks ({jobs_per_chunk} sims/task)")
+        self.logger.info(f"   → Splitting {num_simulations} simulations into {n_tasks} tasks ({jobs_per_chunk} sims/task)")
 
         # Submit jobs via Python (no MATLAB startup!)
         job_info = job_manager.submit_jobs(
@@ -775,6 +779,7 @@ class QSPSimulator:
             'ssh_host': ssh_config.get('host', ''),
             'ssh_user': ssh_config.get('user', ''),
             'ssh_key': ssh_config.get('key', ''),
+            'strict_host_key_checking': ssh_config.get('strict_host_key_checking', True),
         }
 
         if not self.batch_config['ssh_host']:
@@ -785,7 +790,7 @@ class QSPSimulator:
 
         return self.batch_config
 
-    def _validate_hpc_connection(self):
+    def _validate_hpc_connection(self) -> None:
         """
         Validate SSH connection to HPC cluster (fast fail).
 
@@ -797,7 +802,7 @@ class QSPSimulator:
             from qsp_hpc.batch.hpc_job_manager import HPCJobManager
 
             # Create job manager (loads from global config)
-            job_manager = HPCJobManager()
+            job_manager = self.job_manager or HPCJobManager()
 
             # Validate SSH connection (fast - should return in 1-2s)
             job_manager.validate_ssh_connection(timeout=5)
@@ -825,7 +830,7 @@ class QSPSimulator:
             ssh_base.extend(['-i', config['ssh_key']])
         ssh_base.extend([
             '-o', 'BatchMode=yes',
-            '-o', 'StrictHostKeyChecking=no'
+            '-o', f'StrictHostKeyChecking={"yes" if config["strict_host_key_checking"] else "no"}'
         ])
         # Handle SSH config alias (user is empty) vs direct connection (user@host)
         if config['ssh_user']:
@@ -914,8 +919,8 @@ class QSPSimulator:
             job_ids: List of SLURM job IDs to monitor
             num_simulations: Expected number of simulations
         """
-        # Give SLURM a few seconds to register the jobs before first check
-        time.sleep(5)
+        # Give SLURM time to register the jobs before first check
+        time.sleep(SLURM_REGISTRATION_DELAY)
 
         start_time = time.time()
         max_tasks_seen = 0  # Track the maximum number of tasks we've seen
@@ -936,7 +941,7 @@ class QSPSimulator:
                         total_status[key] += status[key]
                 except Exception as e:
                     if self.verbose:
-                        print(f"Warning: Could not check status for job {job_id}: {e}")
+                        self.logger.warning(f"Could not check status for job {job_id}: {e}")
 
             # Calculate progress
             total_tasks = sum(total_status.values())
@@ -951,9 +956,9 @@ class QSPSimulator:
             elapsed = time.time() - start_time
             elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
 
-            print(f"  {total_status['completed']}/{total_tasks} done ({completed_pct:.1f}%) | "
-                  f"Running: {total_status['running']}, Pending: {total_status['pending']}, "
-                  f"Failed: {total_status['failed']} | {elapsed_str}")
+            self.logger.info(f"  {total_status['completed']}/{total_tasks} done ({completed_pct:.1f}%) | "
+                             f"Running: {total_status['running']}, Pending: {total_status['pending']}, "
+                             f"Failed: {total_status['failed']} | {elapsed_str}")
 
             # Check if all jobs completed or failed
             active_jobs = total_status['running'] + total_status['pending']
@@ -970,8 +975,8 @@ class QSPSimulator:
                     print(f"  All {max_tasks_seen} jobs completed (no longer visible in queue)")
                 break
             # 3. Waited a while and never saw any tasks (possible monitoring failure, proceed anyway)
-            elif total_tasks == 0 and elapsed > 120:
-                print("  No jobs visible in queue after 2 minutes - proceeding to download")
+            elif total_tasks == 0 and elapsed > JOB_QUEUE_TIMEOUT:
+                self.logger.warning(f"No jobs visible in queue after {JOB_QUEUE_TIMEOUT}s - proceeding to download")
                 break
 
             # Check timeout

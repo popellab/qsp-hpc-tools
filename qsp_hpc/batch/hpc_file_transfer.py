@@ -15,6 +15,7 @@ import tarfile
 from pathlib import Path
 from typing import Dict, Any, Optional
 from qsp_hpc.utils.logging_config import setup_logger
+from qsp_hpc.utils.security import validate_project_name, safe_shell_quote
 
 
 class HPCFileTransfer:
@@ -135,6 +136,9 @@ bash scripts/hpc/setup_hpc_venv.sh
 
     def setup_remote_directories(self, project_name: str) -> None:
         """Create necessary directories on remote cluster and clean old files."""
+        # Validate project name to prevent command injection
+        project_name = validate_project_name(project_name)
+
         remote_root = (self.config.remote_project_path or "").strip()
         if not remote_root or remote_root in {"/", ".", "//"}:
             raise ValueError("remote_project_path must be set to a non-root directory before deleting files")
@@ -145,7 +149,9 @@ bash scripts/hpc/setup_hpc_venv.sh
         for d in dirs:
             remote_dir = f"{remote_base}/{d}"
             # Remove all files in directory, then recreate it
-            self.transport.exec(f'rm -rf "{remote_dir}" && mkdir -p "{remote_dir}"')
+            # Use safe_shell_quote to prevent injection even though project_name is validated
+            safe_dir = safe_shell_quote(remote_dir)
+            self.transport.exec(f'rm -rf {safe_dir} && mkdir -p {safe_dir}')
 
     def upload_job_config(
         self,

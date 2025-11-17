@@ -67,7 +67,8 @@ def setup(global_only):
                     if line.startswith('Host ') and not '*' in line:
                         host = line.split()[1]
                         ssh_hosts.append(host)
-        except Exception:
+        except (OSError, IOError, IndexError):
+            # Ignore errors reading SSH config - it's optional
             pass
 
     if ssh_hosts:
@@ -159,7 +160,8 @@ def setup(global_only):
             if returncode == 0:
                 remote_username = output.strip()
                 click.echo(f"  Detected remote user: {remote_username}")
-        except Exception:
+        except (OSError, RuntimeError, TimeoutError):
+            # Fall back to generic username if SSH command fails
             remote_username = "username"
 
     # Suggest paths based on remote username
@@ -453,7 +455,8 @@ def test(timeout):
                     click.secho(" ⚠ not found", fg='yellow')
             else:
                 click.secho(" ✗", fg='red')
-        except Exception:
+        except (OSError, RuntimeError, TimeoutError):
+            # SSH command failed
             click.secho(" ✗", fg='red')
 
     # Test MATLAB
@@ -467,7 +470,8 @@ def test(timeout):
             click.secho(" ✓", fg='green')
         else:
             click.secho(" ⚠ could not load", fg='yellow')
-    except Exception:
+    except (OSError, RuntimeError, TimeoutError):
+        # SSH command failed
         click.secho(" ✗", fg='red')
 
     # Test paths
@@ -481,7 +485,8 @@ def test(timeout):
             returncode, _ = manager._ssh_exec(f"test -d {path}", timeout=timeout)
             if returncode != 0:
                 all_paths_ok = False
-        except Exception:
+        except (OSError, RuntimeError, TimeoutError):
+            # SSH command failed
             all_paths_ok = False
 
     if all_paths_ok:

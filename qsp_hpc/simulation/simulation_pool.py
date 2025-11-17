@@ -54,6 +54,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Tuple, Optional, List, Dict, Union
 from scipy.io import loadmat, savemat
+from qsp_hpc.utils.logging_config import setup_logger
+from qsp_hpc.constants import HASH_PREFIX_LENGTH
 
 
 class SimulationPoolManager:
@@ -117,8 +119,8 @@ class SimulationPoolManager:
         # Compute configuration hash
         self.config_hash = self._compute_config_hash()
 
-        # Pool directory: {model_version}_{config_hash[:8]}
-        pool_name = f"{model_version}_{self.config_hash[:8]}"
+        # Pool directory: {model_version}_{config_hash[:HASH_PREFIX_LENGTH]}
+        pool_name = f"{model_version}_{self.config_hash[:HASH_PREFIX_LENGTH]}"
         self.pool_dir = self.cache_dir / pool_name
 
         # Ensure pool directory exists
@@ -130,6 +132,9 @@ class SimulationPoolManager:
         self.batch_pattern = re.compile(
             r'batch_(\d{8}_\d{6})_(.+?)_(\d+)sims_seed(\d+)\.mat'
         )
+
+        # Setup logger
+        self.logger = setup_logger(__name__)
 
     def _compute_config_hash(self) -> str:
         """
@@ -260,7 +265,7 @@ class SimulationPoolManager:
         for batch in batches:
             batch_file = batch['filepath']
             if not batch_file.exists():
-                print(f"  ⚠️  Warning: Batch file not found: {batch_file}")
+                self.logger.warning(f"Batch file not found: {batch_file}")
                 continue
 
             # Load batch data with validation

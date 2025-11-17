@@ -81,8 +81,9 @@ def compute_definition_hash(definition: Dict[str, Any], definition_type: str = "
     # Compute hash
     hash_bytes = hashlib.sha256(semantic_json.encode('utf-8')).digest()
 
-    # Return first 8 characters (32 bits) as hex
-    return hash_bytes.hex()[:8]
+    # Return first HASH_PREFIX_LENGTH characters (32 bits) as hex
+    from qsp_hpc.constants import HASH_PREFIX_LENGTH
+    return hash_bytes.hex()[:HASH_PREFIX_LENGTH]
 
 
 def normalize_model_context(model_context):

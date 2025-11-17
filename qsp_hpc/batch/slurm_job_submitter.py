@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Optional
 from qsp_hpc.utils.logging_config import setup_logger
+from qsp_hpc.utils.security import validate_project_name
 
 
 class SubmissionError(RuntimeError):
@@ -58,6 +59,9 @@ class SLURMJobSubmitter:
         Raises:
             SubmissionError: If job submission fails or job ID cannot be parsed
         """
+        # Validate project name for security
+        project_name = validate_project_name(project_name)
+
         start_time = time.time()
 
         # Log SLURM configuration
@@ -152,6 +156,9 @@ echo "Job completed at $(date)"
         Returns:
             Job ID string
         """
+        # Validate project name for security
+        project_name = validate_project_name(project_name)
+
         # Log configuration
         self.logger.info("SLURM Derivation Configuration:")
         self.logger.info(f"  Partition: {self.config.partition}")

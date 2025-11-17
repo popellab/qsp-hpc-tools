@@ -370,7 +370,7 @@ class HPCJobManager:
             time_limit=time_limit,
             memory_per_job=memory_per_job,
             matlab_module=cluster.get('matlab_module', 'matlab/R2024a').strip(),
-            strict_host_key_checking=ssh.get('strict_host_key_checking', False)  # False for backward compatibility
+            strict_host_key_checking=ssh.get('strict_host_key_checking', True)  # Default to True for security
         )
 
     @staticmethod
@@ -945,89 +945,17 @@ class HPCJobManager:
         status, output = self.transport.exec(f'ls "{pool_path}"/batch_*.parquet | wc -l')
         n_batches = int(output.strip()) if output.strip().isdigit() else 1
 
-        # Log SLURM configuration for derivation job
-        self.logger.info("SLURM Derivation Configuration:")
-        self.logger.info(f"  Partition: {self.config.partition}")
-        self.logger.info("  Time limit: 01:00:00 (fixed for derivation)")
-        self.logger.info("  Memory per job: 4G (fixed for derivation)")
-        self.logger.info(f"  Array size: {n_batches} tasks")
-
-        # Generate SLURM script
-        slurm_script = self._generate_derivation_slurm_script(
-            pool_path, remote_config, derivation_dir, n_batches, project_name
+        # Submit derivation job via slurm_submitter (eliminates code duplication)
+        job_id = self.slurm_submitter.submit_derivation_job(
+            pool_path=pool_path,
+            test_stats_config=remote_config,
+            derivation_dir=derivation_dir,
+            n_batches=n_batches,
+            project_name=project_name
         )
 
-        # Upload SLURM script
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-            f.write(slurm_script)
-            temp_slurm = f.name
-
-        remote_slurm = f"{derivation_dir}/derive_job_{test_stats_hash[:8]}.sh"
-        self.transport.upload(temp_slurm, remote_slurm)
-        Path(temp_slurm).unlink()
-
-        # Submit SLURM job
-        status, output = self.transport.exec(f'sbatch "{remote_slurm}"')
-
-        if status != 0:
-            raise RuntimeError(f"SLURM derivation job submission failed: {output}")
-
-        # Extract job ID
-        import re
-        match = re.search(r'Submitted batch job (\d+)', output)
-        if not match:
-            raise RuntimeError(f"Could not parse job ID from: {output}")
-
-        job_id = match.group(1)
         self.logger.info(f"   🚀 Derivation job {job_id} ({n_batches} tasks)")
-
         return job_id
-
-    def _generate_derivation_slurm_script(
-        self,
-        pool_path: str,
-        config_file: str,
-        derivation_dir: str,
-        n_batches: int,
-        project_name: str
-    ) -> str:
-        """Generate SLURM script for test statistics derivation."""
-        project_path = self.config.remote_project_path
-        log_dir = f"{project_path}/projects/{project_name}/batch_jobs/logs"
-
-        script = f"""#!/bin/bash
-#SBATCH --job-name=qsp_derive
-#SBATCH --partition={self.config.partition}
-#SBATCH --time=01:00:00
-#SBATCH --mem=4G
-#SBATCH --array=0-{n_batches-1}
-#SBATCH --output={log_dir}/qsp_derive_%A_%a.out
-#SBATCH --error={log_dir}/qsp_derive_%A_%a.err
-
-echo "Starting test statistics derivation at $(date)"
-echo "Array task ID: $SLURM_ARRAY_TASK_ID"
-echo "Job ID: $SLURM_JOB_ID"
-
-# Activate Python virtual environment
-VENV_DIR="{self.config.hpc_venv_path}"
-if [ -d "$VENV_DIR" ]; then
-    echo "Activating venv: $VENV_DIR"
-    source "$VENV_DIR/bin/activate"
-else
-    echo "WARNING: Virtual environment not found at $VENV_DIR"
-    echo "Please run: bash scripts/setup_hpc_venv.sh"
-    exit 1
-fi
-
-# Add project root and derivation dir to Python path
-export PYTHONPATH="{project_path}:{derivation_dir}:$PYTHONPATH"
-
-cd "{project_path}"
-python metadata/batch/derive_test_stats_worker.py "{config_file}"
-
-echo "Derivation completed at $(date)"
-"""
-        return script
 
     def download_test_stats(
         self,

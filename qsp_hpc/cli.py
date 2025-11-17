@@ -258,29 +258,19 @@ def setup(global_only):
             click.echo("  Setting up Python environment on HPC...")
             click.echo("  This will:")
             click.echo("    • Create Python venv using 'uv'")
-            click.echo("    • Install numpy, pandas, pyarrow, scipy")
+            click.echo("    • Install qsp-hpc-tools from GitHub")
+            click.echo("    • Install all dependencies (numpy, pandas, pyarrow, scipy)")
             click.echo("  This may take a few minutes...")
             click.echo()
 
-            # Run setup commands directly
-            venv_dir = hpc_venv_path
+            # Use the proper setup script with package source from config
+            qsp_hpc_tools_source = config.get('package', {}).get(
+                'qsp_hpc_tools_source',
+                'git+https://github.com/jeliason/qsp-hpc-tools.git@main'
+            )
             setup_cmd = f"""
-# Setup Python venv on HPC
-set -e
-
-echo "Creating venv at {venv_dir}..."
-uv venv {venv_dir}
-
-echo "Activating venv..."
-source {venv_dir}/bin/activate
-
-echo "Installing packages..."
-uv pip install numpy pandas pyarrow scipy
-
-echo "Verifying installation..."
-python -c "import numpy, pandas, pyarrow, scipy; print('All packages installed successfully')"
-
-echo "Python venv setup complete!"
+cd "{remote_base_dir}"
+bash scripts/hpc/setup_hpc_venv.sh "{qsp_hpc_tools_source}"
 """
 
             try:
@@ -308,8 +298,8 @@ echo "Python venv setup complete!"
             click.echo()
             click.secho("  ℹ️  Remember to set up the Python venv before submitting jobs:", fg='cyan')
             click.echo(f"    ssh {ssh_host}")
-            click.echo(f"    cd {hpc_venv_path.rsplit('/', 1)[0]}")
-            click.echo("    # Run scripts/hpc/setup_hpc_venv.sh")
+            click.echo(f"    cd {remote_base_dir}")
+            click.echo(f"    bash scripts/hpc/setup_hpc_venv.sh")
 
     click.echo()
 

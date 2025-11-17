@@ -1070,6 +1070,61 @@ class HPCJobManager:
 
         return downloaded_files
 
+    def check_job_status(self, job_id: str) -> Dict[str, int]:
+        """
+        Check status of SLURM job array.
+
+        Args:
+            job_id: SLURM job ID
+
+        Returns:
+            Dictionary with counts: {'completed': N, 'running': N, 'pending': N, 'failed': N}
+        """
+        status = {
+            'completed': 0,
+            'running': 0,
+            'pending': 0,
+            'failed': 0
+        }
+
+        # Check squeue for active jobs (running/pending)
+        squeue_cmd = f'squeue -j {job_id} --array --format="%i %T" --noheader 2>/dev/null'
+        returncode, output = self.transport.exec(squeue_cmd)
+
+        if returncode == 0 and output.strip():
+            lines = [line.strip() for line in output.split('\n') if line.strip()]
+            for line in lines:
+                parts = line.split()
+                if len(parts) >= 2:
+                    state_upper = parts[1].upper()
+                    if 'RUNNING' in state_upper:
+                        status['running'] += 1
+                    elif 'PENDING' in state_upper:
+                        status['pending'] += 1
+
+        # Check sacct for completed/failed jobs
+        sacct_cmd = f'sacct -j {job_id} --format=JobID,State --noheader --parsable2'
+        returncode, output = self.transport.exec(sacct_cmd)
+
+        if returncode == 0 and output.strip():
+            lines = [line.strip() for line in output.split('\n') if line.strip()]
+            for line in lines:
+                parts = line.split('|')
+                if len(parts) >= 2:
+                    job_part = parts[0]
+                    state = parts[1]
+
+                    # Only count main array tasks (format: 12345_0, 12345_1, ...)
+                    # Skip: main job (12345), sub-steps (12345_0.batch, 12345_0.extern)
+                    if '_' in job_part and '.' not in job_part:
+                        state_upper = state.upper()
+                        if 'COMPLETED' in state_upper:
+                            status['completed'] += 1
+                        elif 'FAILED' in state_upper or 'CANCELLED' in state_upper or 'TIMEOUT' in state_upper:
+                            status['failed'] += 1
+
+        return status
+
     def parse_parquet_simulations(
         self,
         parquet_file: Path,

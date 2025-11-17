@@ -752,7 +752,7 @@ class QSPSimulator:
 
             for job_id in job_ids:
                 try:
-                    status = self._check_job_status(job_id)
+                    status = self.job_manager.check_job_status(job_id)
                     for key in total_status:
                         total_status[key] += status[key]
                 except Exception as e:

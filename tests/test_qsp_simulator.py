@@ -555,7 +555,8 @@ class TestFlowDecisions:
         fake_job_mgr = Mock()
         fake_job_mgr.config.simulation_pool_path = '/pool'
         fake_job_mgr.check_hpc_test_stats.return_value = True
-        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -581,7 +582,8 @@ class TestFlowDecisions:
         fake_job_mgr = Mock()
         fake_job_mgr.config.simulation_pool_path = '/pool'
         fake_job_mgr.check_hpc_test_stats.return_value = False
-        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -689,7 +691,8 @@ class TestHelperFunctions:
         fake_job_mgr = Mock()
         fake_job_mgr.config.simulation_pool_path = '/pool'
         fake_job_mgr.check_hpc_test_stats.return_value = False
-        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -809,7 +812,8 @@ class TestNetworkAndSSHFailures:
         fake_job_mgr = Mock()
         fake_job_mgr.config.simulation_pool_path = '/pool'
         fake_job_mgr.check_hpc_test_stats.return_value = True
-        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -838,7 +842,8 @@ class TestJobSubmissionFailures:
         fake_job_mgr = Mock()
         fake_job_mgr.config.simulation_pool_path = '/pool'
         fake_job_mgr.check_hpc_test_stats.return_value = False
-        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -862,7 +867,8 @@ class TestJobSubmissionFailures:
         fake_job_mgr = Mock()
         fake_job_mgr.config.simulation_pool_path = '/pool'
         fake_job_mgr.check_hpc_test_stats.return_value = False
-        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -890,7 +896,8 @@ class TestJobMonitoringAndTimeouts:
         fake_job_mgr = Mock()
         fake_job_mgr.config.simulation_pool_path = '/pool'
         fake_job_mgr.check_hpc_test_stats.return_value = False
-        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -916,7 +923,8 @@ class TestJobMonitoringAndTimeouts:
         fake_job_mgr = Mock()
         fake_job_mgr.config.simulation_pool_path = '/pool'
         fake_job_mgr.check_hpc_test_stats.return_value = False
-        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
         fake_job_mgr.wait_for_jobs.return_value = False  # Jobs never complete
 
         sim = QSPSimulator(
@@ -1168,7 +1176,8 @@ class TestEdgeCases:
         fake_job_mgr = Mock()
         fake_job_mgr.config.simulation_pool_path = '/pool'
         fake_job_mgr.check_hpc_test_stats.return_value = False
-        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '', 0)
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -1363,7 +1372,8 @@ class TestThreeTierCachingStrategy:
         fake_job_mgr = Mock()
         fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
         fake_job_mgr.check_hpc_test_stats.return_value = False  # No test stats
-        fake_job_mgr.check_hpc_full_simulations.return_value = (True, '/hpc/pool/path', 50)  # Full sims available
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = True  # Full sims available
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 50
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -1396,7 +1406,8 @@ class TestThreeTierCachingStrategy:
         fake_job_mgr = Mock()
         fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
         fake_job_mgr.check_hpc_test_stats.return_value = False
-        fake_job_mgr.check_hpc_full_simulations.return_value = (False, '/hpc/pool/path', 0)  # Nothing available
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False  # Nothing available
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,

@@ -285,12 +285,15 @@ class QSPSimulator:
         verbose: bool = False
     ) -> Tuple[bool, str, int]:
         """Check HPC for existing full simulations."""
-        hpc_pool_id = f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}"
+        # Construct pool path with scenario suffix (must match save location)
+        hpc_pool_id = f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
+        hpc_pool_path = f"{self.job_manager.config.simulation_pool_path}/{hpc_pool_id}"
         self._debug(f"HPC pool: {hpc_pool_id}")
 
-        has_full_sims, hpc_pool_path, n_available = self.job_manager.check_hpc_full_simulations(
-            self.model_version, priors_hash, num_simulations
-        )
+        # Check directly using result_collector
+        has_full_sims = self.job_manager.result_collector.check_pool_directory_exists(hpc_pool_path)
+        n_available = self.job_manager.result_collector.count_pool_simulations(hpc_pool_path) if has_full_sims else 0
+        has_full_sims = n_available >= num_simulations
 
         if has_full_sims:
             self._info(f"Found {n_available} HPC simulations (sufficient)")
@@ -474,11 +477,16 @@ class QSPSimulator:
             except Exception as exc:
                 raise QSPSimulatorError(f"Failed downloading test stats from HPC: {exc}") from exc
 
-        # 3. Check HPC for full simulations
+        # 3. Check HPC for full simulations (construct path explicitly to include scenario)
         try:
-            has_full_sims, _, n_hpc_available = self.job_manager.check_hpc_full_simulations(
-                f"{self.model_version}_{self.scenario}", priors_hash, num_simulations
-            )
+            # Use same path construction as when saving (line 463)
+            hpc_full_sim_path = f"{self.job_manager.config.simulation_pool_path}/{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
+            has_full_sims = self.job_manager.result_collector.check_pool_directory_exists(hpc_full_sim_path)
+            if has_full_sims:
+                n_hpc_available = self.job_manager.result_collector.count_pool_simulations(hpc_full_sim_path)
+            else:
+                n_hpc_available = 0
+            has_full_sims = n_hpc_available >= num_simulations
         except (RemoteCommandError, MissingOutputError) as exc:
             raise QSPSimulatorError(f"Failed checking HPC full simulations: {exc}") from exc
 

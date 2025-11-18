@@ -116,7 +116,8 @@ class TestQSPSimulatorInitialization:
             model_version='v1',
             scenario='default',
             cache_dir=cache_dir,
-            seed=42
+            seed=42,
+            local_only=True
         )
 
         assert simulator.test_stats_csv == sample_test_stats_csv
@@ -162,6 +163,7 @@ class TestQSPSimulatorInitialization:
             priors_csv=sample_priors_csv,
             project_name='test_project',
             model_version='v1',
+            local_only=True,
             cache_dir=cache_dir
         )
 
@@ -173,7 +175,8 @@ class TestQSPSimulatorInitialization:
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
             project_name='test_project',
-            model_version='v1'
+            model_version='v1',
+            local_only=True
         )
 
         assert simulator.scenario == 'default'
@@ -192,7 +195,8 @@ class TestQSPSimulatorInitialization:
             project_name='test_project',
             model_version='v1',
             scenario='gvax',
-            cache_dir=temp_dir / "cache"
+            cache_dir=temp_dir / "cache",
+            local_only=True
         )
 
         assert simulator.scenario == 'gvax'
@@ -205,7 +209,8 @@ class TestQSPSimulatorInitialization:
             project_name='test_project',
             model_version='v1',
             scenario='default',
-            cache_dir=temp_dir / "cache"
+            cache_dir=temp_dir / "cache",
+            local_only=True
         )
 
         repr_str = repr(simulator)

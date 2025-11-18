@@ -2668,3 +2668,181 @@ class TestProjectConfiguration:
         )
 
         assert sim.max_tasks == 50
+
+
+class TestPriorPPCSimulationReuse:
+    """
+    Test that prior PPCs correctly reuse existing simulations from shared pool.
+
+    This validates the fix for the bug where prior PPCs would run ALL n_samples
+    new simulations instead of only running the deficit and reusing existing ones.
+    """
+
+    def test_prior_ppc_reuses_training_simulations(
+        self, sample_test_stats_csv, sample_priors_csv, temp_dir
+    ):
+        """
+        Test that prior PPCs reuse existing training simulations.
+
+        Scenario:
+        1. Training generates 18 simulations (saved to shared HPC pool)
+        2. Prior PPC needs 200 simulations
+        3. Simulator should find 18 existing, run only 182 new
+        4. Return all 200 samples
+
+        This is a regression test for the bug where prior PPCs called
+        simulate_with_parameters() which didn't reuse existing simulations.
+        """
+        # Create simulator
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='baseline_pdac',
+            scenario='default',
+            cache_dir=temp_dir / 'cache',
+            local_only=False
+        )
+
+        # Mock the pool to simulate having 18 existing simulations
+        fake_pool = MagicMock()
+        sim.pool = fake_pool
+
+        # First call: pool has 0 locally, HPC has 18 full sims
+        fake_pool.get_available_simulations.return_value = 0
+
+        # Mock HPC checks
+        sim.job_manager.check_hpc_test_stats = MagicMock(return_value=False)
+        sim.job_manager.result_collector.check_pool_directory_exists = MagicMock(return_value=True)
+        sim.job_manager.result_collector.count_pool_simulations = MagicMock(return_value=18)
+
+        # Mock running new simulations (182 needed)
+        sim._run_new_simulations = MagicMock()
+
+        # Mock pool loading after running new sims - returns all 200
+        fake_pool.load_simulations.return_value = (
+            np.random.rand(200, 8),  # 200 params
+            np.random.rand(200, 12)  # 200 observables
+        )
+
+        # Call simulator (like prior PPCs do)
+        theta, obs = sim(200)
+
+        # Verify it ran only 182 new simulations (not 200)
+        sim._run_new_simulations.assert_called_once_with(182)
+
+        # Verify it loaded 200 from pool after adding new ones
+        fake_pool.load_simulations.assert_called_once()
+        assert fake_pool.load_simulations.call_args[1]['n_requested'] == 200
+        assert fake_pool.load_simulations.call_args[1]['scenario'] == 'default'
+
+        # Verify we got 200 samples back
+        assert theta.shape == (200, 8)
+        assert obs.shape == (200, 12)
+
+    def test_prior_ppc_runs_all_when_pool_empty(
+        self, sample_test_stats_csv, sample_priors_csv, temp_dir
+    ):
+        """
+        Test that prior PPCs run all simulations when pool is empty.
+
+        Scenario:
+        1. No existing simulations
+        2. Prior PPC needs 200 simulations
+        3. Simulator should run all 200
+        """
+        # Create simulator
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='baseline_pdac',
+            scenario='default',
+            cache_dir=temp_dir / 'cache',
+            local_only=False
+        )
+
+        # Mock the pool - empty
+        fake_pool = MagicMock()
+        sim.pool = fake_pool
+        fake_pool.get_available_simulations.return_value = 0
+
+        # Mock HPC checks - no simulations
+        sim.job_manager.check_hpc_test_stats = MagicMock(return_value=False)
+        sim.job_manager.result_collector.check_pool_directory_exists = MagicMock(return_value=False)
+        sim.job_manager.result_collector.count_pool_simulations = MagicMock(return_value=0)
+
+        # Mock running new simulations
+        sim._run_new_simulations = MagicMock()
+
+        # Mock pool loading
+        fake_pool.load_simulations.return_value = (
+            np.random.rand(200, 8),
+            np.random.rand(200, 12)
+        )
+
+        # Call simulator
+        theta, obs = sim(200)
+
+        # Verify it ran all 200 simulations
+        sim._run_new_simulations.assert_called_once_with(200)
+
+        # Verify we got 200 samples back
+        assert theta.shape == (200, 8)
+        assert obs.shape == (200, 12)
+
+    def test_prior_ppc_uses_all_when_pool_sufficient(
+        self, sample_test_stats_csv, sample_priors_csv, temp_dir
+    ):
+        """
+        Test that prior PPCs use existing simulations when enough are available.
+
+        Scenario:
+        1. Pool has 500 existing simulations
+        2. Prior PPC needs 200 simulations
+        3. Simulator should use existing (no new runs needed)
+        """
+        # Create simulator
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='baseline_pdac',
+            scenario='default',
+            cache_dir=temp_dir / 'cache',
+            local_only=False
+        )
+
+        # Mock the pool - has plenty
+        fake_pool = MagicMock()
+        sim.pool = fake_pool
+        fake_pool.get_available_simulations.return_value = 0  # Not in local cache
+
+        # Mock HPC checks - has 500 full sims
+        sim.job_manager.check_hpc_test_stats = MagicMock(return_value=False)
+        sim.job_manager.result_collector.check_pool_directory_exists = MagicMock(return_value=True)
+        sim.job_manager.result_collector.count_pool_simulations = MagicMock(return_value=500)
+
+        # Mock derivation and download
+        sim._derive_test_statistics = MagicMock()
+        sim._download_and_add_to_pool = MagicMock(return_value=(
+            np.random.rand(200, 8),
+            np.random.rand(200, 12)
+        ))
+
+        # Mock running new simulations (should NOT be called)
+        sim._run_new_simulations = MagicMock()
+
+        # Call simulator
+        theta, obs = sim(200)
+
+        # Verify it did NOT run new simulations
+        sim._run_new_simulations.assert_not_called()
+
+        # Verify it derived test stats and downloaded
+        sim._derive_test_statistics.assert_called_once()
+        sim._download_and_add_to_pool.assert_called_once()
+
+        # Verify we got 200 samples back
+        assert theta.shape == (200, 8)
+        assert obs.shape == (200, 12)

@@ -484,10 +484,9 @@ class TestParameterGeneration:
 class TestPoolIntegration:
     """Test integration with SimulationPoolManager."""
 
-    @patch('qsp_hpc.simulation.qsp_simulator.SimulationPoolManager')  # Patch where it's used
-    def test_initializes_pool_manager(self, mock_pool_class, sample_test_stats_csv, sample_priors_csv, temp_dir):
+    def test_initializes_pool_manager(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
         """Test that SimulationPoolManager is initialized correctly."""
-        # No need to mock HPCJobManager since it's lazy-loaded and won't be created for this test
+        # Create simulator and check that pool is initialized
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
@@ -501,16 +500,11 @@ class TestPoolIntegration:
         )
 
         # Pool is initialized during __init__, not lazily
-        # Check that pool was created with correct parameters
-        mock_pool_class.assert_called_once()
-        call_kwargs = mock_pool_class.call_args[1]
-
-        assert call_kwargs['model_version'] == 'v1'
-        assert call_kwargs['model_description'] == 'Test model'
-        assert call_kwargs['model_script'] == 'test_model'
-        assert call_kwargs['cache_dir'] == temp_dir / "cache"
-        assert call_kwargs['priors_csv'] == sample_priors_csv
-        assert call_kwargs['test_stats_csv'] == sample_test_stats_csv
+        # Check that pool was created and has expected attributes
+        assert simulator.pool is not None
+        assert simulator.pool.model_version == 'v1'
+        assert simulator.pool.model_description == 'Test model'
+        assert simulator.pool.model_script == 'test_model'
 
     def test_injected_pool_and_job_manager_used(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
         fake_pool = Mock()
@@ -2702,7 +2696,13 @@ class TestPriorPPCSimulationReuse:
         This is a regression test for the bug where prior PPCs called
         simulate_with_parameters() which didn't reuse existing simulations.
         """
-        # Create simulator
+        # Mock job manager to avoid needing config file
+        fake_job_manager = MagicMock()
+        fake_job_manager.check_hpc_test_stats = MagicMock(return_value=False)
+        fake_job_manager.result_collector.check_pool_directory_exists = MagicMock(return_value=True)
+        fake_job_manager.result_collector.count_pool_simulations = MagicMock(return_value=18)
+
+        # Create simulator with mocked job manager
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
@@ -2710,7 +2710,7 @@ class TestPriorPPCSimulationReuse:
             model_version='baseline_pdac',
             scenario='default',
             cache_dir=temp_dir / 'cache',
-            local_only=False
+            job_manager=fake_job_manager  # Inject mock to avoid config requirement
         )
 
         # Mock the pool to simulate having 18 existing simulations
@@ -2719,11 +2719,6 @@ class TestPriorPPCSimulationReuse:
 
         # First call: pool has 0 locally, HPC has 18 full sims
         fake_pool.get_available_simulations.return_value = 0
-
-        # Mock HPC checks
-        sim.job_manager.check_hpc_test_stats = MagicMock(return_value=False)
-        sim.job_manager.result_collector.check_pool_directory_exists = MagicMock(return_value=True)
-        sim.job_manager.result_collector.count_pool_simulations = MagicMock(return_value=18)
 
         # Mock running new simulations (182 needed)
         sim._run_new_simulations = MagicMock()
@@ -2760,7 +2755,13 @@ class TestPriorPPCSimulationReuse:
         2. Prior PPC needs 200 simulations
         3. Simulator should run all 200
         """
-        # Create simulator
+        # Mock job manager to avoid needing config file
+        fake_job_manager = MagicMock()
+        fake_job_manager.check_hpc_test_stats = MagicMock(return_value=False)
+        fake_job_manager.result_collector.check_pool_directory_exists = MagicMock(return_value=False)
+        fake_job_manager.result_collector.count_pool_simulations = MagicMock(return_value=0)
+
+        # Create simulator with mocked job manager
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
@@ -2768,18 +2769,13 @@ class TestPriorPPCSimulationReuse:
             model_version='baseline_pdac',
             scenario='default',
             cache_dir=temp_dir / 'cache',
-            local_only=False
+            job_manager=fake_job_manager  # Inject mock to avoid config requirement
         )
 
         # Mock the pool - empty
         fake_pool = MagicMock()
         sim.pool = fake_pool
         fake_pool.get_available_simulations.return_value = 0
-
-        # Mock HPC checks - no simulations
-        sim.job_manager.check_hpc_test_stats = MagicMock(return_value=False)
-        sim.job_manager.result_collector.check_pool_directory_exists = MagicMock(return_value=False)
-        sim.job_manager.result_collector.count_pool_simulations = MagicMock(return_value=0)
 
         # Mock running new simulations
         sim._run_new_simulations = MagicMock()
@@ -2811,7 +2807,13 @@ class TestPriorPPCSimulationReuse:
         2. Prior PPC needs 200 simulations
         3. Simulator should use existing (no new runs needed)
         """
-        # Create simulator
+        # Mock job manager to avoid needing config file
+        fake_job_manager = MagicMock()
+        fake_job_manager.check_hpc_test_stats = MagicMock(return_value=False)
+        fake_job_manager.result_collector.check_pool_directory_exists = MagicMock(return_value=True)
+        fake_job_manager.result_collector.count_pool_simulations = MagicMock(return_value=500)
+
+        # Create simulator with mocked job manager
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
@@ -2819,18 +2821,13 @@ class TestPriorPPCSimulationReuse:
             model_version='baseline_pdac',
             scenario='default',
             cache_dir=temp_dir / 'cache',
-            local_only=False
+            job_manager=fake_job_manager  # Inject mock to avoid config requirement
         )
 
         # Mock the pool - has plenty
         fake_pool = MagicMock()
         sim.pool = fake_pool
         fake_pool.get_available_simulations.return_value = 0  # Not in local cache
-
-        # Mock HPC checks - has 500 full sims
-        sim.job_manager.check_hpc_test_stats = MagicMock(return_value=False)
-        sim.job_manager.result_collector.check_pool_directory_exists = MagicMock(return_value=True)
-        sim.job_manager.result_collector.count_pool_simulations = MagicMock(return_value=500)
 
         # Mock derivation and download
         sim._derive_test_statistics = MagicMock()

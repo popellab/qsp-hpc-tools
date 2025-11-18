@@ -485,9 +485,9 @@ class TestPoolIntegration:
     """Test integration with SimulationPoolManager."""
 
     @patch('qsp_hpc.simulation.qsp_simulator.SimulationPoolManager')  # Patch where it's used
-    @patch('qsp_hpc.simulation.qsp_simulator.HPCJobManager')  # Mock HPCJobManager
-    def test_initializes_pool_manager(self, mock_hpc_manager, mock_pool_class, sample_test_stats_csv, sample_priors_csv, temp_dir):
+    def test_initializes_pool_manager(self, mock_pool_class, sample_test_stats_csv, sample_priors_csv, temp_dir):
         """Test that SimulationPoolManager is initialized correctly."""
+        # No need to mock HPCJobManager since it's lazy-loaded and won't be created for this test
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
@@ -496,7 +496,8 @@ class TestPoolIntegration:
             model_version='v1',
             model_description='Test model',
             scenario='gvax',
-            cache_dir=temp_dir / "cache"
+            cache_dir=temp_dir / "cache",
+            local_only=True  # Prevent lazy-loading of HPCJobManager
         )
 
         # Pool is initialized during __init__, not lazily
@@ -1032,17 +1033,20 @@ class TestConfigurationErrors:
         fake_pool = Mock()
         fake_pool.get_available_simulations.return_value = 0
 
-        # Patch HPCJobManager BEFORE creating simulator since it's now created in __init__
-        with patch('qsp_hpc.simulation.qsp_simulator.HPCJobManager', side_effect=FileNotFoundError("No credentials")):
+        # Create simulator (lazy loading means no error yet)
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+        )
+
+        # Error should occur when we try to access job_manager (lazy loading)
+        with patch('qsp_hpc.batch.hpc_job_manager.HPCJobManager', side_effect=FileNotFoundError("No credentials")):
             with pytest.raises(FileNotFoundError, match="No credentials"):
-                sim = QSPSimulator(
-                    test_stats_csv=sample_test_stats_csv,
-                    priors_csv=sample_priors_csv,
-                    project_name='test_project',
-                    model_version='v1',
-                    cache_dir=temp_dir / 'cache',
-                    pool=fake_pool,
-                )
+                _ = sim.job_manager  # Trigger lazy loading
 
     def test_invalid_model_script_path(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
         """Test that invalid model script is handled."""

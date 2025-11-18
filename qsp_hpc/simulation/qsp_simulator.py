@@ -33,7 +33,7 @@ import numpy as np
 from scipy.io import loadmat
 
 from qsp_hpc.batch.batch_utils import calculate_batch_split
-from qsp_hpc.batch.hpc_job_manager import HPCJobManager, MissingOutputError, RemoteCommandError, SubmissionError
+from qsp_hpc.batch.hpc_job_manager import MissingOutputError, RemoteCommandError, SubmissionError
 from qsp_hpc.constants import SLURM_REGISTRATION_DELAY, JOB_QUEUE_TIMEOUT, HASH_PREFIX_LENGTH
 from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
 from qsp_hpc.utils.logging_config import setup_logger
@@ -141,11 +141,8 @@ class QSPSimulator:
             model_script=model_script
         )
 
-        # Create HPCJobManager once (unless injected for testing or local_only mode)
-        if job_manager is None and not local_only:
-            self.job_manager = HPCJobManager(verbose=verbose)
-        else:
-            self.job_manager = job_manager
+        # Store job_manager for lazy initialization (don't create until needed)
+        self._job_manager = job_manager  # May be None or injected for testing
 
         # Optional injected MATLAB runner for testing/mocking
         self._matlab_runner = matlab_runner
@@ -173,6 +170,25 @@ class QSPSimulator:
             f"  cache_sampling_seed={self.cache_sampling_seed}\n"
             f")"
         )
+
+    @property
+    def job_manager(self):
+        """
+        Lazy-load HPCJobManager only when needed.
+
+        This avoids requiring HPC configuration for local-only operations
+        and makes unit testing easier by deferring config file loading.
+
+        Returns:
+            HPCJobManager instance (created on first access if not injected)
+
+        Raises:
+            FileNotFoundError: If config file doesn't exist (when actually needed)
+        """
+        if self._job_manager is None and not self.local_only:
+            from qsp_hpc.batch.hpc_job_manager import HPCJobManager
+            self._job_manager = HPCJobManager(verbose=self.verbose)
+        return self._job_manager
 
     def _info(self, msg: str):
         """Log info message."""

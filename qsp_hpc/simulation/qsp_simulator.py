@@ -571,76 +571,14 @@ class QSPSimulator:
         n_samples = theta.shape[0]
         self._info(f"QSP Simulator ({pool_suffix}): {n_samples} samples ({self.model_version})")
 
-        # Compute hash keys
-        priors_hash = self._compute_priors_hash()
-        test_stats_hash = self._compute_test_stats_hash()
-
-        # IMPORTANT: Full simulations are shared across all uses (training, PPCs, etc.)
-        # Only test statistics are separated by suffix for organization.
+        # Run new simulations with the provided parameter values
         #
-        # HPC full simulation path (NO SUFFIX - shared pool):
-        #   baseline_pdac_{hash}_default/
+        # NOTE: We do NOT check the shared HPC pool here because this function is called
+        # with SPECIFIC parameter values (e.g., posterior samples) that must be simulated
+        # exactly as provided. The shared pool contains simulations from prior sampling
+        # which have different parameter values and cannot be reused.
         #
-        # Local test stats cache (WITH SUFFIX - purpose-specific):
-        #   baseline_pdac_{hash}_default_prior_ppc_{cache_key}/
-        #   baseline_pdac_{hash}_default_ppc_{obs_hash}_{cache_key}/
-
-        # HPC pool ID (shared across all uses - no suffix)
-        hpc_pool_id = f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
-
-        # Local cache ID (includes suffix for organization)
-        local_pool_id = f"{hpc_pool_id}_{pool_suffix}" if pool_suffix else hpc_pool_id
-
-        # 1. Check local cache (suffix-specific)
-        local_cache_key = hashlib.sha256(
-            (priors_hash + test_stats_hash + self.model_version + self.scenario + pool_suffix).encode()
-        ).hexdigest()[:16]
-        local_cache_dir = self.cache_dir / f"{local_pool_id}_{local_cache_key}"
-
-        # 2. Check HPC for existing full simulations (shared pool - no suffix)
-        hpc_pool_path = f"{self.job_manager.config.simulation_pool_path}/{hpc_pool_id}"
-        has_full_sims = self.job_manager.result_collector.check_pool_directory_exists(hpc_pool_path)
-        if has_full_sims:
-            n_available = self.job_manager.result_collector.count_pool_simulations(hpc_pool_path)
-        else:
-            n_available = 0
-        has_full_sims = n_available >= n_samples
-
-        if has_full_sims:
-            if self.verbose:
-                self._info(f"HPC has {n_available} simulations (sufficient)")
-
-            # Check/derive test statistics from shared full simulation pool
-            has_test_stats = self.job_manager.check_hpc_test_stats(
-                hpc_pool_path, test_stats_hash, expected_n_sims=n_samples
-            )
-
-            if not has_test_stats:
-                self._info("Deriving test statistics from shared full simulation pool...")
-                job_id = self.job_manager.submit_derivation_job(
-                    hpc_pool_path, str(self.test_stats_csv), test_stats_hash
-                )
-                self._wait_for_completion([job_id], n_samples)
-
-            # Download test stats to suffix-specific local cache
-            self._info(f"Downloading to local cache ({pool_suffix})...")
-            params, test_stats = self.job_manager.download_test_stats(
-                hpc_pool_path, test_stats_hash, local_cache_dir
-            )
-
-            # Caching handled by SimulationPoolManager
-
-            # Sample if needed
-            if test_stats.shape[0] > n_samples:
-                if self.verbose:
-                    self._debug(f"Sampling {n_samples} from {test_stats.shape[0]} available")
-                indices = self.rng.choice(test_stats.shape[0], size=n_samples, replace=False)
-                test_stats = test_stats[indices]
-
-            self._info(f"Complete: Returning {test_stats.shape[0]} samples")
-            return test_stats
-
-        # 3. Run new simulations
+        # Use __call__(n_samples) instead if you want to sample from prior and reuse existing.
         self._info(f"Running {n_samples} new simulations...")
 
         # Create temporary CSV with provided parameters

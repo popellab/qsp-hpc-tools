@@ -1624,6 +1624,170 @@ class TestPoolPathConsistency:
             f"Hash should be same for same model/priors: {gvax_hash} vs {control_hash}"
 
 
+# ============================================================================
+# Regression Tests for Returning Full Requested Simulations
+# ============================================================================
+
+class TestFullSimulationReturn:
+    """Regression tests to ensure all requested simulations are returned."""
+
+    def test_returns_all_simulations_when_combining_cache_and_new(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """
+        Regression test: Ensure full requested amount is returned when combining cached + new.
+
+        Bug context: Previously, when 6 were cached locally and 10 requested, code would run
+        4 new simulations on HPC but return only those 4 instead of all 10.
+
+        Flow: Local has 0 -> Check HPC (has 6) -> Run 4 new -> Load all 10 from local pool
+        """
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0  # No local cache initially
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = False
+        # HPC has 6 full simulations available
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = True
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 6
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        # Mock the results: after deriving from 6 HPC sims and running 4 new, should have all 10
+        all_10_params = np.random.randn(10, 3)
+        all_10_obs = np.random.randn(10, 3)
+        fake_pool.load_simulations.return_value = (all_10_params, all_10_obs)
+
+        # Mock both derivation and running new simulations
+        with patch.object(sim, '_derive_test_statistics'):
+            with patch.object(sim, '_run_new_simulations') as mock_run:
+                params, obs = sim(10)
+
+        # Verify _run_new_simulations was called with the deficit (10 - 6 = 4)
+        mock_run.assert_called_once_with(4)
+
+        # Verify load_simulations was called with FULL amount (10)
+        fake_pool.load_simulations.assert_called_once()
+        call_kwargs = fake_pool.load_simulations.call_args[1]
+        assert call_kwargs['n_requested'] == 10, \
+            "Should request all 10 from pool, not just the 4 new ones"
+
+        # Verify we got back all 10, not just 4
+        assert params.shape == (10, 3), \
+            f"Should return all 10 simulations, got {params.shape[0]}"
+        assert obs.shape == (10, 3), \
+            f"Should return all 10 simulations, got {obs.shape[0]}"
+
+    def test_runs_correct_deficit_amount(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """
+        Regression test: Verify correct number of new simulations are run.
+
+        Tests various HPC cache states to ensure deficit calculation is correct.
+        """
+        test_cases = [
+            (0, 10, 10),   # HPC empty: run all 10
+            (6, 10, 4),    # HPC has 6: run 4 more
+            (8, 10, 2),    # HPC has 8: run 2 more
+            (10, 10, 0),   # HPC has all: run 0 (shouldn't reach _run_new_simulations)
+        ]
+
+        for n_hpc_cached, n_requested, expected_new in test_cases:
+            fake_pool = Mock()
+            fake_pool.get_available_simulations.return_value = 0  # No local cache
+
+            fake_job_mgr = Mock()
+            fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+            fake_job_mgr.check_hpc_test_stats.return_value = False
+            # Mock HPC with n_hpc_cached simulations
+            if n_hpc_cached > 0:
+                fake_job_mgr.result_collector.check_pool_directory_exists.return_value = True
+                fake_job_mgr.result_collector.count_pool_simulations.return_value = n_hpc_cached
+            else:
+                fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+                fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
+
+            sim = QSPSimulator(
+                test_stats_csv=sample_test_stats_csv,
+                priors_csv=sample_priors_csv,
+                project_name='test_project',
+                model_version='v1',
+                cache_dir=temp_dir / 'cache',
+                pool=fake_pool,
+                job_manager=fake_job_mgr
+            )
+
+            # Mock return values
+            result_params = np.random.randn(n_requested, 3)
+            result_obs = np.random.randn(n_requested, 3)
+            fake_pool.load_simulations.return_value = (result_params, result_obs)
+
+            if n_hpc_cached >= n_requested:
+                # HPC has enough - should derive and download
+                with patch.object(sim, '_derive_test_statistics'):
+                    with patch.object(sim, '_download_and_add_to_pool', return_value=(result_params, result_obs)):
+                        params, obs = sim(n_requested)
+                assert params.shape[0] == n_requested
+            else:
+                # Should derive from HPC cache and run new simulations for the deficit
+                with patch.object(sim, '_derive_test_statistics'):
+                    with patch.object(sim, '_run_new_simulations') as mock_run:
+                        params, obs = sim(n_requested)
+
+                        if expected_new > 0:
+                            mock_run.assert_called_once_with(expected_new), \
+                                f"HPC cache={n_hpc_cached}, Need={n_requested}, should run {expected_new} new"
+
+                        # Always verify full amount returned
+                        assert params.shape[0] == n_requested, \
+                            f"Should return {n_requested} total, got {params.shape[0]}"
+
+    def test_load_simulations_called_with_correct_scenario(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """
+        Regression test: Ensure load_simulations is called with correct scenario.
+
+        When loading combined results, must use the correct scenario to get the right pool.
+        """
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 5  # Have 5 cached
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = False
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            scenario='gvax',  # Custom scenario
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        # Mock return
+        fake_pool.load_simulations.return_value = (np.random.randn(10, 3), np.random.randn(10, 3))
+
+        with patch.object(sim, '_run_new_simulations'):
+            sim(10)
+
+        # Verify load_simulations was called with correct scenario
+        call_kwargs = fake_pool.load_simulations.call_args[1]
+        assert call_kwargs['scenario'] == 'gvax', \
+            "Should load from correct scenario pool"
+        assert call_kwargs['n_requested'] == 10, \
+            "Should request full amount"
+
+
 class TestParameterGenerationIntegration:
     """Test parameter generation with various pool states."""
 

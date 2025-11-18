@@ -306,10 +306,13 @@ class SimulationPoolManager:
 
         # Sample subset if we have more than requested
         if n_loaded > n_requested:
+            self.logger.info(f"  Pool has {n_loaded} simulations, sampling {n_requested}")
             indices = random_state.choice(n_loaded, size=n_requested, replace=False)
             params_all = params_all[indices]
             observables_all = observables_all[indices]
             n_loaded = n_requested
+        else:
+            self.logger.info(f"  Loaded {n_loaded} simulations from pool (requested {n_requested})")
 
         return params_all, observables_all
 

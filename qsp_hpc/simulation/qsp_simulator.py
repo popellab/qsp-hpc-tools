@@ -506,11 +506,13 @@ class QSPSimulator:
                 self._run_new_simulations(n_needed)
 
                 # Now load the full requested amount from pool (old + new)
+                self._info(f"Loading {num_simulations} simulations from pool after adding {n_needed} new ones")
                 params, observables = self.pool.load_simulations(
                     n_requested=num_simulations,
                     scenario=self.scenario,
                     random_state=self.rng
                 )
+                self._info(f"  Loaded {params.shape[0]} parameter sets and {observables.shape[0]} observable sets")
                 return params, observables
             except (RemoteCommandError, MissingOutputError, SubmissionError) as exc:
                 raise QSPSimulatorError(f"Failed running new simulations on HPC: {exc}") from exc

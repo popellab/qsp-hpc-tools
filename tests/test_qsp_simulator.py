@@ -1788,6 +1788,222 @@ class TestFullSimulationReturn:
             "Should request full amount"
 
 
+# ============================================================================
+# Regression Tests for Shared Pool Design (Full Sims vs Test Stats)
+# ============================================================================
+
+class TestSharedPoolDesign:
+    """Tests for shared HPC full simulation pool with separate test stats caching."""
+
+    def test_simulate_with_parameters_uses_shared_hpc_pool(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """
+        Test that simulate_with_parameters() uses shared HPC pool (no suffix in path).
+
+        Bug context: Previously, pool_suffix was appended to HPC full sim path,
+        causing wasteful duplication of expensive simulations.
+
+        Now: Full sims go to shared pool, only test stats are cached separately.
+        """
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = False
+        # Mock that HPC has full sims in SHARED pool (no suffix)
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = True
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 100
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            scenario='default',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        # Generate some parameters
+        theta = np.random.randn(10, 3)
+
+        # Call with pool_suffix='prior_ppc'
+        with patch.object(sim.job_manager, 'check_hpc_test_stats', return_value=True):
+            with patch.object(sim.job_manager, 'download_test_stats',
+                            return_value=(theta, np.random.randn(10, 3))):
+                sim.simulate_with_parameters(theta, pool_suffix='prior_ppc')
+
+        # Verify HPC pool path checked was the SHARED pool (no suffix)
+        calls = fake_job_mgr.result_collector.check_pool_directory_exists.call_args_list
+        assert len(calls) > 0, "Should have checked HPC pool"
+
+        checked_path = calls[0][0][0]
+        # Should NOT contain 'prior_ppc' in the path
+        assert 'prior_ppc' not in checked_path, \
+            f"HPC full sim pool should NOT include suffix: {checked_path}"
+        # Should end with scenario only
+        assert checked_path.endswith('_default'), \
+            f"HPC pool path should end with scenario (no suffix): {checked_path}"
+
+    def test_prior_ppc_reuses_training_full_sims(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """
+        Test that prior PPCs reuse full simulations from training runs.
+
+        Workflow:
+        1. Run training sims → saves to baseline_pdac_{hash}_default/
+        2. Run prior PPCs → finds existing sims in same pool
+        3. Derives new test stats from those shared full sims
+        """
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='baseline_pdac',
+            scenario='default',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        # Compute expected shared pool path
+        priors_hash = sim._compute_priors_hash()
+        expected_shared_path = f"/hpc/pool/baseline_pdac_{priors_hash[:8]}_default"
+
+        # Setup: Training has already run and created full sims
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = True
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 100
+        fake_job_mgr.check_hpc_test_stats.return_value = True
+
+        theta = np.random.randn(50, 3)
+
+        # Mock download
+        with patch.object(sim.job_manager, 'download_test_stats',
+                         return_value=(theta, np.random.randn(50, 3))):
+            result = sim.simulate_with_parameters(theta, pool_suffix='prior_ppc')
+
+        # Verify it checked the shared pool (same path as training would use)
+        path_checked = fake_job_mgr.result_collector.check_pool_directory_exists.call_args[0][0]
+        assert path_checked == expected_shared_path, \
+            f"Prior PPC should check shared pool path:\n  Expected: {expected_shared_path}\n  Got: {path_checked}"
+
+        assert result.shape[0] == 50, "Should return requested number of samples"
+
+    def test_multiple_ppcs_share_same_full_sims(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """
+        Test that multiple PPC types (prior, posterior) share the same full simulation pool.
+
+        This verifies that:
+        - Prior PPCs check shared pool
+        - Posterior PPCs check shared pool
+        - Both would use same HPC path for full sims
+        """
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = True
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 100
+        fake_job_mgr.check_hpc_test_stats.return_value = True
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            scenario='gvax',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        theta = np.random.randn(20, 3)
+
+        # Run prior PPC
+        with patch.object(sim.job_manager, 'download_test_stats',
+                         return_value=(theta, np.random.randn(20, 3))):
+            sim.simulate_with_parameters(theta, pool_suffix='prior_ppc')
+
+        prior_ppc_path = fake_job_mgr.result_collector.check_pool_directory_exists.call_args[0][0]
+
+        # Reset mock
+        fake_job_mgr.result_collector.check_pool_directory_exists.reset_mock()
+
+        # Run posterior PPC
+        with patch.object(sim.job_manager, 'download_test_stats',
+                         return_value=(theta, np.random.randn(20, 3))):
+            sim.simulate_with_parameters(theta, pool_suffix='ppc_a1b2c3d4')
+
+        posterior_ppc_path = fake_job_mgr.result_collector.check_pool_directory_exists.call_args[0][0]
+
+        # Both should check the SAME shared pool path
+        assert prior_ppc_path == posterior_ppc_path, \
+            f"Prior and posterior PPCs should use same shared pool:\n  Prior: {prior_ppc_path}\n  Posterior: {posterior_ppc_path}"
+
+        # Path should end with scenario only (no suffix)
+        assert prior_ppc_path.endswith('_gvax'), \
+            f"Shared pool path should end with scenario: {prior_ppc_path}"
+
+    def test_test_stats_cached_separately_by_suffix(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """
+        Test that test statistics are cached separately based on pool_suffix.
+
+        Even though full sims are shared, different uses (training, prior PPC, posterior PPC)
+        might have different test statistics, so those should be cached separately.
+        """
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = True
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 100
+        fake_job_mgr.check_hpc_test_stats.return_value = True
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            scenario='default',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        theta = np.random.randn(10, 3)
+
+        # Call with different suffixes
+        with patch.object(sim.job_manager, 'download_test_stats',
+                         return_value=(theta, np.random.randn(10, 3))) as mock_download:
+            sim.simulate_with_parameters(theta, pool_suffix='prior_ppc')
+            prior_cache_dir = mock_download.call_args[0][2]  # Third arg is local_cache_dir
+
+        with patch.object(sim.job_manager, 'download_test_stats',
+                         return_value=(theta, np.random.randn(10, 3))) as mock_download:
+            sim.simulate_with_parameters(theta, pool_suffix='ppc_obs123')
+            posterior_cache_dir = mock_download.call_args[0][2]
+
+        # Local cache dirs should be DIFFERENT (suffix-specific)
+        assert prior_cache_dir != posterior_cache_dir, \
+            "Test stats should be cached separately by suffix"
+
+        # Prior PPC cache should contain 'prior_ppc'
+        assert 'prior_ppc' in str(prior_cache_dir), \
+            f"Prior PPC cache should include suffix: {prior_cache_dir}"
+
+        # Posterior PPC cache should contain 'ppc_obs123'
+        assert 'ppc_obs123' in str(posterior_cache_dir), \
+            f"Posterior PPC cache should include suffix: {posterior_cache_dir}"
+
+
 class TestParameterGenerationIntegration:
     """Test parameter generation with various pool states."""
 

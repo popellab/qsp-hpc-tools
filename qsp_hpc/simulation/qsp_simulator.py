@@ -559,42 +559,57 @@ class QSPSimulator:
         priors_hash = self._compute_priors_hash()
         test_stats_hash = self._compute_test_stats_hash()
 
-        # Create pool ID with suffix to separate posterior predictive from training
-        pool_id_base = f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{pool_suffix}"
+        # IMPORTANT: Full simulations are shared across all uses (training, PPCs, etc.)
+        # Only test statistics are separated by suffix for organization.
+        #
+        # HPC full simulation path (NO SUFFIX - shared pool):
+        #   baseline_pdac_{hash}_default/
+        #
+        # Local test stats cache (WITH SUFFIX - purpose-specific):
+        #   baseline_pdac_{hash}_default_prior_ppc_{cache_key}/
+        #   baseline_pdac_{hash}_default_ppc_{obs_hash}_{cache_key}/
 
-        # 1. Check local cache
+        # HPC pool ID (shared across all uses - no suffix)
+        hpc_pool_id = f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
+
+        # Local cache ID (includes suffix for organization)
+        local_pool_id = f"{hpc_pool_id}_{pool_suffix}" if pool_suffix else hpc_pool_id
+
+        # 1. Check local cache (suffix-specific)
         local_cache_key = hashlib.sha256(
-            (priors_hash + test_stats_hash + self.model_version + pool_suffix).encode()
+            (priors_hash + test_stats_hash + self.model_version + self.scenario + pool_suffix).encode()
         ).hexdigest()[:16]
-        local_cache_dir = self.cache_dir / f"{pool_id_base}_{local_cache_key}"
+        local_cache_dir = self.cache_dir / f"{local_pool_id}_{local_cache_key}"
 
-
-        # 2. Check HPC for existing simulations
-        pool_path = f"{self.job_manager.config.simulation_pool_path}/{pool_id_base}"
-        has_full_sims, _, n_available = self.job_manager.check_hpc_full_simulations(
-            self.model_version + f"_{pool_suffix}", priors_hash, n_samples
-        )
+        # 2. Check HPC for existing full simulations (shared pool - no suffix)
+        hpc_pool_path = f"{self.job_manager.config.simulation_pool_path}/{hpc_pool_id}"
+        has_full_sims = self.job_manager.result_collector.check_pool_directory_exists(hpc_pool_path)
+        if has_full_sims:
+            n_available = self.job_manager.result_collector.count_pool_simulations(hpc_pool_path)
+        else:
+            n_available = 0
+        has_full_sims = n_available >= n_samples
 
         if has_full_sims:
             if self.verbose:
                 self._info(f"HPC has {n_available} simulations (sufficient)")
 
-            # Check/derive test statistics
+            # Check/derive test statistics from shared full simulation pool
             has_test_stats = self.job_manager.check_hpc_test_stats(
-                pool_path, test_stats_hash, expected_n_sims=n_samples
+                hpc_pool_path, test_stats_hash, expected_n_sims=n_samples
             )
 
             if not has_test_stats:
-                self._info("Deriving test statistics from full simulations...")
+                self._info("Deriving test statistics from shared full simulation pool...")
                 job_id = self.job_manager.submit_derivation_job(
-                    pool_path, str(self.test_stats_csv), test_stats_hash
+                    hpc_pool_path, str(self.test_stats_csv), test_stats_hash
                 )
                 self._wait_for_completion([job_id], n_samples)
 
-            # Download test stats
-            self._info("Downloading from HPC...")
+            # Download test stats to suffix-specific local cache
+            self._info(f"Downloading to local cache ({pool_suffix})...")
             params, test_stats = self.job_manager.download_test_stats(
-                pool_path, test_stats_hash, local_cache_dir
+                hpc_pool_path, test_stats_hash, local_cache_dir
             )
 
             # Caching handled by SimulationPoolManager
@@ -621,8 +636,8 @@ class QSPSimulator:
                 writer.writerow(row)
 
         try:
-            # Run MATLAB simulations with pooling enabled
-            observables = self._run_matlab_simulation(samples_csv, n_samples, pool_suffix=pool_suffix)
+            # Run MATLAB simulations - they go to shared pool (no suffix)
+            observables = self._run_matlab_simulation(samples_csv, n_samples)
 
             # Caching handled by SimulationPoolManager
 
@@ -666,22 +681,20 @@ class QSPSimulator:
     def _run_matlab_simulation(
         self,
         samples_csv: str,
-        num_simulations: int,
-        pool_suffix: str = ''
+        num_simulations: int
     ) -> np.ndarray:
         """
         Run MATLAB simulation for parameter samples on HPC.
 
-        Uses Python job submission via HPCJobManager for efficient batch execution.
+        Full simulations are ALWAYS saved to the shared pool (no suffix).
+        This allows training, prior PPCs, and posterior PPCs to reuse the same
+        expensive full simulations. Test statistics are cached separately by caller.
 
-        NOTE: Caching is handled by SimulationPoolManager in __call__().
-              This method only executes simulations.
+        Uses Python job submission via HPCJobManager for efficient batch execution.
 
         Args:
             samples_csv: Path to CSV file with parameter samples
             num_simulations: Number of simulations
-            pool_suffix: Optional suffix to append to simulation pool ID
-                        (used for posterior predictive simulations)
 
         Returns:
             Numpy array of observables (num_simulations x num_observables)
@@ -689,12 +702,14 @@ class QSPSimulator:
         # Validate SSH connection before submitting jobs
         self._validate_hpc_connection()
 
-        # Import HPC job manager
-        # Compute simulation pool ID for full simulations (scenario-specific)
+        # Compute simulation pool ID for full simulations
+        # IMPORTANT: Full simulations always go to the SHARED pool (no suffix)
+        # This allows training, prior PPCs, and posterior PPCs to reuse the same expensive simulations
         priors_hash = self._compute_priors_hash()
         simulation_pool_id = f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
-        if pool_suffix:
-            simulation_pool_id = f"{simulation_pool_id}_{pool_suffix}"
+
+        # NOTE: We do NOT append pool_suffix here - full sims are shared
+        # The suffix is only used for local test stats caching
 
         # Log HPC save path
         hpc_save_path = f"{self.job_manager.config.simulation_pool_path}/{simulation_pool_id}"

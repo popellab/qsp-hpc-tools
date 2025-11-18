@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
-    {name = "Joel Eliason", email = "jeliason@example.com"}
+    {name = "Joel Eliason", email = "joel.eliason119@gmail.com"}
 ]
 keywords = ["qsp", "pharmacology", "hpc", "simulation", "slurm"]
 classifiers = [

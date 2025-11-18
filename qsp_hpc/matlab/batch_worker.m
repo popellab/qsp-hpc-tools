@@ -217,39 +217,6 @@ try
 
             fprintf('   ✓ Full simulations saved to: %s\n', output_file);
 
-            % Update manifest.json
-            fprintf('   Updating simulation pool manifest...\n');
-            try
-                % Determine Python command (use HPC venv from environment)
-                hpc_venv_path = getenv('HPC_VENV_PATH');
-                if ~isempty(hpc_venv_path)
-                    venv_python = fullfile(hpc_venv_path, 'bin', 'python');
-                else
-                    % Fallback to default location
-                    home_dir = getenv('HOME');
-                    venv_python = fullfile(home_dir, 'qspio_venv', 'bin', 'python');
-                end
-
-                if exist(venv_python, 'file')
-                    python_cmd = venv_python;
-                else
-                    python_cmd = 'python';
-                end
-
-                % Call update_manifest.py
-                manifest_script = fullfile(current_dir, 'metadata', 'batch', 'update_manifest.py');
-                manifest_cmd = sprintf('%s "%s" "%s"', python_cmd, manifest_script, persistent_dir);
-                [status, output] = system(manifest_cmd);
-
-                if status == 0
-                    fprintf('   ✓ Manifest updated\n');
-                else
-                    fprintf('   ⚠️  Warning: Failed to update manifest: %s\n', output);
-                end
-            catch manifest_err
-                fprintf('   ⚠️  Warning: Failed to update manifest: %s\n', manifest_err.message);
-            end
-
         catch save_err
             fprintf('   ⚠️  Warning: Failed to save full simulations: %s\n', save_err.message);
             % Don't fail the job if full sim saving fails

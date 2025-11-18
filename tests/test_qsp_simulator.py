@@ -1431,6 +1431,192 @@ class TestThreeTierCachingStrategy:
             assert params.shape == (50, 3)
 
 
+# ============================================================================
+# Regression Tests for Pool Path Construction (Scenario Support)
+# ============================================================================
+
+class TestPoolPathConsistency:
+    """Regression tests to prevent pool path naming bugs."""
+
+    def test_hpc_pool_path_includes_scenario(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """
+        Regression test: Ensure HPC pool paths include scenario suffix.
+
+        Bug context: Previously, code was constructing paths as {version}_{hash}
+        when checking but {version}_{hash}_{scenario} when saving, causing
+        simulations to never be found on HPC.
+        """
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = False
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='baseline_pdac',
+            scenario='gvax',  # Custom scenario
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        # Mock _run_new_simulations to capture behavior
+        with patch.object(sim, '_run_new_simulations', return_value=(np.ones((1, 1)), np.ones((1, 1)))):
+            sim(1)
+
+        # Verify that result_collector was called with scenario-aware path
+        calls = fake_job_mgr.result_collector.check_pool_directory_exists.call_args_list
+        assert len(calls) > 0, "Should have checked for pool directory"
+
+        # Extract the path that was checked
+        checked_path = calls[0][0][0]  # First call, first positional arg
+
+        # Path MUST include all three components in correct order: {version}_{hash}_{scenario}
+        assert 'baseline_pdac' in checked_path, "Path should include model version"
+        assert 'gvax' in checked_path, "Path should include scenario"
+
+        # Verify correct order: scenario should come AFTER hash, not before
+        # Path format: /hpc/pool/baseline_pdac_{hash}_gvax
+        path_parts = checked_path.split('/')[-1].split('_')
+        assert len(path_parts) >= 3, f"Path should have at least 3 parts: {checked_path}"
+        assert path_parts[0] == 'baseline', "First part should be 'baseline'"
+        assert path_parts[1] == 'pdac', "Second part should be 'pdac'"
+        assert path_parts[-1] == 'gvax', f"Last part should be scenario 'gvax', got: {path_parts[-1]}"
+
+    def test_save_and_check_paths_match(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """
+        Regression test: Verify path used for saving matches path used for checking.
+
+        This test ensures that when we save full simulations to HPC, we use the
+        same path pattern that we later use to check for those simulations.
+        """
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        # Track paths used during operations
+        checked_paths = []
+
+        def track_check(path):
+            checked_paths.append(path)
+            return False  # Simulate not found
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = False
+        fake_job_mgr.result_collector.check_pool_directory_exists.side_effect = track_check
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            scenario='control',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        # Compute the hash that would be used
+        priors_hash = sim._compute_priors_hash()
+
+        # Expected path pattern: {simulation_pool_path}/{version}_{hash[:8]}_{scenario}
+        expected_suffix = f"v1_{priors_hash[:8]}_control"
+
+        # Trigger simulation which will check for existing pool
+        with patch.object(sim, '_run_new_simulations', return_value=(np.ones((1, 1)), np.ones((1, 1)))):
+            sim(1)
+
+        # Verify the checked path matches expected pattern
+        assert len(checked_paths) > 0, "Should have checked at least one path"
+
+        # All checked paths should end with the expected suffix
+        for path in checked_paths:
+            assert path.endswith(expected_suffix), \
+                f"Path '{path}' should end with '{expected_suffix}'"
+            assert 'control_' not in path or path.endswith('_control'), \
+                f"Scenario should be at END of path, not middle: {path}"
+
+    def test_multiple_scenarios_use_different_paths(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
+        """
+        Test that different scenarios create different pool paths.
+
+        This ensures scenarios are truly isolated on HPC storage.
+        """
+        fake_pool = Mock()
+        fake_pool.get_available_simulations.return_value = 0
+
+        fake_job_mgr = Mock()
+        fake_job_mgr.config.simulation_pool_path = '/hpc/pool'
+        fake_job_mgr.check_hpc_test_stats.return_value = False
+        fake_job_mgr.result_collector.check_pool_directory_exists.return_value = False
+        fake_job_mgr.result_collector.count_pool_simulations.return_value = 0
+
+        # Create simulators with different scenarios
+        sim_gvax = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            scenario='gvax',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        sim_control = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            project_name='test_project',
+            model_version='v1',
+            scenario='control',
+            cache_dir=temp_dir / 'cache',
+            pool=fake_pool,
+            job_manager=fake_job_mgr
+        )
+
+        # Mock simulations
+        with patch.object(sim_gvax, '_run_new_simulations', return_value=(np.ones((1, 1)), np.ones((1, 1)))):
+            sim_gvax(1)
+
+        gvax_calls = fake_job_mgr.result_collector.check_pool_directory_exists.call_args_list
+
+        fake_job_mgr.result_collector.check_pool_directory_exists.reset_mock()
+
+        with patch.object(sim_control, '_run_new_simulations', return_value=(np.ones((1, 1)), np.ones((1, 1)))):
+            sim_control(1)
+
+        control_calls = fake_job_mgr.result_collector.check_pool_directory_exists.call_args_list
+
+        # Extract paths
+        gvax_path = gvax_calls[0][0][0]
+        control_path = control_calls[0][0][0]
+
+        # Paths should be different
+        assert gvax_path != control_path, \
+            f"Different scenarios should use different paths:\n  gvax: {gvax_path}\n  control: {control_path}"
+
+        # Both should contain scenario name
+        assert 'gvax' in gvax_path, f"GVAX path should contain 'gvax': {gvax_path}"
+        assert 'control' in control_path, f"Control path should contain 'control': {control_path}"
+
+        # Hash portion should be the same (same priors/model)
+        gvax_parts = gvax_path.split('/')[-1].split('_')
+        control_parts = control_path.split('/')[-1].split('_')
+
+        # Extract hash (should be second-to-last component before scenario)
+        gvax_hash = gvax_parts[-2]
+        control_hash = control_parts[-2]
+
+        assert gvax_hash == control_hash, \
+            f"Hash should be same for same model/priors: {gvax_hash} vs {control_hash}"
+
+
 class TestParameterGenerationIntegration:
     """Test parameter generation with various pool states."""
 

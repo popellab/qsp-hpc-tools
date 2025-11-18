@@ -596,10 +596,12 @@ class TestFlowDecisions:
             job_manager=fake_job_mgr
         )
 
-        with patch.object(sim, '_run_new_simulations', return_value=(np.ones((1, 1)), np.ones((1, 1)))) as runner:
+        # Mock pool to return simulations after _run_new_simulations adds them
+        fake_pool.load_simulations.return_value = (np.ones((1, 1)), np.ones((1, 1)))
+        with patch.object(sim, '_run_new_simulations') as runner:
             sim(1)
 
-        runner.assert_called_once()
+        runner.assert_called_once_with(1)
 
     def test_hpc_errors_are_wrapped(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
         fake_pool = Mock()
@@ -1194,7 +1196,8 @@ class TestEdgeCases:
         large_n = 10000
         params_matrix = np.random.rand(large_n, 3)
 
-        with patch.object(sim, '_run_new_simulations', return_value=(params_matrix, params_matrix)):
+        fake_pool.load_simulations.return_value = (params_matrix, params_matrix)
+        with patch.object(sim, '_run_new_simulations'):
             params, obs = sim(large_n)
             assert params.shape[0] == large_n
 
@@ -1423,7 +1426,8 @@ class TestThreeTierCachingStrategy:
         new_params = np.random.randn(50, 3)
         new_obs = np.random.randn(50, 3)
 
-        with patch.object(sim, '_run_new_simulations', return_value=(new_params, new_obs)) as mock_run:
+        fake_pool.load_simulations.return_value = (new_params, new_obs)
+        with patch.object(sim, '_run_new_simulations') as mock_run:
             params, obs = sim(50)
 
             # Verify new simulations were run
@@ -1466,7 +1470,8 @@ class TestPoolPathConsistency:
         )
 
         # Mock _run_new_simulations to capture behavior
-        with patch.object(sim, '_run_new_simulations', return_value=(np.ones((1, 1)), np.ones((1, 1)))):
+        fake_pool.load_simulations.return_value = (np.ones((1, 1)), np.ones((1, 1)))
+        with patch.object(sim, '_run_new_simulations'):
             sim(1)
 
         # Verify that result_collector was called with scenario-aware path
@@ -1529,7 +1534,8 @@ class TestPoolPathConsistency:
         expected_suffix = f"v1_{priors_hash[:8]}_control"
 
         # Trigger simulation which will check for existing pool
-        with patch.object(sim, '_run_new_simulations', return_value=(np.ones((1, 1)), np.ones((1, 1)))):
+        fake_pool.load_simulations.return_value = (np.ones((1, 1)), np.ones((1, 1)))
+        with patch.object(sim, '_run_new_simulations'):
             sim(1)
 
         # Verify the checked path matches expected pattern
@@ -1581,14 +1587,15 @@ class TestPoolPathConsistency:
         )
 
         # Mock simulations
-        with patch.object(sim_gvax, '_run_new_simulations', return_value=(np.ones((1, 1)), np.ones((1, 1)))):
+        fake_pool.load_simulations.return_value = (np.ones((1, 1)), np.ones((1, 1)))
+        with patch.object(sim_gvax, '_run_new_simulations'):
             sim_gvax(1)
 
         gvax_calls = fake_job_mgr.result_collector.check_pool_directory_exists.call_args_list
 
         fake_job_mgr.result_collector.check_pool_directory_exists.reset_mock()
 
-        with patch.object(sim_control, '_run_new_simulations', return_value=(np.ones((1, 1)), np.ones((1, 1)))):
+        with patch.object(sim_control, '_run_new_simulations'):
             sim_control(1)
 
         control_calls = fake_job_mgr.result_collector.check_pool_directory_exists.call_args_list

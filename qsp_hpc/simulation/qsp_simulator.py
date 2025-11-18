@@ -364,15 +364,15 @@ class QSPSimulator:
     def _run_new_simulations(
         self,
         num_simulations: int
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> None:
         """
         Run new simulations on HPC and add to pool.
 
+        Results are added to the pool, not returned directly.
+        Caller should use pool.load_simulations() to get results.
+
         Args:
             num_simulations: Number of simulations to run
-
-        Returns:
-            Tuple of (params, observables)
         """
         self._info(f"Running {num_simulations} new simulations on HPC (scenario='{self.scenario}')...")
 
@@ -381,7 +381,6 @@ class QSPSimulator:
         try:
             observables_np = self._run_matlab_simulation(samples_csv, num_simulations)
             self._update_pool_with_results(theta_np, observables_np)
-            return theta_np, observables_np
         finally:
             Path(samples_csv).unlink(missing_ok=True)
 
@@ -503,7 +502,15 @@ class QSPSimulator:
         if n_needed > 0:
             self._info(f"Running {n_needed} new simulations on HPC (scenario='{self.scenario}')")
             try:
-                params, observables = self._run_new_simulations(n_needed)
+                # Run new simulations and add to pool
+                self._run_new_simulations(n_needed)
+
+                # Now load the full requested amount from pool (old + new)
+                params, observables = self.pool.load_simulations(
+                    n_requested=num_simulations,
+                    scenario=self.scenario,
+                    random_state=self.rng
+                )
                 return params, observables
             except (RemoteCommandError, MissingOutputError, SubmissionError) as exc:
                 raise QSPSimulatorError(f"Failed running new simulations on HPC: {exc}") from exc

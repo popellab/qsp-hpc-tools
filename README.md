@@ -309,6 +309,25 @@ pytest -m "not hpc" -v
 
 ### Code Quality
 
+**Pre-commit hooks** (recommended):
+```bash
+# Install pre-commit hooks (one-time setup)
+pip install pre-commit
+pre-commit install
+
+# Hooks will run automatically on git commit
+# To run manually on all files:
+pre-commit run --all-files
+```
+
+The pre-commit hooks will automatically:
+- Format code with Black
+- Lint with Ruff (and auto-fix issues)
+- Check types with mypy
+- Run fast unit tests
+- Check for trailing whitespace, merge conflicts, etc.
+
+**Manual commands**:
 ```bash
 # Format code with black
 black qsp_hpc/ tests/
@@ -316,8 +335,8 @@ black qsp_hpc/ tests/
 # Lint with ruff
 ruff check qsp_hpc/ tests/
 
-# Type checking (if mypy is added)
-# mypy qsp_hpc/
+# Type checking with mypy
+mypy qsp_hpc/simulation/ qsp_hpc/batch/ qsp_hpc/utils/
 ```
 
 ### Project Structure

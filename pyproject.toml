@@ -41,6 +41,7 @@ dev = [
     "black>=22.0",
     "ruff>=0.0.270",
     "mypy>=1.0",
+    "pre-commit>=3.0",
 ]
 
 [project.urls]

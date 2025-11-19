@@ -204,12 +204,10 @@ class TestDerivationJobSubmission:
         assert "#SBATCH --partition=normal" in script_content
         assert "#SBATCH --time=01:00:00" in script_content  # Fixed time for derivation
         assert "#SBATCH --mem-per-cpu=4G" in script_content  # Fixed memory
-        assert "#SBATCH --array=1-5" in script_content  # 1-indexed for derivation
+        assert "#SBATCH --array=0-4" in script_content  # 0-indexed (5 batches = 0-4)
         assert "source /home/testuser/.venv/hpc-qsp/bin/activate" in script_content
         assert "qsp_hpc.batch.derive_test_stats_worker" in script_content
-        assert '--pool-path "/scratch/pool"' in script_content
-        assert '--config "/scratch/test_stats.csv"' in script_content
-        assert '--output-dir "/scratch/derivation"' in script_content
+        assert '"/scratch/test_stats.csv"' in script_content  # Config JSON path
 
     def test_submit_derivation_job_invalid_project_name(self, submitter):
         """Test rejection of invalid project names in derivation jobs."""
@@ -263,17 +261,14 @@ class TestScriptGeneration:
         assert "#SBATCH --partition=normal" in script
         assert "#SBATCH --time=01:00:00" in script
         assert "#SBATCH --mem-per-cpu=4G" in script
-        assert "#SBATCH --array=1-10" in script  # 1-indexed
+        assert "#SBATCH --array=0-9" in script  # 0-indexed (10 batches = 0-9)
 
         # Check Python virtual environment activation
         assert "source /home/testuser/.venv/hpc-qsp/bin/activate" in script
 
         # Check Python command
         assert "python3 -m qsp_hpc.batch.derive_test_stats_worker" in script
-        assert '--pool-path "/scratch/test_pool"' in script
-        assert '--config "/scratch/test_stats.csv"' in script
-        assert '--output-dir "/scratch/derive_output"' in script
-        assert "--task-id $SLURM_ARRAY_TASK_ID" in script
+        assert '"/scratch/test_stats.csv"' in script  # Config JSON path
 
 
 class TestSubmissionError:

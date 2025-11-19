@@ -217,18 +217,14 @@ echo "Job completed at $(date)"
 #SBATCH --partition={self.config.partition}
 #SBATCH --time=01:00:00
 #SBATCH --mem-per-cpu=4G
-#SBATCH --array=1-{n_batches}
+#SBATCH --array=0-{n_batches-1}
 #SBATCH --output={self.config.remote_project_path}/projects/{project_name}/batch_jobs/logs/qsp_derive_%A_%a.out
 #SBATCH --error={self.config.remote_project_path}/projects/{project_name}/batch_jobs/logs/qsp_derive_%A_%a.err
 
 # Activate Python virtual environment
 source {self.config.hpc_venv_path}/bin/activate
 
-# Run derivation worker
+# Run derivation worker with config JSON
 cd {self.config.remote_project_path}
-python3 -m qsp_hpc.batch.derive_test_stats_worker \\
-    --pool-path "{pool_path}" \\
-    --config "{test_stats_config}" \\
-    --output-dir "{derivation_dir}" \\
-    --task-id $SLURM_ARRAY_TASK_ID
+python3 -m qsp_hpc.batch.derive_test_stats_worker "{test_stats_config}"
 """

@@ -43,7 +43,7 @@ import yaml
 
 from qsp_hpc.batch.hpc_file_transfer import HPCFileTransfer
 from qsp_hpc.batch.result_collector import MissingOutputError, ResultCollector
-from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter
+from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter, SubmissionError  # noqa: F401
 from qsp_hpc.utils.logging_config import setup_logger
 from qsp_hpc.utils.security import (
     build_safe_ssh_command,

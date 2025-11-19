@@ -246,7 +246,7 @@ class TestSecurityIntegration:
 
             # Invalid project name should fail early
             with pytest.raises(SecurityError):
-                bad_project = validate_project_name("../evil")
+                validate_project_name("../evil")
 
     def test_command_injection_prevention(self):
         """Test that command injection is prevented."""

@@ -66,11 +66,11 @@ class TestSetupCommand:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         # Mock SSH connection test to succeed
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.validate_ssh_connection = Mock()
             mock_manager.transport.exec = Mock(return_value=(0, "slurm 23.02.1"))
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             # Provide input for all prompts
             result = cli_runner.invoke(
@@ -131,10 +131,10 @@ class TestSetupCommand:
         """Test setup handles SSH connection failure gracefully."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.validate_ssh_connection = Mock(side_effect=Exception("Connection refused"))
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(
                 setup,
@@ -168,11 +168,11 @@ Host other-host
 """
         )
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.validate_ssh_connection = Mock()
             mock_manager.transport.exec = Mock(return_value=(0, "slurm 23.02.1"))
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(
                 setup,
@@ -205,7 +205,7 @@ Host other-host
         """Test setup creates missing remote directories when requested."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.validate_ssh_connection = Mock()
             # Mock exec calls for: SLURM check, whoami, dir checks, mkdirs, MATLAB
@@ -222,7 +222,7 @@ Host other-host
                     (0, "MODULE_OK"),  # MATLAB module check
                 ]
             )
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(
                 setup,
@@ -266,7 +266,7 @@ class TestTestCommand:
         """Test 'test' command with successful connection."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.config = BatchConfig(
                 ssh_host="hpc.example.edu",
@@ -291,7 +291,7 @@ class TestTestCommand:
                     (0, ""),  # test -d sim pool
                 ]
             )
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(test)
 
@@ -302,7 +302,7 @@ class TestTestCommand:
         """Test 'test' command with SSH connection failure."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.config = BatchConfig(
                 ssh_host="hpc.example.edu",
@@ -313,7 +313,7 @@ class TestTestCommand:
                 simulation_pool_path="/scratch/testuser/simulations",
             )
             mock_manager.validate_ssh_connection = Mock(side_effect=Exception("Connection timeout"))
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(test)
 
@@ -324,7 +324,7 @@ class TestTestCommand:
         """Test 'test' command warns if partition not found."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.config = BatchConfig(
                 ssh_host="hpc.example.edu",
@@ -349,7 +349,7 @@ class TestTestCommand:
                     (0, ""),  # sim pool
                 ]
             )
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(test)
 
@@ -374,7 +374,7 @@ class TestInfoCommand:
         """Test 'info' command hides SSH key by default (security feature)."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.config = BatchConfig(
                 ssh_host="hpc.example.edu",
@@ -388,7 +388,7 @@ class TestInfoCommand:
                 memory_per_job="4G",
                 matlab_module="matlab/R2024a",
             )
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(info)
 
@@ -403,7 +403,7 @@ class TestInfoCommand:
         """Test 'info' command shows SSH key with --show-secrets flag."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.config = BatchConfig(
                 ssh_host="hpc.example.edu",
@@ -417,7 +417,7 @@ class TestInfoCommand:
                 memory_per_job="4G",
                 matlab_module="matlab/R2024a",
             )
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(info, ["--show-secrets"])
 
@@ -428,7 +428,7 @@ class TestInfoCommand:
         """Test 'info' command displays all configuration values."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.config = BatchConfig(
                 ssh_host="hpc.example.edu",
@@ -442,7 +442,7 @@ class TestInfoCommand:
                 memory_per_job="4G",
                 matlab_module="matlab/R2024a",
             )
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(info)
 
@@ -479,7 +479,7 @@ class TestLogsCommand:
         """Test 'logs' command retrieves logs for specific job ID."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.config = Mock()
             mock_manager.config.remote_project_path = "/home/testuser/qsp-projects"
@@ -489,7 +489,7 @@ class TestLogsCommand:
                     (0, "Task 1 completed\nTask 2 running\n"),  # tail log content
                 ]
             )
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(logs, ["--job-id", "12345"])
 
@@ -501,7 +501,7 @@ class TestLogsCommand:
         """Test 'logs' command retrieves logs for specific array task."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.config = Mock()
             mock_manager.config.remote_project_path = "/home/testuser/qsp-projects"
@@ -511,7 +511,7 @@ class TestLogsCommand:
                     (0, "Array task 3 output\n"),  # tail log content
                 ]
             )
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(logs, ["--job-id", "12345", "--task-id", "3"])
 
@@ -522,12 +522,12 @@ class TestLogsCommand:
         """Test 'logs' command handles missing log files gracefully."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()
             mock_manager.config = Mock()
             mock_manager.config.remote_project_path = "/home/testuser/qsp-projects"
             mock_manager.transport.exec = Mock(return_value=(0, ""))  # No log file found
-            MockManager.return_value = mock_manager
+            mock_mgr_cls.return_value = mock_manager
 
             result = cli_runner.invoke(logs, ["--job-id", "99999"])
 
@@ -538,8 +538,8 @@ class TestLogsCommand:
         """Test 'logs' command with project name."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as MockManager:
-            MockManager.return_value = Mock()
+        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
+            mock_mgr_cls.return_value = Mock()
 
             result = cli_runner.invoke(logs, ["test_project"])
 

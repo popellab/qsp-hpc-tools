@@ -377,8 +377,8 @@ class TestHashComputation:
 # ============================================================================
 
 
-class TestParameterGeneration:
-    """Test parameter generation from priors."""
+class TestParameterGenerationBasics:
+    """Test basic parameter generation from priors."""
 
     def test_generate_parameters_correct_shape(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
         """Test that generated parameters have correct shape."""

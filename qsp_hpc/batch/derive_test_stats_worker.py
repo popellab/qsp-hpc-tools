@@ -28,8 +28,8 @@ import pandas as pd
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from qsp_hpc.data.test_stat_functions import get_test_stat_function
-from qsp_hpc.utils.logging_config import setup_logger
+from qsp_hpc.data.test_stat_functions import get_test_stat_function  # noqa: E402
+from qsp_hpc.utils.logging_config import setup_logger  # noqa: E402
 
 # Setup logger
 logger = setup_logger(__name__, verbose=True)

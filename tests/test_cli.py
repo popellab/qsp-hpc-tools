@@ -246,7 +246,9 @@ Host other-host
             assert result.exit_code == 0
 
             # Verify mkdir commands were called (3 directories)
-            mkdir_calls = [call for call in mock_manager.transport.exec.call_args_list if "mkdir" in str(call)]
+            mkdir_calls = [
+                call for call in mock_manager.transport.exec.call_args_list if "mkdir" in str(call)
+            ]
             assert len(mkdir_calls) == 3
 
 
@@ -320,7 +322,9 @@ class TestTestCommand:
             assert result.exit_code == 1
             assert "Connection timeout" in result.output
 
-    def test_test_command_partition_not_found(self, cli_runner, tmp_path, monkeypatch, mock_config_file):
+    def test_test_command_partition_not_found(
+        self, cli_runner, tmp_path, monkeypatch, mock_config_file
+    ):
         """Test 'test' command warns if partition not found."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
@@ -424,7 +428,9 @@ class TestInfoCommand:
             assert result.exit_code == 0
             assert "~/.ssh/id_rsa" in result.output  # Key path shown
 
-    def test_info_command_shows_all_config_sections(self, cli_runner, tmp_path, monkeypatch, mock_config_file):
+    def test_info_command_shows_all_config_sections(
+        self, cli_runner, tmp_path, monkeypatch, mock_config_file
+    ):
         """Test 'info' command displays all configuration values."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
@@ -507,7 +513,10 @@ class TestLogsCommand:
             mock_manager.config.remote_project_path = "/home/testuser/qsp-projects"
             mock_manager.transport.exec = Mock(
                 side_effect=[
-                    (0, "/home/testuser/qsp-projects/job123/slurm-12345_3.out"),  # find log with task ID
+                    (
+                        0,
+                        "/home/testuser/qsp-projects/job123/slurm-12345_3.out",
+                    ),  # find log with task ID
                     (0, "Array task 3 output\n"),  # tail log content
                 ]
             )
@@ -534,7 +543,9 @@ class TestLogsCommand:
             # Should complete (not crash) even when log not found
             assert result.exit_code == 0
 
-    def test_logs_command_with_project_name(self, cli_runner, tmp_path, monkeypatch, mock_config_file):
+    def test_logs_command_with_project_name(
+        self, cli_runner, tmp_path, monkeypatch, mock_config_file
+    ):
         """Test 'logs' command with project name."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 

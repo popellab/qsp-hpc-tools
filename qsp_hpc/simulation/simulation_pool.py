@@ -228,7 +228,10 @@ class SimulationPoolManager:
         return sum(b["n_sims"] for b in batches)
 
     def load_simulations(
-        self, n_requested: int, scenario: Optional[str] = None, random_state: Optional[np.random.Generator] = None
+        self,
+        n_requested: int,
+        scenario: Optional[str] = None,
+        random_state: Optional[np.random.Generator] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Load simulations from pool by aggregating batches for a specific scenario.
@@ -316,7 +319,10 @@ class SimulationPoolManager:
         return params_all, observables_all
 
     def load_multi_scenario(
-        self, scenarios: List[str], n_requested: int, random_state: Optional[np.random.Generator] = None
+        self,
+        scenarios: List[str],
+        n_requested: int,
+        random_state: Optional[np.random.Generator] = None,
     ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         """
         Load simulations for multiple scenarios jointly.
@@ -337,12 +343,16 @@ class SimulationPoolManager:
 
         results = {}
         for scenario in scenarios:
-            params, obs = self.load_simulations(n_requested=n_requested, scenario=scenario, random_state=random_state)
+            params, obs = self.load_simulations(
+                n_requested=n_requested, scenario=scenario, random_state=random_state
+            )
             results[scenario] = (params, obs)
 
         return results
 
-    def add_batch(self, params_matrix: np.ndarray, observables_matrix: np.ndarray, seed: int, scenario: str) -> str:
+    def add_batch(
+        self, params_matrix: np.ndarray, observables_matrix: np.ndarray, seed: int, scenario: str
+    ) -> str:
         """
         Add new batch of simulations to pool for a specific scenario.
 
@@ -374,7 +384,12 @@ class SimulationPoolManager:
             {
                 "params_matrix": params_matrix,
                 "observables_matrix": observables_matrix,
-                "metadata": {"n_sims": n_sims, "seed": seed, "scenario": scenario, "timestamp": timestamp},
+                "metadata": {
+                    "n_sims": n_sims,
+                    "seed": seed,
+                    "scenario": scenario,
+                    "timestamp": timestamp,
+                },
             },
         )
 

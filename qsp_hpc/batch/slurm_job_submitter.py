@@ -82,7 +82,9 @@ class SLURMJobSubmitter:
 
         try:
             # Upload script
-            remote_script_dir = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/scripts"
+            remote_script_dir = (
+                f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/scripts"
+            )
             remote_script = f"{remote_script_dir}/qsp_batch_job.sh"
 
             self.transport.upload(temp_script, remote_script)
@@ -140,7 +142,12 @@ echo "Job completed at $(date)"
         return script
 
     def submit_derivation_job(
-        self, pool_path: str, test_stats_config: str, derivation_dir: str, n_batches: int, project_name: str
+        self,
+        pool_path: str,
+        test_stats_config: str,
+        derivation_dir: str,
+        n_batches: int,
+        project_name: str,
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -197,7 +204,12 @@ echo "Job completed at $(date)"
             Path(temp_script).unlink()
 
     def _generate_derivation_slurm_script(
-        self, pool_path: str, test_stats_config: str, derivation_dir: str, n_batches: int, project_name: str
+        self,
+        pool_path: str,
+        test_stats_config: str,
+        derivation_dir: str,
+        n_batches: int,
+        project_name: str,
     ) -> str:
         """Generate SLURM script for test statistics derivation."""
         return f"""#!/bin/bash

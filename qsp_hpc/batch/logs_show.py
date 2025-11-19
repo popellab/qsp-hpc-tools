@@ -52,7 +52,9 @@ def show_logs(array_task_id: int = 0, lines: int = 50, project: str = "pdac_2025
     print("   → Finding latest qsp_derive logs...")
 
     # Use safe command construction
-    list_cmd = build_safe_ssh_command(["sh", "-c", "ls -t qsp_derive_*.out 2>/dev/null | head -1"], cwd=log_dir)
+    list_cmd = build_safe_ssh_command(
+        ["sh", "-c", "ls -t qsp_derive_*.out 2>/dev/null | head -1"], cwd=log_dir
+    )
     status, output = job_manager.transport.exec(list_cmd)
 
     if status != 0 or not output.strip():
@@ -81,7 +83,11 @@ def show_logs(array_task_id: int = 0, lines: int = 50, project: str = "pdac_2025
 
     # Use safe command construction
     tail_cmd = build_safe_ssh_command(
-        ["sh", "-c", f'if [ -f {out_log} ]; then tail -{lines} {out_log}; else echo "(Log file not found)"; fi'],
+        [
+            "sh",
+            "-c",
+            f'if [ -f {out_log} ]; then tail -{lines} {out_log}; else echo "(Log file not found)"; fi',
+        ],
         cwd=log_dir,
     )
     status, output = job_manager.transport.exec(tail_cmd)
@@ -150,11 +156,20 @@ Examples:
         """,
     )
 
-    parser.add_argument("task", type=int, nargs="?", default=0, help="Array task ID to show logs for (default: 0)")
+    parser.add_argument(
+        "task", type=int, nargs="?", default=0, help="Array task ID to show logs for (default: 0)"
+    )
 
-    parser.add_argument("--lines", type=int, default=50, help="Number of lines to show from end of log (default: 50)")
+    parser.add_argument(
+        "--lines",
+        type=int,
+        default=50,
+        help="Number of lines to show from end of log (default: 50)",
+    )
 
-    parser.add_argument("--project", type=str, default="pdac_2025", help="Project name (default: pdac_2025)")
+    parser.add_argument(
+        "--project", type=str, default="pdac_2025", help="Project name (default: pdac_2025)"
+    )
 
     args = parser.parse_args()
 

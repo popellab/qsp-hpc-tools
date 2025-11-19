@@ -116,7 +116,9 @@ class TestJobSubmission:
 
     def test_submit_job_verbose_logging(self, mock_config, mock_transport):
         """Test that verbose mode enables debug logging."""
-        submitter_verbose = SLURMJobSubmitter(config=mock_config, transport=mock_transport, verbose=True)
+        submitter_verbose = SLURMJobSubmitter(
+            config=mock_config, transport=mock_transport, verbose=True
+        )
 
         mock_transport.exec.return_value = (0, "Submitted batch job 12345\n")
 

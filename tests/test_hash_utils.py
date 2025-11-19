@@ -15,7 +15,12 @@ class TestComputeDefinitionHash:
 
     def test_parameter_hash_basic(self):
         """Test basic parameter hash computation."""
-        definition = {"name": "k_absorption", "units": "1/hour", "canonical_scale": "log", "value": 1.5}
+        definition = {
+            "name": "k_absorption",
+            "units": "1/hour",
+            "canonical_scale": "log",
+            "value": 1.5,
+        }
         hash_val = compute_definition_hash(definition, "parameter")
         assert isinstance(hash_val, str)
         assert len(hash_val) == 8
@@ -23,7 +28,12 @@ class TestComputeDefinitionHash:
 
     def test_species_hash_basic(self):
         """Test basic species hash computation."""
-        definition = {"name": "drug_plasma", "compartment": "plasma", "units": "ng/mL", "value": 0.0}
+        definition = {
+            "name": "drug_plasma",
+            "compartment": "plasma",
+            "units": "ng/mL",
+            "value": 0.0,
+        }
         hash_val = compute_definition_hash(definition, "species")
         assert isinstance(hash_val, str)
         assert len(hash_val) == 8
@@ -51,7 +61,11 @@ class TestComputeDefinitionHash:
     def test_description_change_no_hash_change(self):
         """Test that description changes don't affect hash."""
         def1 = {"name": "k_absorption", "description": "Old description", "units": "1/hour"}
-        def2 = {"name": "k_absorption", "description": "New improved description", "units": "1/hour"}
+        def2 = {
+            "name": "k_absorption",
+            "description": "New improved description",
+            "units": "1/hour",
+        }
         hash1 = compute_definition_hash(def1, "parameter")
         hash2 = compute_definition_hash(def2, "parameter")
         assert hash1 == hash2

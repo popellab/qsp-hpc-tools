@@ -50,7 +50,8 @@ def validate_project_name(name: str) -> str:
     # Only allow safe characters: alphanumeric, underscore, hyphen, period
     if not re.match(r"^[a-zA-Z0-9_.-]+$", name):
         raise SecurityError(
-            f"Invalid project name '{name}': " f"only alphanumeric characters, underscore, hyphen, and period allowed"
+            f"Invalid project name '{name}': "
+            f"only alphanumeric characters, underscore, hyphen, and period allowed"
         )
 
     return name
@@ -96,7 +97,10 @@ def validate_safe_path(base_dir: str, *path_components: str) -> Path:
         # This works even with symlinks because both are resolved
         resolved.relative_to(base)
     except ValueError:
-        raise SecurityError(f"Path would escape base directory: " f"base={base}, target={target}, resolved={resolved}")
+        raise SecurityError(
+            f"Path would escape base directory: "
+            f"base={base}, target={target}, resolved={resolved}"
+        )
 
     return resolved
 

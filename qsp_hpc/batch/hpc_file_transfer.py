@@ -77,7 +77,9 @@ class HPCFileTransfer:
 
         # Build remote target (handle SSH config aliases where user is optional)
         if self.config.ssh_user:
-            remote_target = f"{self.config.ssh_user}@{self.config.ssh_host}:{self.config.remote_project_path}"
+            remote_target = (
+                f"{self.config.ssh_user}@{self.config.ssh_host}:{self.config.remote_project_path}"
+            )
         else:
             remote_target = f"{self.config.ssh_host}:{self.config.remote_project_path}"
 
@@ -98,7 +100,9 @@ class HPCFileTransfer:
         result = subprocess.run(rsync_cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
-            raise RuntimeError(f"rsync failed (rc={result.returncode}): {result.stderr or result.stdout}")
+            raise RuntimeError(
+                f"rsync failed (rc={result.returncode}): {result.stderr or result.stdout}"
+            )
 
         elapsed = time.time() - start_time
         if self.verbose:
@@ -125,7 +129,9 @@ class HPCFileTransfer:
         if status == 0 and "VENV_OK" in output:
             # Venv exists - upgrade qsp-hpc-tools to latest version from GitHub
             if self.verbose:
-                self.logger.info("HPC venv configured - upgrading qsp-hpc-tools to latest version...")
+                self.logger.info(
+                    "HPC venv configured - upgrading qsp-hpc-tools to latest version..."
+                )
 
             upgrade_cmd = f"""
                 uv pip install --upgrade --python {self.config.hpc_venv_path}/bin/python "{self.config.qsp_hpc_tools_source}"
@@ -175,7 +181,9 @@ echo "Python venv setup complete!"
 
         remote_root = (self.config.remote_project_path or "").strip()
         if not remote_root or remote_root in {"/", ".", "//"}:
-            raise ValueError("remote_project_path must be set to a non-root directory before deleting files")
+            raise ValueError(
+                "remote_project_path must be set to a non-root directory before deleting files"
+            )
 
         remote_base = f"{remote_root}/projects/{project_name}/batch_jobs"
         dirs = ["input", "output", "scripts", "logs"]
@@ -220,7 +228,9 @@ echo "Python venv setup complete!"
             temp_file = f.name
 
         try:
-            remote_input_dir = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
+            remote_input_dir = (
+                f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
+            )
             remote_file = f"{remote_input_dir}/job_config.json"
 
             self.transport.upload(temp_file, remote_file)
@@ -234,7 +244,9 @@ echo "Python venv setup complete!"
         """Upload parameter samples CSV."""
         start_time = time.time()
 
-        remote_input_dir = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
+        remote_input_dir = (
+            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
+        )
         remote_file = f"{remote_input_dir}/params.csv"
 
         self.transport.upload(csv_path, remote_file)
@@ -246,7 +258,9 @@ echo "Python venv setup complete!"
         """Upload test statistics CSV and extract embedded functions as tarball."""
         start_time = time.time()
 
-        remote_input_dir = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
+        remote_input_dir = (
+            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
+        )
 
         # Upload CSV file
         remote_csv = f"{remote_input_dir}/test_stats.csv"
@@ -290,7 +304,9 @@ echo "Python venv setup complete!"
 
                     if self.verbose:
                         elapsed = time.time() - start_time
-                        self.logger.debug(f"Test statistics uploaded ({n_functions} functions, {elapsed:.1f}s)")
+                        self.logger.debug(
+                            f"Test statistics uploaded ({n_functions} functions, {elapsed:.1f}s)"
+                        )
 
                 finally:
                     # Clean up temp directory

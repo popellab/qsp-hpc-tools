@@ -26,7 +26,9 @@ def cli():
 
 
 @cli.command()
-@click.option("--global-only", is_flag=True, help="Setup only global config (skip project-specific)")
+@click.option(
+    "--global-only", is_flag=True, help="Setup only global config (skip project-specific)"
+)
 def setup(global_only):
     """
     Interactive setup wizard for QSP HPC credentials.
@@ -93,8 +95,12 @@ def setup(global_only):
         click.echo()
         click.echo("  Leave user and key empty to use settings from ~/.ssh/config")
 
-    ssh_user = click.prompt("  Username (leave empty for SSH config)", default="", type=str, show_default=False)
-    ssh_key = click.prompt("  SSH key path (leave empty for SSH config)", default="", type=str, show_default=False)
+    ssh_user = click.prompt(
+        "  Username (leave empty for SSH config)", default="", type=str, show_default=False
+    )
+    ssh_key = click.prompt(
+        "  SSH key path (leave empty for SSH config)", default="", type=str, show_default=False
+    )
 
     # Test SSH connection
     click.echo()
@@ -165,7 +171,9 @@ def setup(global_only):
             remote_username = None
 
     # Prompt for data base directory
-    data_base_dir = click.prompt("  Data base directory name (under your home)", default="data", type=str)
+    data_base_dir = click.prompt(
+        "  Data base directory name (under your home)", default="data", type=str
+    )
 
     # Suggest paths based on remote username (if detected)
     if remote_username:
@@ -184,11 +192,17 @@ def setup(global_only):
 
     # Venv stored relative to remote base directory
     default_venv = f"{remote_base_dir}/.venv/hpc-qsp"
-    hpc_venv_path = click.prompt("  Python virtual environment path", default=default_venv, type=str)
+    hpc_venv_path = click.prompt(
+        "  Python virtual environment path", default=default_venv, type=str
+    )
 
     simulation_pool_path = click.prompt(
         "  Simulation pool directory (for cached full simulations)",
-        default=default_pool if default_pool else f"/home/your-username/{data_base_dir}/your-username/qsp_simulations",
+        default=(
+            default_pool
+            if default_pool
+            else f"/home/your-username/{data_base_dir}/your-username/qsp_simulations"
+        ),
         type=str,
     )
 
@@ -308,7 +322,9 @@ def setup(global_only):
             for dir_name, dir_path in dirs_need_creation:
                 click.echo(f"  Creating {dir_name}: {dir_path}...", nl=False)
                 try:
-                    returncode, output = test_manager.transport.exec(f"mkdir -p {dir_path}", timeout=10)
+                    returncode, output = test_manager.transport.exec(
+                        f"mkdir -p {dir_path}", timeout=10
+                    )
                     if returncode == 0:
                         click.secho(" ✓", fg="green")
                     else:
@@ -319,7 +335,10 @@ def setup(global_only):
                     click.echo(f"    Error: {e}")
         else:
             click.echo()
-            click.secho("  ⚠️  You'll need to create these directories manually before using qsp-hpc", fg="yellow")
+            click.secho(
+                "  ⚠️  You'll need to create these directories manually before using qsp-hpc",
+                fg="yellow",
+            )
 
     # Special handling for Python venv
     click.echo()
@@ -394,7 +413,9 @@ echo "Python venv setup complete!"
                 click.echo(f"  Error: {e}")
         else:
             click.echo()
-            click.secho("  ℹ️  Remember to set up the Python venv before submitting jobs:", fg="cyan")
+            click.secho(
+                "  ℹ️  Remember to set up the Python venv before submitting jobs:", fg="cyan"
+            )
             click.echo(f"    ssh {ssh_host}")
             click.echo(f"    uv venv --python 3.11 {hpc_venv_path}")
             click.echo(
@@ -511,7 +532,10 @@ def test(timeout):
     # Test paths
     click.echo("Checking remote directories...", nl=False)
     all_paths_ok = True
-    for path_name, path in [("venv", config.hpc_venv_path), ("simulation pool", config.simulation_pool_path)]:
+    for path_name, path in [
+        ("venv", config.hpc_venv_path),
+        ("simulation pool", config.simulation_pool_path),
+    ]:
         try:
             returncode, _ = manager.transport.exec(f"test -d {path}", timeout=timeout)
             if returncode != 0:
@@ -633,12 +657,15 @@ def logs(project_name, task_id, lines, job_id):
 
         # Try to find the log file
         returncode, output = manager.transport.exec(
-            f"find {manager.config.remote_project_path} -name '{log_pattern}' 2>/dev/null | head -1", timeout=10
+            f"find {manager.config.remote_project_path} -name '{log_pattern}' 2>/dev/null | head -1",
+            timeout=10,
         )
 
         if returncode == 0 and output.strip():
             log_file = output.strip()
-            returncode, log_content = manager.transport.exec(f"tail -n {lines} {log_file}", timeout=10)
+            returncode, log_content = manager.transport.exec(
+                f"tail -n {lines} {log_file}", timeout=10
+            )
 
             if returncode == 0:
                 click.echo()

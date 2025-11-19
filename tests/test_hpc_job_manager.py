@@ -124,7 +124,11 @@ class TestHPCConfigLoading:
         with open(creds_path, "w") as fh:
             yaml.safe_dump(
                 {
-                    "ssh": {"host": "test-hpc.example.com", "user": "testuser", "key": str(ssh_key)},
+                    "ssh": {
+                        "host": "test-hpc.example.com",
+                        "user": "testuser",
+                        "key": str(ssh_key),
+                    },
                     "paths": {
                         "remote_base_dir": "/home/testuser/qsp-hpc",
                         "simulation_pool_path": "/scratch/testuser/simulations",
@@ -182,7 +186,10 @@ class TestHPCConfigLoading:
         with open(project_dir / ".qsp-hpc" / "credentials.yaml", "w") as fh:
             yaml.safe_dump(project_override, fh)
 
-        with patch.object(Path, "home", return_value=tmp_home), patch.object(Path, "cwd", return_value=project_dir):
+        with (
+            patch.object(Path, "home", return_value=tmp_home),
+            patch.object(Path, "cwd", return_value=project_dir),
+        ):
             manager = HPCJobManager()
 
         cfg = manager.config
@@ -302,7 +309,12 @@ class TestJobStateManagement:
     def test_job_state_serialization(self, tmp_path, monkeypatch):
         """Test saving job state to pickle file."""
         info = JobInfo(
-            job_ids=["1"], state_file="", n_jobs=1, n_simulations=10, project_name="proj", submission_time="2025-01-01"
+            job_ids=["1"],
+            state_file="",
+            n_jobs=1,
+            n_simulations=10,
+            project_name="proj",
+            submission_time="2025-01-01",
         )
         # Point remote path to a non-existent location; manager should fall back to cwd
         manager = HPCJobManager(
@@ -352,9 +364,9 @@ class TestJobStateManagement:
         calls = {"combined": False, "downloaded": False}
 
         manager._combine_chunks_remotely = lambda project_name: calls.__setitem__("combined", True)
-        manager._download_combined_results = lambda project_name: calls.__setitem__("downloaded", True) or np.ones(
-            (1, 1)
-        )
+        manager._download_combined_results = lambda project_name: calls.__setitem__(
+            "downloaded", True
+        ) or np.ones((1, 1))
 
         result = manager.collect_results(str(state_file))
 
@@ -366,7 +378,12 @@ class TestJobStateManagement:
     def test_job_state_file_naming(self, monkeypatch, tmp_path):
         """Test job state filename includes timestamp and project name."""
         info = JobInfo(
-            job_ids=["1"], state_file="", n_jobs=1, n_simulations=1, project_name="proj", submission_time="now"
+            job_ids=["1"],
+            state_file="",
+            n_jobs=1,
+            n_simulations=1,
+            project_name="proj",
+            submission_time="now",
         )
         manager = HPCJobManager(
             config={
@@ -397,7 +414,9 @@ class TestPathConstruction:
             manager._setup_remote_directories("proj")
 
         # All calls should include the remote base directory
-        assert all(mock_hpc_config.remote_project_path in call.args[0] for call in mock_exec.call_args_list)
+        assert all(
+            mock_hpc_config.remote_project_path in call.args[0] for call in mock_exec.call_args_list
+        )
 
     def test_remote_simulation_pool_path(self, mock_hpc_config):
         """Test construction of simulation pool path."""
@@ -496,7 +515,10 @@ class TestCommandExecutionBehaviors:
         """Test that SCP upload errors are wrapped in RemoteCommandError."""
         manager = HPCJobManager(config=mock_hpc_config)
         # Mock subprocess.run to raise CalledProcessError
-        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "scp", stderr="upload failed")):
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.CalledProcessError(1, "scp", stderr="upload failed"),
+        ):
             with pytest.raises(RemoteCommandError) as exc_info:
                 manager.transport.upload("/tmp/file", "/remote/path")
             assert "scp upload" in str(exc_info.value)
@@ -505,7 +527,10 @@ class TestCommandExecutionBehaviors:
         """Test that SCP download errors are wrapped in RemoteCommandError."""
         manager = HPCJobManager(config=mock_hpc_config)
         # Mock subprocess.run to raise CalledProcessError
-        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "scp", stderr="download failed")):
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.CalledProcessError(1, "scp", stderr="download failed"),
+        ):
             with pytest.raises(RemoteCommandError) as exc_info:
                 manager.transport.download("/remote/file", "/tmp")
             assert "scp download" in str(exc_info.value)
@@ -618,7 +643,9 @@ class TestRemoteFileOperations:
             assert returncode == 0
 
             # Verify it exists
-            returncode, output = manager._ssh_exec(f"test -d {test_dir} && echo 'exists'", timeout=10)
+            returncode, output = manager._ssh_exec(
+                f"test -d {test_dir} && echo 'exists'", timeout=10
+            )
             assert returncode == 0
             assert "exists" in output
 
@@ -667,7 +694,9 @@ class TestRemoteFileOperations:
 
         try:
             # Create parent directory and file on HPC
-            manager._ssh_exec(f"mkdir -p ~/pytest_qsp_hpc && echo '{test_content}' > {remote_file}", timeout=10)
+            manager._ssh_exec(
+                f"mkdir -p ~/pytest_qsp_hpc && echo '{test_content}' > {remote_file}", timeout=10
+            )
 
             # Download to local
             local_dir = tmp_path / "downloads"
@@ -735,7 +764,9 @@ class TestRemoteFileOperations:
 
         try:
             # Create parent directory and write content using cat with heredoc
-            write_cmd = f"mkdir -p ~/pytest_qsp_hpc && cat > {test_file} << 'EOF'\n{test_content}\nEOF"
+            write_cmd = (
+                f"mkdir -p ~/pytest_qsp_hpc && cat > {test_file} << 'EOF'\n{test_content}\nEOF"
+            )
             returncode, _ = manager._ssh_exec(write_cmd, timeout=10)
             assert returncode == 0
 
@@ -790,7 +821,8 @@ class TestSLURMCommands:
 
         # Get recent job history
         returncode, output = manager._ssh_exec(
-            "sacct --user=$USER --starttime=now-7days --format=JobID,JobName,State --noheader", timeout=15
+            "sacct --user=$USER --starttime=now-7days --format=JobID,JobName,State --noheader",
+            timeout=15,
         )
         assert returncode == 0
         # Output could be empty if no recent jobs, that's ok

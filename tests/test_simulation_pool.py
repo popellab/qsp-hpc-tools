@@ -118,7 +118,9 @@ class TestSimulationPoolManagerInit:
         )
         assert pool1.config_hash == pool2.config_hash
 
-    def test_config_hash_changes_with_model_version(self, temp_dir, sample_priors_csv, sample_test_stats_csv):
+    def test_config_hash_changes_with_model_version(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv
+    ):
         """Test that config hash changes when model version changes."""
         pool1 = SimulationPoolManager(
             cache_dir=temp_dir / "cache",
@@ -228,7 +230,9 @@ class TestScenarioManagement:
         scenarios_to_create = ["gvax", "control", "anti_pd1"]
 
         for i, scenario in enumerate(scenarios_to_create):
-            batch_file = pool_manager.pool_dir / f"batch_20250114_12{i:02d}30_{scenario}_1000sims_seed42.mat"
+            batch_file = (
+                pool_manager.pool_dir / f"batch_20250114_12{i:02d}30_{scenario}_1000sims_seed42.mat"
+            )
             savemat(batch_file, {"params": np.random.rand(100, 3), "obs": np.random.rand(100, 3)})
 
         scenarios = pool_manager.list_scenarios()
@@ -238,7 +242,9 @@ class TestScenarioManagement:
         """Test that list_scenarios deduplicates scenarios."""
         # Create multiple batches for same scenario
         for i in range(3):
-            batch_file = pool_manager.pool_dir / f"batch_20250114_12{i:02d}30_gvax_1000sims_seed{42+i}.mat"
+            batch_file = (
+                pool_manager.pool_dir / f"batch_20250114_12{i:02d}30_gvax_1000sims_seed{42+i}.mat"
+            )
             savemat(batch_file, {"params": np.random.rand(100, 3), "obs": np.random.rand(100, 3)})
 
         scenarios = pool_manager.list_scenarios()
@@ -352,7 +358,9 @@ class TestLoadAndAdd:
         pool_manager.add_batch(params, observables, seed=1, scenario="gvax")
 
         rng = np.random.default_rng(0)
-        loaded_params, loaded_obs = pool_manager.load_simulations(n_requested=2, scenario="gvax", random_state=rng)
+        loaded_params, loaded_obs = pool_manager.load_simulations(
+            n_requested=2, scenario="gvax", random_state=rng
+        )
 
         assert loaded_params.shape == (2, 3)
         assert loaded_obs.shape == (2, 1)
@@ -371,7 +379,9 @@ class TestLoadAndAdd:
         pool_manager.add_batch(params + 10, obs + 10, seed=2, scenario="control")
 
         rng = np.random.default_rng(1)
-        result = pool_manager.load_multi_scenario(["gvax", "control"], n_requested=2, random_state=rng)
+        result = pool_manager.load_multi_scenario(
+            ["gvax", "control"], n_requested=2, random_state=rng
+        )
 
         assert set(result.keys()) == {"gvax", "control"}
         assert result["gvax"][0].shape[0] == 2

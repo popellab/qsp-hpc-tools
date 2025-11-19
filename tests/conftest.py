@@ -42,13 +42,17 @@ def temp_dir():
 @pytest.fixture
 def sample_priors():
     """Sample prior parameters for testing."""
-    return pd.DataFrame({"param1": [1.0, 2.0, 3.0], "param2": [0.5, 1.5, 2.5], "param3": [10.0, 20.0, 30.0]})
+    return pd.DataFrame(
+        {"param1": [1.0, 2.0, 3.0], "param2": [0.5, 1.5, 2.5], "param3": [10.0, 20.0, 30.0]}
+    )
 
 
 @pytest.fixture
 def sample_test_stats():
     """Sample test statistics for testing."""
-    return pd.DataFrame({"stat1": [0.1, 0.2, 0.3], "stat2": [1.0, 2.0, 3.0], "stat3": [100.0, 200.0, 300.0]})
+    return pd.DataFrame(
+        {"stat1": [0.1, 0.2, 0.3], "stat2": [1.0, 2.0, 3.0], "stat3": [100.0, 200.0, 300.0]}
+    )
 
 
 @pytest.fixture
@@ -91,7 +95,13 @@ def mock_config():
         "ssh_host": "test-hpc.example.com",
         "ssh_user": "testuser",
         "remote_base_dir": "/home/testuser/qsp-hpc",
-        "slurm": {"partition": "test-partition", "nodes": 1, "cpus_per_task": 4, "memory": "16GB", "time": "01:00:00"},
+        "slurm": {
+            "partition": "test-partition",
+            "nodes": 1,
+            "cpus_per_task": 4,
+            "memory": "16GB",
+            "time": "01:00:00",
+        },
     }
 
 

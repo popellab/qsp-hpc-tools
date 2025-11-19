@@ -87,7 +87,11 @@ def write_species_parquet(json_file: str, output_file: str) -> None:
         for j, species_name in enumerate(species_names):
             # Clean species name for column (replace dots with underscores)
             col_name = species_name.replace(".", "_")
-            species_data = species_arrays[i][j] if (i < len(species_arrays) and j < len(species_arrays[i])) else []
+            species_data = (
+                species_arrays[i][j]
+                if (i < len(species_arrays) and j < len(species_arrays[i]))
+                else []
+            )
             record[col_name] = species_data if species_data else []
 
         records.append(record)

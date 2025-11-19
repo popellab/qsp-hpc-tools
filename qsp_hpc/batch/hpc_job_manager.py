@@ -197,7 +197,9 @@ class SSHTransport:
         try:
             subprocess.run(scp_cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as exc:
-            raise RemoteCommandError(f"scp upload to {remote_path}", exc.returncode, exc.stderr or str(exc)) from exc
+            raise RemoteCommandError(
+                f"scp upload to {remote_path}", exc.returncode, exc.stderr or str(exc)
+            ) from exc
 
     def download(self, remote_path: str, local_dir: str) -> None:
         """
@@ -231,7 +233,9 @@ class SSHTransport:
         try:
             subprocess.run(scp_cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as exc:
-            raise RemoteCommandError(f"scp download {remote_path}", exc.returncode, exc.stderr or str(exc)) from exc
+            raise RemoteCommandError(
+                f"scp download {remote_path}", exc.returncode, exc.stderr or str(exc)
+            ) from exc
 
 
 class HPCJobManager:
@@ -305,7 +309,8 @@ class HPCJobManager:
         """Parse and validate a credentials dict into BatchConfig."""
         if not cfg:
             raise ValueError(
-                f"Configuration file {source} is empty.\n" "Please run 'qsp-hpc setup' to configure HPC connection."
+                f"Configuration file {source} is empty.\n"
+                "Please run 'qsp-hpc setup' to configure HPC connection."
             )
 
         ssh = cfg.get("ssh", {})
@@ -351,16 +356,26 @@ class HPCJobManager:
 
         # Validate SLURM time limit format (HH:MM:SS or DD-HH:MM:SS)
         time_limit = slurm.get("time_limit", "01:00:00")
-        if not isinstance(time_limit, str) or not time_limit.replace("-", "").replace(":", "").isdigit():
+        if (
+            not isinstance(time_limit, str)
+            or not time_limit.replace("-", "").replace(":", "").isdigit()
+        ):
             raise ValueError(
-                f"Invalid SLURM time_limit format: {time_limit}\n" "Expected format: HH:MM:SS or DD-HH:MM:SS"
+                f"Invalid SLURM time_limit format: {time_limit}\n"
+                "Expected format: HH:MM:SS or DD-HH:MM:SS"
             )
 
         # Validate memory format (e.g., '4G', '512M')
         memory_per_job = slurm.get("mem_per_cpu", "4G")
-        if not isinstance(memory_per_job, str) or memory_per_job[-1].upper() not in ["K", "M", "G", "T"]:
+        if not isinstance(memory_per_job, str) or memory_per_job[-1].upper() not in [
+            "K",
+            "M",
+            "G",
+            "T",
+        ]:
             raise ValueError(
-                f"Invalid memory format: {memory_per_job}\n" "Expected format: <number><unit> (e.g., '4G', '512M')"
+                f"Invalid memory format: {memory_per_job}\n"
+                "Expected format: <number><unit> (e.g., '4G', '512M')"
             )
 
         return BatchConfig(
@@ -374,7 +389,9 @@ class HPCJobManager:
             time_limit=time_limit,
             memory_per_job=memory_per_job,
             matlab_module=cluster.get("matlab_module", "matlab/R2024a").strip(),
-            strict_host_key_checking=ssh.get("strict_host_key_checking", True),  # Default to True for security
+            strict_host_key_checking=ssh.get(
+                "strict_host_key_checking", True
+            ),  # Default to True for security
             qsp_hpc_tools_source=package.get(
                 "qsp_hpc_tools_source", "git+ssh://git@github.com/jeliason/qsp-hpc-tools.git"
             ).strip(),
@@ -624,7 +641,9 @@ class HPCJobManager:
         # Validate project name for security
         project_name = validate_project_name(project_name)
 
-        remote_output = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/output"
+        remote_output = (
+            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/output"
+        )
 
         # Check that chunk files exist - using safe command construction
         check_cmd = build_safe_ssh_command(
@@ -635,7 +654,8 @@ class HPCJobManager:
 
         if num_chunks == 0:
             raise MissingOutputError(
-                f"No chunk output files found in {remote_output}. " "Jobs may have failed or not produced output files."
+                f"No chunk output files found in {remote_output}. "
+                "Jobs may have failed or not produced output files."
             )
 
         # Combine test stats - using safe command construction
@@ -649,7 +669,9 @@ class HPCJobManager:
 
     def _download_combined_results(self, project_name: str) -> np.ndarray:
         """Download and load combined results."""
-        remote_output = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/output"
+        remote_output = (
+            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/output"
+        )
 
         # Create temp directory
         temp_dir = Path(tempfile.mkdtemp())
@@ -699,7 +721,9 @@ class HPCJobManager:
         Returns:
             Tuple of (has_enough, pool_path, n_available)
         """
-        return self.result_collector.check_hpc_full_simulations(model_version, priors_hash, n_requested)
+        return self.result_collector.check_hpc_full_simulations(
+            model_version, priors_hash, n_requested
+        )
 
     def _combine_chunks_on_hpc(self, test_stats_dir: str) -> None:
         """Combine test statistics chunks on HPC using Python script."""
@@ -789,7 +813,9 @@ class HPCJobManager:
 
         return params, test_stats
 
-    def check_hpc_test_stats(self, pool_path: str, test_stats_hash: str, expected_n_sims: Optional[int] = None) -> bool:
+    def check_hpc_test_stats(
+        self, pool_path: str, test_stats_hash: str, expected_n_sims: Optional[int] = None
+    ) -> bool:
         """
         Check if HPC has derived test statistics for given configuration.
 
@@ -832,7 +858,9 @@ class HPCJobManager:
 
             # Params chunks may not exist for older datasets (backward compatibility)
             if n_params_chunks == 0:
-                self.logger.info("  Warning:  No params chunks found (older format without parameters)")
+                self.logger.info(
+                    "  Warning:  No params chunks found (older format without parameters)"
+                )
             else:
                 self.logger.info(
                     f"   Found {n_test_stats_chunks} test stats chunks and {n_params_chunks} params chunks"
@@ -874,14 +902,20 @@ class HPCJobManager:
                         self.transport.exec(f'rm -rf "{test_stats_dir}"')
                         return False
                     else:
-                        self.logger.info(f"   Derived test stats count matches: {n_derived} simulations")
+                        self.logger.info(
+                            f"   Derived test stats count matches: {n_derived} simulations"
+                        )
                 except ValueError:
                     pass
 
         return True
 
     def submit_derivation_job(
-        self, pool_path: str, test_stats_csv: str, test_stats_hash: str, project_name: str = "pdac_2025"
+        self,
+        pool_path: str,
+        test_stats_csv: str,
+        test_stats_hash: str,
+        project_name: str = "pdac_2025",
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -901,7 +935,9 @@ class HPCJobManager:
         self.ensure_hpc_venv()
 
         # Create persistent directory for derivation inputs (in batch_jobs)
-        derivation_dir = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/derivation"
+        derivation_dir = (
+            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/derivation"
+        )
         self.transport.exec(f'mkdir -p "{derivation_dir}"')
 
         # Upload test statistics CSV
@@ -987,7 +1023,9 @@ class HPCJobManager:
             self.logger.info(f"Test stats directory: {test_stats_dir}")
 
         # Check directory exists
-        check_cmd = f'test -d "{test_stats_dir}" && ls -la "{test_stats_dir}" || echo "DIRECTORY_NOT_FOUND"'
+        check_cmd = (
+            f'test -d "{test_stats_dir}" && ls -la "{test_stats_dir}" || echo "DIRECTORY_NOT_FOUND"'
+        )
         status, output = self.transport.exec(check_cmd)
 
         if self.verbose:
@@ -1012,7 +1050,9 @@ class HPCJobManager:
         # Download combined files and load
         return self._download_combined_files(test_stats_dir, local_dest)
 
-    def download_latest_parquet_batch(self, pool_path: str, local_dest: Path, n_files: int = 1) -> List[Path]:
+    def download_latest_parquet_batch(
+        self, pool_path: str, local_dest: Path, n_files: int = 1
+    ) -> List[Path]:
         """
         Download the most recent Parquet batch file(s) from HPC simulation pool.
 
@@ -1108,13 +1148,20 @@ class HPCJobManager:
                         state_upper = state.upper()
                         if "COMPLETED" in state_upper:
                             status["completed"] += 1
-                        elif "FAILED" in state_upper or "CANCELLED" in state_upper or "TIMEOUT" in state_upper:
+                        elif (
+                            "FAILED" in state_upper
+                            or "CANCELLED" in state_upper
+                            or "TIMEOUT" in state_upper
+                        ):
                             status["failed"] += 1
 
         return status
 
     def parse_parquet_simulations(
-        self, parquet_file: Path, species_of_interest: Optional[List[str]] = None, max_simulations: Optional[int] = None
+        self,
+        parquet_file: Path,
+        species_of_interest: Optional[List[str]] = None,
+        max_simulations: Optional[int] = None,
     ) -> Dict:
         """
         Parse Parquet file containing full simulation data.
@@ -1138,7 +1185,9 @@ class HPCJobManager:
         try:
             import pandas as pd
         except ImportError:
-            raise ImportError("pandas required for Parquet parsing. Install with: pip install pandas pyarrow")
+            raise ImportError(
+                "pandas required for Parquet parsing. Install with: pip install pandas pyarrow"
+            )
 
         # Read Parquet file
         df = pd.read_parquet(parquet_file)
@@ -1195,7 +1244,9 @@ class HPCJobManager:
                 elif requested_species in species_map:
                     selected_species.append(species_map[requested_species])
                 else:
-                    self.logger.info(f"  Warning:  Warning: Species '{requested_species}' not found")
+                    self.logger.info(
+                        f"  Warning:  Warning: Species '{requested_species}' not found"
+                    )
 
             if not selected_species:
                 raise ValueError("None of the requested species found in Parquet file")

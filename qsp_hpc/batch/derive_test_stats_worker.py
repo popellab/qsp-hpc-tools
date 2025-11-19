@@ -98,7 +98,9 @@ def compute_test_statistics_batch(sim_df: pd.DataFrame, test_stats_df: pd.DataFr
 
     n_computed: int = int(np.sum(~np.isnan(test_stats_matrix)))
     n_total = test_stats_matrix.size
-    logger.info(f"Computed {n_computed}/{n_total} test statistic values ({100*n_computed/n_total:.1f}%)")
+    logger.info(
+        f"Computed {n_computed}/{n_total} test statistic values ({100*n_computed/n_total:.1f}%)"
+    )
 
     return test_stats_matrix  # type: ignore[no-any-return]
 

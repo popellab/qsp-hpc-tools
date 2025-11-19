@@ -51,7 +51,9 @@ class TestCheckPoolDirectoryExists:
         """Test checking for existing directory."""
         mock_transport.exec.return_value = (0, "exists\n")
 
-        exists = result_collector.check_pool_directory_exists("/scratch/testuser/simulations/test_pool")
+        exists = result_collector.check_pool_directory_exists(
+            "/scratch/testuser/simulations/test_pool"
+        )
 
         assert exists is True
         mock_transport.exec.assert_called_once()
@@ -60,7 +62,9 @@ class TestCheckPoolDirectoryExists:
         """Test checking for non-existent directory."""
         mock_transport.exec.return_value = (0, "not_found\n")
 
-        exists = result_collector.check_pool_directory_exists("/scratch/testuser/simulations/missing_pool")
+        exists = result_collector.check_pool_directory_exists(
+            "/scratch/testuser/simulations/missing_pool"
+        )
 
         assert exists is False
 
@@ -68,7 +72,9 @@ class TestCheckPoolDirectoryExists:
         """Test handling of SSH command failure."""
         mock_transport.exec.return_value = (1, "error\n")
 
-        exists = result_collector.check_pool_directory_exists("/scratch/testuser/simulations/test_pool")
+        exists = result_collector.check_pool_directory_exists(
+            "/scratch/testuser/simulations/test_pool"
+        )
 
         # Should still work - not_found is not in output
         assert exists is True  # Because 'not_found' not in 'error'
@@ -207,7 +213,9 @@ class TestCheckHPCFullSimulations:
         mock_transport.exec.return_value = (0, "not_found\n")
 
         has_enough, pool_path, n_available = result_collector.check_hpc_full_simulations(
-            model_version="baseline_pdac", priors_hash="abcdefghijklmnop", n_requested=100  # 16 chars
+            model_version="baseline_pdac",
+            priors_hash="abcdefghijklmnop",
+            n_requested=100,  # 16 chars
         )
 
         # Pool path should use only first 8 chars of hash
@@ -245,7 +253,9 @@ class TestCheckHPCTestStats:
         ]
 
         exists = result_collector.check_hpc_test_stats(
-            pool_path="/scratch/testuser/simulations/test_pool", test_stats_hash="xyz789abc", expected_n_sims=1000
+            pool_path="/scratch/testuser/simulations/test_pool",
+            test_stats_hash="xyz789abc",
+            expected_n_sims=1000,
         )
 
         assert exists is True
@@ -273,7 +283,9 @@ class TestCheckHPCTestStats:
         ]
 
         exists = result_collector.check_hpc_test_stats(
-            pool_path="/scratch/testuser/simulations/test_pool", test_stats_hash="xyz789abc", expected_n_sims=1000
+            pool_path="/scratch/testuser/simulations/test_pool",
+            test_stats_hash="xyz789abc",
+            expected_n_sims=1000,
         )
 
         # Should return True - files exist, validation command failed but doesn't block

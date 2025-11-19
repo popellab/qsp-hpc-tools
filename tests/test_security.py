@@ -260,7 +260,9 @@ class TestSecurityIntegration:
             validate_project_name("test;whoami")
 
         # Build safe command with dangerous input
-        cmd = build_safe_ssh_command(["ls", "file; rm -rf /"], cwd='/path"; cat /etc/passwd; echo "')
+        cmd = build_safe_ssh_command(
+            ["ls", "file; rm -rf /"], cwd='/path"; cat /etc/passwd; echo "'
+        )
         # Both should be quoted
         assert "'" in cmd or '"' in cmd
 

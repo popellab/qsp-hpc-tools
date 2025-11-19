@@ -158,7 +158,9 @@ class ResultCollector:
 
         return has_enough, pool_path, n_available
 
-    def check_hpc_test_stats(self, pool_path: str, test_stats_hash: str, expected_n_sims: Optional[int] = None) -> bool:
+    def check_hpc_test_stats(
+        self, pool_path: str, test_stats_hash: str, expected_n_sims: Optional[int] = None
+    ) -> bool:
         """
         Check if derived test statistics exist on HPC.
 
@@ -190,7 +192,9 @@ class ResultCollector:
                 # Subtract 1 for header line
                 n_lines = int(output.strip()) - 1
                 if n_lines < expected_n_sims:
-                    self.logger.warning(f"Test stats file has {n_lines} rows, expected {expected_n_sims}")
+                    self.logger.warning(
+                        f"Test stats file has {n_lines} rows, expected {expected_n_sims}"
+                    )
                     return False
 
         return True

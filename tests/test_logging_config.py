@@ -41,7 +41,13 @@ class TestSetupLogger:
         # Verbose format should include asctime, name, levelname, message
         # We can't directly check the format string, but we can check the output
         record = logging.LogRecord(
-            name="test.verbose", level=logging.DEBUG, pathname="", lineno=0, msg="Test message", args=(), exc_info=None
+            name="test.verbose",
+            level=logging.DEBUG,
+            pathname="",
+            lineno=0,
+            msg="Test message",
+            args=(),
+            exc_info=None,
         )
         formatted = formatter.format(record)
         assert "test.verbose" in formatted
@@ -60,7 +66,13 @@ class TestSetupLogger:
 
         # Create a test record
         record = logging.LogRecord(
-            name="test.simple", level=logging.INFO, pathname="", lineno=0, msg="Test message", args=(), exc_info=None
+            name="test.simple",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="Test message",
+            args=(),
+            exc_info=None,
         )
         formatted = formatter.format(record)
 

@@ -24,7 +24,9 @@ def _safe_sort_key(entry: Dict[str, Any]) -> tuple:
     """
     reaction = str(entry.get("reaction", "")) if entry.get("reaction") is not None else ""
     rule = str(entry.get("rule", "")) if entry.get("rule") is not None else ""
-    reaction_rate = str(entry.get("reaction_rate", "")) if entry.get("reaction_rate") is not None else ""
+    reaction_rate = (
+        str(entry.get("reaction_rate", "")) if entry.get("reaction_rate") is not None else ""
+    )
     return (reaction, rule, reaction_rate)
 
 
@@ -74,7 +76,9 @@ def compute_definition_hash(definition: Dict[str, Any], definition_type: str = "
     if "tags" in definition:
         # Sort tags for stable hashing
         semantic_content["tags"] = (
-            sorted(definition["tags"]) if isinstance(definition["tags"], list) else definition["tags"]
+            sorted(definition["tags"])
+            if isinstance(definition["tags"], list)
+            else definition["tags"]
         )
 
     # Convert to stable JSON string
@@ -103,7 +107,9 @@ def normalize_model_context(model_context):
         Normalized model context dict
     """
     if not isinstance(model_context, dict):
-        raise ValueError("model_context must be a dict with 'derived_from_context' and 'reactions_and_rules'")
+        raise ValueError(
+            "model_context must be a dict with 'derived_from_context' and 'reactions_and_rules'"
+        )
 
     normalized = {}
 

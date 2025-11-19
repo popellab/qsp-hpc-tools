@@ -16,6 +16,7 @@ The config JSON should contain:
     - test_stats_hash: Hash of test statistics configuration
 """
 
+import importlib.util
 import json
 import os
 import sys
@@ -28,8 +29,48 @@ import pandas as pd
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from qsp_hpc.data.test_stat_functions import get_test_stat_function  # noqa: E402
 from qsp_hpc.utils.logging_config import setup_logger  # noqa: E402
+
+
+# Import test_stat_functions from the derivation directory (uploaded by job manager)
+# This allows each project to have its own test stat functions
+def load_test_stat_functions():
+    """
+    Dynamically load test_stat_functions.py from the derivation directory.
+
+    The HPC job manager uploads the project-specific test_stat_functions.py
+    to the same directory as this worker script. We import it dynamically
+    to avoid hardcoding project-specific code in the qsp-hpc-tools package.
+    """
+    # Find test_stat_functions.py in the current working directory
+    test_stat_funcs_path = Path.cwd() / "test_stat_functions.py"
+
+    if not test_stat_funcs_path.exists():
+        # Try the script's directory as fallback
+        test_stat_funcs_path = Path(__file__).parent / "test_stat_functions.py"
+
+    if not test_stat_funcs_path.exists():
+        raise FileNotFoundError(
+            f"test_stat_functions.py not found in current directory or script directory.\n"
+            f"Current directory: {Path.cwd()}\n"
+            f"Script directory: {Path(__file__).parent}"
+        )
+
+    # Load module from file
+    spec = importlib.util.spec_from_file_location("test_stat_functions", test_stat_funcs_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load spec for {test_stat_funcs_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["test_stat_functions"] = module
+    spec.loader.exec_module(module)
+
+    return module
+
+
+# Load the test stat functions module
+test_stat_module = load_test_stat_functions()
+get_test_stat_function = test_stat_module.get_test_stat_function
 
 # Setup logger
 logger = setup_logger(__name__, verbose=True)

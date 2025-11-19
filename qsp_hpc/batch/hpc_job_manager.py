@@ -944,8 +944,17 @@ class HPCJobManager:
         remote_test_stats_csv = f"{derivation_dir}/test_stats_{test_stats_hash[:8]}.csv"
         self.transport.upload(test_stats_csv, remote_test_stats_csv)
 
-        # Upload test_stat_functions.py
-        local_test_stat_funcs = Path("metadata/test_stat_functions.py")
+        # Upload test_stat_functions.py from same directory as test_stats_csv
+        test_stats_dir = Path(test_stats_csv).parent
+        local_test_stat_funcs = test_stats_dir / "test_stat_functions.py"
+
+        if not local_test_stat_funcs.exists():
+            raise FileNotFoundError(
+                f"test_stat_functions.py not found in same directory as test_stats CSV.\n"
+                f"Expected: {local_test_stat_funcs}\n"
+                f"Please ensure test_stat_functions.py is in {test_stats_dir}"
+            )
+
         remote_test_stat_funcs = f"{derivation_dir}/test_stat_functions.py"
         self.transport.upload(str(local_test_stat_funcs), remote_test_stat_funcs)
 

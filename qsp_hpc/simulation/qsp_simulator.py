@@ -334,9 +334,13 @@ class QSPSimulator:
         # Need to derive test statistics
         self._info("Deriving test statistics from full simulations...")
 
-        # Launch derivation job
+        # Launch derivation job (with selective batch processing)
         job_id = self.job_manager.submit_derivation_job(
-            hpc_pool_path, str(self.test_stats_csv), test_stats_hash, project_name=self.project_name
+            hpc_pool_path,
+            str(self.test_stats_csv),
+            test_stats_hash,
+            project_name=self.project_name,
+            num_simulations=num_simulations,
         )
 
         # Wait for derivation job to complete

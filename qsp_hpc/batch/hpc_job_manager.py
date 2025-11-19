@@ -893,15 +893,22 @@ class HPCJobManager:
             if status == 0:
                 try:
                     n_derived = int(output.strip())
-                    if n_derived != expected_n_sims:
+                    if n_derived < expected_n_sims:
+                        # Not enough derived - need to derive more
                         self.logger.info(
-                            f"  Warning:  Derived test stats count mismatch: {n_derived} vs {expected_n_sims} expected"
+                            f"  Warning:  Not enough derived test stats: {n_derived} < {expected_n_sims} needed"
                         )
-                        self.logger.info("   Will re-derive from complete pool")
+                        self.logger.info("   Will derive additional batches")
                         # Delete old derived test stats so they get re-derived
                         self.transport.exec(f'rm -rf "{test_stats_dir}"')
                         return False
+                    elif n_derived > expected_n_sims:
+                        # Have more than needed - that's fine!
+                        self.logger.info(
+                            f"   Found {n_derived} derived sims (need {expected_n_sims}) - using existing"
+                        )
                     else:
+                        # Exact match
                         self.logger.info(
                             f"   Derived test stats count matches: {n_derived} simulations"
                         )
@@ -910,21 +917,86 @@ class HPCJobManager:
 
         return True
 
+    def _calculate_batches_needed(
+        self, pool_path: str, num_simulations: Optional[int] = None
+    ) -> int:
+        """
+        Calculate how many Parquet batches need to be processed to get num_simulations.
+
+        If num_simulations is None, returns all batches (old behavior).
+
+        Args:
+            pool_path: Path to simulation pool on HPC
+            num_simulations: Number of simulations needed (None = all batches)
+
+        Returns:
+            Number of batches to process
+        """
+        # Count total batches
+        status, output = self.transport.exec(
+            f'ls "{pool_path}"/batch_*.parquet 2>/dev/null | wc -l'
+        )
+        total_batches = int(output.strip()) if output.strip().isdigit() else 0
+
+        if total_batches == 0:
+            self.logger.warning(f"No Parquet batches found in {pool_path}")
+            return 0
+
+        # If num_simulations not specified, derive all batches
+        if num_simulations is None:
+            self.logger.debug(
+                f"No simulation count specified - will derive all {total_batches} batches"
+            )
+            return total_batches
+
+        # Count total simulations across all batches
+        total_sims = self.result_collector.count_pool_simulations(pool_path)
+
+        if total_sims == 0:
+            self.logger.warning("Could not count simulations in pool - deriving all batches")
+            return total_batches
+
+        # Calculate average simulations per batch
+        avg_sims_per_batch = total_sims / total_batches
+
+        # Calculate batches needed (round up)
+        import math
+
+        batches_needed = math.ceil(num_simulations / avg_sims_per_batch)
+
+        # Cap at total batches available
+        batches_needed = min(batches_needed, total_batches)
+
+        self.logger.info(
+            f"   Pool has {total_sims} sims in {total_batches} batches "
+            f"(~{avg_sims_per_batch:.1f} sims/batch)"
+        )
+        self.logger.info(
+            f"   Need {num_simulations} sims → will derive first {batches_needed} batches"
+        )
+
+        return batches_needed
+
     def submit_derivation_job(
         self,
         pool_path: str,
         test_stats_csv: str,
         test_stats_hash: str,
         project_name: str = "pdac_2025",
+        num_simulations: Optional[int] = None,
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
+
+        Only derives the minimum number of batches needed to satisfy num_simulations,
+        rather than processing the entire pool.
 
         Args:
             pool_path: Path to simulation pool on HPC (e.g., {simulation_pool_path}/baseline_pdac_abc12345)
             test_stats_csv: Local path to test statistics CSV
             test_stats_hash: Hash of test statistics CSV
             project_name: Project name for logging
+            num_simulations: Number of simulations needed (None = derive all batches)
 
         Returns:
             SLURM job ID
@@ -975,9 +1047,11 @@ class HPCJobManager:
         self.transport.upload(temp_config, remote_config)
         Path(temp_config).unlink()
 
-        # Count number of Parquet files (one job per file)
-        status, output = self.transport.exec(f'ls "{pool_path}"/batch_*.parquet | wc -l')
-        n_batches = int(output.strip()) if output.strip().isdigit() else 1
+        # Calculate how many batches to derive (selective derivation)
+        n_batches = self._calculate_batches_needed(pool_path, num_simulations)
+
+        if n_batches == 0:
+            raise ValueError(f"No Parquet batches found in {pool_path}")
 
         # Submit derivation job via slurm_submitter (eliminates code duplication)
         job_id = self.slurm_submitter.submit_derivation_job(

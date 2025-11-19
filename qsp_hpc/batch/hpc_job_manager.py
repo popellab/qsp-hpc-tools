@@ -726,17 +726,12 @@ class HPCJobManager:
         )
 
     def _combine_chunks_on_hpc(self, test_stats_dir: str) -> None:
-        """Combine test statistics chunks on HPC using Python script."""
+        """Combine test statistics chunks on HPC using installed Python script."""
         if self.verbose:
             self.logger.info("Combining chunk files on HPC...")
 
-        # Upload combine script (small file, quick to upload)
-        local_script = Path("metadata/combine_test_stats_chunks.py")
-        remote_script = f"{test_stats_dir}/combine_chunks.py"
-        self.transport.upload(str(local_script), remote_script)
-
-        # Run combine script using HPC venv
-        combine_cmd = f'{self.config.hpc_venv_path}/bin/python "{remote_script}" "{test_stats_dir}"'
+        # Run combine script from installed qsp-hpc-tools package
+        combine_cmd = f'{self.config.hpc_venv_path}/bin/python -m qsp_hpc.batch.combine_test_stats_chunks "{test_stats_dir}"'
         status, output = self.transport.exec(combine_cmd, timeout=60)
 
         if self.verbose:

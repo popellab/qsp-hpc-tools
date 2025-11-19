@@ -146,13 +146,13 @@ def main():
         epilog="""
 Examples:
   # Show task 0 from latest job
-  python metadata/cli/logs_show.py
+  python -m qsp_hpc.batch.logs_show
 
   # Show task 3 from latest job
-  python metadata/cli/logs_show.py 3
+  python -m qsp_hpc.batch.logs_show 3
 
   # Show last 100 lines instead of 50
-  python metadata/cli/logs_show.py 3 --lines 100
+  python -m qsp_hpc.batch.logs_show 3 --lines 100
         """,
     )
 

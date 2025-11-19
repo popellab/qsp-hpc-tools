@@ -271,6 +271,32 @@ class TestScriptGeneration:
         assert '"/scratch/test_stats.csv"' in script  # Config JSON path
 
 
+class TestDerivationWorkerCompatibility:
+    """Test SLURM script matches derivation worker expectations."""
+
+    def test_slurm_script_passes_config_json_not_cli_args(self, submitter):
+        """Test SLURM script passes config JSON path, not command-line arguments.
+
+        Regression test for bug where worker expects single config JSON argument
+        but SLURM script was passing --pool-path, --config, etc.
+        """
+        script = submitter._generate_derivation_slurm_script(
+            pool_path="/scratch/pool",
+            test_stats_config="/scratch/config.json",
+            derivation_dir="/scratch/derive",
+            n_batches=5,
+            project_name="test_project",
+        )
+
+        # Should pass config as single positional argument
+        assert 'derive_test_stats_worker "/scratch/config.json"' in script
+
+        # Should NOT use command-line flags
+        assert "--pool-path" not in script
+        assert "--config" not in script
+        assert "--output-dir" not in script
+
+
 class TestSubmissionError:
     """Tests for SubmissionError exception."""
 

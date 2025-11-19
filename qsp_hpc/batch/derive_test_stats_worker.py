@@ -52,16 +52,23 @@ def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
     """
     registry = {}
 
+    # Validate required column exists
+    if "python_function" not in test_stats_df.columns:
+        raise ValueError(
+            "Test statistics CSV missing required 'python_function' column. "
+            "See docs/TEST_STATISTICS_CSV_FORMAT.md for format specification."
+        )
+
     for _, row in test_stats_df.iterrows():
         test_stat_id = row["test_statistic_id"]
 
-        # Check if python_function column exists (backwards compatibility)
-        if "python_function" not in row or pd.isna(row["python_function"]):
-            logger.warning(
-                f"Test statistic '{test_stat_id}' missing python_function column. "
-                "Skipping (legacy MATLAB-only test stats not supported)."
+        # Check if python_function is provided
+        if pd.isna(row["python_function"]):
+            raise ValueError(
+                f"Test statistic '{test_stat_id}' has empty python_function. "
+                "All test statistics must define a Python function. "
+                "See docs/TEST_STATISTICS_CSV_FORMAT.md for examples."
             )
-            continue
 
         function_code = row["python_function"]
 

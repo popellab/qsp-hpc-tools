@@ -95,8 +95,8 @@ class TestBuildTestStatRegistry:
         result = registry["log_growth_rate"](time, tumor_cells)
         assert result == pytest.approx(r, rel=1e-2)
 
-    def test_missing_python_function(self):
-        """Test that rows without python_function are skipped with warning."""
+    def test_missing_python_function_column(self):
+        """Test that missing python_function column raises error."""
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["legacy_stat"],
@@ -105,13 +105,11 @@ class TestBuildTestStatRegistry:
             }
         )
 
-        registry = build_test_stat_registry(test_stats_df)
-
-        # Should return empty registry and log warning
-        assert len(registry) == 0
+        with pytest.raises(ValueError, match="missing required 'python_function' column"):
+            build_test_stat_registry(test_stats_df)
 
     def test_nan_python_function(self):
-        """Test that NaN python_function is skipped."""
+        """Test that NaN python_function raises error."""
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["missing_func"],
@@ -120,9 +118,8 @@ class TestBuildTestStatRegistry:
             }
         )
 
-        registry = build_test_stat_registry(test_stats_df)
-
-        assert len(registry) == 0
+        with pytest.raises(ValueError, match="has empty python_function"):
+            build_test_stat_registry(test_stats_df)
 
     def test_invalid_function_code(self):
         """Test that invalid Python code raises error."""
@@ -308,16 +305,16 @@ class TestComputeTestStatisticsBatch:
         assert result[0, 0] == pytest.approx(2.0, rel=1e-6)
 
     def test_missing_test_stat_in_registry(self):
-        """Test that missing test statistics are skipped with warning."""
+        """Test that test stat not in registry is skipped with NaN."""
         test_stats_df = pd.DataFrame(
             {
-                "test_statistic_id": ["missing_stat"],
+                "test_statistic_id": ["stat_not_in_registry"],
                 "required_species": ["V_T_C1"],
-                "python_function": [np.nan],  # Won't be in registry
+                "python_function": ["def compute(time, V_T_C1):\n    return np.mean(V_T_C1)"],
             }
         )
 
-        # Empty registry (function was NaN)
+        # Manually create empty registry (simulating a compilation failure)
         registry = {}
 
         sim_df = pd.DataFrame(
@@ -326,7 +323,7 @@ class TestComputeTestStatisticsBatch:
 
         result = compute_test_statistics_batch(sim_df, test_stats_df, registry)
 
-        # Should return NaN for missing test stat
+        # Should return NaN for missing test stat in registry
         assert result.shape == (1, 1)
         assert np.isnan(result[0, 0])
 

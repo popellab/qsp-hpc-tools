@@ -8,6 +8,7 @@ from typing import List, Optional
 
 class SecurityError(Exception):
     """Raised when a security validation fails."""
+
     pass
 
 
@@ -35,28 +36,21 @@ def validate_project_name(name: str) -> str:
         raise SecurityError("Project name cannot be empty")
 
     # Prevent hidden files (check before .. to get correct error message)
-    if name.startswith('.'):
-        raise SecurityError(
-            f"Invalid project name '{name}': cannot start with '.'"
-        )
+    if name.startswith("."):
+        raise SecurityError(f"Invalid project name '{name}': cannot start with '.'")
 
     # Check for path traversal attempts
-    if '..' in name:
-        raise SecurityError(
-            f"Invalid project name '{name}': cannot contain '..'"
-        )
+    if ".." in name:
+        raise SecurityError(f"Invalid project name '{name}': cannot contain '..'")
 
     # Check for path separators
-    if '/' in name or '\\' in name:
-        raise SecurityError(
-            f"Invalid project name '{name}': cannot contain path separators (/ \\)"
-        )
+    if "/" in name or "\\" in name:
+        raise SecurityError(f"Invalid project name '{name}': cannot contain path separators (/ \\)")
 
     # Only allow safe characters: alphanumeric, underscore, hyphen, period
-    if not re.match(r'^[a-zA-Z0-9_.-]+$', name):
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", name):
         raise SecurityError(
-            f"Invalid project name '{name}': "
-            f"only alphanumeric characters, underscore, hyphen, and period allowed"
+            f"Invalid project name '{name}': " f"only alphanumeric characters, underscore, hyphen, and period allowed"
         )
 
     return name
@@ -92,10 +86,8 @@ def validate_safe_path(base_dir: str, *path_components: str) -> Path:
     target = base
     for component in path_components:
         # Validate each component doesn't contain separators
-        if '/' in component or '\\' in component:
-            raise SecurityError(
-                f"Path component '{component}' cannot contain separators"
-            )
+        if "/" in component or "\\" in component:
+            raise SecurityError(f"Path component '{component}' cannot contain separators")
         target = target / component
 
     # Resolve and check it's within base
@@ -104,10 +96,7 @@ def validate_safe_path(base_dir: str, *path_components: str) -> Path:
         # This works even with symlinks because both are resolved
         resolved.relative_to(base)
     except ValueError:
-        raise SecurityError(
-            f"Path would escape base directory: "
-            f"base={base}, target={target}, resolved={resolved}"
-        )
+        raise SecurityError(f"Path would escape base directory: " f"base={base}, target={target}, resolved={resolved}")
 
     return resolved
 
@@ -160,7 +149,7 @@ def build_safe_ssh_command(command_parts: List[str], cwd: Optional[str] = None) 
     # Quote each part
     safe_parts = [shlex.quote(part) for part in command_parts]
 
-    command = ' '.join(safe_parts)
+    command = " ".join(safe_parts)
 
     if cwd:
         safe_cwd = shlex.quote(cwd)
@@ -188,15 +177,11 @@ def validate_pool_path(pool_path: str) -> str:
         raise SecurityError("Pool path cannot be empty")
 
     # Check for path traversal
-    if '..' in pool_path:
-        raise SecurityError(
-            f"Invalid pool path '{pool_path}': cannot contain '..'"
-        )
+    if ".." in pool_path:
+        raise SecurityError(f"Invalid pool path '{pool_path}': cannot contain '..'")
 
     # Pool paths should be relatively simple (no absolute paths)
-    if pool_path.startswith('/') or pool_path.startswith('\\'):
-        raise SecurityError(
-            f"Invalid pool path '{pool_path}': cannot be absolute path"
-        )
+    if pool_path.startswith("/") or pool_path.startswith("\\"):
+        raise SecurityError(f"Invalid pool path '{pool_path}': cannot be absolute path")
 
     return pool_path

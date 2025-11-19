@@ -6,13 +6,11 @@ This script is called by MATLAB batch_worker.m to save full simulation
 outputs to Parquet format on HPC.
 """
 
-import sys
 import json
+import sys
+
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-from pathlib import Path
 
 
 def write_species_parquet(json_file: str, output_file: str) -> None:
@@ -36,14 +34,14 @@ def write_species_parquet(json_file: str, output_file: str) -> None:
     }
     """
     # Load JSON data
-    with open(json_file, 'r') as f:
+    with open(json_file, "r") as f:
         data = json.load(f)
 
-    n_sims = data['n_sims']
-    species_names = data['species_names']
-    time_arrays = data['time_arrays']
-    species_arrays = data['species_arrays']
-    status = data['status']
+    n_sims = data["n_sims"]
+    species_names = data["species_names"]
+    time_arrays = data["time_arrays"]
+    species_arrays = data["species_arrays"]
+    status = data["status"]
 
     # Ensure arrays are lists (MATLAB jsonencode may create scalars for n_sims=1)
     if not isinstance(status, list):
@@ -54,8 +52,8 @@ def write_species_parquet(json_file: str, output_file: str) -> None:
         species_arrays = [species_arrays]
 
     # Extract parameter data (optional)
-    param_names = data.get('param_names', [])
-    param_values = data.get('param_values', [])
+    param_names = data.get("param_names", [])
+    param_values = data.get("param_values", [])
 
     # Convert param_values to 2D array if needed (MATLAB jsonencode flattens 1xN matrices)
     if param_values and param_names:
@@ -74,10 +72,7 @@ def write_species_parquet(json_file: str, output_file: str) -> None:
 
     records = []
     for i in range(n_sims):
-        record = {
-            'simulation_id': i,
-            'status': status[i]
-        }
+        record = {"simulation_id": i, "status": status[i]}
 
         # Add parameters (if provided) - use actual parameter names as column names
         if param_names and len(param_values) > 0:
@@ -86,12 +81,12 @@ def write_species_parquet(json_file: str, output_file: str) -> None:
                 record[param_name] = float(param_values[i][j])
 
         # Add time array
-        record['time'] = time_arrays[i] if time_arrays[i] else []
+        record["time"] = time_arrays[i] if time_arrays[i] else []
 
         # Add each species
         for j, species_name in enumerate(species_names):
             # Clean species name for column (replace dots with underscores)
-            col_name = species_name.replace('.', '_')
+            col_name = species_name.replace(".", "_")
             species_data = species_arrays[i][j] if (i < len(species_arrays) and j < len(species_arrays[i])) else []
             record[col_name] = species_data if species_data else []
 
@@ -101,17 +96,12 @@ def write_species_parquet(json_file: str, output_file: str) -> None:
     df = pd.DataFrame(records)
 
     # Write to Parquet with compression
-    df.to_parquet(
-        output_file,
-        engine='pyarrow',
-        compression='snappy',
-        index=False
-    )
+    df.to_parquet(output_file, engine="pyarrow", compression="snappy", index=False)
 
     print(f"   ✓ Saved {n_sims} simulations to {output_file}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: python write_species_parquet.py <json_file> <output_parquet>")
         sys.exit(1)

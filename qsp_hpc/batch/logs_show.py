@@ -21,17 +21,12 @@ Usage:
 
 import argparse
 import sys
-from pathlib import Path
 
 from qsp_hpc.batch.hpc_job_manager import HPCJobManager
-from qsp_hpc.utils.security import validate_project_name, build_safe_ssh_command
+from qsp_hpc.utils.security import build_safe_ssh_command, validate_project_name
 
 
-def show_logs(
-    array_task_id: int = 0,
-    lines: int = 50,
-    project: str = 'pdac_2025'
-):
+def show_logs(array_task_id: int = 0, lines: int = 50, project: str = "pdac_2025"):
     """
     Show logs from latest HPC derivation job.
 
@@ -43,7 +38,7 @@ def show_logs(
     # Validate project name for security
     project = validate_project_name(project)
 
-    print(f"📋 Fetching HPC derivation logs...")
+    print("📋 Fetching HPC derivation logs...")
     print(f"   Project: {project}")
     print(f"   Task: {array_task_id}")
 
@@ -54,13 +49,10 @@ def show_logs(
     log_dir = f"{job_manager.config.remote_project_path}/projects/{project}/batch_jobs/logs"
 
     # Find the latest derivation log file
-    print(f"   → Finding latest qsp_derive logs...")
+    print("   → Finding latest qsp_derive logs...")
 
     # Use safe command construction
-    list_cmd = build_safe_ssh_command(
-        ['sh', '-c', 'ls -t qsp_derive_*.out 2>/dev/null | head -1'],
-        cwd=log_dir
-    )
+    list_cmd = build_safe_ssh_command(["sh", "-c", "ls -t qsp_derive_*.out 2>/dev/null | head -1"], cwd=log_dir)
     status, output = job_manager.transport.exec(list_cmd)
 
     if status != 0 or not output.strip():
@@ -70,7 +62,7 @@ def show_logs(
     latest_log = output.strip()
     # Extract job ID from filename
     # Format: qsp_derive_12345_6.out
-    parts = latest_log.replace('.out', '').split('_')
+    parts = latest_log.replace(".out", "").split("_")
     if len(parts) < 3:
         print(f"   ✗ Could not parse job ID from: {latest_log}")
         sys.exit(1)
@@ -89,8 +81,8 @@ def show_logs(
 
     # Use safe command construction
     tail_cmd = build_safe_ssh_command(
-        ['sh', '-c', f'if [ -f {out_log} ]; then tail -{lines} {out_log}; else echo "(Log file not found)"; fi'],
-        cwd=log_dir
+        ["sh", "-c", f'if [ -f {out_log} ]; then tail -{lines} {out_log}; else echo "(Log file not found)"; fi'],
+        cwd=log_dir,
     )
     status, output = job_manager.transport.exec(tail_cmd)
 
@@ -106,8 +98,12 @@ def show_logs(
 
     # Use safe command construction
     tail_cmd = build_safe_ssh_command(
-        ['sh', '-c', f'if [ -f {err_log} ]; then if [ -s {err_log} ]; then tail -{lines} {err_log}; else echo "(Empty - no errors)"; fi; else echo "(Log file not found)"; fi'],
-        cwd=log_dir
+        [
+            "sh",
+            "-c",
+            f'if [ -f {err_log} ]; then if [ -s {err_log} ]; then tail -{lines} {err_log}; else echo "(Empty - no errors)"; fi; else echo "(Log file not found)"; fi',
+        ],
+        cwd=log_dir,
     )
     status, output = job_manager.transport.exec(tail_cmd)
 
@@ -123,8 +119,12 @@ def show_logs(
 
     # Use safe command construction
     summary_cmd = build_safe_ssh_command(
-        ['sh', '-c', f'echo "Available tasks:"; ls qsp_derive_{job_id}_*.out 2>/dev/null | sed "s/.*_{job_id}_//;s/.out$//" | sort -n | head -20; echo ""; echo "Task count: $(ls qsp_derive_{job_id}_*.out 2>/dev/null | wc -l)"'],
-        cwd=log_dir
+        [
+            "sh",
+            "-c",
+            f'echo "Available tasks:"; ls qsp_derive_{job_id}_*.out 2>/dev/null | sed "s/.*_{job_id}_//;s/.out$//" | sort -n | head -20; echo ""; echo "Task count: $(ls qsp_derive_{job_id}_*.out 2>/dev/null | wc -l)"',
+        ],
+        cwd=log_dir,
     )
     status, output = job_manager.transport.exec(summary_cmd)
 
@@ -135,9 +135,9 @@ def show_logs(
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Show logs from latest HPC derivation job',
+        description="Show logs from latest HPC derivation job",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
+        epilog="""
 Examples:
   # Show task 0 from latest job
   python metadata/cli/logs_show.py
@@ -147,43 +147,23 @@ Examples:
 
   # Show last 100 lines instead of 50
   python metadata/cli/logs_show.py 3 --lines 100
-        '''
+        """,
     )
 
-    parser.add_argument(
-        'task',
-        type=int,
-        nargs='?',
-        default=0,
-        help='Array task ID to show logs for (default: 0)'
-    )
+    parser.add_argument("task", type=int, nargs="?", default=0, help="Array task ID to show logs for (default: 0)")
 
-    parser.add_argument(
-        '--lines',
-        type=int,
-        default=50,
-        help='Number of lines to show from end of log (default: 50)'
-    )
+    parser.add_argument("--lines", type=int, default=50, help="Number of lines to show from end of log (default: 50)")
 
-    parser.add_argument(
-        '--project',
-        type=str,
-        default='pdac_2025',
-        help='Project name (default: pdac_2025)'
-    )
+    parser.add_argument("--project", type=str, default="pdac_2025", help="Project name (default: pdac_2025)")
 
     args = parser.parse_args()
 
     try:
-        show_logs(
-            array_task_id=args.task,
-            lines=args.lines,
-            project=args.project
-        )
+        show_logs(array_task_id=args.task, lines=args.lines, project=args.project)
     except Exception as e:
         print(f"\n❌ Error: {e}")
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

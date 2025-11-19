@@ -12,8 +12,8 @@ Main components:
 
 __version__ = "0.1.0"
 
-from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
 from qsp_hpc.simulation.qsp_simulator import QSPSimulator, qsp_simulator
+from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
 
 __all__ = [
     "SimulationPoolManager",

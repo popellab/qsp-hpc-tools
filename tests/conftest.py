@@ -1,11 +1,12 @@
 """Pytest configuration and shared fixtures."""
 
-import pytest
-import tempfile
 import shutil
+import tempfile
 from pathlib import Path
-import pandas as pd
+
 import numpy as np
+import pandas as pd
+import pytest
 
 
 def pytest_addoption(parser):
@@ -41,31 +42,25 @@ def temp_dir():
 @pytest.fixture
 def sample_priors():
     """Sample prior parameters for testing."""
-    return pd.DataFrame({
-        'param1': [1.0, 2.0, 3.0],
-        'param2': [0.5, 1.5, 2.5],
-        'param3': [10.0, 20.0, 30.0]
-    })
+    return pd.DataFrame({"param1": [1.0, 2.0, 3.0], "param2": [0.5, 1.5, 2.5], "param3": [10.0, 20.0, 30.0]})
 
 
 @pytest.fixture
 def sample_test_stats():
     """Sample test statistics for testing."""
-    return pd.DataFrame({
-        'stat1': [0.1, 0.2, 0.3],
-        'stat2': [1.0, 2.0, 3.0],
-        'stat3': [100.0, 200.0, 300.0]
-    })
+    return pd.DataFrame({"stat1": [0.1, 0.2, 0.3], "stat2": [1.0, 2.0, 3.0], "stat3": [100.0, 200.0, 300.0]})
 
 
 @pytest.fixture
 def sample_params():
     """Sample parameter sets for simulation."""
-    return pd.DataFrame({
-        'param1': np.random.uniform(0, 1, 10),
-        'param2': np.random.uniform(0, 10, 10),
-        'param3': np.random.uniform(100, 1000, 10)
-    })
+    return pd.DataFrame(
+        {
+            "param1": np.random.uniform(0, 1, 10),
+            "param2": np.random.uniform(0, 10, 10),
+            "param3": np.random.uniform(100, 1000, 10),
+        }
+    )
 
 
 @pytest.fixture
@@ -76,11 +71,13 @@ def sample_simulation_batch(temp_dir):
 
     # Create some sample parquet files with typical naming pattern
     for i in range(5):
-        df = pd.DataFrame({
-            'param1': [np.random.uniform(0, 1)],
-            'param2': [np.random.uniform(0, 10)],
-            'result': [np.random.uniform(0, 100)]
-        })
+        df = pd.DataFrame(
+            {
+                "param1": [np.random.uniform(0, 1)],
+                "param2": [np.random.uniform(0, 10)],
+                "result": [np.random.uniform(0, 100)],
+            }
+        )
         filename = f"batch_{i:04d}_scenario_default_task_0.parquet"
         df.to_parquet(batch_dir / filename)
 
@@ -91,16 +88,10 @@ def sample_simulation_batch(temp_dir):
 def mock_config():
     """Mock configuration for testing."""
     return {
-        'ssh_host': 'test-hpc.example.com',
-        'ssh_user': 'testuser',
-        'remote_base_dir': '/home/testuser/qsp-hpc',
-        'slurm': {
-            'partition': 'test-partition',
-            'nodes': 1,
-            'cpus_per_task': 4,
-            'memory': '16GB',
-            'time': '01:00:00'
-        }
+        "ssh_host": "test-hpc.example.com",
+        "ssh_user": "testuser",
+        "remote_base_dir": "/home/testuser/qsp-hpc",
+        "slurm": {"partition": "test-partition", "nodes": 1, "cpus_per_task": 4, "memory": "16GB", "time": "01:00:00"},
     }
 
 
@@ -108,13 +99,10 @@ def mock_config():
 def sample_model_context():
     """Sample model context for hash testing."""
     return {
-        'model_name': 'test_model',
-        'solver': 'ode45',
-        'tspan': [0, 100],
-        'parameters': {
-            'param1': 1.0,
-            'param2': 2.0
-        }
+        "model_name": "test_model",
+        "solver": "ode45",
+        "tspan": [0, 100],
+        "parameters": {"param1": 1.0, "param2": 2.0},
     }
 
 
@@ -124,7 +112,7 @@ def ssh_rate_limit(request):
     import time
 
     # Only apply to HPC tests
-    if 'hpc' in [mark.name for mark in request.node.iter_markers()]:
+    if "hpc" in [mark.name for mark in request.node.iter_markers()]:
         yield
         # Small delay after each HPC test to avoid rate limiting
         time.sleep(2)

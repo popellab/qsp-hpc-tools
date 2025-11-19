@@ -6,26 +6,26 @@ Tests result collection, parsing, and downloading from HPC including
 error handling for missing files, corrupt data, and network failures.
 """
 
-import pytest
 import json
-import numpy as np
 from pathlib import Path
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock
 
-from qsp_hpc.batch.result_collector import ResultCollector, MissingOutputError
+import pytest
+
 from qsp_hpc.batch.hpc_job_manager import BatchConfig
+from qsp_hpc.batch.result_collector import MissingOutputError, ResultCollector
 
 
 @pytest.fixture
 def mock_config():
     """Create mock BatchConfig."""
     return BatchConfig(
-        ssh_host='hpc.example.edu',
-        ssh_user='testuser',
-        ssh_key='~/.ssh/id_rsa',
-        remote_project_path='/home/testuser/qsp-projects',
-        hpc_venv_path='/home/testuser/.venv/hpc-qsp',
-        simulation_pool_path='/scratch/testuser/simulations'
+        ssh_host="hpc.example.edu",
+        ssh_user="testuser",
+        ssh_key="~/.ssh/id_rsa",
+        remote_project_path="/home/testuser/qsp-projects",
+        hpc_venv_path="/home/testuser/.venv/hpc-qsp",
+        simulation_pool_path="/scratch/testuser/simulations",
     )
 
 
@@ -41,11 +41,7 @@ def mock_transport():
 @pytest.fixture
 def result_collector(mock_config, mock_transport):
     """Create ResultCollector instance with mocks."""
-    return ResultCollector(
-        config=mock_config,
-        transport=mock_transport,
-        verbose=False
-    )
+    return ResultCollector(config=mock_config, transport=mock_transport, verbose=False)
 
 
 class TestCheckPoolDirectoryExists:
@@ -55,9 +51,7 @@ class TestCheckPoolDirectoryExists:
         """Test checking for existing directory."""
         mock_transport.exec.return_value = (0, "exists\n")
 
-        exists = result_collector.check_pool_directory_exists(
-            "/scratch/testuser/simulations/test_pool"
-        )
+        exists = result_collector.check_pool_directory_exists("/scratch/testuser/simulations/test_pool")
 
         assert exists is True
         mock_transport.exec.assert_called_once()
@@ -66,9 +60,7 @@ class TestCheckPoolDirectoryExists:
         """Test checking for non-existent directory."""
         mock_transport.exec.return_value = (0, "not_found\n")
 
-        exists = result_collector.check_pool_directory_exists(
-            "/scratch/testuser/simulations/missing_pool"
-        )
+        exists = result_collector.check_pool_directory_exists("/scratch/testuser/simulations/missing_pool")
 
         assert exists is False
 
@@ -76,9 +68,7 @@ class TestCheckPoolDirectoryExists:
         """Test handling of SSH command failure."""
         mock_transport.exec.return_value = (1, "error\n")
 
-        exists = result_collector.check_pool_directory_exists(
-            "/scratch/testuser/simulations/test_pool"
-        )
+        exists = result_collector.check_pool_directory_exists("/scratch/testuser/simulations/test_pool")
 
         # Should still work - not_found is not in output
         assert exists is True  # Because 'not_found' not in 'error'
@@ -89,16 +79,11 @@ class TestCountPoolSimulations:
 
     def test_count_from_manifest(self, result_collector, mock_transport):
         """Test counting simulations from manifest.json."""
-        manifest = {
-            'total_simulations': 1000,
-            'n_batches': 10
-        }
+        manifest = {"total_simulations": 1000, "n_batches": 10}
         output = f"MANIFEST_FOUND\n{json.dumps(manifest)}"
         mock_transport.exec.return_value = (0, output)
 
-        count = result_collector.count_pool_simulations(
-            "/scratch/testuser/simulations/test_pool"
-        )
+        count = result_collector.count_pool_simulations("/scratch/testuser/simulations/test_pool")
 
         assert count == 1000
 
@@ -109,9 +94,7 @@ N_FILES:5
 N_SIMS:500"""
         mock_transport.exec.return_value = (0, output)
 
-        count = result_collector.count_pool_simulations(
-            "/scratch/testuser/simulations/test_pool"
-        )
+        count = result_collector.count_pool_simulations("/scratch/testuser/simulations/test_pool")
 
         assert count == 500
 
@@ -122,9 +105,7 @@ N_FILES:0
 N_SIMS:0"""
         mock_transport.exec.return_value = (0, output)
 
-        count = result_collector.count_pool_simulations(
-            "/scratch/testuser/simulations/test_pool"
-        )
+        count = result_collector.count_pool_simulations("/scratch/testuser/simulations/test_pool")
 
         assert count == 0
 
@@ -132,9 +113,7 @@ N_SIMS:0"""
         """Test handling of count command failure."""
         mock_transport.exec.return_value = (1, "error")
 
-        count = result_collector.count_pool_simulations(
-            "/scratch/testuser/simulations/test_pool"
-        )
+        count = result_collector.count_pool_simulations("/scratch/testuser/simulations/test_pool")
 
         assert count == 0
 
@@ -143,22 +122,18 @@ N_SIMS:0"""
         output = "MANIFEST_FOUND\n{invalid json}"
         mock_transport.exec.return_value = (0, output)
 
-        count = result_collector.count_pool_simulations(
-            "/scratch/testuser/simulations/test_pool"
-        )
+        count = result_collector.count_pool_simulations("/scratch/testuser/simulations/test_pool")
 
         # Should gracefully handle JSON parse error
         assert count == 0
 
     def test_count_manifest_missing_field(self, result_collector, mock_transport):
         """Test handling of manifest without total_simulations field."""
-        manifest = {'n_batches': 10}  # Missing total_simulations
+        manifest = {"n_batches": 10}  # Missing total_simulations
         output = f"MANIFEST_FOUND\n{json.dumps(manifest)}"
         mock_transport.exec.return_value = (0, output)
 
-        count = result_collector.count_pool_simulations(
-            "/scratch/testuser/simulations/test_pool"
-        )
+        count = result_collector.count_pool_simulations("/scratch/testuser/simulations/test_pool")
 
         assert count == 0
 
@@ -169,9 +144,7 @@ N_FILES:5
 N_SIMS:not_a_number"""
         mock_transport.exec.return_value = (0, output)
 
-        count = result_collector.count_pool_simulations(
-            "/scratch/testuser/simulations/test_pool"
-        )
+        count = result_collector.count_pool_simulations("/scratch/testuser/simulations/test_pool")
 
         # Should gracefully handle parse error
         assert count == 0
@@ -180,9 +153,7 @@ N_SIMS:not_a_number"""
         """Test handling of empty command output."""
         mock_transport.exec.return_value = (0, "")
 
-        count = result_collector.count_pool_simulations(
-            "/scratch/testuser/simulations/test_pool"
-        )
+        count = result_collector.count_pool_simulations("/scratch/testuser/simulations/test_pool")
 
         assert count == 0
 
@@ -199,13 +170,11 @@ class TestCheckHPCFullSimulations:
         ]
 
         has_enough, pool_path, n_available = result_collector.check_hpc_full_simulations(
-            model_version='baseline_pdac',
-            priors_hash='abc123defg',
-            n_requested=500
+            model_version="baseline_pdac", priors_hash="abc123defg", n_requested=500
         )
 
         assert has_enough is True
-        assert pool_path == '/scratch/testuser/simulations/baseline_pdac_abc123de'
+        assert pool_path == "/scratch/testuser/simulations/baseline_pdac_abc123de"
         assert n_available == 1000
 
     def test_insufficient_simulations(self, result_collector, mock_transport):
@@ -216,9 +185,7 @@ class TestCheckHPCFullSimulations:
         ]
 
         has_enough, pool_path, n_available = result_collector.check_hpc_full_simulations(
-            model_version='baseline_pdac',
-            priors_hash='abc123defg',
-            n_requested=500
+            model_version="baseline_pdac", priors_hash="abc123defg", n_requested=500
         )
 
         assert has_enough is False
@@ -229,9 +196,7 @@ class TestCheckHPCFullSimulations:
         mock_transport.exec.return_value = (0, "not_found\n")
 
         has_enough, pool_path, n_available = result_collector.check_hpc_full_simulations(
-            model_version='baseline_pdac',
-            priors_hash='abc123defg',
-            n_requested=500
+            model_version="baseline_pdac", priors_hash="abc123defg", n_requested=500
         )
 
         assert has_enough is False
@@ -242,13 +207,11 @@ class TestCheckHPCFullSimulations:
         mock_transport.exec.return_value = (0, "not_found\n")
 
         has_enough, pool_path, n_available = result_collector.check_hpc_full_simulations(
-            model_version='baseline_pdac',
-            priors_hash='abcdefghijklmnop',  # 16 chars
-            n_requested=100
+            model_version="baseline_pdac", priors_hash="abcdefghijklmnop", n_requested=100  # 16 chars
         )
 
         # Pool path should use only first 8 chars of hash
-        assert pool_path == '/scratch/testuser/simulations/baseline_pdac_abcdefgh'
+        assert pool_path == "/scratch/testuser/simulations/baseline_pdac_abcdefgh"
 
 
 class TestCheckHPCTestStats:
@@ -259,8 +222,7 @@ class TestCheckHPCTestStats:
         mock_transport.exec.return_value = (0, "exists\n")
 
         exists = result_collector.check_hpc_test_stats(
-            pool_path='/scratch/testuser/simulations/test_pool',
-            test_stats_hash='xyz789abc'
+            pool_path="/scratch/testuser/simulations/test_pool", test_stats_hash="xyz789abc"
         )
 
         assert exists is True
@@ -270,8 +232,7 @@ class TestCheckHPCTestStats:
         mock_transport.exec.return_value = (1, "")
 
         exists = result_collector.check_hpc_test_stats(
-            pool_path='/scratch/testuser/simulations/test_pool',
-            test_stats_hash='xyz789abc'
+            pool_path="/scratch/testuser/simulations/test_pool", test_stats_hash="xyz789abc"
         )
 
         assert exists is False
@@ -280,13 +241,11 @@ class TestCheckHPCTestStats:
         """Test test stats existence with expected simulation count validation."""
         mock_transport.exec.side_effect = [
             (0, "exists\n"),  # Both files exist
-            (0, "1001\n"),    # 1000 sims + 1 header = 1001 lines
+            (0, "1001\n"),  # 1000 sims + 1 header = 1001 lines
         ]
 
         exists = result_collector.check_hpc_test_stats(
-            pool_path='/scratch/testuser/simulations/test_pool',
-            test_stats_hash='xyz789abc',
-            expected_n_sims=1000
+            pool_path="/scratch/testuser/simulations/test_pool", test_stats_hash="xyz789abc", expected_n_sims=1000
         )
 
         assert exists is True
@@ -295,13 +254,13 @@ class TestCheckHPCTestStats:
         """Test when test stats file has fewer rows than expected."""
         mock_transport.exec.side_effect = [
             (0, "exists\n"),  # Both files exist
-            (0, "501\n"),     # 500 sims + 1 header = 501 lines
+            (0, "501\n"),  # 500 sims + 1 header = 501 lines
         ]
 
         exists = result_collector.check_hpc_test_stats(
-            pool_path='/scratch/testuser/simulations/test_pool',
-            test_stats_hash='xyz789abc',
-            expected_n_sims=1000  # Expect 1000 but only 500 exist
+            pool_path="/scratch/testuser/simulations/test_pool",
+            test_stats_hash="xyz789abc",
+            expected_n_sims=1000,  # Expect 1000 but only 500 exist
         )
 
         assert exists is False
@@ -310,13 +269,11 @@ class TestCheckHPCTestStats:
         """Test when count validation command fails."""
         mock_transport.exec.side_effect = [
             (0, "exists\n"),  # Both files exist
-            (1, "error"),     # wc command fails
+            (1, "error"),  # wc command fails
         ]
 
         exists = result_collector.check_hpc_test_stats(
-            pool_path='/scratch/testuser/simulations/test_pool',
-            test_stats_hash='xyz789abc',
-            expected_n_sims=1000
+            pool_path="/scratch/testuser/simulations/test_pool", test_stats_hash="xyz789abc", expected_n_sims=1000
         )
 
         # Should return True - files exist, validation command failed but doesn't block
@@ -348,9 +305,9 @@ class TestDownloadTestStats:
         # Download test stats
         local_cache = tmp_path / "cache"
         params, test_stats = result_collector.download_test_stats(
-            pool_path='/scratch/testuser/simulations/test_pool',
-            test_stats_hash='xyz789abc',
-            local_cache_dir=local_cache
+            pool_path="/scratch/testuser/simulations/test_pool",
+            test_stats_hash="xyz789abc",
+            local_cache_dir=local_cache,
         )
 
         # Verify arrays
@@ -382,9 +339,9 @@ class TestDownloadTestStats:
         # Use non-existent cache directory
         local_cache = tmp_path / "new_cache" / "subdir"
         params, test_stats = result_collector.download_test_stats(
-            pool_path='/scratch/testuser/simulations/test_pool',
-            test_stats_hash='xyz789abc',
-            local_cache_dir=local_cache
+            pool_path="/scratch/testuser/simulations/test_pool",
+            test_stats_hash="xyz789abc",
+            local_cache_dir=local_cache,
         )
 
         # Verify directory was created
@@ -397,21 +354,13 @@ class TestResultCollectorVerboseMode:
 
     def test_verbose_logging_enabled(self, mock_config, mock_transport):
         """Test that verbose mode enables debug logging."""
-        collector = ResultCollector(
-            config=mock_config,
-            transport=mock_transport,
-            verbose=True
-        )
+        collector = ResultCollector(config=mock_config, transport=mock_transport, verbose=True)
 
         assert collector.verbose is True
 
     def test_verbose_logging_disabled(self, mock_config, mock_transport):
         """Test that verbose mode can be disabled."""
-        collector = ResultCollector(
-            config=mock_config,
-            transport=mock_transport,
-            verbose=False
-        )
+        collector = ResultCollector(config=mock_config, transport=mock_transport, verbose=False)
 
         assert collector.verbose is False
 

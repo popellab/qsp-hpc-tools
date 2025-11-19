@@ -1,5 +1,4 @@
 import subprocess
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -158,7 +157,7 @@ def test_sync_codebase_quotes_ssh_key_path(monkeypatch, tmp_path):
     rsync_cmd = captured_cmd[0]
 
     # Find the -e flag
-    e_flag_index = rsync_cmd.index('-e')
+    e_flag_index = rsync_cmd.index("-e")
     ssh_command = rsync_cmd[e_flag_index + 1]
 
     # Should be: 'ssh -i "/path with spaces/id_rsa"'

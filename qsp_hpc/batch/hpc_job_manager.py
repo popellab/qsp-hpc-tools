@@ -30,33 +30,31 @@ Usage:
     # Use with qsp_simulator for monitoring
 """
 
-import subprocess
-import yaml
 import pickle
-import json
-import logging
+import subprocess
 import tempfile
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-from dataclasses import dataclass, asdict
+
 import numpy as np
+import yaml
+
+from qsp_hpc.batch.hpc_file_transfer import HPCFileTransfer
+from qsp_hpc.batch.result_collector import MissingOutputError, ResultCollector
+from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter
 from qsp_hpc.utils.logging_config import setup_logger
 from qsp_hpc.utils.security import (
-    validate_project_name,
-    validate_safe_path,
     build_safe_ssh_command,
-    validate_pool_path,
-    SecurityError
+    validate_project_name,
 )
-from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter, SubmissionError
-from qsp_hpc.batch.hpc_file_transfer import HPCFileTransfer
-from qsp_hpc.batch.result_collector import ResultCollector, MissingOutputError
 
 
 @dataclass
 class JobInfo:
     """Information about submitted HPC jobs."""
+
     job_ids: List[str]
     state_file: str
     n_jobs: int
@@ -68,19 +66,20 @@ class JobInfo:
 @dataclass
 class BatchConfig:
     """HPC batch configuration."""
+
     ssh_host: str
     ssh_user: str
     simulation_pool_path: str
     hpc_venv_path: str
-    ssh_key: str = ''
-    remote_project_path: str = ''
-    partition: str = 'shared'
-    time_limit: str = '20:00'
-    memory_per_job: str = '2G'
-    matlab_module: str = 'matlab/R2024a'
+    ssh_key: str = ""
+    remote_project_path: str = ""
+    partition: str = "shared"
+    time_limit: str = "20:00"
+    memory_per_job: str = "2G"
+    matlab_module: str = "matlab/R2024a"
     jobs_per_chunk: int = 20
     strict_host_key_checking: bool = True  # Security: verify SSH host keys by default
-    qsp_hpc_tools_source: str = 'git+ssh://git@github.com/jeliason/qsp-hpc-tools.git'
+    qsp_hpc_tools_source: str = "git+ssh://git@github.com/jeliason/qsp-hpc-tools.git"
 
 
 class RemoteCommandError(RuntimeError):
@@ -109,12 +108,13 @@ class SSHTransport:
         """Warn user once about disabled host key checking."""
         if not self._warned_about_host_key_checking and not self.config.strict_host_key_checking:
             import warnings
+
             warnings.warn(
                 "SSH host key verification is DISABLED. This makes connections vulnerable to "
                 "man-in-the-middle attacks. Set 'strict_host_key_checking: true' in credentials.yaml "
                 "and add the host key to ~/.ssh/known_hosts for better security.",
                 category=UserWarning,
-                stacklevel=3
+                stacklevel=3,
             )
             self._warned_about_host_key_checking = True
 
@@ -138,27 +138,28 @@ class SSHTransport:
         """
         self._warn_insecure_ssh()
 
-        ssh_cmd = ['ssh']
+        ssh_cmd = ["ssh"]
 
         if self.config.ssh_key:
-            ssh_cmd.extend(['-i', self.config.ssh_key])
+            ssh_cmd.extend(["-i", self.config.ssh_key])
 
-        ssh_cmd.extend([
-            '-o', 'ServerAliveInterval=30',
-            '-o', 'ServerAliveCountMax=5',
-            '-o', f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
-            '-o', 'BatchMode=yes'
-        ])
+        ssh_cmd.extend(
+            [
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=5",
+                "-o",
+                f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
+                "-o",
+                "BatchMode=yes",
+            ]
+        )
 
         ssh_cmd.append(self._build_ssh_target())
         ssh_cmd.append(command)
 
-        result = subprocess.run(
-            ssh_cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
+        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
 
         return result.returncode, result.stdout + result.stderr
 
@@ -175,28 +176,28 @@ class SSHTransport:
         """
         self._warn_insecure_ssh()
 
-        scp_cmd = ['scp']
+        scp_cmd = ["scp"]
 
         if self.config.ssh_key:
-            scp_cmd.extend(['-i', self.config.ssh_key])
+            scp_cmd.extend(["-i", self.config.ssh_key])
 
         remote_target = f"{self._build_ssh_target()}:{remote_path}"
 
-        scp_cmd.extend([
-            '-o', f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
-            '-o', 'BatchMode=yes',
-            local_path,
-            remote_target
-        ])
+        scp_cmd.extend(
+            [
+                "-o",
+                f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
+                "-o",
+                "BatchMode=yes",
+                local_path,
+                remote_target,
+            ]
+        )
 
         try:
             subprocess.run(scp_cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as exc:
-            raise RemoteCommandError(
-                f"scp upload to {remote_path}",
-                exc.returncode,
-                exc.stderr or str(exc)
-            ) from exc
+            raise RemoteCommandError(f"scp upload to {remote_path}", exc.returncode, exc.stderr or str(exc)) from exc
 
     def download(self, remote_path: str, local_dir: str) -> None:
         """
@@ -211,27 +212,26 @@ class SSHTransport:
         """
         self._warn_insecure_ssh()
 
-        scp_cmd = ['scp']
+        scp_cmd = ["scp"]
 
         if self.config.ssh_key:
-            scp_cmd.extend(['-i', self.config.ssh_key])
+            scp_cmd.extend(["-i", self.config.ssh_key])
 
         remote_source = f"{self._build_ssh_target()}:{remote_path}"
 
-        scp_cmd.extend([
-            '-o', f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
-            remote_source,
-            local_dir
-        ])
+        scp_cmd.extend(
+            [
+                "-o",
+                f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
+                remote_source,
+                local_dir,
+            ]
+        )
 
         try:
             subprocess.run(scp_cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as exc:
-            raise RemoteCommandError(
-                f"scp download {remote_path}",
-                exc.returncode,
-                exc.stderr or str(exc)
-            ) from exc
+            raise RemoteCommandError(f"scp download {remote_path}", exc.returncode, exc.stderr or str(exc)) from exc
 
 
 class HPCJobManager:
@@ -242,7 +242,12 @@ class HPCJobManager:
     eliminating MATLAB startup overhead and enabling faster job submission.
     """
 
-    def __init__(self, config: Union[Dict, BatchConfig, None] = None, verbose: bool = False, transport: Optional[SSHTransport] = None):
+    def __init__(
+        self,
+        config: Union[Dict, BatchConfig, None] = None,
+        verbose: bool = False,
+        transport: Optional[SSHTransport] = None,
+    ):
         """
         Initialize HPC job manager.
 
@@ -255,8 +260,8 @@ class HPCJobManager:
         elif isinstance(config, dict):
             # Normalize common fields (e.g., expand ssh_key)
             cfg_copy = dict(config)
-            if cfg_copy.get('ssh_key'):
-                cfg_copy['ssh_key'] = str(Path(cfg_copy['ssh_key']).expanduser())
+            if cfg_copy.get("ssh_key"):
+                cfg_copy["ssh_key"] = str(Path(cfg_copy["ssh_key"]).expanduser())
             config = BatchConfig(**cfg_copy)
 
         self.config = config
@@ -275,8 +280,8 @@ class HPCJobManager:
 
         Run 'qsp-hpc setup' to create this configuration file.
         """
-        global_config_file = Path.home() / '.config' / 'qsp-hpc' / 'credentials.yaml'
-        project_config_file = Path.cwd() / '.qsp-hpc' / 'credentials.yaml'
+        global_config_file = Path.home() / ".config" / "qsp-hpc" / "credentials.yaml"
+        project_config_file = Path.cwd() / ".qsp-hpc" / "credentials.yaml"
 
         if not global_config_file.exists():
             raise FileNotFoundError(
@@ -284,12 +289,12 @@ class HPCJobManager:
                 "Please run 'qsp-hpc setup' to configure HPC connection."
             )
 
-        with open(global_config_file, 'r') as f:
+        with open(global_config_file, "r") as f:
             yaml_config = yaml.safe_load(f) or {}
 
         # Layer project-specific overrides if present
         if project_config_file.exists():
-            with open(project_config_file, 'r') as f:
+            with open(project_config_file, "r") as f:
                 project_cfg = yaml.safe_load(f) or {}
             yaml_config = self._merge_config_dicts(yaml_config, project_cfg)
 
@@ -300,18 +305,17 @@ class HPCJobManager:
         """Parse and validate a credentials dict into BatchConfig."""
         if not cfg:
             raise ValueError(
-                f"Configuration file {source} is empty.\n"
-                "Please run 'qsp-hpc setup' to configure HPC connection."
+                f"Configuration file {source} is empty.\n" "Please run 'qsp-hpc setup' to configure HPC connection."
             )
 
-        ssh = cfg.get('ssh', {})
-        cluster = cfg.get('cluster', {})
-        paths = cfg.get('paths', {})
-        slurm = cfg.get('slurm', {})
-        package = cfg.get('package', {})
+        ssh = cfg.get("ssh", {})
+        cluster = cfg.get("cluster", {})
+        paths = cfg.get("paths", {})
+        slurm = cfg.get("slurm", {})
+        package = cfg.get("package", {})
 
         # Validate required SSH fields
-        ssh_host = ssh.get('host', '').strip()
+        ssh_host = ssh.get("host", "").strip()
         if not ssh_host:
             raise ValueError(
                 "ssh.host must be specified in credentials.yaml\n"
@@ -319,8 +323,8 @@ class HPCJobManager:
             )
 
         # Validate required paths
-        simulation_pool_path = paths.get('simulation_pool_path', '').strip()
-        hpc_venv_path = paths.get('hpc_venv_path', '').strip()
+        simulation_pool_path = paths.get("simulation_pool_path", "").strip()
+        hpc_venv_path = paths.get("hpc_venv_path", "").strip()
 
         if not simulation_pool_path:
             raise ValueError(
@@ -334,7 +338,7 @@ class HPCJobManager:
             )
 
         # Validate and expand SSH key path
-        ssh_key = ssh.get('key', '').strip()
+        ssh_key = ssh.get("key", "").strip()
         if ssh_key:
             ssh_key_path = Path(ssh_key).expanduser()
             # Only validate if file should exist (not empty string)
@@ -346,34 +350,34 @@ class HPCJobManager:
             ssh_key = str(ssh_key_path)
 
         # Validate SLURM time limit format (HH:MM:SS or DD-HH:MM:SS)
-        time_limit = slurm.get('time_limit', '01:00:00')
-        if not isinstance(time_limit, str) or not time_limit.replace('-', '').replace(':', '').isdigit():
+        time_limit = slurm.get("time_limit", "01:00:00")
+        if not isinstance(time_limit, str) or not time_limit.replace("-", "").replace(":", "").isdigit():
             raise ValueError(
-                f"Invalid SLURM time_limit format: {time_limit}\n"
-                "Expected format: HH:MM:SS or DD-HH:MM:SS"
+                f"Invalid SLURM time_limit format: {time_limit}\n" "Expected format: HH:MM:SS or DD-HH:MM:SS"
             )
 
         # Validate memory format (e.g., '4G', '512M')
-        memory_per_job = slurm.get('mem_per_cpu', '4G')
-        if not isinstance(memory_per_job, str) or not memory_per_job[-1].upper() in ['K', 'M', 'G', 'T']:
+        memory_per_job = slurm.get("mem_per_cpu", "4G")
+        if not isinstance(memory_per_job, str) or memory_per_job[-1].upper() not in ["K", "M", "G", "T"]:
             raise ValueError(
-                f"Invalid memory format: {memory_per_job}\n"
-                "Expected format: <number><unit> (e.g., '4G', '512M')"
+                f"Invalid memory format: {memory_per_job}\n" "Expected format: <number><unit> (e.g., '4G', '512M')"
             )
 
         return BatchConfig(
             ssh_host=ssh_host,
-            ssh_user=ssh.get('user', '').strip(),
+            ssh_user=ssh.get("user", "").strip(),
             simulation_pool_path=simulation_pool_path,
             hpc_venv_path=hpc_venv_path,
             ssh_key=ssh_key,
-            remote_project_path=paths.get('remote_base_dir', '').strip(),
-            partition=slurm.get('partition', 'shared').strip(),
+            remote_project_path=paths.get("remote_base_dir", "").strip(),
+            partition=slurm.get("partition", "shared").strip(),
             time_limit=time_limit,
             memory_per_job=memory_per_job,
-            matlab_module=cluster.get('matlab_module', 'matlab/R2024a').strip(),
-            strict_host_key_checking=ssh.get('strict_host_key_checking', True),  # Default to True for security
-            qsp_hpc_tools_source=package.get('qsp_hpc_tools_source', 'git+ssh://git@github.com/jeliason/qsp-hpc-tools.git').strip()
+            matlab_module=cluster.get("matlab_module", "matlab/R2024a").strip(),
+            strict_host_key_checking=ssh.get("strict_host_key_checking", True),  # Default to True for security
+            qsp_hpc_tools_source=package.get(
+                "qsp_hpc_tools_source", "git+ssh://git@github.com/jeliason/qsp-hpc-tools.git"
+            ).strip(),
         )
 
     @staticmethod
@@ -407,7 +411,7 @@ class HPCJobManager:
         try:
             status, output = self.transport.exec('echo "SSH_OK"', timeout=timeout)
 
-            if status == 0 and 'SSH_OK' in output:
+            if status == 0 and "SSH_OK" in output:
                 return True
             else:
                 raise RuntimeError(f"SSH connection failed: {output}")
@@ -416,7 +420,6 @@ class HPCJobManager:
             raise RuntimeError(f"SSH connection timeout after {timeout}s") from exc
         except Exception as exc:
             raise RuntimeError(f"SSH connection error: {exc}") from exc
-
 
     def ensure_hpc_venv(self) -> None:
         """
@@ -447,7 +450,7 @@ class HPCJobManager:
         jobs_per_chunk: Optional[int] = None,
         skip_sync: bool = False,
         save_full_simulations: bool = False,
-        simulation_pool_id: Optional[str] = None
+        simulation_pool_id: Optional[str] = None,
     ) -> JobInfo:
         """
         Submit batch jobs to HPC cluster.
@@ -475,6 +478,7 @@ class HPCJobManager:
             jobs_per_chunk = self.config.jobs_per_chunk
 
         from qsp_hpc.batch.batch_utils import calculate_num_tasks
+
         n_jobs = calculate_num_tasks(num_simulations, jobs_per_chunk)
 
         # Sync codebase
@@ -495,7 +499,7 @@ class HPCJobManager:
             jobs_per_chunk=jobs_per_chunk,
             project_name=project_name,
             save_full_simulations=save_full_simulations,
-            simulation_pool_id=simulation_pool_id
+            simulation_pool_id=simulation_pool_id,
         )
 
         # Upload parameter CSV
@@ -510,11 +514,11 @@ class HPCJobManager:
         # Save job state
         job_info = JobInfo(
             job_ids=[job_id],
-            state_file='',  # Will be set below
+            state_file="",  # Will be set below
             n_jobs=n_jobs,
             n_simulations=num_simulations,
             project_name=project_name,
-            submission_time=time.strftime('%Y-%m-%d %H:%M:%S')
+            submission_time=time.strftime("%Y-%m-%d %H:%M:%S"),
         )
 
         state_file = self._save_job_state(job_info, project_name)
@@ -535,7 +539,7 @@ class HPCJobManager:
         jobs_per_chunk: int,
         project_name: str,
         save_full_simulations: bool = True,
-        simulation_pool_id: Optional[str] = None
+        simulation_pool_id: Optional[str] = None,
     ) -> None:
         """Create and upload job configuration as JSON."""
         return self.file_transfer.upload_job_config(
@@ -546,7 +550,7 @@ class HPCJobManager:
             jobs_per_chunk,
             project_name,
             save_full_simulations,
-            simulation_pool_id
+            simulation_pool_id,
         )
 
     def _upload_parameter_csv(self, csv_path: str, project_name: str) -> None:
@@ -568,18 +572,20 @@ class HPCJobManager:
     def _save_job_state(self, job_info: JobInfo, project_name: str) -> str:
         """Save job state to file."""
         # Prefer local storage for state to avoid writing to remote-only paths
-        state_root = Path(self.config.remote_project_path) if (
-            self.config.remote_project_path and Path(self.config.remote_project_path).exists()
-        ) else Path.cwd()
+        state_root = (
+            Path(self.config.remote_project_path)
+            if (self.config.remote_project_path and Path(self.config.remote_project_path).exists())
+            else Path.cwd()
+        )
 
         base_dir = state_root / f"projects/{project_name}/batch_jobs"
         base_dir.mkdir(parents=True, exist_ok=True)
 
-        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
         state_file = base_dir / f"job_state_{timestamp}.pkl"
 
         try:
-            with open(state_file, 'wb') as f:
+            with open(state_file, "wb") as f:
                 pickle.dump(asdict(job_info), f)
         except OSError as exc:  # pragma: no cover - hard to trigger in tests
             raise RuntimeError(f"Failed to write job state to {state_file}: {exc}") from exc
@@ -597,10 +603,10 @@ class HPCJobManager:
             Numpy array of observables (test statistics)
         """
         # Load job state
-        with open(state_file, 'rb') as f:
+        with open(state_file, "rb") as f:
             job_state = pickle.load(f)
 
-        project_name = job_state['project_name']
+        project_name = job_state["project_name"]
 
         # Combine chunks on HPC
         self._combine_chunks_remotely(project_name)
@@ -622,22 +628,19 @@ class HPCJobManager:
 
         # Check that chunk files exist - using safe command construction
         check_cmd = build_safe_ssh_command(
-            ['sh', '-c', 'ls chunk_*_test_stats.csv 2>/dev/null | wc -l'],
-            cwd=remote_output
+            ["sh", "-c", "ls chunk_*_test_stats.csv 2>/dev/null | wc -l"], cwd=remote_output
         )
         status, output = self.transport.exec(check_cmd)
         num_chunks = int(output.strip()) if output.strip().isdigit() else 0
 
         if num_chunks == 0:
             raise MissingOutputError(
-                f"No chunk output files found in {remote_output}. "
-                "Jobs may have failed or not produced output files."
+                f"No chunk output files found in {remote_output}. " "Jobs may have failed or not produced output files."
             )
 
         # Combine test stats - using safe command construction
         combine_cmd = build_safe_ssh_command(
-            ['sh', '-c', 'cat chunk_*_test_stats.csv > combined_test_stats.csv'],
-            cwd=remote_output
+            ["sh", "-c", "cat chunk_*_test_stats.csv > combined_test_stats.csv"], cwd=remote_output
         )
         status, output = self.transport.exec(combine_cmd)
 
@@ -661,7 +664,7 @@ class HPCJobManager:
             if not local_file.exists():
                 raise MissingOutputError(f"Combined results not found locally: {local_file}")
 
-            observables = np.loadtxt(local_file, delimiter=',', ndmin=2)
+            observables = np.loadtxt(local_file, delimiter=",", ndmin=2)
             # Ensure 2D shape (num_simulations, num_observables)
             if observables.ndim == 1:
                 observables = observables.reshape(1, -1)
@@ -671,6 +674,7 @@ class HPCJobManager:
         finally:
             # Clean up temp directory
             import shutil
+
             shutil.rmtree(temp_dir)
 
     def _check_pool_directory_exists(self, pool_path: str) -> bool:
@@ -682,10 +686,7 @@ class HPCJobManager:
         return self.result_collector.count_pool_simulations(pool_path)
 
     def check_hpc_full_simulations(
-        self,
-        model_version: str,
-        priors_hash: str,
-        n_requested: int
+        self, model_version: str, priors_hash: str, n_requested: int
     ) -> Tuple[bool, str, int]:
         """
         Check if HPC has enough full simulations in persistent storage.
@@ -703,10 +704,10 @@ class HPCJobManager:
     def _combine_chunks_on_hpc(self, test_stats_dir: str) -> None:
         """Combine test statistics chunks on HPC using Python script."""
         if self.verbose:
-            self.logger.info(f"Combining chunk files on HPC...")
+            self.logger.info("Combining chunk files on HPC...")
 
         # Upload combine script (small file, quick to upload)
-        local_script = Path('metadata/combine_test_stats_chunks.py')
+        local_script = Path("metadata/combine_test_stats_chunks.py")
         remote_script = f"{test_stats_dir}/combine_chunks.py"
         self.transport.upload(str(local_script), remote_script)
 
@@ -715,17 +716,15 @@ class HPCJobManager:
         status, output = self.transport.exec(combine_cmd, timeout=60)
 
         if self.verbose:
-            self.logger.info(f"HPC combine output:")
-            for line in output.strip().split('\n'):
+            self.logger.info("HPC combine output:")
+            for line in output.strip().split("\n"):
                 self.logger.info(f"  {line}")
 
         if status != 0:
             raise RuntimeError(f"Failed to combine chunks on HPC: {output}")
 
     def _download_combined_files(
-        self,
-        test_stats_dir: str,
-        local_dest: Path
+        self, test_stats_dir: str, local_dest: Path
     ) -> Tuple[Optional[np.ndarray], np.ndarray]:
         """Download and load combined test statistics and parameters from HPC."""
         local_dest.mkdir(parents=True, exist_ok=True)
@@ -733,19 +732,19 @@ class HPCJobManager:
         # Download test stats
         remote_test_stats_file = f"{test_stats_dir}/combined_test_stats.csv"
         if self.verbose:
-            self.logger.info(f"Downloading combined test stats...")
+            self.logger.info("Downloading combined test stats...")
         self.transport.download(remote_test_stats_file, str(local_dest))
 
         # Check for combined params
         check_params_cmd = f'test -f "{test_stats_dir}/combined_params.csv" && echo "exists"'
         status_params, output_params = self.transport.exec(check_params_cmd)
-        has_params = (status_params == 0 and 'exists' in output_params)
+        has_params = status_params == 0 and "exists" in output_params
 
         params = None
         if has_params:
             remote_params_file = f"{test_stats_dir}/combined_params.csv"
             if self.verbose:
-                self.logger.info(f"Downloading combined params...")
+                self.logger.info("Downloading combined params...")
             self.transport.download(remote_params_file, str(local_dest))
 
         # Rename downloaded files
@@ -764,6 +763,7 @@ class HPCJobManager:
 
                 # Load params
                 import pandas as pd
+
                 params_df = pd.read_csv(local_params_file)
                 params = params_df.values
 
@@ -776,6 +776,7 @@ class HPCJobManager:
 
         # Load test stats using pandas (handles NaN/empty values properly)
         import pandas as pd
+
         test_stats_df = pd.read_csv(local_test_stats_file, header=None)
         test_stats = test_stats_df.values
 
@@ -788,12 +789,7 @@ class HPCJobManager:
 
         return params, test_stats
 
-    def check_hpc_test_stats(
-        self,
-        pool_path: str,
-        test_stats_hash: str,
-        expected_n_sims: Optional[int] = None
-    ) -> bool:
+    def check_hpc_test_stats(self, pool_path: str, test_stats_hash: str, expected_n_sims: Optional[int] = None) -> bool:
         """
         Check if HPC has derived test statistics for given configuration.
 
@@ -809,11 +805,11 @@ class HPCJobManager:
 
         # Check if test stats directory exists and has both params and test stats chunk files
         # (derivation worker creates chunk_XXX_params.csv and chunk_XXX_test_stats.csv files)
-        check_cmd = f'''
+        check_cmd = f"""
             test -d "{test_stats_dir}" || exit 1
             echo "TEST_STATS_CHUNKS:$(ls "{test_stats_dir}"/chunk_*_test_stats.csv 2>/dev/null | wc -l)"
             echo "PARAMS_CHUNKS:$(ls "{test_stats_dir}"/chunk_*_params.csv 2>/dev/null | wc -l)"
-        '''
+        """
         status, output = self.transport.exec(check_cmd)
 
         if status != 0:
@@ -823,22 +819,24 @@ class HPCJobManager:
         try:
             n_test_stats_chunks = 0
             n_params_chunks = 0
-            for line in output.strip().split('\n'):
-                if 'TEST_STATS_CHUNKS:' in line:
-                    n_test_stats_chunks = int(line.split(':')[1])
-                elif 'PARAMS_CHUNKS:' in line:
-                    n_params_chunks = int(line.split(':')[1])
+            for line in output.strip().split("\n"):
+                if "TEST_STATS_CHUNKS:" in line:
+                    n_test_stats_chunks = int(line.split(":")[1])
+                elif "PARAMS_CHUNKS:" in line:
+                    n_params_chunks = int(line.split(":")[1])
 
             # Both must have at least one chunk
             if n_test_stats_chunks == 0:
-                self.logger.info(f"   No test stats chunks found")
+                self.logger.info("   No test stats chunks found")
                 return False
 
             # Params chunks may not exist for older datasets (backward compatibility)
             if n_params_chunks == 0:
-                self.logger.info(f"  Warning:  No params chunks found (older format without parameters)")
+                self.logger.info("  Warning:  No params chunks found (older format without parameters)")
             else:
-                self.logger.info(f"   Found {n_test_stats_chunks} test stats chunks and {n_params_chunks} params chunks")
+                self.logger.info(
+                    f"   Found {n_test_stats_chunks} test stats chunks and {n_params_chunks} params chunks"
+                )
 
         except Exception as e:
             self.logger.info(f"   Error parsing chunk counts: {e}")
@@ -847,7 +845,7 @@ class HPCJobManager:
         # If expected count provided, validate that derived test stats match pool size
         if expected_n_sims is not None:
             # Count rows in combined test stats (or combine chunks first if needed)
-            count_cmd = f'''
+            count_cmd = f"""
                 cd "{test_stats_dir}" 2>/dev/null || exit 1
 
                 # Check if combined file exists, otherwise combine chunks
@@ -861,15 +859,17 @@ class HPCJobManager:
                 else
                     echo "0"
                 fi
-            '''
+            """
             status, output = self.transport.exec(count_cmd)
 
             if status == 0:
                 try:
                     n_derived = int(output.strip())
                     if n_derived != expected_n_sims:
-                        self.logger.info(f"  Warning:  Derived test stats count mismatch: {n_derived} vs {expected_n_sims} expected")
-                        self.logger.info(f"   Will re-derive from complete pool")
+                        self.logger.info(
+                            f"  Warning:  Derived test stats count mismatch: {n_derived} vs {expected_n_sims} expected"
+                        )
+                        self.logger.info("   Will re-derive from complete pool")
                         # Delete old derived test stats so they get re-derived
                         self.transport.exec(f'rm -rf "{test_stats_dir}"')
                         return False
@@ -881,11 +881,7 @@ class HPCJobManager:
         return True
 
     def submit_derivation_job(
-        self,
-        pool_path: str,
-        test_stats_csv: str,
-        test_stats_hash: str,
-        project_name: str = 'pdac_2025'
+        self, pool_path: str, test_stats_csv: str, test_stats_hash: str, project_name: str = "pdac_2025"
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -899,7 +895,7 @@ class HPCJobManager:
         Returns:
             SLURM job ID
         """
-        self.logger.info(f"   Submitting test statistics derivation job...")
+        self.logger.info("   Submitting test statistics derivation job...")
 
         # Ensure Python venv is set up
         self.ensure_hpc_venv()
@@ -913,30 +909,32 @@ class HPCJobManager:
         self.transport.upload(test_stats_csv, remote_test_stats_csv)
 
         # Upload test_stat_functions.py
-        local_test_stat_funcs = Path('metadata/test_stat_functions.py')
+        local_test_stat_funcs = Path("metadata/test_stat_functions.py")
         remote_test_stat_funcs = f"{derivation_dir}/test_stat_functions.py"
         self.transport.upload(str(local_test_stat_funcs), remote_test_stat_funcs)
 
         # Expand $HOME in pool_path (Python won't expand shell variables)
         # Get the actual home directory from HPC
-        status, home_dir = self.transport.exec('echo $HOME')
+        status, home_dir = self.transport.exec("echo $HOME")
         home_dir = home_dir.strip()
-        expanded_pool_path = pool_path.replace('$HOME', home_dir)
+        expanded_pool_path = pool_path.replace("$HOME", home_dir)
 
         self.logger.info(f"   Expanded pool path: {expanded_pool_path}")
 
         # Create derivation config JSON
         config = {
-            'simulation_pool_dir': expanded_pool_path,
-            'test_stats_csv': remote_test_stats_csv,
-            'output_dir': expanded_pool_path,
-            'test_stats_hash': test_stats_hash
+            "simulation_pool_dir": expanded_pool_path,
+            "test_stats_csv": remote_test_stats_csv,
+            "output_dir": expanded_pool_path,
+            "test_stats_hash": test_stats_hash,
         }
 
         # Write config locally then upload
         import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             import json
+
             json.dump(config, f, indent=2)
             temp_config = f.name
 
@@ -954,17 +952,14 @@ class HPCJobManager:
             test_stats_config=remote_config,
             derivation_dir=derivation_dir,
             n_batches=n_batches,
-            project_name=project_name
+            project_name=project_name,
         )
 
         self.logger.info(f"   🚀 Derivation job {job_id} ({n_batches} tasks)")
         return job_id
 
     def download_test_stats(
-        self,
-        pool_path: str,
-        test_stats_hash: str,
-        local_dest: Path
+        self, pool_path: str, test_stats_hash: str, local_dest: Path
     ) -> Tuple[Optional[np.ndarray], np.ndarray]:
         """
         Download and combine derived parameters and test statistics from HPC.
@@ -980,9 +975,9 @@ class HPCJobManager:
             - test_stats: Numpy array of test statistics (n_sims x n_test_stats)
         """
         # Expand $HOME if present (needed for scp)
-        if '$HOME' in pool_path:
-            status, home_dir = self.transport.exec('echo $HOME')
-            pool_path = pool_path.replace('$HOME', home_dir.strip())
+        if "$HOME" in pool_path:
+            status, home_dir = self.transport.exec("echo $HOME")
+            pool_path = pool_path.replace("$HOME", home_dir.strip())
             if self.verbose:
                 self.logger.info(f"Expanded pool path: {pool_path}")
 
@@ -996,13 +991,13 @@ class HPCJobManager:
         status, output = self.transport.exec(check_cmd)
 
         if self.verbose:
-            self.logger.info(f"Directory listing:")
-            for line in output.strip().split('\n')[:10]:  # Show first 10 lines
+            self.logger.info("Directory listing:")
+            for line in output.strip().split("\n")[:10]:  # Show first 10 lines
                 self.logger.info(f"  {line}")
 
-        if 'DIRECTORY_NOT_FOUND' in output:
+        if "DIRECTORY_NOT_FOUND" in output:
             # Determine likely project name for better error message
-            project_name = 'pdac_2025'  # Could be passed as parameter if needed
+            project_name = "pdac_2025"  # Could be passed as parameter if needed
             log_path = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/logs"
 
             raise RuntimeError(
@@ -1017,12 +1012,7 @@ class HPCJobManager:
         # Download combined files and load
         return self._download_combined_files(test_stats_dir, local_dest)
 
-    def download_latest_parquet_batch(
-        self,
-        pool_path: str,
-        local_dest: Path,
-        n_files: int = 1
-    ) -> List[Path]:
+    def download_latest_parquet_batch(self, pool_path: str, local_dest: Path, n_files: int = 1) -> List[Path]:
         """
         Download the most recent Parquet batch file(s) from HPC simulation pool.
 
@@ -1035,9 +1025,9 @@ class HPCJobManager:
             List of local paths to downloaded Parquet files
         """
         # Expand $HOME if present
-        if '$HOME' in pool_path:
-            status, home_dir = self.transport.exec('echo $HOME')
-            pool_path = pool_path.replace('$HOME', home_dir.strip())
+        if "$HOME" in pool_path:
+            status, home_dir = self.transport.exec("echo $HOME")
+            pool_path = pool_path.replace("$HOME", home_dir.strip())
 
         self.logger.info(f"   Downloading {n_files} most recent Parquet batch(es) from HPC...")
         self.logger.info(f"   Pool path: {pool_path}")
@@ -1049,7 +1039,7 @@ class HPCJobManager:
         if status != 0 or not output.strip():
             raise RuntimeError(f"No Parquet files found in {pool_path}")
 
-        parquet_files = output.strip().split('\n')
+        parquet_files = output.strip().split("\n")
         self.logger.info(f"   Found {len(parquet_files)} recent file(s)")
 
         # Create local destination
@@ -1083,56 +1073,48 @@ class HPCJobManager:
         Returns:
             Dictionary with counts: {'completed': N, 'running': N, 'pending': N, 'failed': N}
         """
-        status = {
-            'completed': 0,
-            'running': 0,
-            'pending': 0,
-            'failed': 0
-        }
+        status = {"completed": 0, "running": 0, "pending": 0, "failed": 0}
 
         # Check squeue for active jobs (running/pending)
         squeue_cmd = f'squeue -j {job_id} --array --format="%i %T" --noheader 2>/dev/null'
         returncode, output = self.transport.exec(squeue_cmd)
 
         if returncode == 0 and output.strip():
-            lines = [line.strip() for line in output.split('\n') if line.strip()]
+            lines = [line.strip() for line in output.split("\n") if line.strip()]
             for line in lines:
                 parts = line.split()
                 if len(parts) >= 2:
                     state_upper = parts[1].upper()
-                    if 'RUNNING' in state_upper:
-                        status['running'] += 1
-                    elif 'PENDING' in state_upper:
-                        status['pending'] += 1
+                    if "RUNNING" in state_upper:
+                        status["running"] += 1
+                    elif "PENDING" in state_upper:
+                        status["pending"] += 1
 
         # Check sacct for completed/failed jobs
-        sacct_cmd = f'sacct -j {job_id} --format=JobID,State --noheader --parsable2'
+        sacct_cmd = f"sacct -j {job_id} --format=JobID,State --noheader --parsable2"
         returncode, output = self.transport.exec(sacct_cmd)
 
         if returncode == 0 and output.strip():
-            lines = [line.strip() for line in output.split('\n') if line.strip()]
+            lines = [line.strip() for line in output.split("\n") if line.strip()]
             for line in lines:
-                parts = line.split('|')
+                parts = line.split("|")
                 if len(parts) >= 2:
                     job_part = parts[0]
                     state = parts[1]
 
                     # Only count main array tasks (format: 12345_0, 12345_1, ...)
                     # Skip: main job (12345), sub-steps (12345_0.batch, 12345_0.extern)
-                    if '_' in job_part and '.' not in job_part:
+                    if "_" in job_part and "." not in job_part:
                         state_upper = state.upper()
-                        if 'COMPLETED' in state_upper:
-                            status['completed'] += 1
-                        elif 'FAILED' in state_upper or 'CANCELLED' in state_upper or 'TIMEOUT' in state_upper:
-                            status['failed'] += 1
+                        if "COMPLETED" in state_upper:
+                            status["completed"] += 1
+                        elif "FAILED" in state_upper or "CANCELLED" in state_upper or "TIMEOUT" in state_upper:
+                            status["failed"] += 1
 
         return status
 
     def parse_parquet_simulations(
-        self,
-        parquet_file: Path,
-        species_of_interest: Optional[List[str]] = None,
-        max_simulations: Optional[int] = None
+        self, parquet_file: Path, species_of_interest: Optional[List[str]] = None, max_simulations: Optional[int] = None
     ) -> Dict:
         """
         Parse Parquet file containing full simulation data.
@@ -1165,11 +1147,11 @@ class HPCJobManager:
         self.logger.info(f"   Columns: {len(df.columns)} ({df.columns[0]}, {df.columns[1]}, ...)")
 
         # Extract metadata columns
-        simulation_ids = df['simulation_id'].values
-        statuses = df['status'].values
+        simulation_ids = df["simulation_id"].values
+        statuses = df["status"].values
 
         # Filter to successful simulations only
-        success_mask = (statuses == 1)
+        success_mask = statuses == 1
         n_successful: int = int(np.sum(success_mask))
 
         if n_successful == 0:
@@ -1189,12 +1171,12 @@ class HPCJobManager:
 
         # Extract time vector (from first successful simulation)
         first_success_idx = np.where(success_mask)[0][0]
-        time = np.array(df.iloc[first_success_idx]['time'])
+        time = np.array(df.iloc[first_success_idx]["time"])
 
         self.logger.info(f"   Time points: {len(time)} ({time[0]:.1f} to {time[-1]:.1f})")
 
         # Get species columns (exclude metadata: simulation_id, status, time)
-        metadata_cols = {'simulation_id', 'status', 'time'}
+        metadata_cols = {"simulation_id", "status", "time"}
         species_names = [col for col in df.columns if col not in metadata_cols]
 
         self.logger.info(f"   Species: {len(species_names)} total")
@@ -1202,7 +1184,7 @@ class HPCJobManager:
         # Filter species if requested
         if species_of_interest is not None:
             # Map species names (replace dots with underscores)
-            species_map = {name.replace('.', '_'): name for name in species_names}
+            species_map = {name.replace(".", "_"): name for name in species_names}
 
             selected_species = []
             for requested_species in species_of_interest:
@@ -1216,7 +1198,7 @@ class HPCJobManager:
                     self.logger.info(f"  Warning:  Warning: Species '{requested_species}' not found")
 
             if not selected_species:
-                raise ValueError(f"None of the requested species found in Parquet file")
+                raise ValueError("None of the requested species found in Parquet file")
 
             species_names = selected_species
             self.logger.info(f"   Selected {len(species_names)} species")
@@ -1238,12 +1220,12 @@ class HPCJobManager:
         self.logger.info(f"   Extracted {len(species_names)} species x {n_successful} simulations")
 
         return {
-            'n_simulations': n_successful,
-            'time': time,
-            'simulations': simulations,
-            'species_names': species_names,
-            'simulation_ids': simulation_ids[success_mask],
-            'statuses': statuses[success_mask]
+            "n_simulations": n_successful,
+            "time": time,
+            "simulations": simulations,
+            "species_names": species_names,
+            "simulation_ids": simulation_ids[success_mask],
+            "statuses": statuses[success_mask],
         }
 
 

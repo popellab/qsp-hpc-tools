@@ -22,19 +22,16 @@ Usage:
 
 import csv
 import hashlib
-import logging
-import re
 import tempfile
 import time
 from pathlib import Path
-from typing import Union, Tuple, Optional, Dict, List, Any, Callable
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-from scipy.io import loadmat
 
 from qsp_hpc.batch.batch_utils import calculate_batch_split
 from qsp_hpc.batch.hpc_job_manager import MissingOutputError, RemoteCommandError, SubmissionError
-from qsp_hpc.constants import SLURM_REGISTRATION_DELAY, JOB_QUEUE_TIMEOUT, HASH_PREFIX_LENGTH
+from qsp_hpc.constants import HASH_PREFIX_LENGTH, JOB_QUEUE_TIMEOUT, SLURM_REGISTRATION_DELAY
 from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
 from qsp_hpc.utils.logging_config import setup_logger
 
@@ -65,11 +62,11 @@ class QSPSimulator:
         test_stats_csv: Union[str, Path],
         priors_csv: Union[str, Path],
         project_name: str,
-        model_script: str = '',
-        model_version: str = 'v1',
-        model_description: str = '',
-        scenario: str = 'default',
-        cache_dir: Union[str, Path] = 'cache/sbi_simulations',
+        model_script: str = "",
+        model_version: str = "v1",
+        model_description: str = "",
+        scenario: str = "default",
+        cache_dir: Union[str, Path] = "cache/sbi_simulations",
         seed: int = 2025,
         cache_sampling_seed: Optional[int] = None,
         max_tasks: int = 10,
@@ -127,9 +124,9 @@ class QSPSimulator:
             raise FileNotFoundError(f"Priors CSV not found: {self.priors_csv}")
 
         # Load parameter names from priors CSV
-        with open(self.priors_csv, 'r') as f:
+        with open(self.priors_csv, "r") as f:
             reader = csv.DictReader(f)
-            self.param_names = [row['name'] for row in reader]
+            self.param_names = [row["name"] for row in reader]
 
         # Initialize SimulationPoolManager for local caching
         self.pool = pool or SimulationPoolManager(
@@ -138,7 +135,7 @@ class QSPSimulator:
             model_description=model_description,
             priors_csv=priors_csv,
             test_stats_csv=test_stats_csv,
-            model_script=model_script
+            model_script=model_script,
         )
 
         # Store job_manager for lazy initialization (don't create until needed)
@@ -187,6 +184,7 @@ class QSPSimulator:
         """
         if self._job_manager is None and not self.local_only:
             from qsp_hpc.batch.hpc_job_manager import HPCJobManager
+
             self._job_manager = HPCJobManager(verbose=self.verbose)
         return self._job_manager
 
@@ -220,30 +218,23 @@ class QSPSimulator:
 
         # Load priors CSV
         priors_df = pd.read_csv(self.priors_csv)
-        param_names = priors_df['name'].tolist()
-        dist_types = priors_df['distribution'].tolist()
-        dist_param1 = priors_df['dist_param1'].values
-        dist_param2 = priors_df['dist_param2'].values
+        param_names = priors_df["name"].tolist()
+        dist_types = priors_df["distribution"].tolist()
+        dist_param1 = priors_df["dist_param1"].values
+        dist_param2 = priors_df["dist_param2"].values
 
         # Generate samples
         samples = np.zeros((n_samples, len(param_names)))
         for i in range(len(param_names)):
-            if dist_types[i] == 'lognormal':
-                samples[:, i] = self.param_rng.lognormal(
-                    mean=dist_param1[i],
-                    sigma=dist_param2[i],
-                    size=n_samples
-                )
+            if dist_types[i] == "lognormal":
+                samples[:, i] = self.param_rng.lognormal(mean=dist_param1[i], sigma=dist_param2[i], size=n_samples)
             else:
                 raise ValueError(f"Unsupported distribution: {dist_types[i]}")
 
         return samples  # type: ignore[no-any-return]
 
     def _download_and_add_to_pool(
-        self,
-        hpc_pool_path: str,
-        test_stats_hash: str,
-        num_simulations: int
+        self, hpc_pool_path: str, test_stats_hash: str, num_simulations: int
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Download test statistics from HPC and add to SimulationPoolManager.
@@ -270,35 +261,27 @@ class QSPSimulator:
 
             if params is None:
                 raise RuntimeError(
-                    f"HPC has test statistics but no parameters. "
-                    f"This indicates older simulation data that is no longer supported. "
-                    f"Please re-run simulations."
+                    "HPC has test statistics but no parameters. "
+                    "This indicates older simulation data that is no longer supported. "
+                    "Please re-run simulations."
                 )
 
             # Add to SimulationPoolManager
             self._info(f"Adding {params.shape[0]} simulations to pool (scenario='{self.scenario}')")
             self.pool.add_batch(
-                params_matrix=params,
-                observables_matrix=test_stats,
-                seed=self.seed,
-                scenario=self.scenario
+                params_matrix=params, observables_matrix=test_stats, seed=self.seed, scenario=self.scenario
             )
 
         # Load from pool (handles sampling if needed)
         params_out, obs_out = self.pool.load_simulations(
-            n_requested=num_simulations,
-            scenario=self.scenario,
-            random_state=self.rng
+            n_requested=num_simulations, scenario=self.scenario, random_state=self.rng
         )
 
         self._info(f"Complete: Returning {params_out.shape[0]} samples")
         return params_out, obs_out
 
     def _check_hpc_simulations(
-        self,
-        num_simulations: int,
-        priors_hash: str,
-        verbose: bool = False
+        self, num_simulations: int, priors_hash: str, verbose: bool = False
     ) -> Tuple[bool, str, int]:
         """Check HPC for existing full simulations."""
         # Construct pool path with scenario suffix (must match save location)
@@ -321,13 +304,8 @@ class QSPSimulator:
 
         return has_full_sims, hpc_pool_path, n_available
 
-
     def _derive_test_statistics(
-        self,
-        hpc_pool_path: str,
-        test_stats_hash: str,
-        num_simulations: int,
-        verbose: bool = False
+        self, hpc_pool_path: str, test_stats_hash: str, num_simulations: int, verbose: bool = False
     ) -> None:
         """Derive test statistics from full simulations on HPC."""
         # Validate that derived test stats match requested simulation count
@@ -347,10 +325,7 @@ class QSPSimulator:
 
         # Launch derivation job
         job_id = self.job_manager.submit_derivation_job(
-            hpc_pool_path,
-            str(self.test_stats_csv),
-            test_stats_hash,
-            project_name=self.project_name
+            hpc_pool_path, str(self.test_stats_csv), test_stats_hash, project_name=self.project_name
         )
 
         # Wait for derivation job to complete
@@ -376,11 +351,7 @@ class QSPSimulator:
                 f"Check HPC logs at: {log_path}/qsp_derive_*.err"
             )
 
-
-    def _run_new_simulations(
-        self,
-        num_simulations: int
-    ) -> None:
+    def _run_new_simulations(self, num_simulations: int) -> None:
         """
         Run new simulations on HPC and add to pool.
 
@@ -403,7 +374,7 @@ class QSPSimulator:
     def _stage_parameters_to_csv(self, num_simulations: int) -> Tuple[np.ndarray, str]:
         """Generate parameters and stage to a temporary CSV."""
         theta_np = self._generate_parameters(num_simulations)
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as tmp:
             samples_csv = tmp.name
             writer = csv.writer(tmp)
             writer.writerow(self.param_names)
@@ -415,10 +386,7 @@ class QSPSimulator:
         """Add completed simulations to the local pool."""
         self._info(f"Adding {params.shape[0]} simulations to pool (scenario='{self.scenario}')")
         self.pool.add_batch(
-            params_matrix=params,
-            observables_matrix=observables,
-            seed=self.seed,
-            scenario=self.scenario
+            params_matrix=params, observables_matrix=observables, seed=self.seed, scenario=self.scenario
         )
         self._info(f"Complete: {observables.shape[0]} simulations finished")
 
@@ -448,7 +416,9 @@ class QSPSimulator:
         else:
             num_simulations = int(batch_size)
 
-        self._info(f"QSP Simulator: {num_simulations} simulations (scenario='{self.scenario}', version={self.model_version})")
+        self._info(
+            f"QSP Simulator: {num_simulations} simulations (scenario='{self.scenario}', version={self.model_version})"
+        )
 
         # 1. Check SimulationPoolManager for cached test statistics (fast path)
         n_available = self.pool.get_available_simulations(scenario=self.scenario)
@@ -456,9 +426,7 @@ class QSPSimulator:
             if self.verbose:
                 self._info(f"  Found {n_available} simulations in local pool (sufficient)")
             params, observables = self.pool.load_simulations(
-                n_requested=num_simulations,
-                scenario=self.scenario,
-                random_state=self.rng
+                n_requested=num_simulations, scenario=self.scenario, random_state=self.rng
             )
             return params, observables
 
@@ -486,7 +454,7 @@ class QSPSimulator:
             raise QSPSimulatorError(f"Failed checking HPC test stats: {exc}") from exc
 
         if has_test_stats:
-            self._info(f"Found derived test statistics on HPC")
+            self._info("Found derived test statistics on HPC")
             try:
                 return self._download_and_add_to_pool(hpc_pool_path, test_stats_hash, num_simulations)
             except Exception as exc:
@@ -524,9 +492,7 @@ class QSPSimulator:
                 # Now load the full requested amount from pool (old + new)
                 self._info(f"Loading {num_simulations} simulations from pool after adding {n_needed} new ones")
                 params, observables = self.pool.load_simulations(
-                    n_requested=num_simulations,
-                    scenario=self.scenario,
-                    random_state=self.rng
+                    n_requested=num_simulations, scenario=self.scenario, random_state=self.rng
                 )
                 self._info(f"  Loaded {params.shape[0]} parameter sets and {observables.shape[0]} observable sets")
                 return params, observables
@@ -541,11 +507,7 @@ class QSPSimulator:
         except (RemoteCommandError, MissingOutputError, SubmissionError) as exc:
             raise QSPSimulatorError(f"Failed deriving/downloading partial HPC sims: {exc}") from exc
 
-    def simulate_with_parameters(
-        self,
-        theta: np.ndarray,
-        pool_suffix: str = 'posterior_predictive'
-    ) -> np.ndarray:
+    def simulate_with_parameters(self, theta: np.ndarray, pool_suffix: str = "posterior_predictive") -> np.ndarray:
         """
         Run QSP simulations for given parameter samples with caching.
 
@@ -582,7 +544,7 @@ class QSPSimulator:
         self._info(f"Running {n_samples} new simulations...")
 
         # Create temporary CSV with provided parameters
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as tmp:
             samples_csv = tmp.name
             writer = csv.writer(tmp)
             writer.writerow(self.param_names)
@@ -612,13 +574,13 @@ class QSPSimulator:
 
         # Hash priors CSV content
         priors_content = self.priors_csv.read_text()
-        hasher.update(priors_content.encode('utf-8'))
+        hasher.update(priors_content.encode("utf-8"))
 
         # Hash model script name
-        hasher.update(self.model_script.encode('utf-8'))
+        hasher.update(self.model_script.encode("utf-8"))
 
         # Hash model version
-        hasher.update(self.model_version.encode('utf-8'))
+        hasher.update(self.model_version.encode("utf-8"))
 
         return hasher.hexdigest()
 
@@ -630,13 +592,9 @@ class QSPSimulator:
             SHA256 hash (full hex string)
         """
         test_stats_content = self.test_stats_csv.read_text()
-        return hashlib.sha256(test_stats_content.encode('utf-8')).hexdigest()
+        return hashlib.sha256(test_stats_content.encode("utf-8")).hexdigest()
 
-    def _run_matlab_simulation(
-        self,
-        samples_csv: str,
-        num_simulations: int
-    ) -> np.ndarray:
+    def _run_matlab_simulation(self, samples_csv: str, num_simulations: int) -> np.ndarray:
         """
         Run MATLAB simulation for parameter samples on HPC.
 
@@ -671,7 +629,9 @@ class QSPSimulator:
 
         # Calculate optimal split across tasks
         jobs_per_chunk, n_tasks = calculate_batch_split(num_simulations, self.max_tasks)
-        self.logger.info(f"   → Splitting {num_simulations} simulations into {n_tasks} tasks ({jobs_per_chunk} sims/task)")
+        self.logger.info(
+            f"   → Splitting {num_simulations} simulations into {n_tasks} tasks ({jobs_per_chunk} sims/task)"
+        )
 
         # Submit jobs via Python (no MATLAB startup!)
         job_info = self.job_manager.submit_jobs(
@@ -684,16 +644,14 @@ class QSPSimulator:
             jobs_per_chunk=jobs_per_chunk,
             skip_sync=False,  # Sync codebase first
             save_full_simulations=True,  # Enable full simulation saving
-            simulation_pool_id=simulation_pool_id  # Pool ID for HPC storage
+            simulation_pool_id=simulation_pool_id,  # Pool ID for HPC storage
         )
 
         # Wait for jobs to complete
         self._wait_for_completion(job_info.job_ids, num_simulations)
 
         # Collect results via Python (no MATLAB needed!)
-        observables_matrix = self.job_manager.collect_results(
-            state_file=job_info.state_file
-        )
+        observables_matrix = self.job_manager.collect_results(state_file=job_info.state_file)
 
         return observables_matrix
 
@@ -729,12 +687,7 @@ class QSPSimulator:
 
         while True:
             # Check status of all jobs
-            total_status = {
-                'completed': 0,
-                'running': 0,
-                'pending': 0,
-                'failed': 0
-            }
+            total_status = {"completed": 0, "running": 0, "pending": 0, "failed": 0}
 
             for job_id in job_ids:
                 try:
@@ -750,7 +703,7 @@ class QSPSimulator:
             max_tasks_seen = max(max_tasks_seen, total_tasks)
 
             if total_tasks > 0:
-                completed_pct = (total_status['completed'] / total_tasks) * 100
+                completed_pct = (total_status["completed"] / total_tasks) * 100
             else:
                 completed_pct = 0
 
@@ -758,17 +711,19 @@ class QSPSimulator:
             elapsed = time.time() - start_time
             elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
 
-            self.logger.info(f"  {total_status['completed']}/{total_tasks} done ({completed_pct:.1f}%) | "
-                             f"Running: {total_status['running']}, Pending: {total_status['pending']}, "
-                             f"Failed: {total_status['failed']} | {elapsed_str}")
+            self.logger.info(
+                f"  {total_status['completed']}/{total_tasks} done ({completed_pct:.1f}%) | "
+                f"Running: {total_status['running']}, Pending: {total_status['pending']}, "
+                f"Failed: {total_status['failed']} | {elapsed_str}"
+            )
 
             # Check if all jobs completed or failed
-            active_jobs = total_status['running'] + total_status['pending']
+            active_jobs = total_status["running"] + total_status["pending"]
 
             # Break conditions:
             # 1. We've seen tasks and they're all done (completed + failed = total)
             if total_tasks > 0 and active_jobs == 0:
-                if total_status['failed'] > 0:
+                if total_status["failed"] > 0:
                     print(f"  Warning: {total_status['failed']} task(s) failed")
                 break
             # 2. No tasks visible but we previously saw them (they completed and disappeared)
@@ -784,18 +739,14 @@ class QSPSimulator:
             # Check timeout
             if self.max_wait_time and (time.time() - start_time) > self.max_wait_time:
                 raise TimeoutError(
-                    f"Job monitoring timeout after {self.max_wait_time}s. "
-                    f"Jobs may still be running on HPC."
+                    f"Job monitoring timeout after {self.max_wait_time}s. " f"Jobs may still be running on HPC."
                 )
 
             # Wait before next check
             time.sleep(self.poll_interval)
 
 
-def get_observed_data(
-    test_stats_csv: Union[str, Path],
-    value_column: str = 'mean'
-) -> Dict[str, np.ndarray]:
+def get_observed_data(test_stats_csv: Union[str, Path], value_column: str = "mean") -> Dict[str, np.ndarray]:
     """
     Extract observed data from test statistics CSV as dictionary.
 
@@ -822,24 +773,23 @@ def get_observed_data(
 
     if value_column not in df.columns:
         raise ValueError(
-            f"Column '{value_column}' not found in test statistics CSV. "
-            f"Available columns: {', '.join(df.columns)}"
+            f"Column '{value_column}' not found in test statistics CSV. " f"Available columns: {', '.join(df.columns)}"
         )
 
-    if 'test_statistic_id' not in df.columns:
+    if "test_statistic_id" not in df.columns:
         raise ValueError(
             f"Column 'test_statistic_id' not found in test statistics CSV. "
             f"Available columns: {', '.join(df.columns)}"
         )
 
     # Extract observable names and values
-    observable_names = df['test_statistic_id'].tolist()
+    observable_names = df["test_statistic_id"].tolist()
     observed_values = df[value_column].values
 
     # Build dictionary with 2D arrays (1, 1) for each observable
     obs_dict = {}
     for i, obs_name in enumerate(observable_names):
-        obs_dict[obs_name] = observed_values[i:i+1].reshape(1, 1)
+        obs_dict[obs_name] = observed_values[i : i + 1].reshape(1, 1)
 
     return obs_dict
 
@@ -847,18 +797,18 @@ def get_observed_data(
 def qsp_simulator(
     test_stats_csv: Union[str, Path],
     priors_csv: Union[str, Path],
-    model_script: str = '',
-    model_version: str = 'v1',
-    model_description: str = '',
-    scenario: str = 'default',
-    cache_dir: Union[str, Path] = 'cache/sbi_simulations',
+    model_script: str = "",
+    model_version: str = "v1",
+    model_description: str = "",
+    scenario: str = "default",
+    cache_dir: Union[str, Path] = "cache/sbi_simulations",
     project_name: Optional[str] = None,
     seed: int = 2025,
     cache_sampling_seed: Optional[int] = None,
     max_tasks: int = 10,
     poll_interval: int = 30,
     max_wait_time: Optional[int] = None,
-    verbose: bool = False
+    verbose: bool = False,
 ) -> QSPSimulator:
     """
     Create a QSP simulator for SBI workflows.
@@ -927,5 +877,5 @@ def qsp_simulator(
         max_tasks=max_tasks,
         poll_interval=poll_interval,
         max_wait_time=max_wait_time,
-        verbose=verbose
+        verbose=verbose,
     )

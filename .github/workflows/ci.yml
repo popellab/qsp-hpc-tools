@@ -65,11 +65,6 @@ jobs:
       run: |
         ruff check qsp_hpc tests
 
-    - name: Run mypy
-      run: |
-        mypy qsp_hpc
-      continue-on-error: true  # Don't fail CI on mypy errors yet (we'll fix gradually)
-
     - name: Check formatting with black
       run: |
         black --check qsp_hpc tests

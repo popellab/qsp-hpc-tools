@@ -1,6 +1,5 @@
 """Tests for batch processing utilities."""
 
-import pytest
 from qsp_hpc.batch.batch_utils import calculate_batch_split, calculate_num_tasks
 
 
@@ -123,11 +122,11 @@ class TestBatchSplitIntegration:
     def test_various_scenarios(self):
         """Test various realistic batch scenarios."""
         scenarios = [
-            (1000, 100),    # Large batch, many tasks
-            (50, 10),       # Medium batch
-            (5, 100),       # Few simulations, many tasks available
-            (1, 1),         # Minimum case
-            (10000, 500),   # Very large batch
+            (1000, 100),  # Large batch, many tasks
+            (50, 10),  # Medium batch
+            (5, 100),  # Few simulations, many tasks available
+            (1, 1),  # Minimum case
+            (10000, 500),  # Very large batch
         ]
 
         for num_sims, max_tasks in scenarios:

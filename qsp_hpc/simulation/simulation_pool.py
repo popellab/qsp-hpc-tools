@@ -49,13 +49,15 @@ Usage:
 
 import hashlib
 import re
-import numpy as np
-from pathlib import Path
 from datetime import datetime
-from typing import Tuple, Optional, List, Dict, Union
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
 from scipy.io import loadmat, savemat
-from qsp_hpc.utils.logging_config import setup_logger
+
 from qsp_hpc.constants import HASH_PREFIX_LENGTH
+from qsp_hpc.utils.logging_config import setup_logger
 
 
 class SimulationPoolManager:
@@ -90,7 +92,7 @@ class SimulationPoolManager:
         model_description: str,
         priors_csv: Union[str, Path],
         test_stats_csv: Union[str, Path],
-        model_script: str
+        model_script: str,
     ):
         """
         Initialize simulation pool manager.
@@ -129,9 +131,7 @@ class SimulationPoolManager:
         # Batch filename pattern for parsing
         # Format: batch_{timestamp}_{scenario}_{n_sims}sims_seed{seed}.mat
         # Note: scenario can contain underscores, so we use non-greedy match
-        self.batch_pattern = re.compile(
-            r'batch_(\d{8}_\d{6})_(.+?)_(\d+)sims_seed(\d+)\.mat'
-        )
+        self.batch_pattern = re.compile(r"batch_(\d{8}_\d{6})_(.+?)_(\d+)sims_seed(\d+)\.mat")
 
         # Setup logger
         self.logger = setup_logger(__name__)
@@ -153,17 +153,17 @@ class SimulationPoolManager:
 
         # Hash priors CSV content
         priors_content = self.priors_csv.read_text()
-        hasher.update(priors_content.encode('utf-8'))
+        hasher.update(priors_content.encode("utf-8"))
 
         # Hash test statistics CSV content
         test_stats_content = self.test_stats_csv.read_text()
-        hasher.update(test_stats_content.encode('utf-8'))
+        hasher.update(test_stats_content.encode("utf-8"))
 
         # Hash model script name
-        hasher.update(self.model_script.encode('utf-8'))
+        hasher.update(self.model_script.encode("utf-8"))
 
         # Hash model version
-        hasher.update(self.model_version.encode('utf-8'))
+        hasher.update(self.model_version.encode("utf-8"))
 
         return hasher.hexdigest()
 
@@ -179,7 +179,7 @@ class SimulationPoolManager:
         """
         batches = []
 
-        for batch_file in sorted(self.pool_dir.glob('batch_*.mat')):
+        for batch_file in sorted(self.pool_dir.glob("batch_*.mat")):
             match = self.batch_pattern.match(batch_file.name)
             if not match:
                 continue
@@ -190,14 +190,16 @@ class SimulationPoolManager:
             if scenario is not None and file_scenario != scenario:
                 continue
 
-            batches.append({
-                'filename': batch_file.name,
-                'filepath': batch_file,
-                'timestamp': timestamp,
-                'scenario': file_scenario,
-                'n_sims': int(n_sims),
-                'seed': int(seed)
-            })
+            batches.append(
+                {
+                    "filename": batch_file.name,
+                    "filepath": batch_file,
+                    "timestamp": timestamp,
+                    "scenario": file_scenario,
+                    "n_sims": int(n_sims),
+                    "seed": int(seed),
+                }
+            )
 
         return batches
 
@@ -209,7 +211,7 @@ class SimulationPoolManager:
             Sorted list of unique scenario names
         """
         batches = self._scan_batches()
-        scenarios = sorted(set(b['scenario'] for b in batches))
+        scenarios = sorted(set(b["scenario"] for b in batches))
         return scenarios
 
     def get_available_simulations(self, scenario: Optional[str] = None) -> int:
@@ -223,13 +225,10 @@ class SimulationPoolManager:
             Total number of simulations across matching batches
         """
         batches = self._scan_batches(scenario=scenario)
-        return sum(b['n_sims'] for b in batches)
+        return sum(b["n_sims"] for b in batches)
 
     def load_simulations(
-        self,
-        n_requested: int,
-        scenario: Optional[str] = None,
-        random_state: Optional[np.random.Generator] = None
+        self, n_requested: int, scenario: Optional[str] = None, random_state: Optional[np.random.Generator] = None
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Load simulations from pool by aggregating batches for a specific scenario.
@@ -263,7 +262,7 @@ class SimulationPoolManager:
         all_observables = []
 
         for batch in batches:
-            batch_file = batch['filepath']
+            batch_file = batch["filepath"]
             if not batch_file.exists():
                 self.logger.warning(f"Batch file not found: {batch_file}")
                 continue
@@ -274,11 +273,11 @@ class SimulationPoolManager:
             except Exception as exc:  # pragma: no cover - exercised in tests
                 raise ValueError(f"Failed to load batch file {batch_file}: {exc}") from exc
 
-            if 'params_matrix' not in mat_data or 'observables_matrix' not in mat_data:
+            if "params_matrix" not in mat_data or "observables_matrix" not in mat_data:
                 raise ValueError(f"Batch file missing required keys: {batch_file}")
 
-            params = mat_data['params_matrix']
-            observables = mat_data['observables_matrix']
+            params = mat_data["params_matrix"]
+            observables = mat_data["observables_matrix"]
 
             # Ensure 2D shape
             if params.ndim == 1:
@@ -317,10 +316,7 @@ class SimulationPoolManager:
         return params_all, observables_all
 
     def load_multi_scenario(
-        self,
-        scenarios: List[str],
-        n_requested: int,
-        random_state: Optional[np.random.Generator] = None
+        self, scenarios: List[str], n_requested: int, random_state: Optional[np.random.Generator] = None
     ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         """
         Load simulations for multiple scenarios jointly.
@@ -341,22 +337,12 @@ class SimulationPoolManager:
 
         results = {}
         for scenario in scenarios:
-            params, obs = self.load_simulations(
-                n_requested=n_requested,
-                scenario=scenario,
-                random_state=random_state
-            )
+            params, obs = self.load_simulations(n_requested=n_requested, scenario=scenario, random_state=random_state)
             results[scenario] = (params, obs)
 
         return results
 
-    def add_batch(
-        self,
-        params_matrix: np.ndarray,
-        observables_matrix: np.ndarray,
-        seed: int,
-        scenario: str
-    ) -> str:
+    def add_batch(self, params_matrix: np.ndarray, observables_matrix: np.ndarray, seed: int, scenario: str) -> str:
         """
         Add new batch of simulations to pool for a specific scenario.
 
@@ -378,21 +364,19 @@ class SimulationPoolManager:
         n_sims = params_matrix.shape[0]
 
         # Generate batch filename with timestamp and scenario
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         batch_filename = f"batch_{timestamp}_{scenario}_{n_sims}sims_seed{seed}.mat"
         batch_file = self.pool_dir / batch_filename
 
         # Save batch to .mat file with scenario metadata
-        savemat(batch_file, {
-            'params_matrix': params_matrix,
-            'observables_matrix': observables_matrix,
-            'metadata': {
-                'n_sims': n_sims,
-                'seed': seed,
-                'scenario': scenario,
-                'timestamp': timestamp
-            }
-        })
+        savemat(
+            batch_file,
+            {
+                "params_matrix": params_matrix,
+                "observables_matrix": observables_matrix,
+                "metadata": {"n_sims": n_sims, "seed": seed, "scenario": scenario, "timestamp": timestamp},
+            },
+        )
 
         return batch_filename
 
@@ -414,19 +398,19 @@ class SimulationPoolManager:
         for scen in scenarios:
             scen_batches = self._scan_batches(scenario=scen)
             scenario_info[scen] = {
-                'n_batches': len(scen_batches),
-                'total_simulations': sum(b['n_sims'] for b in scen_batches)
+                "n_batches": len(scen_batches),
+                "total_simulations": sum(b["n_sims"] for b in scen_batches),
             }
 
         return {
-            'pool_dir': str(self.pool_dir),
-            'model_version': self.model_version,
-            'model_description': self.model_description,
-            'config_hash': self.config_hash,
-            'scenarios': scenarios,
-            'scenario_info': scenario_info,
-            'total_simulations': sum(b['n_sims'] for b in batches),
-            'n_batches': len(batches)
+            "pool_dir": str(self.pool_dir),
+            "model_version": self.model_version,
+            "model_description": self.model_description,
+            "config_hash": self.config_hash,
+            "scenarios": scenarios,
+            "scenario_info": scenario_info,
+            "total_simulations": sum(b["n_sims"] for b in batches),
+            "n_batches": len(batches),
         }
 
     @classmethod
@@ -447,14 +431,14 @@ class SimulationPoolManager:
             return []
 
         pools = []
-        batch_pattern = re.compile(r'batch_(\d{8}_\d{6})_(.+?)_(\d+)sims_seed(\d+)\.mat')
+        batch_pattern = re.compile(r"batch_(\d{8}_\d{6})_(.+?)_(\d+)sims_seed(\d+)\.mat")
 
         for pool_dir in sorted(cache_dir.iterdir()):
             if not pool_dir.is_dir():
                 continue
 
             # Scan for batch files
-            batch_files = list(pool_dir.glob('batch_*.mat'))
+            batch_files = list(pool_dir.glob("batch_*.mat"))
             if len(batch_files) == 0:
                 continue
 
@@ -470,18 +454,18 @@ class SimulationPoolManager:
 
             # Parse pool directory name: {model_version}_{config_hash[:8]}
             pool_name = pool_dir.name
-            parts = pool_name.rsplit('_', 1)
+            parts = pool_name.rsplit("_", 1)
             model_version = parts[0] if len(parts) == 2 else pool_name
-            config_hash = parts[1] if len(parts) == 2 else 'unknown'
+            config_hash = parts[1] if len(parts) == 2 else "unknown"
 
             pool_info = {
-                'pool_dir': str(pool_dir),
-                'pool_name': pool_name,
-                'model_version': model_version,
-                'config_hash': config_hash,
-                'scenarios': sorted(scenarios),
-                'total_simulations': total_sims,
-                'n_batches': len(batch_files)
+                "pool_dir": str(pool_dir),
+                "pool_name": pool_name,
+                "model_version": model_version,
+                "config_hash": config_hash,
+                "scenarios": sorted(scenarios),
+                "total_simulations": total_sims,
+                "n_batches": len(batch_files),
             }
             pools.append(pool_info)
 

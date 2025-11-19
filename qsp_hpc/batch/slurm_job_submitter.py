@@ -10,13 +10,14 @@ import re
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
+
 from qsp_hpc.utils.logging_config import setup_logger
 from qsp_hpc.utils.security import validate_project_name
 
 
 class SubmissionError(RuntimeError):
     """Raised when SLURM submission cannot be parsed or accepted."""
+
     pass
 
 
@@ -75,7 +76,7 @@ class SLURMJobSubmitter:
         script_content = self._generate_slurm_script(n_jobs, project_name)
 
         # Write to temp file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
             f.write(script_content)
             temp_script = f.name
 
@@ -93,7 +94,7 @@ class SLURMJobSubmitter:
                 raise SubmissionError(f"SLURM submission failed: {output}")
 
             # Extract job ID
-            match = re.search(r'Submitted batch job (\d+)', output)
+            match = re.search(r"Submitted batch job (\d+)", output)
             if not match:
                 raise SubmissionError(f"Could not parse job ID from: {output}")
 
@@ -139,12 +140,7 @@ echo "Job completed at $(date)"
         return script
 
     def submit_derivation_job(
-        self,
-        pool_path: str,
-        test_stats_config: str,
-        derivation_dir: str,
-        n_batches: int,
-        project_name: str
+        self, pool_path: str, test_stats_config: str, derivation_dir: str, n_batches: int, project_name: str
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -175,7 +171,7 @@ echo "Job completed at $(date)"
         )
 
         # Write to temp file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
             f.write(script_content)
             temp_script = f.name
 
@@ -191,7 +187,7 @@ echo "Job completed at $(date)"
                 raise SubmissionError(f"Derivation job submission failed: {output}")
 
             # Extract job ID
-            match = re.search(r'Submitted batch job (\d+)', output)
+            match = re.search(r"Submitted batch job (\d+)", output)
             if not match:
                 raise SubmissionError(f"Could not parse job ID from: {output}")
 
@@ -201,12 +197,7 @@ echo "Job completed at $(date)"
             Path(temp_script).unlink()
 
     def _generate_derivation_slurm_script(
-        self,
-        pool_path: str,
-        test_stats_config: str,
-        derivation_dir: str,
-        n_batches: int,
-        project_name: str
+        self, pool_path: str, test_stats_config: str, derivation_dir: str, n_batches: int, project_name: str
     ) -> str:
         """Generate SLURM script for test statistics derivation."""
         return f"""#!/bin/bash

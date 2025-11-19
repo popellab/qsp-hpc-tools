@@ -5,12 +5,12 @@ Tests for SLURM Job Submitter.
 Tests SLURM script generation, job submission, and error handling.
 """
 
-import pytest
-from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock
 
-from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter, SubmissionError
+import pytest
+
 from qsp_hpc.batch.hpc_job_manager import BatchConfig
+from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter, SubmissionError
 from qsp_hpc.utils.security import SecurityError
 
 
@@ -18,16 +18,16 @@ from qsp_hpc.utils.security import SecurityError
 def mock_config():
     """Create mock BatchConfig."""
     return BatchConfig(
-        ssh_host='hpc.example.edu',
-        ssh_user='testuser',
-        ssh_key='~/.ssh/id_rsa',
-        remote_project_path='/home/testuser/qsp-projects',
-        hpc_venv_path='/home/testuser/.venv/hpc-qsp',
-        simulation_pool_path='/scratch/testuser/simulations',
-        partition='normal',
-        time_limit='04:00:00',
-        memory_per_job='4G',
-        matlab_module='matlab/R2024a'
+        ssh_host="hpc.example.edu",
+        ssh_user="testuser",
+        ssh_key="~/.ssh/id_rsa",
+        remote_project_path="/home/testuser/qsp-projects",
+        hpc_venv_path="/home/testuser/.venv/hpc-qsp",
+        simulation_pool_path="/scratch/testuser/simulations",
+        partition="normal",
+        time_limit="04:00:00",
+        memory_per_job="4G",
+        matlab_module="matlab/R2024a",
     )
 
 
@@ -43,11 +43,7 @@ def mock_transport():
 @pytest.fixture
 def submitter(mock_config, mock_transport):
     """Create SLURMJobSubmitter instance."""
-    return SLURMJobSubmitter(
-        config=mock_config,
-        transport=mock_transport,
-        verbose=False
-    )
+    return SLURMJobSubmitter(config=mock_config, transport=mock_transport, verbose=False)
 
 
 class TestJobSubmission:
@@ -58,9 +54,9 @@ class TestJobSubmission:
         # Mock successful submission
         mock_transport.exec.return_value = (0, "Submitted batch job 12345\n")
 
-        job_id = submitter.submit_job(n_jobs=10, project_name='test_project')
+        job_id = submitter.submit_job(n_jobs=10, project_name="test_project")
 
-        assert job_id == '12345'
+        assert job_id == "12345"
 
         # Verify upload was called
         assert mock_transport.upload.called
@@ -68,7 +64,7 @@ class TestJobSubmission:
         # Verify sbatch was executed
         assert mock_transport.exec.called
         call_args = mock_transport.exec.call_args[0][0]
-        assert 'sbatch' in call_args
+        assert "sbatch" in call_args
 
     def test_submit_job_submission_failure(self, submitter, mock_transport):
         """Test handling of SLURM submission failure."""
@@ -76,7 +72,7 @@ class TestJobSubmission:
         mock_transport.exec.return_value = (1, "sbatch: error: Unable to allocate resources\n")
 
         with pytest.raises(SubmissionError, match="SLURM submission failed"):
-            submitter.submit_job(n_jobs=10, project_name='test_project')
+            submitter.submit_job(n_jobs=10, project_name="test_project")
 
     def test_submit_job_cannot_parse_job_id(self, submitter, mock_transport):
         """Test handling when job ID cannot be parsed."""
@@ -84,12 +80,12 @@ class TestJobSubmission:
         mock_transport.exec.return_value = (0, "Some unexpected output\n")
 
         with pytest.raises(SubmissionError, match="Could not parse job ID"):
-            submitter.submit_job(n_jobs=10, project_name='test_project')
+            submitter.submit_job(n_jobs=10, project_name="test_project")
 
     def test_submit_job_invalid_project_name(self, submitter):
         """Test rejection of invalid project names."""
         with pytest.raises(SecurityError, match="Invalid project name"):
-            submitter.submit_job(n_jobs=10, project_name='../../../etc/passwd')
+            submitter.submit_job(n_jobs=10, project_name="../../../etc/passwd")
 
     def test_submit_job_generates_correct_script(self, submitter, mock_transport):
         """Test that generated script contains correct SLURM directives."""
@@ -99,38 +95,34 @@ class TestJobSubmission:
         uploaded_files = []
 
         def capture_upload(local_path, remote_path):
-            with open(local_path, 'r') as f:
+            with open(local_path, "r") as f:
                 uploaded_files.append((remote_path, f.read()))
 
         mock_transport.upload.side_effect = capture_upload
 
-        submitter.submit_job(n_jobs=10, project_name='test_project')
+        submitter.submit_job(n_jobs=10, project_name="test_project")
 
         # Check that script was uploaded
         assert len(uploaded_files) == 1
         remote_path, script_content = uploaded_files[0]
 
         # Verify script content
-        assert '#SBATCH --partition=normal' in script_content
-        assert '#SBATCH --time=04:00:00' in script_content
-        assert '#SBATCH --mem=4G' in script_content
-        assert '#SBATCH --array=0-9' in script_content  # 0-indexed, 10 tasks
-        assert 'module load matlab/R2024a' in script_content
+        assert "#SBATCH --partition=normal" in script_content
+        assert "#SBATCH --time=04:00:00" in script_content
+        assert "#SBATCH --mem=4G" in script_content
+        assert "#SBATCH --array=0-9" in script_content  # 0-indexed, 10 tasks
+        assert "module load matlab/R2024a" in script_content
         assert "batch_worker('test_project')" in script_content
 
     def test_submit_job_verbose_logging(self, mock_config, mock_transport):
         """Test that verbose mode enables debug logging."""
-        submitter_verbose = SLURMJobSubmitter(
-            config=mock_config,
-            transport=mock_transport,
-            verbose=True
-        )
+        submitter_verbose = SLURMJobSubmitter(config=mock_config, transport=mock_transport, verbose=True)
 
         mock_transport.exec.return_value = (0, "Submitted batch job 12345\n")
 
-        job_id = submitter_verbose.submit_job(n_jobs=5, project_name='test_project')
+        job_id = submitter_verbose.submit_job(n_jobs=5, project_name="test_project")
 
-        assert job_id == '12345'
+        assert job_id == "12345"
 
 
 class TestDerivationJobSubmission:
@@ -141,14 +133,14 @@ class TestDerivationJobSubmission:
         mock_transport.exec.return_value = (0, "Submitted batch job 67890\n")
 
         job_id = submitter.submit_derivation_job(
-            pool_path='/scratch/pool',
-            test_stats_config='/scratch/test_stats.csv',
-            derivation_dir='/scratch/derivation',
+            pool_path="/scratch/pool",
+            test_stats_config="/scratch/test_stats.csv",
+            derivation_dir="/scratch/derivation",
             n_batches=5,
-            project_name='test_project'
+            project_name="test_project",
         )
 
-        assert job_id == '67890'
+        assert job_id == "67890"
 
         # Verify upload was called
         assert mock_transport.upload.called
@@ -162,11 +154,11 @@ class TestDerivationJobSubmission:
 
         with pytest.raises(SubmissionError, match="Derivation job submission failed"):
             submitter.submit_derivation_job(
-                pool_path='/scratch/pool',
-                test_stats_config='/scratch/test_stats.csv',
-                derivation_dir='/scratch/derivation',
+                pool_path="/scratch/pool",
+                test_stats_config="/scratch/test_stats.csv",
+                derivation_dir="/scratch/derivation",
                 n_batches=5,
-                project_name='test_project'
+                project_name="test_project",
             )
 
     def test_submit_derivation_job_cannot_parse_id(self, submitter, mock_transport):
@@ -175,11 +167,11 @@ class TestDerivationJobSubmission:
 
         with pytest.raises(SubmissionError, match="Could not parse job ID"):
             submitter.submit_derivation_job(
-                pool_path='/scratch/pool',
-                test_stats_config='/scratch/test_stats.csv',
-                derivation_dir='/scratch/derivation',
+                pool_path="/scratch/pool",
+                test_stats_config="/scratch/test_stats.csv",
+                derivation_dir="/scratch/derivation",
                 n_batches=5,
-                project_name='test_project'
+                project_name="test_project",
             )
 
     def test_submit_derivation_job_generates_correct_script(self, submitter, mock_transport):
@@ -189,30 +181,30 @@ class TestDerivationJobSubmission:
         uploaded_files = []
 
         def capture_upload(local_path, remote_path):
-            with open(local_path, 'r') as f:
+            with open(local_path, "r") as f:
                 uploaded_files.append((remote_path, f.read()))
 
         mock_transport.upload.side_effect = capture_upload
 
         submitter.submit_derivation_job(
-            pool_path='/scratch/pool',
-            test_stats_config='/scratch/test_stats.csv',
-            derivation_dir='/scratch/derivation',
+            pool_path="/scratch/pool",
+            test_stats_config="/scratch/test_stats.csv",
+            derivation_dir="/scratch/derivation",
             n_batches=5,
-            project_name='test_project'
+            project_name="test_project",
         )
 
         # Verify script content
         assert len(uploaded_files) == 1
         remote_path, script_content = uploaded_files[0]
 
-        assert '#SBATCH --job-name=qsp_derive' in script_content
-        assert '#SBATCH --partition=normal' in script_content
-        assert '#SBATCH --time=01:00:00' in script_content  # Fixed time for derivation
-        assert '#SBATCH --mem-per-cpu=4G' in script_content  # Fixed memory
-        assert '#SBATCH --array=1-5' in script_content  # 1-indexed for derivation
-        assert 'source /home/testuser/.venv/hpc-qsp/bin/activate' in script_content
-        assert 'qsp_hpc.batch.derive_test_stats_worker' in script_content
+        assert "#SBATCH --job-name=qsp_derive" in script_content
+        assert "#SBATCH --partition=normal" in script_content
+        assert "#SBATCH --time=01:00:00" in script_content  # Fixed time for derivation
+        assert "#SBATCH --mem-per-cpu=4G" in script_content  # Fixed memory
+        assert "#SBATCH --array=1-5" in script_content  # 1-indexed for derivation
+        assert "source /home/testuser/.venv/hpc-qsp/bin/activate" in script_content
+        assert "qsp_hpc.batch.derive_test_stats_worker" in script_content
         assert '--pool-path "/scratch/pool"' in script_content
         assert '--config "/scratch/test_stats.csv"' in script_content
         assert '--output-dir "/scratch/derivation"' in script_content
@@ -221,11 +213,11 @@ class TestDerivationJobSubmission:
         """Test rejection of invalid project names in derivation jobs."""
         with pytest.raises(SecurityError, match="Invalid project name"):
             submitter.submit_derivation_job(
-                pool_path='/scratch/pool',
-                test_stats_config='/scratch/test_stats.csv',
-                derivation_dir='/scratch/derivation',
+                pool_path="/scratch/pool",
+                test_stats_config="/scratch/test_stats.csv",
+                derivation_dir="/scratch/derivation",
                 n_batches=5,
-                project_name='../../malicious'
+                project_name="../../malicious",
             )
 
 
@@ -234,20 +226,20 @@ class TestScriptGeneration:
 
     def test_generate_slurm_script(self, submitter):
         """Test SLURM script generation."""
-        script = submitter._generate_slurm_script(n_jobs=20, project_name='my_project')
+        script = submitter._generate_slurm_script(n_jobs=20, project_name="my_project")
 
         # Check SLURM directives
-        assert '#SBATCH --job-name=qsp_batch' in script
-        assert '#SBATCH --partition=normal' in script
-        assert '#SBATCH --time=04:00:00' in script
-        assert '#SBATCH --mem=4G' in script
-        assert '#SBATCH --array=0-19' in script  # 0-indexed, 20 tasks
+        assert "#SBATCH --job-name=qsp_batch" in script
+        assert "#SBATCH --partition=normal" in script
+        assert "#SBATCH --time=04:00:00" in script
+        assert "#SBATCH --mem=4G" in script
+        assert "#SBATCH --array=0-19" in script  # 0-indexed, 20 tasks
 
         # Check log file paths
-        assert '/home/testuser/qsp-projects/projects/my_project/batch_jobs/logs' in script
+        assert "/home/testuser/qsp-projects/projects/my_project/batch_jobs/logs" in script
 
         # Check MATLAB execution
-        assert 'module load matlab/R2024a' in script
+        assert "module load matlab/R2024a" in script
         assert "batch_worker('my_project')" in script
 
         # Check environment exports
@@ -257,29 +249,29 @@ class TestScriptGeneration:
     def test_generate_derivation_slurm_script(self, submitter):
         """Test derivation SLURM script generation."""
         script = submitter._generate_derivation_slurm_script(
-            pool_path='/scratch/test_pool',
-            test_stats_config='/scratch/test_stats.csv',
-            derivation_dir='/scratch/derive_output',
+            pool_path="/scratch/test_pool",
+            test_stats_config="/scratch/test_stats.csv",
+            derivation_dir="/scratch/derive_output",
             n_batches=10,
-            project_name='my_project'
+            project_name="my_project",
         )
 
         # Check SLURM directives
-        assert '#SBATCH --job-name=qsp_derive' in script
-        assert '#SBATCH --partition=normal' in script
-        assert '#SBATCH --time=01:00:00' in script
-        assert '#SBATCH --mem-per-cpu=4G' in script
-        assert '#SBATCH --array=1-10' in script  # 1-indexed
+        assert "#SBATCH --job-name=qsp_derive" in script
+        assert "#SBATCH --partition=normal" in script
+        assert "#SBATCH --time=01:00:00" in script
+        assert "#SBATCH --mem-per-cpu=4G" in script
+        assert "#SBATCH --array=1-10" in script  # 1-indexed
 
         # Check Python virtual environment activation
-        assert 'source /home/testuser/.venv/hpc-qsp/bin/activate' in script
+        assert "source /home/testuser/.venv/hpc-qsp/bin/activate" in script
 
         # Check Python command
-        assert 'python3 -m qsp_hpc.batch.derive_test_stats_worker' in script
+        assert "python3 -m qsp_hpc.batch.derive_test_stats_worker" in script
         assert '--pool-path "/scratch/test_pool"' in script
         assert '--config "/scratch/test_stats.csv"' in script
         assert '--output-dir "/scratch/derive_output"' in script
-        assert '--task-id $SLURM_ARRAY_TASK_ID' in script
+        assert "--task-id $SLURM_ARRAY_TASK_ID" in script
 
 
 class TestSubmissionError:

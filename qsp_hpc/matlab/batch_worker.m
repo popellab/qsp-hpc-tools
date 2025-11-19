@@ -40,7 +40,7 @@ try
     else
         fprintf('   Project name provided: %s\n', project_name);
     end
-    
+
     % Determine file paths using absolute paths
     current_dir = pwd;
     base_dir = fullfile(current_dir, 'projects', project_name, 'batch_jobs');
@@ -80,10 +80,10 @@ try
     model_data.config = struct();
     model_data.config.model_script = model_script;
     model_data.project_name = project_name;
-    
+
     % Recreate model on remote worker instead of using serialized model
     fprintf('   Recreating model on remote worker...\n');
-    
+
     % Run the model setup script
     eval(model_data.config.model_script);  % Creates 'model' variable
 
@@ -101,7 +101,7 @@ try
         dose_schedule = [];
         fprintf('   Using baseline dose schedule (no treatment)\n');
     end
-    
+
     % Apply simulation configuration from model_data or use defaults
     if isfield(model_data, 'sim_config') && ~isempty(model_data.sim_config)
         sim_config = model_data.sim_config;
@@ -129,7 +129,7 @@ try
             'abs_tolerance', 1e-12, ...
             'rel_tolerance', 1e-9);
     end
-    
+
     % Update model_data with fresh objects
     model_data.model = model;
     model_data.dose_schedule = dose_schedule;
@@ -282,18 +282,18 @@ try
     if ~isempty(fieldnames(outputs))
         fprintf('   Outputs: %s\n', strjoin(fieldnames(outputs), ', '));
     end
-    
+
 catch ME
     fprintf('❌ Worker failed with error: %s\n', ME.message);
     fprintf('   Stack trace:\n');
     for i = 1:length(ME.stack)
         fprintf('     %s (line %d)\n', ME.stack(i).name, ME.stack(i).line);
     end
-    
+
     % Save error information for debugging
     error_file = fullfile(output_dir, sprintf('error_%s.mat', datestr(now, 'yyyymmdd_HHMMSS')));
     save(error_file, 'ME');
-    
+
     rethrow(ME);
 end
 
@@ -411,15 +411,15 @@ variant = addvariant(model, variant_name);
 
 for j = 1:length(chunk_params.names)
     param_name = chunk_params.names{j};
-    
+
     % Check if parameter exists in chunk
     if isfield(chunk_params, param_name) && isfield(chunk_params.(param_name), 'LHS')
         param_value = chunk_params.(param_name).LHS(patient_index);
-        
+
         % Check if parameter exists in model
         param_obj = sbioselect(model, 'Type', 'parameter', 'Name', param_name);
         compartment_obj = sbioselect(model, 'Type', 'compartment', 'Name', param_name);
-        
+
         if ~isempty(param_obj)
             addcontent(variant, {'parameter', param_name, 'Value', param_value});
         elseif ~isempty(compartment_obj)
@@ -447,7 +447,7 @@ else
     % Fallback: check if we're in a subdirectory of a project
     [parent_dir, ~] = fileparts(current_dir);
     project_match = regexp(parent_dir, '.*[/\\]projects[/\\]([^/\\]+)', 'tokens');
-    
+
     if ~isempty(project_match) && ~isempty(project_match{1})
         project_name = project_match{1}{1};
     else

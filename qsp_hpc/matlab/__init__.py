@@ -8,8 +8,8 @@ This package contains MATLAB functions that run on HPC nodes:
 - load_parameter_samples_csv.m: Load parameter samples from CSV
 """
 
-import os
 from pathlib import Path
+
 
 def get_matlab_path() -> Path:
     """Get path to MATLAB scripts directory."""

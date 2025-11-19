@@ -6,14 +6,17 @@ Handles downloading, parsing, and aggregating simulation results from HPC.
 """
 
 import json
-import numpy as np
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Optional, Tuple
+
+import numpy as np
+
 from qsp_hpc.utils.logging_config import setup_logger
 
 
 class MissingOutputError(RuntimeError):
     """Raised when expected remote output artifacts are missing."""
+
     pass
 
 
@@ -50,11 +53,11 @@ class ResultCollector:
         if self.verbose:
             self.logger.debug(f"Directory check result: {output.strip()}")
 
-        return 'not_found' not in output
+        return "not_found" not in output
 
     def count_pool_simulations(self, pool_path: str) -> int:
         """Count number of simulations in pool from manifest or filenames."""
-        count_cmd = f'''
+        count_cmd = f"""
             cd "{pool_path}" 2>/dev/null || exit 1
 
             if [ -f manifest.json ]; then
@@ -68,12 +71,12 @@ class ResultCollector:
                 sed 's/sims//' | \
                 awk '{{sum+=$1}} END {{print "N_SIMS:" sum}}'
             fi
-        '''
+        """
         status, output = self.transport.exec(count_cmd)
 
         if self.verbose:
             self.logger.debug("Count command output:")
-            for line in output.strip().split('\n'):
+            for line in output.strip().split("\n"):
                 self.logger.debug(f"  {line}")
 
         if status != 0:
@@ -85,22 +88,22 @@ class ResultCollector:
 
         try:
             # Check if we got manifest
-            if 'MANIFEST_FOUND' in output:
+            if "MANIFEST_FOUND" in output:
                 # Extract JSON (everything after MANIFEST_FOUND line)
-                lines = output.split('\n')
-                manifest_start = lines.index('MANIFEST_FOUND') + 1
-                manifest_json = '\n'.join(lines[manifest_start:])
+                lines = output.split("\n")
+                manifest_start = lines.index("MANIFEST_FOUND") + 1
+                manifest_json = "\n".join(lines[manifest_start:])
 
                 manifest = json.loads(manifest_json)
-                n_available = manifest.get('total_simulations', 0)
+                n_available = manifest.get("total_simulations", 0)
                 if self.verbose:
                     self.logger.debug(f"Parsed manifest: {n_available} simulations")
 
-            elif 'COUNTING_FILES' in output:
+            elif "COUNTING_FILES" in output:
                 # Extract N_SIMS value
-                for line in output.split('\n'):
-                    if line.startswith('N_SIMS:'):
-                        n_available = int(line.split(':')[1].strip())
+                for line in output.split("\n"):
+                    if line.startswith("N_SIMS:"):
+                        n_available = int(line.split(":")[1].strip())
                         self.logger.debug(f"Counted from filenames: {n_available} simulations")
                         break
             else:
@@ -118,10 +121,7 @@ class ResultCollector:
         return n_available
 
     def check_hpc_full_simulations(
-        self,
-        model_version: str,
-        priors_hash: str,
-        n_requested: int
+        self, model_version: str, priors_hash: str, n_requested: int
     ) -> Tuple[bool, str, int]:
         """
         Check HPC for existing full simulation results.
@@ -152,16 +152,13 @@ class ResultCollector:
         has_enough = n_available >= n_requested
 
         if self.verbose:
-            self.logger.debug(f"Found {n_available} simulations, need {n_requested}: {'sufficient' if has_enough else 'insufficient'}")
+            self.logger.debug(
+                f"Found {n_available} simulations, need {n_requested}: {'sufficient' if has_enough else 'insufficient'}"
+            )
 
         return has_enough, pool_path, n_available
 
-    def check_hpc_test_stats(
-        self,
-        pool_path: str,
-        test_stats_hash: str,
-        expected_n_sims: Optional[int] = None
-    ) -> bool:
+    def check_hpc_test_stats(self, pool_path: str, test_stats_hash: str, expected_n_sims: Optional[int] = None) -> bool:
         """
         Check if derived test statistics exist on HPC.
 
@@ -181,7 +178,7 @@ class ResultCollector:
         check_cmd = f'test -f "{params_file}" && test -f "{stats_file}" && echo "exists"'
         status, output = self.transport.exec(check_cmd)
 
-        if status != 0 or 'exists' not in output:
+        if status != 0 or "exists" not in output:
             return False
 
         # If expected count specified, validate it
@@ -193,18 +190,13 @@ class ResultCollector:
                 # Subtract 1 for header line
                 n_lines = int(output.strip()) - 1
                 if n_lines < expected_n_sims:
-                    self.logger.warning(
-                        f"Test stats file has {n_lines} rows, expected {expected_n_sims}"
-                    )
+                    self.logger.warning(f"Test stats file has {n_lines} rows, expected {expected_n_sims}")
                     return False
 
         return True
 
     def download_test_stats(
-        self,
-        pool_path: str,
-        test_stats_hash: str,
-        local_cache_dir: Path
+        self, pool_path: str, test_stats_hash: str, local_cache_dir: Path
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Download derived test statistics from HPC.
@@ -235,7 +227,7 @@ class ResultCollector:
         (local_cache_dir / f"test_stats_{test_stats_hash[:8]}.csv").rename(local_stats)
 
         # Load into numpy arrays
-        params = np.loadtxt(local_params, delimiter=',', skiprows=1)
-        test_stats = np.loadtxt(local_stats, delimiter=',', skiprows=1)
+        params = np.loadtxt(local_params, delimiter=",", skiprows=1)
+        test_stats = np.loadtxt(local_stats, delimiter=",", skiprows=1)
 
         return params, test_stats

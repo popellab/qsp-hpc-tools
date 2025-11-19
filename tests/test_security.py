@@ -1,16 +1,17 @@
 """Tests for security utilities."""
 
-import pytest
-from pathlib import Path
 import tempfile
+from pathlib import Path
+
+import pytest
 
 from qsp_hpc.utils.security import (
+    SecurityError,
+    build_safe_ssh_command,
+    safe_shell_quote,
+    validate_pool_path,
     validate_project_name,
     validate_safe_path,
-    safe_shell_quote,
-    build_safe_ssh_command,
-    validate_pool_path,
-    SecurityError
 )
 
 
@@ -26,7 +27,7 @@ class TestValidateProjectName:
             "project123",
             "my.project",
             "Project_2025",
-            "abc123_test-v2.1"
+            "abc123_test-v2.1",
         ]
         for name in valid_names:
             assert validate_project_name(name) == name
@@ -65,7 +66,7 @@ class TestValidateProjectName:
             "test>output.txt",
             "test$USER",
             "test*wildcard",
-            "test with spaces"
+            "test with spaces",
         ]
         # All invalid names should raise SecurityError (regardless of specific message)
         for name in invalid_names:
@@ -149,7 +150,7 @@ class TestSafeShellQuote:
             "test$(whoami)",
             "test`cat /etc/passwd`",
             "test && echo pwned",
-            "test | grep secret"
+            "test | grep secret",
         ]
         for s in dangerous:
             quoted = safe_shell_quote(s)
@@ -169,33 +170,33 @@ class TestBuildSafeSSHCommand:
 
     def test_simple_command(self):
         """Test building simple commands."""
-        cmd = build_safe_ssh_command(['ls', '-la'])
-        assert 'ls' in cmd
-        assert '-la' in cmd
+        cmd = build_safe_ssh_command(["ls", "-la"])
+        assert "ls" in cmd
+        assert "-la" in cmd
 
     def test_command_with_spaces(self):
         """Test command with spaces in arguments."""
-        cmd = build_safe_ssh_command(['cat', 'file with spaces.txt'])
+        cmd = build_safe_ssh_command(["cat", "file with spaces.txt"])
         # Should be quoted
         assert "'" in cmd or '"' in cmd
 
     def test_command_with_cwd(self):
         """Test command with working directory."""
-        cmd = build_safe_ssh_command(['ls'], cwd='/path/to/dir')
-        assert 'cd' in cmd
-        assert '/path/to/dir' in cmd
-        assert '&&' in cmd
-        assert 'ls' in cmd
+        cmd = build_safe_ssh_command(["ls"], cwd="/path/to/dir")
+        assert "cd" in cmd
+        assert "/path/to/dir" in cmd
+        assert "&&" in cmd
+        assert "ls" in cmd
 
     def test_dangerous_arguments_quoted(self):
         """Test that dangerous arguments are properly quoted."""
-        cmd = build_safe_ssh_command(['echo', 'test; rm -rf /'])
+        cmd = build_safe_ssh_command(["echo", "test; rm -rf /"])
         # Should be quoted to prevent execution
         assert "'" in cmd or '"' in cmd
 
     def test_dangerous_cwd_quoted(self):
         """Test that dangerous cwd is properly quoted."""
-        cmd = build_safe_ssh_command(['ls'], cwd='/path"; rm -rf /; echo "')
+        cmd = build_safe_ssh_command(["ls"], cwd='/path"; rm -rf /; echo "')
         # Should be quoted
         assert "'" in cmd or '"' in cmd
 
@@ -205,11 +206,7 @@ class TestValidatePoolPath:
 
     def test_valid_pool_paths(self):
         """Test valid pool paths."""
-        valid = [
-            "model_v1_abcd1234",
-            "model_version_hash",
-            "simple_path"
-        ]
+        valid = ["model_v1_abcd1234", "model_version_hash", "simple_path"]
         for path in valid:
             assert validate_pool_path(path) == path
 
@@ -263,10 +260,7 @@ class TestSecurityIntegration:
             validate_project_name("test;whoami")
 
         # Build safe command with dangerous input
-        cmd = build_safe_ssh_command(
-            ['ls', 'file; rm -rf /'],
-            cwd='/path"; cat /etc/passwd; echo "'
-        )
+        cmd = build_safe_ssh_command(["ls", "file; rm -rf /"], cwd='/path"; cat /etc/passwd; echo "')
         # Both should be quoted
         assert "'" in cmd or '"' in cmd
 

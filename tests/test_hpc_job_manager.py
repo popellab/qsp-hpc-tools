@@ -13,43 +13,45 @@ Run HPC tests with: pytest -m hpc -v
 Skip HPC tests with: pytest -m "not hpc" -v
 """
 
-import pytest
-import yaml
-import time
 import pickle
-import numpy as np
 import subprocess
 import tempfile
+import time
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
+
+import numpy as np
+import pytest
+import yaml
+
 from qsp_hpc.batch.hpc_job_manager import (
-    HPCJobManager,
     BatchConfig,
+    HPCJobManager,
     JobInfo,
-    RemoteCommandError,
     MissingOutputError,
+    RemoteCommandError,
     SubmissionError,
 )
-
 
 # ============================================================================
 # Fixtures
 # ============================================================================
 
+
 @pytest.fixture
 def mock_hpc_config():
     """Mock HPC configuration for unit tests."""
     return BatchConfig(
-        ssh_host='test-hpc.example.com',
-        ssh_user='testuser',
-        ssh_key=str(Path.home() / '.ssh' / 'id_rsa'),
-        remote_project_path='/home/testuser/qsp-hpc',
-        matlab_module='matlab/R2024a',
-        hpc_venv_path='/home/testuser/.venv/hpc-qsp',
-        simulation_pool_path='/scratch/testuser/simulations',
-        partition='normal',
-        time_limit='04:00:00',
-        memory_per_job='4G'
+        ssh_host="test-hpc.example.com",
+        ssh_user="testuser",
+        ssh_key=str(Path.home() / ".ssh" / "id_rsa"),
+        remote_project_path="/home/testuser/qsp-hpc",
+        matlab_module="matlab/R2024a",
+        hpc_venv_path="/home/testuser/.venv/hpc-qsp",
+        simulation_pool_path="/scratch/testuser/simulations",
+        partition="normal",
+        time_limit="04:00:00",
+        memory_per_job="4G",
     )
 
 
@@ -57,28 +59,26 @@ def mock_hpc_config():
 def temp_config_file(tmp_path, mock_hpc_config):
     """Create temporary config file for testing."""
     config_data = {
-        'ssh': {
-            'host': mock_hpc_config.ssh_host,
-            'user': mock_hpc_config.ssh_user,
-            'key': str(mock_hpc_config.ssh_key)
+        "ssh": {
+            "host": mock_hpc_config.ssh_host,
+            "user": mock_hpc_config.ssh_user,
+            "key": str(mock_hpc_config.ssh_key),
         },
-        'cluster': {
-            'matlab_module': mock_hpc_config.matlab_module
+        "cluster": {"matlab_module": mock_hpc_config.matlab_module},
+        "paths": {
+            "remote_base_dir": mock_hpc_config.remote_project_path,
+            "hpc_venv_path": mock_hpc_config.hpc_venv_path,
+            "simulation_pool_path": mock_hpc_config.simulation_pool_path,
         },
-        'paths': {
-            'remote_base_dir': mock_hpc_config.remote_project_path,
-            'hpc_venv_path': mock_hpc_config.hpc_venv_path,
-            'simulation_pool_path': mock_hpc_config.simulation_pool_path
+        "slurm": {
+            "partition": mock_hpc_config.partition,
+            "time_limit": mock_hpc_config.time_limit,
+            "mem_per_cpu": mock_hpc_config.memory_per_job,
         },
-        'slurm': {
-            'partition': mock_hpc_config.partition,
-            'time_limit': mock_hpc_config.time_limit,
-            'mem_per_cpu': mock_hpc_config.memory_per_job
-        }
     }
 
-    config_file = tmp_path / 'test_credentials.yaml'
-    with open(config_file, 'w') as f:
+    config_file = tmp_path / "test_credentials.yaml"
+    with open(config_file, "w") as f:
         yaml.dump(config_data, f)
 
     return config_file
@@ -92,7 +92,7 @@ def real_hpc_config():
     This fixture is used for integration tests marked with @pytest.mark.hpc.
     It will skip the test if no valid config is found.
     """
-    config_path = Path.home() / '.config' / 'qsp-hpc' / 'credentials.yaml'
+    config_path = Path.home() / ".config" / "qsp-hpc" / "credentials.yaml"
 
     if config_path.exists():
         return config_path
@@ -104,99 +104,103 @@ def real_hpc_config():
 # Unit Tests (No HPC Required)
 # ============================================================================
 
+
 class TestHPCConfigLoading:
     """Test configuration loading and validation."""
 
     def test_config_loading_from_file(self, tmp_path):
         """Test loading config from YAML file."""
         tmp_home = tmp_path / "home"
-        creds_dir = tmp_home / '.config' / 'qsp-hpc'
+        creds_dir = tmp_home / ".config" / "qsp-hpc"
         creds_dir.mkdir(parents=True)
 
         # Create SSH key file for validation
-        ssh_dir = tmp_home / '.ssh'
+        ssh_dir = tmp_home / ".ssh"
         ssh_dir.mkdir(parents=True)
-        ssh_key = ssh_dir / 'id_rsa'
-        ssh_key.write_text('fake-ssh-key-for-testing')
+        ssh_key = ssh_dir / "id_rsa"
+        ssh_key.write_text("fake-ssh-key-for-testing")
 
-        creds_path = creds_dir / 'credentials.yaml'
-        with open(creds_path, 'w') as fh:
-            yaml.safe_dump({
-                'ssh': {'host': 'test-hpc.example.com', 'user': 'testuser', 'key': str(ssh_key)},
-                'paths': {
-                    'remote_base_dir': '/home/testuser/qsp-hpc',
-                    'simulation_pool_path': '/scratch/testuser/simulations',
-                    'hpc_venv_path': '/home/testuser/.venv/hpc-qsp'
+        creds_path = creds_dir / "credentials.yaml"
+        with open(creds_path, "w") as fh:
+            yaml.safe_dump(
+                {
+                    "ssh": {"host": "test-hpc.example.com", "user": "testuser", "key": str(ssh_key)},
+                    "paths": {
+                        "remote_base_dir": "/home/testuser/qsp-hpc",
+                        "simulation_pool_path": "/scratch/testuser/simulations",
+                        "hpc_venv_path": "/home/testuser/.venv/hpc-qsp",
+                    },
+                    "cluster": {"matlab_module": "matlab/R2024a"},
+                    "slurm": {"partition": "normal", "time_limit": "02:00:00", "mem_per_cpu": "8G"},
                 },
-                'cluster': {'matlab_module': 'matlab/R2024a'},
-                'slurm': {'partition': 'normal', 'time_limit': '02:00:00', 'mem_per_cpu': '8G'}
-            }, fh)
+                fh,
+            )
 
         with patch.object(Path, "home", return_value=tmp_home):
             manager = HPCJobManager()
 
         cfg = manager.config
-        assert cfg.ssh_host == 'test-hpc.example.com'
-        assert cfg.ssh_user == 'testuser'
-        assert cfg.remote_project_path == '/home/testuser/qsp-hpc'
-        assert cfg.simulation_pool_path == '/scratch/testuser/simulations'
-        assert cfg.hpc_venv_path == '/home/testuser/.venv/hpc-qsp'
-        assert cfg.partition == 'normal'
-        assert cfg.time_limit == '02:00:00'
+        assert cfg.ssh_host == "test-hpc.example.com"
+        assert cfg.ssh_user == "testuser"
+        assert cfg.remote_project_path == "/home/testuser/qsp-hpc"
+        assert cfg.simulation_pool_path == "/scratch/testuser/simulations"
+        assert cfg.hpc_venv_path == "/home/testuser/.venv/hpc-qsp"
+        assert cfg.partition == "normal"
+        assert cfg.time_limit == "02:00:00"
 
     def test_hierarchical_config_merge(self):
         """Test that project config overrides global config."""
         tmp_home = Path(tempfile.mkdtemp())
-        global_dir = tmp_home / '.config' / 'qsp-hpc'
-        project_dir = tmp_home / 'project'
+        global_dir = tmp_home / ".config" / "qsp-hpc"
+        project_dir = tmp_home / "project"
         global_dir.mkdir(parents=True)
-        (project_dir / '.qsp-hpc').mkdir(parents=True)
+        (project_dir / ".qsp-hpc").mkdir(parents=True)
 
         # Create SSH key file for validation
-        ssh_dir = tmp_home / '.ssh'
+        ssh_dir = tmp_home / ".ssh"
         ssh_dir.mkdir(parents=True)
-        ssh_key = ssh_dir / 'id_rsa'
-        ssh_key.write_text('fake-ssh-key-for-testing')
+        ssh_key = ssh_dir / "id_rsa"
+        ssh_key.write_text("fake-ssh-key-for-testing")
 
         global_cfg = {
-            'ssh': {'host': 'global-host', 'user': 'global', 'key': str(ssh_key)},
-            'paths': {
-                'remote_base_dir': '/global/base',
-                'simulation_pool_path': '/global/pool',
-                'hpc_venv_path': '/global/venv'
+            "ssh": {"host": "global-host", "user": "global", "key": str(ssh_key)},
+            "paths": {
+                "remote_base_dir": "/global/base",
+                "simulation_pool_path": "/global/pool",
+                "hpc_venv_path": "/global/venv",
             },
-            'slurm': {'partition': 'global', 'time_limit': '01:00:00', 'mem_per_cpu': '4G'}
+            "slurm": {"partition": "global", "time_limit": "01:00:00", "mem_per_cpu": "4G"},
         }
         project_override = {
-            'ssh': {'host': 'project-host'},
-            'paths': {'remote_base_dir': '/project/base'},
-            'slurm': {'partition': 'project-partition'}
+            "ssh": {"host": "project-host"},
+            "paths": {"remote_base_dir": "/project/base"},
+            "slurm": {"partition": "project-partition"},
         }
 
-        with open(global_dir / 'credentials.yaml', 'w') as fh:
+        with open(global_dir / "credentials.yaml", "w") as fh:
             yaml.safe_dump(global_cfg, fh)
-        with open(project_dir / '.qsp-hpc' / 'credentials.yaml', 'w') as fh:
+        with open(project_dir / ".qsp-hpc" / "credentials.yaml", "w") as fh:
             yaml.safe_dump(project_override, fh)
 
         with patch.object(Path, "home", return_value=tmp_home), patch.object(Path, "cwd", return_value=project_dir):
             manager = HPCJobManager()
 
         cfg = manager.config
-        assert cfg.ssh_host == 'project-host'  # override
-        assert cfg.remote_project_path == '/project/base'  # override
-        assert cfg.partition == 'project-partition'  # override
-        assert cfg.simulation_pool_path == '/global/pool'  # inherited
-        assert cfg.hpc_venv_path == '/global/venv'  # inherited
+        assert cfg.ssh_host == "project-host"  # override
+        assert cfg.remote_project_path == "/project/base"  # override
+        assert cfg.partition == "project-partition"  # override
+        assert cfg.simulation_pool_path == "/global/pool"  # inherited
+        assert cfg.hpc_venv_path == "/global/venv"  # inherited
 
     def test_missing_required_fields_error(self, tmp_path):
         """Test that missing required config fields raise error."""
         tmp_home = tmp_path / "home"
-        creds_dir = tmp_home / '.config' / 'qsp-hpc'
+        creds_dir = tmp_home / ".config" / "qsp-hpc"
         creds_dir.mkdir(parents=True)
 
         # Missing simulation_pool_path and hpc_venv_path
-        with open(creds_dir / 'credentials.yaml', 'w') as fh:
-            yaml.safe_dump({'ssh': {'host': 'host'}, 'paths': {}}, fh)
+        with open(creds_dir / "credentials.yaml", "w") as fh:
+            yaml.safe_dump({"ssh": {"host": "host"}, "paths": {}}, fh)
 
         with patch.object(Path, "home", return_value=tmp_home):
             with pytest.raises(ValueError):
@@ -205,14 +209,14 @@ class TestHPCConfigLoading:
     def test_ssh_key_expansion(self):
         """Test that SSH key path expands ~ correctly."""
         custom_cfg = {
-            'ssh_host': 'example',
-            'ssh_user': 'user',
-            'ssh_key': '~/.ssh/id_rsa',
-            'simulation_pool_path': '/pool',
-            'hpc_venv_path': '/venv'
+            "ssh_host": "example",
+            "ssh_user": "user",
+            "ssh_key": "~/.ssh/id_rsa",
+            "simulation_pool_path": "/pool",
+            "hpc_venv_path": "/venv",
         }
         manager = HPCJobManager(config=custom_cfg)
-        assert manager.config.ssh_key == str(Path('~/.ssh/id_rsa').expanduser())
+        assert manager.config.ssh_key == str(Path("~/.ssh/id_rsa").expanduser())
 
     def test_save_job_state_uses_local_path_when_remote_missing(self, tmp_path, mock_hpc_config):
         job_info = JobInfo(
@@ -285,87 +289,102 @@ class TestJobStateManagement:
     def test_job_info_creation(self):
         """Test creating JobInfo object."""
         info = JobInfo(
-            job_ids=['123'],
-            state_file='state.pkl',
+            job_ids=["123"],
+            state_file="state.pkl",
             n_jobs=2,
             n_simulations=20,
-            project_name='proj',
-            submission_time='now'
+            project_name="proj",
+            submission_time="now",
         )
-        assert info.job_ids == ['123']
+        assert info.job_ids == ["123"]
         assert info.n_jobs == 2
 
     def test_job_state_serialization(self, tmp_path, monkeypatch):
         """Test saving job state to pickle file."""
         info = JobInfo(
-            job_ids=['1'],
-            state_file='',
-            n_jobs=1,
-            n_simulations=10,
-            project_name='proj',
-            submission_time='2025-01-01'
+            job_ids=["1"], state_file="", n_jobs=1, n_simulations=10, project_name="proj", submission_time="2025-01-01"
         )
         # Point remote path to a non-existent location; manager should fall back to cwd
-        manager = HPCJobManager(config={
-            'ssh_host': 'example', 'ssh_user': 'user', 'simulation_pool_path': '/pool', 'hpc_venv_path': '/venv', 'remote_project_path': str(tmp_path / 'remote')
-        })
+        manager = HPCJobManager(
+            config={
+                "ssh_host": "example",
+                "ssh_user": "user",
+                "simulation_pool_path": "/pool",
+                "hpc_venv_path": "/venv",
+                "remote_project_path": str(tmp_path / "remote"),
+            }
+        )
 
         # Write inside temp directory to avoid polluting repo
         monkeypatch.chdir(tmp_path)
-        state_file = manager._save_job_state(info, project_name='proj')
+        state_file = manager._save_job_state(info, project_name="proj")
 
-        saved = pickle.load(open(state_file, 'rb'))
-        assert saved['job_ids'] == ['1']
-        assert saved['n_simulations'] == 10
-        assert Path(state_file).parent.name == 'batch_jobs'
-        assert str(tmp_path / 'projects/proj') in state_file
+        saved = pickle.load(open(state_file, "rb"))
+        assert saved["job_ids"] == ["1"]
+        assert saved["n_simulations"] == 10
+        assert Path(state_file).parent.name == "batch_jobs"
+        assert str(tmp_path / "projects/proj") in state_file
 
     def test_job_state_deserialization(self, tmp_path):
         """Test loading job state from pickle file."""
         state_payload = {
-            'job_ids': ['1'],
-            'state_file': 'state.pkl',
-            'n_jobs': 1,
-            'n_simulations': 5,
-            'project_name': 'proj',
-            'submission_time': 'now'
+            "job_ids": ["1"],
+            "state_file": "state.pkl",
+            "n_jobs": 1,
+            "n_simulations": 5,
+            "project_name": "proj",
+            "submission_time": "now",
         }
-        state_file = tmp_path / 'state.pkl'
-        with open(state_file, 'wb') as fh:
+        state_file = tmp_path / "state.pkl"
+        with open(state_file, "wb") as fh:
             pickle.dump(state_payload, fh)
 
-        manager = HPCJobManager(config={
-            'ssh_host': 'example', 'ssh_user': 'user', 'simulation_pool_path': '/pool', 'hpc_venv_path': '/venv', 'remote_project_path': str(tmp_path / 'remote')
-        })
+        manager = HPCJobManager(
+            config={
+                "ssh_host": "example",
+                "ssh_user": "user",
+                "simulation_pool_path": "/pool",
+                "hpc_venv_path": "/venv",
+                "remote_project_path": str(tmp_path / "remote"),
+            }
+        )
 
-        calls = {'combined': False, 'downloaded': False}
+        calls = {"combined": False, "downloaded": False}
 
-        manager._combine_chunks_remotely = lambda project_name: calls.__setitem__('combined', True)
-        manager._download_combined_results = lambda project_name: calls.__setitem__('downloaded', True) or np.ones((1, 1))
+        manager._combine_chunks_remotely = lambda project_name: calls.__setitem__("combined", True)
+        manager._download_combined_results = lambda project_name: calls.__setitem__("downloaded", True) or np.ones(
+            (1, 1)
+        )
 
         result = manager.collect_results(str(state_file))
 
-        assert calls['combined'] is True
-        assert calls['downloaded'] is True
+        assert calls["combined"] is True
+        assert calls["downloaded"] is True
         assert isinstance(result, np.ndarray)
         assert not state_file.exists()
 
     def test_job_state_file_naming(self, monkeypatch, tmp_path):
         """Test job state filename includes timestamp and project name."""
         info = JobInfo(
-            job_ids=['1'], state_file='', n_jobs=1, n_simulations=1, project_name='proj', submission_time='now'
+            job_ids=["1"], state_file="", n_jobs=1, n_simulations=1, project_name="proj", submission_time="now"
         )
-        manager = HPCJobManager(config={
-            'ssh_host': 'example', 'ssh_user': 'user', 'simulation_pool_path': '/pool', 'hpc_venv_path': '/venv', 'remote_project_path': str(tmp_path / 'remote')
-        })
+        manager = HPCJobManager(
+            config={
+                "ssh_host": "example",
+                "ssh_user": "user",
+                "simulation_pool_path": "/pool",
+                "hpc_venv_path": "/venv",
+                "remote_project_path": str(tmp_path / "remote"),
+            }
+        )
 
         monkeypatch.chdir(tmp_path)
-        state_file = manager._save_job_state(info, 'proj')
+        state_file = manager._save_job_state(info, "proj")
 
-        assert 'job_state_' in Path(state_file).name
-        assert Path(state_file).parent.name == 'batch_jobs'
+        assert "job_state_" in Path(state_file).name
+        assert Path(state_file).parent.name == "batch_jobs"
         # Should fall back to cwd when remote path is missing
-        assert state_file.startswith(str(tmp_path / 'projects/proj'))
+        assert state_file.startswith(str(tmp_path / "projects/proj"))
 
 
 class TestPathConstruction:
@@ -374,8 +393,8 @@ class TestPathConstruction:
     def test_remote_project_path(self, mock_hpc_config):
         """Test construction of remote project path."""
         manager = HPCJobManager(config=mock_hpc_config)
-        with patch.object(manager.transport, 'exec', return_value=(0, '')) as mock_exec:
-            manager._setup_remote_directories('proj')
+        with patch.object(manager.transport, "exec", return_value=(0, "")) as mock_exec:
+            manager._setup_remote_directories("proj")
 
         # All calls should include the remote base directory
         assert all(mock_hpc_config.remote_project_path in call.args[0] for call in mock_exec.call_args_list)
@@ -383,20 +402,20 @@ class TestPathConstruction:
     def test_remote_simulation_pool_path(self, mock_hpc_config):
         """Test construction of simulation pool path."""
         manager = HPCJobManager(config=mock_hpc_config)
-        script = manager._generate_slurm_script(1, 'proj')
+        script = manager._generate_slurm_script(1, "proj")
         assert mock_hpc_config.simulation_pool_path in script
 
     def test_remote_log_path(self, mock_hpc_config):
         """Test construction of SLURM log file paths."""
         manager = HPCJobManager(config=mock_hpc_config)
-        script = manager._generate_slurm_script(2, 'proj')
+        script = manager._generate_slurm_script(2, "proj")
         assert f"{mock_hpc_config.remote_project_path}/projects/proj/batch_jobs/logs" in script
 
 
 class TestSyncCodebase:
     """Tests for rsync command construction."""
 
-    @patch('subprocess.run')
+    @patch("subprocess.run")
     def test_sync_includes_ssh_key_and_excludes(self, mock_run, mock_hpc_config):
         manager = HPCJobManager(config=mock_hpc_config)
         # Mock ssh exec for mkdir
@@ -411,13 +430,13 @@ class TestSyncCodebase:
         # First call is mkdir, second is rsync
         assert mock_run.call_count == 1
         args = mock_run.call_args[0][0]
-        assert 'rsync' in args[0]
+        assert "rsync" in args[0]
         # Ensure SSH key is passed
         assert any(mock_hpc_config.ssh_key in part for part in args)
         # Ensure a known exclude is present
-        assert '--exclude' in args
+        assert "--exclude" in args
 
-    @patch('subprocess.run')
+    @patch("subprocess.run")
     def test_sync_skipped(self, mock_run, mock_hpc_config):
         manager = HPCJobManager(config=mock_hpc_config)
         manager.sync_codebase(skip_sync=True)
@@ -477,7 +496,7 @@ class TestCommandExecutionBehaviors:
         """Test that SCP upload errors are wrapped in RemoteCommandError."""
         manager = HPCJobManager(config=mock_hpc_config)
         # Mock subprocess.run to raise CalledProcessError
-        with patch('subprocess.run', side_effect=subprocess.CalledProcessError(1, "scp", stderr="upload failed")):
+        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "scp", stderr="upload failed")):
             with pytest.raises(RemoteCommandError) as exc_info:
                 manager.transport.upload("/tmp/file", "/remote/path")
             assert "scp upload" in str(exc_info.value)
@@ -486,7 +505,7 @@ class TestCommandExecutionBehaviors:
         """Test that SCP download errors are wrapped in RemoteCommandError."""
         manager = HPCJobManager(config=mock_hpc_config)
         # Mock subprocess.run to raise CalledProcessError
-        with patch('subprocess.run', side_effect=subprocess.CalledProcessError(1, "scp", stderr="download failed")):
+        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "scp", stderr="download failed")):
             with pytest.raises(RemoteCommandError) as exc_info:
                 manager.transport.download("/remote/file", "/tmp")
             assert "scp download" in str(exc_info.value)
@@ -495,6 +514,7 @@ class TestCommandExecutionBehaviors:
 # ============================================================================
 # Integration Tests (Require Real HPC)
 # ============================================================================
+
 
 @pytest.mark.hpc
 class TestHPCConnection:
@@ -515,7 +535,7 @@ class TestHPCConnection:
         # If we get here without hanging, SSH key auth is working
         returncode, output = manager._ssh_exec("echo 'auth_test'", timeout=10)
         assert returncode == 0
-        assert 'auth_test' in output
+        assert "auth_test" in output
 
     def test_whoami_command(self, real_hpc_config):
         """Test running whoami on remote system."""
@@ -541,7 +561,7 @@ class TestHPCConnection:
 
         # Should get a valid path
         pwd = output.strip()
-        assert pwd.startswith('/')
+        assert pwd.startswith("/")
         assert len(pwd) > 1
 
     def test_hostname_command(self, real_hpc_config):
@@ -561,7 +581,7 @@ class TestHPCConnection:
         test_string = "test with spaces and $VARS and 'quotes'"
         returncode, output = manager._ssh_exec(f"echo '{test_string}'", timeout=10)
         assert returncode == 0
-        assert 'test with spaces' in output
+        assert "test with spaces" in output
 
     def test_ssh_timeout_handling(self, real_hpc_config):
         """Test that SSH timeout works correctly."""
@@ -600,7 +620,7 @@ class TestRemoteFileOperations:
             # Verify it exists
             returncode, output = manager._ssh_exec(f"test -d {test_dir} && echo 'exists'", timeout=10)
             assert returncode == 0
-            assert 'exists' in output
+            assert "exists" in output
 
         finally:
             # Cleanup
@@ -680,8 +700,8 @@ class TestRemoteFileOperations:
             # List files
             returncode, output = manager._ssh_exec(f"ls {test_dir}", timeout=10)
             assert returncode == 0, f"ls failed: {output}"
-            assert 'file1.txt' in output
-            assert 'file2.txt' in output
+            assert "file1.txt" in output
+            assert "file2.txt" in output
 
         finally:
             # Cleanup
@@ -697,16 +717,12 @@ class TestRemoteFileOperations:
 
         # Create parent directory and file, then verify
         returncode, _ = manager._ssh_exec(
-            f"mkdir -p ~/pytest_qsp_hpc && touch {test_file} && test -f {test_file}",
-            timeout=10
+            f"mkdir -p ~/pytest_qsp_hpc && touch {test_file} && test -f {test_file}", timeout=10
         )
         assert returncode == 0
 
         # Remove file and verify it's gone
-        returncode, _ = manager._ssh_exec(
-            f"rm -f {test_file} && ! test -f {test_file}",
-            timeout=10
-        )
+        returncode, _ = manager._ssh_exec(f"rm -f {test_file} && ! test -f {test_file}", timeout=10)
         assert returncode == 0
 
     def test_write_and_read_file_content(self, real_hpc_config):
@@ -715,7 +731,7 @@ class TestRemoteFileOperations:
 
         timestamp = int(time.time())
         test_file = f"~/pytest_qsp_hpc/test_content_{timestamp}.txt"
-        test_content = f"Line 1\nLine 2\nSpecial chars: $VAR @#%"
+        test_content = "Line 1\nLine 2\nSpecial chars: $VAR @#%"
 
         try:
             # Create parent directory and write content using cat with heredoc
@@ -747,7 +763,7 @@ class TestSLURMCommands:
         assert returncode == 0
 
         # Should have header at minimum
-        assert 'JOBID' in output or 'PARTITION' in output or len(output) >= 0
+        assert "JOBID" in output or "PARTITION" in output or len(output) >= 0
 
     def test_sinfo_partition_check(self, real_hpc_config):
         """Test checking available SLURM partitions."""
@@ -758,13 +774,13 @@ class TestSLURMCommands:
         assert returncode == 0
 
         # Should have at least one partition listed
-        lines = output.strip().split('\n')
+        lines = output.strip().split("\n")
         assert len(lines) >= 1  # At least header
 
         # Check if configured partition exists
         if manager.config.partition:
             # Remove asterisk that marks default partition
-            partitions = [line.strip().replace('*', '') for line in lines]
+            partitions = [line.strip().replace("*", "") for line in lines]
             # Note: partition might not exist, just verify command works
             assert len(partitions) > 0
 
@@ -773,7 +789,9 @@ class TestSLURMCommands:
         manager = HPCJobManager()
 
         # Get recent job history
-        returncode, output = manager._ssh_exec("sacct --user=$USER --starttime=now-7days --format=JobID,JobName,State --noheader", timeout=15)
+        returncode, output = manager._ssh_exec(
+            "sacct --user=$USER --starttime=now-7days --format=JobID,JobName,State --noheader", timeout=15
+        )
         assert returncode == 0
         # Output could be empty if no recent jobs, that's ok
 
@@ -785,7 +803,7 @@ class TestSLURMCommands:
         assert returncode == 0
 
         # Should contain config information
-        assert 'Configuration data' in output or 'AccountingStorage' in output
+        assert "Configuration data" in output or "AccountingStorage" in output
 
     def test_sinfo_node_list(self, real_hpc_config):
         """Test listing SLURM nodes."""
@@ -795,13 +813,15 @@ class TestSLURMCommands:
         assert returncode == 0
 
         # Should have node information
-        assert 'NODELIST' in output or 'PARTITION' in output
+        assert "NODELIST" in output or "PARTITION" in output
 
     def test_squeue_format_options(self, real_hpc_config):
         """Test squeue with custom format."""
         manager = HPCJobManager()
 
-        returncode, output = manager._ssh_exec("squeue -u $USER -o '%.18i %.9P %.20j %.8u %.2t %.10M %.6D %R'", timeout=15)
+        returncode, output = manager._ssh_exec(
+            "squeue -u $USER -o '%.18i %.9P %.20j %.8u %.2t %.10M %.6D %R'", timeout=15
+        )
         assert returncode == 0
 
     def test_slurm_version(self, real_hpc_config):
@@ -810,7 +830,7 @@ class TestSLURMCommands:
 
         returncode, output = manager._ssh_exec("scontrol --version", timeout=15)
         assert returncode == 0
-        assert 'slurm' in output.lower()
+        assert "slurm" in output.lower()
 
 
 @pytest.mark.hpc
@@ -921,10 +941,11 @@ class TestLogRetrieval:
 # Mock-based Tests (SSH operations mocked)
 # ============================================================================
 
+
 class TestWithMockedSSH:
     """Tests with mocked SSH for isolation."""
 
-    @patch('subprocess.run')
+    @patch("subprocess.run")
     def test_submit_job_mocked(self, mock_subprocess, mock_hpc_config):
         """Test job submission with mocked subprocess."""
         # Mock the SSH command that submits the job
@@ -941,12 +962,12 @@ class TestWithMockedSSH:
         # mock_subprocess.assert_called()
         pass
 
-    @patch('subprocess.run')
+    @patch("subprocess.run")
     def test_check_job_status_mocked(self, mock_subprocess, mock_hpc_config):
         """Test job status checking with mocked squeue."""
         pass
 
-    @patch('subprocess.run')
+    @patch("subprocess.run")
     def test_rsync_upload_mocked(self, mock_subprocess, mock_hpc_config):
         """Test rsync upload with mocked subprocess."""
         pass

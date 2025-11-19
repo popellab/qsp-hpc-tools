@@ -7,15 +7,16 @@ including codebase syncing, file uploads, and directory setup.
 """
 
 import json
+import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
-import shutil
-import tarfile
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Optional
+
 from qsp_hpc.utils.logging_config import setup_logger
-from qsp_hpc.utils.security import validate_project_name, safe_shell_quote
+from qsp_hpc.utils.security import safe_shell_quote, validate_project_name
 
 
 class HPCFileTransfer:
@@ -45,18 +46,18 @@ class HPCFileTransfer:
 
         # Rsync exclusion patterns
         self.rsync_exclude_patterns = [
-            '.git',
-            '*.mat',
-            '*.asv',
-            '*.m~',
-            '*.pdf',
-            '__pycache__',
-            '*.pyc',
-            '.DS_Store',
-            'venv/',
-            '.venv/',
-            'projects/*/batch_jobs/output/',
-            'projects/*/cache/',
+            ".git",
+            "*.mat",
+            "*.asv",
+            "*.m~",
+            "*.pdf",
+            "__pycache__",
+            "*.pyc",
+            ".DS_Store",
+            "venv/",
+            ".venv/",
+            "projects/*/batch_jobs/output/",
+            "projects/*/cache/",
         ]
 
     def sync_codebase(self, skip_sync: bool = False) -> None:
@@ -80,26 +81,24 @@ class HPCFileTransfer:
         else:
             remote_target = f"{self.config.ssh_host}:{self.config.remote_project_path}"
 
-        rsync_cmd = ['rsync', '-avz', '--delete']
+        rsync_cmd = ["rsync", "-avz", "--delete"]
 
         # Add SSH key if specified (with proper quoting)
         if self.config.ssh_key:
-            rsync_cmd.extend(['-e', f'ssh -i "{self.config.ssh_key}"'])
+            rsync_cmd.extend(["-e", f'ssh -i "{self.config.ssh_key}"'])
 
         # Add exclusion patterns
         for pattern in self.rsync_exclude_patterns:
-            rsync_cmd.extend(['--exclude', pattern])
+            rsync_cmd.extend(["--exclude", pattern])
 
-        rsync_cmd.append(f'{local_root}/')
+        rsync_cmd.append(f"{local_root}/")
         rsync_cmd.append(remote_target)
 
         # Execute rsync
         result = subprocess.run(rsync_cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
-            raise RuntimeError(
-                f"rsync failed (rc={result.returncode}): {result.stderr or result.stdout}"
-            )
+            raise RuntimeError(f"rsync failed (rc={result.returncode}): {result.stderr or result.stdout}")
 
         elapsed = time.time() - start_time
         if self.verbose:
@@ -116,21 +115,21 @@ class HPCFileTransfer:
             self.logger.info(f"Checking HPC Python environment at {self.config.hpc_venv_path}...")
 
         # Check if venv is properly configured with qsp-hpc-tools installed
-        check_cmd = f'''
+        check_cmd = f"""
             test -f "{self.config.hpc_venv_path}/bin/python" && \
             "{self.config.hpc_venv_path}/bin/python" -c "import qsp_hpc" 2>/dev/null && \
             echo "VENV_OK"
-        '''
+        """
         status, output = self.transport.exec(check_cmd)
 
-        if status == 0 and 'VENV_OK' in output:
+        if status == 0 and "VENV_OK" in output:
             # Venv exists - upgrade qsp-hpc-tools to latest version from GitHub
             if self.verbose:
                 self.logger.info("HPC venv configured - upgrading qsp-hpc-tools to latest version...")
 
-            upgrade_cmd = f'''
+            upgrade_cmd = f"""
                 uv pip install --upgrade --python {self.config.hpc_venv_path}/bin/python "{self.config.qsp_hpc_tools_source}"
-            '''
+            """
             status, output = self.transport.exec(upgrade_cmd, timeout=120)
 
             if status == 0:
@@ -179,14 +178,14 @@ echo "Python venv setup complete!"
             raise ValueError("remote_project_path must be set to a non-root directory before deleting files")
 
         remote_base = f"{remote_root}/projects/{project_name}/batch_jobs"
-        dirs = ['input', 'output', 'scripts', 'logs']
+        dirs = ["input", "output", "scripts", "logs"]
 
         for d in dirs:
             remote_dir = f"{remote_base}/{d}"
             # Remove all files in directory, then recreate it
             # Use safe_shell_quote to prevent injection even though project_name is validated
             safe_dir = safe_shell_quote(remote_dir)
-            self.transport.exec(f'rm -rf {safe_dir} && mkdir -p {safe_dir}')
+            self.transport.exec(f"rm -rf {safe_dir} && mkdir -p {safe_dir}")
 
     def upload_job_config(
         self,
@@ -197,26 +196,26 @@ echo "Python venv setup complete!"
         jobs_per_chunk: int,
         project_name: str,
         save_full_simulations: bool = True,
-        simulation_pool_id: Optional[str] = None
+        simulation_pool_id: Optional[str] = None,
     ) -> None:
         """Create and upload job configuration as JSON."""
         start_time = time.time()
 
         # Create job config dictionary
         job_config = {
-            'project_name': project_name,
-            'n_simulations': num_simulations,
-            'seed': seed,
-            'jobs_per_chunk': jobs_per_chunk,
-            'model_script': model_script,
-            'test_stats_csv': f'projects/{project_name}/batch_jobs/input/test_stats.csv',  # Remote path
-            'param_csv': f'projects/{project_name}/batch_jobs/input/params.csv',  # Remote path
-            'save_full_simulations': save_full_simulations,
-            'simulation_pool_id': simulation_pool_id
+            "project_name": project_name,
+            "n_simulations": num_simulations,
+            "seed": seed,
+            "jobs_per_chunk": jobs_per_chunk,
+            "model_script": model_script,
+            "test_stats_csv": f"projects/{project_name}/batch_jobs/input/test_stats.csv",  # Remote path
+            "param_csv": f"projects/{project_name}/batch_jobs/input/params.csv",  # Remote path
+            "save_full_simulations": save_full_simulations,
+            "simulation_pool_id": simulation_pool_id,
         }
 
         # Write to temp file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(job_config, f, indent=2)
             temp_file = f.name
 
@@ -259,7 +258,7 @@ echo "Python venv setup complete!"
 
             test_stats_df = pd.read_csv(test_stats_csv)
 
-            if 'model_output_code' in test_stats_df.columns and len(test_stats_df) > 0:
+            if "model_output_code" in test_stats_df.columns and len(test_stats_df) > 0:
                 # Create temp directory for functions
                 temp_dir = Path(tempfile.mkdtemp())
 
@@ -267,8 +266,8 @@ echo "Python venv setup complete!"
                     # Extract all functions to temp directory
                     n_functions = 0
                     for idx, row in test_stats_df.iterrows():
-                        test_stat_id = row['test_statistic_id']
-                        func_code = row['model_output_code']
+                        test_stat_id = row["test_statistic_id"]
+                        func_code = row["model_output_code"]
 
                         # Write function to temp directory
                         func_file = temp_dir / f"test_stat_{test_stat_id}.m"
@@ -277,7 +276,7 @@ echo "Python venv setup complete!"
 
                     # Create tarball of all functions
                     tarball_path = temp_dir / "test_stat_functions.tar.gz"
-                    with tarfile.open(tarball_path, 'w:gz') as tar:
+                    with tarfile.open(tarball_path, "w:gz") as tar:
                         for func_file in temp_dir.glob("test_stat_*.m"):
                             tar.add(func_file, arcname=func_file.name)
 

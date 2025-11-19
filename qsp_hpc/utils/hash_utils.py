@@ -9,7 +9,7 @@ pure syntactic changes (like renaming).
 
 import hashlib
 import json
-from typing import Dict, Any, List, Union
+from typing import Any, Dict
 
 
 def _safe_sort_key(entry: Dict[str, Any]) -> tuple:
@@ -73,16 +73,19 @@ def compute_definition_hash(definition: Dict[str, Any], definition_type: str = "
 
     if "tags" in definition:
         # Sort tags for stable hashing
-        semantic_content["tags"] = sorted(definition["tags"]) if isinstance(definition["tags"], list) else definition["tags"]
+        semantic_content["tags"] = (
+            sorted(definition["tags"]) if isinstance(definition["tags"], list) else definition["tags"]
+        )
 
     # Convert to stable JSON string
-    semantic_json = json.dumps(semantic_content, sort_keys=True, separators=(',', ':'))
+    semantic_json = json.dumps(semantic_content, sort_keys=True, separators=(",", ":"))
 
     # Compute hash
-    hash_bytes = hashlib.sha256(semantic_json.encode('utf-8')).digest()
+    hash_bytes = hashlib.sha256(semantic_json.encode("utf-8")).digest()
 
     # Return first HASH_PREFIX_LENGTH characters (32 bits) as hex
     from qsp_hpc.constants import HASH_PREFIX_LENGTH
+
     return hash_bytes.hex()[:HASH_PREFIX_LENGTH]
 
 
@@ -128,14 +131,18 @@ def normalize_model_context(model_context):
             # For other_parameters and other_species, extract just names (not descriptions)
             if "other_parameters" in entry:
                 if isinstance(entry["other_parameters"], list):
-                    names = [item.get("name", item) if isinstance(item, dict) else str(item)
-                            for item in entry["other_parameters"]]
+                    names = [
+                        item.get("name", item) if isinstance(item, dict) else str(item)
+                        for item in entry["other_parameters"]
+                    ]
                     normalized_entry["other_parameters"] = sorted(names)
 
             if "other_species" in entry:
                 if isinstance(entry["other_species"], list):
-                    names = [item.get("name", item) if isinstance(item, dict) else str(item)
-                            for item in entry["other_species"]]
+                    names = [
+                        item.get("name", item) if isinstance(item, dict) else str(item)
+                        for item in entry["other_species"]
+                    ]
                     normalized_entry["other_species"] = sorted(names)
 
             reactions.append(normalized_entry)

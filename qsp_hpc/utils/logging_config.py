@@ -10,11 +10,7 @@ import sys
 from typing import Optional
 
 
-def setup_logger(
-    name: str,
-    level: Optional[int] = None,
-    verbose: bool = False
-) -> logging.Logger:
+def setup_logger(name: str, level: Optional[int] = None, verbose: bool = False) -> logging.Logger:
     """
     Set up a logger with consistent formatting.
 
@@ -50,12 +46,11 @@ def setup_logger(
     if verbose:
         # Detailed format for debugging
         formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
         )
     else:
         # Simpler format for normal use
-        formatter = logging.Formatter('%(levelname)s: %(message)s')
+        formatter = logging.Formatter("%(levelname)s: %(message)s")
 
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -97,7 +92,7 @@ def set_verbosity(verbose: bool = False):
 
     # Update all existing qsp_hpc loggers
     for name in logging.Logger.manager.loggerDict:
-        if name.startswith('qsp_hpc'):
+        if name.startswith("qsp_hpc"):
             logger = logging.getLogger(name)
             logger.setLevel(level)
             for handler in logger.handlers:

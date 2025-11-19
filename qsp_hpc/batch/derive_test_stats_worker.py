@@ -16,13 +16,11 @@ The config JSON should contain:
     - test_stats_hash: Hash of test statistics configuration
 """
 
-import sys
 import json
 import os
-import hashlib
-import logging
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
 
@@ -37,10 +35,7 @@ from qsp_hpc.utils.logging_config import setup_logger
 logger = setup_logger(__name__, verbose=True)
 
 
-def compute_test_statistics_batch(
-    sim_df: pd.DataFrame,
-    test_stats_df: pd.DataFrame
-) -> np.ndarray:
+def compute_test_statistics_batch(sim_df: pd.DataFrame, test_stats_df: pd.DataFrame) -> np.ndarray:
     """
     Compute test statistics for a batch of simulations.
 
@@ -61,12 +56,12 @@ def compute_test_statistics_batch(
     logger.info(f"Computing {n_test_stats} test statistics for {n_sims} simulations...")
 
     for j, row in test_stats_df.iterrows():
-        test_stat_id = row['test_statistic_id']
-        required_species_str = row['required_species']
+        test_stat_id = row["test_statistic_id"]
+        required_species_str = row["required_species"]
 
         # Parse required species (comma-separated, dots replaced with underscores)
         # Parquet columns have full names like V_T_C1 (compartment.species with dots -> underscores)
-        required_species = [s.strip().replace('.', '_') for s in required_species_str.split(',')]
+        required_species = [s.strip().replace(".", "_") for s in required_species_str.split(",")]
 
         # Get test statistic function
         try:
@@ -77,13 +72,13 @@ def compute_test_statistics_batch(
 
         # Apply function to each simulation
         for i, sim_row in sim_df.iterrows():
-            if sim_row['status'] != 1:
+            if sim_row["status"] != 1:
                 # Failed simulation - skip
                 continue
 
             try:
                 # Extract time
-                time = np.array(sim_row['time'])
+                time = np.array(sim_row["time"])
 
                 # Extract required species
                 species_args = [time]
@@ -122,20 +117,20 @@ def main():
     logger.info(f"Array Task ID: {os.getenv('SLURM_ARRAY_TASK_ID', '0')}")
 
     # Load configuration
-    with open(config_file, 'r') as f:
+    with open(config_file, "r") as f:
         config = json.load(f)
 
-    simulation_pool_dir = Path(config['simulation_pool_dir'])
-    test_stats_csv = Path(config['test_stats_csv'])
-    output_dir = Path(config['output_dir'])
-    test_stats_hash = config['test_stats_hash']
+    simulation_pool_dir = Path(config["simulation_pool_dir"])
+    test_stats_csv = Path(config["test_stats_csv"])
+    output_dir = Path(config["output_dir"])
+    test_stats_hash = config["test_stats_hash"]
 
     logger.info(f"Simulation pool: {simulation_pool_dir}")
     logger.info(f"Test stats CSV: {test_stats_csv}")
     logger.info(f"Output dir: {output_dir}")
 
     # Create output directory for this test stats hash
-    test_stats_output_dir = output_dir / 'test_stats' / test_stats_hash
+    test_stats_output_dir = output_dir / "test_stats" / test_stats_hash
     test_stats_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load test statistics configuration
@@ -144,7 +139,7 @@ def main():
     logger.info(f"Found {len(test_stats_df)} test statistics")
 
     # Find all Parquet files in simulation pool
-    parquet_files = sorted(simulation_pool_dir.glob('batch_*.parquet'))
+    parquet_files = sorted(simulation_pool_dir.glob("batch_*.parquet"))
     if not parquet_files:
         logger.error(f"No simulation batches found in {simulation_pool_dir}")
         sys.exit(1)
@@ -152,7 +147,7 @@ def main():
     logger.info(f"Found {len(parquet_files)} simulation batches")
 
     # For array jobs, process only assigned batch
-    array_task_id = int(os.getenv('SLURM_ARRAY_TASK_ID', '0'))
+    array_task_id = int(os.getenv("SLURM_ARRAY_TASK_ID", "0"))
     if array_task_id >= len(parquet_files):
         logger.error(f"Array task {array_task_id} exceeds number of batches {len(parquet_files)}")
         sys.exit(1)
@@ -169,7 +164,7 @@ def main():
 
     # Extract parameter columns
     # Parameters are scalar columns (not lists) that are not metadata columns
-    metadata_cols = {'simulation_id', 'status', 'time'}
+    metadata_cols = {"simulation_id", "status", "time"}
     param_cols = []
     for col in sim_df.columns:
         if col not in metadata_cols:
@@ -179,7 +174,9 @@ def main():
                 param_cols.append(col)
 
     if param_cols:
-        logger.debug(f"Found {len(param_cols)} parameter columns: {param_cols[:5]}{'...' if len(param_cols) > 5 else ''}")
+        logger.debug(
+            f"Found {len(param_cols)} parameter columns: {param_cols[:5]}{'...' if len(param_cols) > 5 else ''}"
+        )
 
         # Save parameters to chunk_XXX_params.csv
         params_output_file = test_stats_output_dir / f"chunk_{array_task_id:03d}_params.csv"
@@ -187,7 +184,7 @@ def main():
 
         # Extract parameter values (n_sims x n_params)
         params_df = sim_df[param_cols]
-        params_df.to_csv(params_output_file, index=False, float_format='%.12e')
+        params_df.to_csv(params_output_file, index=False, float_format="%.12e")
 
         logger.info(f"   ✓ Parameters saved: {params_output_file}")
     else:
@@ -201,11 +198,11 @@ def main():
     logger.info(f"   Saving results to {output_file}...")
 
     # Save as CSV (n_sims x n_test_stats)
-    np.savetxt(output_file, test_stats_matrix, delimiter=',', fmt='%.12e')
+    np.savetxt(output_file, test_stats_matrix, delimiter=",", fmt="%.12e")
 
     logger.info(f"   ✓ Test statistics saved: {output_file}")
-    logger.info(f"   Derivation complete!")
+    logger.info("   Derivation complete!")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

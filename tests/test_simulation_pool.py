@@ -1,22 +1,24 @@
 """Tests for simulation pool manager."""
 
-import pytest
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from scipy.io import savemat, loadmat
+import pytest
+from scipy.io import loadmat, savemat
+
 from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
 
 
 @pytest.fixture
 def sample_priors_csv(temp_dir):
     """Create sample priors CSV file."""
-    priors = pd.DataFrame({
-        'parameter': ['param1', 'param2', 'param3'],
-        'distribution': ['uniform', 'lognormal', 'normal'],
-        'min': [0.0, 0.1, -1.0],
-        'max': [1.0, 10.0, 1.0]
-    })
+    priors = pd.DataFrame(
+        {
+            "parameter": ["param1", "param2", "param3"],
+            "distribution": ["uniform", "lognormal", "normal"],
+            "min": [0.0, 0.1, -1.0],
+            "max": [1.0, 10.0, 1.0],
+        }
+    )
     csv_path = temp_dir / "priors.csv"
     priors.to_csv(csv_path, index=False)
     return csv_path
@@ -25,11 +27,13 @@ def sample_priors_csv(temp_dir):
 @pytest.fixture
 def sample_test_stats_csv(temp_dir):
     """Create sample test statistics CSV file."""
-    test_stats = pd.DataFrame({
-        'observable': ['obs1', 'obs2', 'obs3'],
-        'statistic': ['mean', 'max', 'auc'],
-        'compartment': ['plasma', 'tumor', 'plasma']
-    })
+    test_stats = pd.DataFrame(
+        {
+            "observable": ["obs1", "obs2", "obs3"],
+            "statistic": ["mean", "max", "auc"],
+            "compartment": ["plasma", "tumor", "plasma"],
+        }
+    )
     csv_path = temp_dir / "test_stats.csv"
     test_stats.to_csv(csv_path, index=False)
     return csv_path
@@ -44,7 +48,7 @@ def pool_manager(temp_dir, sample_priors_csv, sample_test_stats_csv):
         model_description="Test model",
         priors_csv=sample_priors_csv,
         test_stats_csv=sample_test_stats_csv,
-        model_script="test_model"
+        model_script="test_model",
     )
 
 
@@ -79,7 +83,7 @@ class TestSimulationPoolManagerInit:
                 model_description="Test model",
                 priors_csv=temp_dir / "nonexistent.csv",
                 test_stats_csv=sample_test_stats_csv,
-                model_script="test_model"
+                model_script="test_model",
             )
 
     def test_missing_test_stats_csv_error(self, temp_dir, sample_priors_csv):
@@ -91,7 +95,7 @@ class TestSimulationPoolManagerInit:
                 model_description="Test model",
                 priors_csv=sample_priors_csv,
                 test_stats_csv=temp_dir / "nonexistent.csv",
-                model_script="test_model"
+                model_script="test_model",
             )
 
     def test_config_hash_stability(self, temp_dir, sample_priors_csv, sample_test_stats_csv):
@@ -102,7 +106,7 @@ class TestSimulationPoolManagerInit:
             model_description="Test model",
             priors_csv=sample_priors_csv,
             test_stats_csv=sample_test_stats_csv,
-            model_script="test_model"
+            model_script="test_model",
         )
         pool2 = SimulationPoolManager(
             cache_dir=temp_dir / "cache2",
@@ -110,7 +114,7 @@ class TestSimulationPoolManagerInit:
             model_description="Test model",
             priors_csv=sample_priors_csv,
             test_stats_csv=sample_test_stats_csv,
-            model_script="test_model"
+            model_script="test_model",
         )
         assert pool1.config_hash == pool2.config_hash
 
@@ -122,7 +126,7 @@ class TestSimulationPoolManagerInit:
             model_description="Test model",
             priors_csv=sample_priors_csv,
             test_stats_csv=sample_test_stats_csv,
-            model_script="test_model"
+            model_script="test_model",
         )
         pool2 = SimulationPoolManager(
             cache_dir=temp_dir / "cache",
@@ -130,7 +134,7 @@ class TestSimulationPoolManagerInit:
             model_description="Test model",
             priors_csv=sample_priors_csv,
             test_stats_csv=sample_test_stats_csv,
-            model_script="test_model"
+            model_script="test_model",
         )
         assert pool1.config_hash != pool2.config_hash
 
@@ -147,17 +151,14 @@ class TestBatchScanning:
         """Test scanning pool with single batch file."""
         # Create a batch file with correct naming
         batch_file = pool_manager.pool_dir / "batch_20250114_120530_gvax_1000sims_seed42.mat"
-        savemat(batch_file, {
-            'params': np.random.rand(1000, 3),
-            'obs': np.random.rand(1000, 3)
-        })
+        savemat(batch_file, {"params": np.random.rand(1000, 3), "obs": np.random.rand(1000, 3)})
 
         batches = pool_manager._scan_batches()
         assert len(batches) == 1
-        assert batches[0]['filename'] == batch_file.name
-        assert batches[0]['scenario'] == 'gvax'
-        assert batches[0]['n_sims'] == 1000
-        assert batches[0]['seed'] == 42
+        assert batches[0]["filename"] == batch_file.name
+        assert batches[0]["scenario"] == "gvax"
+        assert batches[0]["n_sims"] == 1000
+        assert batches[0]["seed"] == 42
 
     def test_scan_multiple_batches(self, pool_manager):
         """Test scanning pool with multiple batch files."""
@@ -165,15 +166,12 @@ class TestBatchScanning:
         batch_files = [
             "batch_20250114_120530_gvax_1000sims_seed42.mat",
             "batch_20250114_130530_gvax_500sims_seed43.mat",
-            "batch_20250114_140530_control_750sims_seed44.mat"
+            "batch_20250114_140530_control_750sims_seed44.mat",
         ]
 
         for batch_name in batch_files:
             batch_file = pool_manager.pool_dir / batch_name
-            savemat(batch_file, {
-                'params': np.random.rand(100, 3),
-                'obs': np.random.rand(100, 3)
-            })
+            savemat(batch_file, {"params": np.random.rand(100, 3), "obs": np.random.rand(100, 3)})
 
         batches = pool_manager._scan_batches()
         assert len(batches) == 3
@@ -181,28 +179,24 @@ class TestBatchScanning:
     def test_scan_with_scenario_filter(self, pool_manager):
         """Test scanning with scenario filter."""
         # Create batch files for different scenarios
-        savemat(pool_manager.pool_dir / "batch_20250114_120530_gvax_1000sims_seed42.mat", {
-            'params': np.random.rand(100, 3),
-            'obs': np.random.rand(100, 3)
-        })
-        savemat(pool_manager.pool_dir / "batch_20250114_130530_control_500sims_seed43.mat", {
-            'params': np.random.rand(100, 3),
-            'obs': np.random.rand(100, 3)
-        })
+        savemat(
+            pool_manager.pool_dir / "batch_20250114_120530_gvax_1000sims_seed42.mat",
+            {"params": np.random.rand(100, 3), "obs": np.random.rand(100, 3)},
+        )
+        savemat(
+            pool_manager.pool_dir / "batch_20250114_130530_control_500sims_seed43.mat",
+            {"params": np.random.rand(100, 3), "obs": np.random.rand(100, 3)},
+        )
 
         # Filter for gvax scenario
-        batches = pool_manager._scan_batches(scenario='gvax')
+        batches = pool_manager._scan_batches(scenario="gvax")
         assert len(batches) == 1
-        assert batches[0]['scenario'] == 'gvax'
+        assert batches[0]["scenario"] == "gvax"
 
     def test_scan_ignores_invalid_filenames(self, pool_manager):
         """Test that scanning ignores files with invalid naming."""
         # Create files with invalid naming
-        invalid_files = [
-            "invalid_name.mat",
-            "batch_wrong_format.mat",
-            "not_a_batch.txt"
-        ]
+        invalid_files = ["invalid_name.mat", "batch_wrong_format.mat", "not_a_batch.txt"]
 
         for filename in invalid_files:
             (pool_manager.pool_dir / filename).touch()
@@ -221,24 +215,21 @@ class TestScenarioManagement:
 
     def test_list_scenarios_single_scenario(self, pool_manager):
         """Test listing scenarios with single scenario."""
-        savemat(pool_manager.pool_dir / "batch_20250114_120530_gvax_1000sims_seed42.mat", {
-            'params': np.random.rand(100, 3),
-            'obs': np.random.rand(100, 3)
-        })
+        savemat(
+            pool_manager.pool_dir / "batch_20250114_120530_gvax_1000sims_seed42.mat",
+            {"params": np.random.rand(100, 3), "obs": np.random.rand(100, 3)},
+        )
 
         scenarios = pool_manager.list_scenarios()
-        assert scenarios == ['gvax']
+        assert scenarios == ["gvax"]
 
     def test_list_scenarios_multiple_scenarios(self, pool_manager):
         """Test listing scenarios with multiple scenarios."""
-        scenarios_to_create = ['gvax', 'control', 'anti_pd1']
+        scenarios_to_create = ["gvax", "control", "anti_pd1"]
 
         for i, scenario in enumerate(scenarios_to_create):
             batch_file = pool_manager.pool_dir / f"batch_20250114_12{i:02d}30_{scenario}_1000sims_seed42.mat"
-            savemat(batch_file, {
-                'params': np.random.rand(100, 3),
-                'obs': np.random.rand(100, 3)
-            })
+            savemat(batch_file, {"params": np.random.rand(100, 3), "obs": np.random.rand(100, 3)})
 
         scenarios = pool_manager.list_scenarios()
         assert scenarios == sorted(scenarios_to_create)
@@ -248,13 +239,10 @@ class TestScenarioManagement:
         # Create multiple batches for same scenario
         for i in range(3):
             batch_file = pool_manager.pool_dir / f"batch_20250114_12{i:02d}30_gvax_1000sims_seed{42+i}.mat"
-            savemat(batch_file, {
-                'params': np.random.rand(100, 3),
-                'obs': np.random.rand(100, 3)
-            })
+            savemat(batch_file, {"params": np.random.rand(100, 3), "obs": np.random.rand(100, 3)})
 
         scenarios = pool_manager.list_scenarios()
-        assert scenarios == ['gvax']
+        assert scenarios == ["gvax"]
 
 
 class TestAvailableSimulations:
@@ -266,39 +254,39 @@ class TestAvailableSimulations:
 
     def test_available_simulations_single_batch(self, pool_manager):
         """Test counting simulations with single batch."""
-        savemat(pool_manager.pool_dir / "batch_20250114_120530_gvax_1000sims_seed42.mat", {
-            'params': np.random.rand(1000, 3),
-            'obs': np.random.rand(1000, 3)
-        })
+        savemat(
+            pool_manager.pool_dir / "batch_20250114_120530_gvax_1000sims_seed42.mat",
+            {"params": np.random.rand(1000, 3), "obs": np.random.rand(1000, 3)},
+        )
 
-        assert pool_manager.get_available_simulations(scenario='gvax') == 1000
+        assert pool_manager.get_available_simulations(scenario="gvax") == 1000
 
     def test_available_simulations_multiple_batches(self, pool_manager):
         """Test counting simulations across multiple batches."""
-        savemat(pool_manager.pool_dir / "batch_20250114_120530_gvax_1000sims_seed42.mat", {
-            'params': np.random.rand(1000, 3),
-            'obs': np.random.rand(1000, 3)
-        })
-        savemat(pool_manager.pool_dir / "batch_20250114_130530_gvax_500sims_seed43.mat", {
-            'params': np.random.rand(500, 3),
-            'obs': np.random.rand(500, 3)
-        })
+        savemat(
+            pool_manager.pool_dir / "batch_20250114_120530_gvax_1000sims_seed42.mat",
+            {"params": np.random.rand(1000, 3), "obs": np.random.rand(1000, 3)},
+        )
+        savemat(
+            pool_manager.pool_dir / "batch_20250114_130530_gvax_500sims_seed43.mat",
+            {"params": np.random.rand(500, 3), "obs": np.random.rand(500, 3)},
+        )
 
-        assert pool_manager.get_available_simulations(scenario='gvax') == 1500
+        assert pool_manager.get_available_simulations(scenario="gvax") == 1500
 
     def test_available_simulations_scenario_filter(self, pool_manager):
         """Test counting simulations with scenario filter."""
-        savemat(pool_manager.pool_dir / "batch_20250114_120530_gvax_1000sims_seed42.mat", {
-            'params': np.random.rand(1000, 3),
-            'obs': np.random.rand(1000, 3)
-        })
-        savemat(pool_manager.pool_dir / "batch_20250114_130530_control_750sims_seed43.mat", {
-            'params': np.random.rand(750, 3),
-            'obs': np.random.rand(750, 3)
-        })
+        savemat(
+            pool_manager.pool_dir / "batch_20250114_120530_gvax_1000sims_seed42.mat",
+            {"params": np.random.rand(1000, 3), "obs": np.random.rand(1000, 3)},
+        )
+        savemat(
+            pool_manager.pool_dir / "batch_20250114_130530_control_750sims_seed43.mat",
+            {"params": np.random.rand(750, 3), "obs": np.random.rand(750, 3)},
+        )
 
-        assert pool_manager.get_available_simulations(scenario='gvax') == 1000
-        assert pool_manager.get_available_simulations(scenario='control') == 750
+        assert pool_manager.get_available_simulations(scenario="gvax") == 1000
+        assert pool_manager.get_available_simulations(scenario="control") == 750
 
 
 class TestBatchPatternParsing:
@@ -309,7 +297,7 @@ class TestBatchPatternParsing:
         valid_names = [
             "batch_20250114_120530_gvax_1000sims_seed42.mat",
             "batch_20250101_000000_control_1sims_seed0.mat",
-            "batch_20251231_235959_anti_pd1_999999sims_seed123.mat"
+            "batch_20251231_235959_anti_pd1_999999sims_seed123.mat",
         ]
 
         for name in valid_names:
@@ -355,25 +343,16 @@ class TestLoadAndAdd:
 
         assert batch_file.exists()
         data = loadmat(batch_file)
-        assert data['params_matrix'].shape == (2, 2)
-        assert data['observables_matrix'].shape == (2, 1)
+        assert data["params_matrix"].shape == (2, 2)
+        assert data["observables_matrix"].shape == (2, 1)
 
     def test_load_simulations_subset_sampling(self, pool_manager):
-        params = np.array([
-            [1, 2, 3],
-            [4, 5, 6],
-            [7, 8, 9],
-            [10, 11, 12]
-        ])
+        params = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]])
         observables = np.array([[10], [20], [30], [40]])
         pool_manager.add_batch(params, observables, seed=1, scenario="gvax")
 
         rng = np.random.default_rng(0)
-        loaded_params, loaded_obs = pool_manager.load_simulations(
-            n_requested=2,
-            scenario="gvax",
-            random_state=rng
-        )
+        loaded_params, loaded_obs = pool_manager.load_simulations(n_requested=2, scenario="gvax", random_state=rng)
 
         assert loaded_params.shape == (2, 3)
         assert loaded_obs.shape == (2, 1)
@@ -440,12 +419,12 @@ class TestLoadAndAdd:
         filename = pool_manager.add_batch(params, obs, seed=3, scenario="gvax")
         data = loadmat(pool_manager.pool_dir / filename)
 
-        assert data['params_matrix'].shape == (1, 2)
-        assert data['observables_matrix'].shape == (1, 2)
-        metadata = data['metadata']
+        assert data["params_matrix"].shape == (1, 2)
+        assert data["observables_matrix"].shape == (1, 2)
+        metadata = data["metadata"]
         # metadata is stored as a numpy object; ensure keys exist
-        assert 'scenario' in metadata.dtype.names
-        assert 'seed' in metadata.dtype.names
+        assert "scenario" in metadata.dtype.names
+        assert "seed" in metadata.dtype.names
 
 
 class TestListPools:
@@ -465,6 +444,6 @@ class TestListPools:
 
         assert len(pools) == 1
         info = pools[0]
-        assert "gvax_pd1" in info['scenarios']
-        assert info['n_batches'] == 1
-        assert info['total_simulations'] == 1
+        assert "gvax_pd1" in info["scenarios"]
+        assert info["n_batches"] == 1
+        assert info["total_simulations"] == 1

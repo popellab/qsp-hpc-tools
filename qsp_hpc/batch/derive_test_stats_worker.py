@@ -16,7 +16,6 @@ The config JSON should contain:
     - test_stats_hash: Hash of test statistics configuration
 """
 
-import importlib.util
 import json
 import os
 import sys
@@ -32,51 +31,73 @@ sys.path.insert(0, str(project_root))
 from qsp_hpc.utils.logging_config import setup_logger  # noqa: E402
 
 
-# Import test_stat_functions from the derivation directory (uploaded by job manager)
-# This allows each project to have its own test stat functions
-def load_test_stat_functions():
+# Test statistic functions are now stored directly in the CSV
+# This eliminates the need for separate test_stat_functions.py files
+def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
     """
-    Dynamically load test_stat_functions.py from the derivation directory.
+    Build test statistic function registry from CSV python_function column.
 
-    The HPC job manager uploads the project-specific test_stat_functions.py
-    to the same directory as this worker script. We import it dynamically
-    to avoid hardcoding project-specific code in the qsp-hpc-tools package.
+    Each row in the CSV should have:
+    - test_statistic_id: Unique identifier
+    - python_function: Python function code as string
+
+    The function code should define a function named 'compute' with signature:
+        def compute(time: np.ndarray, species1: np.ndarray, ...) -> float
+
+    Args:
+        test_stats_df: DataFrame with test statistics configuration
+
+    Returns:
+        Dictionary mapping test_statistic_id -> compiled function
     """
-    # Find test_stat_functions.py in the current working directory
-    test_stat_funcs_path = Path.cwd() / "test_stat_functions.py"
+    registry = {}
 
-    if not test_stat_funcs_path.exists():
-        # Try the script's directory as fallback
-        test_stat_funcs_path = Path(__file__).parent / "test_stat_functions.py"
+    for _, row in test_stats_df.iterrows():
+        test_stat_id = row["test_statistic_id"]
 
-    if not test_stat_funcs_path.exists():
-        raise FileNotFoundError(
-            f"test_stat_functions.py not found in current directory or script directory.\n"
-            f"Current directory: {Path.cwd()}\n"
-            f"Script directory: {Path(__file__).parent}"
-        )
+        # Check if python_function column exists (backwards compatibility)
+        if "python_function" not in row or pd.isna(row["python_function"]):
+            logger.warning(
+                f"Test statistic '{test_stat_id}' missing python_function column. "
+                "Skipping (legacy MATLAB-only test stats not supported)."
+            )
+            continue
 
-    # Load module from file
-    spec = importlib.util.spec_from_file_location("test_stat_functions", test_stat_funcs_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load spec for {test_stat_funcs_path}")
+        function_code = row["python_function"]
 
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["test_stat_functions"] = module
-    spec.loader.exec_module(module)
+        try:
+            # Create isolated namespace for function
+            namespace = {"np": np, "numpy": np}
 
-    return module
+            # Compile and execute the function code
+            exec(function_code, namespace)
 
+            # Extract the 'compute' function
+            if "compute" not in namespace:
+                raise ValueError(
+                    f"Test statistic '{test_stat_id}': python_function must define "
+                    "a function named 'compute'"
+                )
 
-# Load the test stat functions module
-test_stat_module = load_test_stat_functions()
-get_test_stat_function = test_stat_module.get_test_stat_function
+            registry[test_stat_id] = namespace["compute"]
+            logger.debug(f"Loaded function for '{test_stat_id}'")
+
+        except Exception as e:
+            logger.error(f"Failed to compile function for '{test_stat_id}': {e}")
+            logger.error(f"Function code:\n{function_code}")
+            raise
+
+    logger.info(f"Built registry with {len(registry)} test statistic functions")
+    return registry
+
 
 # Setup logger
 logger = setup_logger(__name__, verbose=True)
 
 
-def compute_test_statistics_batch(sim_df: pd.DataFrame, test_stats_df: pd.DataFrame) -> np.ndarray:
+def compute_test_statistics_batch(
+    sim_df: pd.DataFrame, test_stats_df: pd.DataFrame, test_stat_registry: dict
+) -> np.ndarray:
     """
     Compute test statistics for a batch of simulations.
 
@@ -84,7 +105,8 @@ def compute_test_statistics_batch(sim_df: pd.DataFrame, test_stats_df: pd.DataFr
         sim_df: DataFrame with full simulation data (from Parquet)
                 Columns: simulation_id, status, time, species_1, species_2, ...
         test_stats_df: DataFrame with test statistics configuration
-                       Columns: test_statistic_id, required_species, ...
+                       Columns: test_statistic_id, required_species, python_function
+        test_stat_registry: Dict mapping test_statistic_id -> compiled function
 
     Returns:
         test_stats_matrix: Array of shape (n_sims, n_test_stats)
@@ -104,12 +126,15 @@ def compute_test_statistics_batch(sim_df: pd.DataFrame, test_stats_df: pd.DataFr
         # Parquet columns have full names like V_T_C1 (compartment.species with dots -> underscores)
         required_species = [s.strip().replace(".", "_") for s in required_species_str.split(",")]
 
-        # Get test statistic function
-        try:
-            test_stat_func = get_test_stat_function(test_stat_id)
-        except KeyError as e:
-            logger.warning(f"Skipping test statistic: {e}")
+        # Get test statistic function from registry
+        if test_stat_id not in test_stat_registry:
+            logger.warning(
+                f"Test statistic '{test_stat_id}' not found in registry. "
+                "Skipping (function may have failed to compile)."
+            )
             continue
+
+        test_stat_func = test_stat_registry[test_stat_id]
 
         # Apply function to each simulation
         for i, sim_row in sim_df.iterrows():
@@ -181,6 +206,10 @@ def main():
     test_stats_df = pd.read_csv(test_stats_csv)
     logger.info(f"Found {len(test_stats_df)} test statistics")
 
+    # Build test statistic function registry from CSV
+    logger.info("Building test statistic function registry from CSV...")
+    test_stat_registry = build_test_stat_registry(test_stats_df)
+
     # Find all Parquet files in simulation pool
     parquet_files = sorted(simulation_pool_dir.glob("batch_*.parquet"))
     if not parquet_files:
@@ -234,7 +263,7 @@ def main():
         logger.info("   No parameter columns found in Parquet file (may be older format)")
 
     # Compute test statistics
-    test_stats_matrix = compute_test_statistics_batch(sim_df, test_stats_df)
+    test_stats_matrix = compute_test_statistics_batch(sim_df, test_stats_df, test_stat_registry)
 
     # Save results
     output_file = test_stats_output_dir / f"chunk_{array_task_id:03d}_test_stats.csv"

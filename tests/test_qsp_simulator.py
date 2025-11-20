@@ -120,7 +120,6 @@ class TestQSPSimulatorInitialization:
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_script="test_model",
             model_version="v1",
             scenario="default",
@@ -145,7 +144,6 @@ class TestQSPSimulatorInitialization:
             QSPSimulator(
                 test_stats_csv=nonexistent_file,
                 priors_csv=sample_priors_csv,
-                project_name="test_project",
                 model_version="v1",
                 cache_dir=temp_dir / "cache",
             )
@@ -158,7 +156,6 @@ class TestQSPSimulatorInitialization:
             QSPSimulator(
                 test_stats_csv=sample_test_stats_csv,
                 priors_csv=nonexistent_file,
-                project_name="test_project",
                 model_version="v1",
                 cache_dir=temp_dir / "cache",
             )
@@ -170,7 +167,6 @@ class TestQSPSimulatorInitialization:
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             local_only=True,
             cache_dir=cache_dir,
@@ -183,7 +179,6 @@ class TestQSPSimulatorInitialization:
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             local_only=True,
         )
@@ -201,7 +196,6 @@ class TestQSPSimulatorInitialization:
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             scenario="gvax",
             cache_dir=temp_dir / "cache",
@@ -215,7 +209,6 @@ class TestQSPSimulatorInitialization:
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             scenario="default",
             cache_dir=temp_dir / "cache",
@@ -237,7 +230,6 @@ class TestParameterGeneration:
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             seed=7,
@@ -264,7 +256,6 @@ class TestHashComputation:
         sim1 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache1",
         )
@@ -272,7 +263,6 @@ class TestHashComputation:
         sim2 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache2",
         )
@@ -309,7 +299,6 @@ class TestHashComputation:
         sim1 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=priors1,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache1",
         )
@@ -317,7 +306,6 @@ class TestHashComputation:
         sim2 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=priors2,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache2",
         )
@@ -332,7 +320,6 @@ class TestHashComputation:
         sim1 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache1",
         )
@@ -340,7 +327,6 @@ class TestHashComputation:
         sim2 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache2",
         )
@@ -372,7 +358,6 @@ class TestHashComputation:
         sim1 = QSPSimulator(
             test_stats_csv=stats1,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache1",
         )
@@ -380,7 +365,6 @@ class TestHashComputation:
         sim2 = QSPSimulator(
             test_stats_csv=stats2,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache2",
         )
@@ -406,7 +390,6 @@ class TestParameterGenerationBasics:
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
         )
@@ -423,7 +406,6 @@ class TestParameterGenerationBasics:
         sim1 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache1",
             seed=42,
@@ -432,7 +414,6 @@ class TestParameterGenerationBasics:
         sim2 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache2",
             seed=42,
@@ -450,7 +431,6 @@ class TestParameterGenerationBasics:
         sim1 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache1",
             seed=42,
@@ -459,7 +439,6 @@ class TestParameterGenerationBasics:
         sim2 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache2",
             seed=123,
@@ -476,7 +455,6 @@ class TestParameterGenerationBasics:
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
         )
@@ -492,7 +470,6 @@ class TestParameterGenerationBasics:
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
         )
@@ -517,7 +494,6 @@ class TestPoolIntegration:
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_script="test_model",
             model_version="v1",
             model_description="Test model",
@@ -542,7 +518,6 @@ class TestPoolIntegration:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -566,7 +541,6 @@ class TestFlowDecisions:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -592,7 +566,6 @@ class TestFlowDecisions:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_script="model",
             model_version="v1",
             cache_dir=temp_dir / "cache",
@@ -623,7 +596,6 @@ class TestFlowDecisions:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_script="model",
             model_version="v1",
             cache_dir=temp_dir / "cache",
@@ -649,7 +621,6 @@ class TestFlowDecisions:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -668,7 +639,6 @@ class TestFlowDecisions:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -686,7 +656,6 @@ class TestHelperFunctions:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
         )
@@ -707,7 +676,6 @@ class TestHelperFunctions:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -736,7 +704,6 @@ class TestHelperFunctions:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -761,7 +728,6 @@ class TestErrorHandling:
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
         )
@@ -778,7 +744,6 @@ class TestErrorHandling:
         simulator = QSPSimulator(
             test_stats_csv=invalid_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
         )
@@ -808,7 +773,6 @@ class TestNetworkAndSSHFailures:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -834,7 +798,6 @@ class TestNetworkAndSSHFailures:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -861,7 +824,6 @@ class TestNetworkAndSSHFailures:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -893,7 +855,6 @@ class TestJobSubmissionFailures:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -920,7 +881,6 @@ class TestJobSubmissionFailures:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -951,7 +911,6 @@ class TestJobMonitoringAndTimeouts:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -981,7 +940,6 @@ class TestJobMonitoringAndTimeouts:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -1012,7 +970,6 @@ class TestResultDownloadFailures:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -1037,7 +994,6 @@ class TestResultDownloadFailures:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -1062,7 +1018,6 @@ class TestResultDownloadFailures:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -1088,7 +1043,6 @@ class TestConfigurationErrors:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -1108,7 +1062,6 @@ class TestConfigurationErrors:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_script="nonexistent_model_script",
             model_version="v1",
             cache_dir=temp_dir / "cache",
@@ -1139,7 +1092,6 @@ class TestCacheInvalidationScenarios:
         sim1 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=priors1,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache1",
             pool=fake_pool1,
@@ -1163,7 +1115,6 @@ class TestCacheInvalidationScenarios:
         sim2 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=priors2,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache2",
             pool=fake_pool2,
@@ -1184,7 +1135,6 @@ class TestCacheInvalidationScenarios:
         sim1 = QSPSimulator(
             test_stats_csv=stats1,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache1",
         )
@@ -1204,7 +1154,6 @@ class TestCacheInvalidationScenarios:
         sim2 = QSPSimulator(
             test_stats_csv=stats2,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache2",
         )
@@ -1226,7 +1175,6 @@ class TestEdgeCases:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -1252,7 +1200,6 @@ class TestEdgeCases:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -1276,7 +1223,6 @@ class TestEdgeCases:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             scenario="gvax",
             cache_dir=temp_dir / "cache",
@@ -1290,7 +1236,6 @@ class TestEdgeCases:
         sim2 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             scenario="anti_pd1",
             cache_dir=temp_dir / "cache",
@@ -1305,7 +1250,6 @@ class TestEdgeCases:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             verbose=True,
@@ -1318,7 +1262,6 @@ class TestEdgeCases:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             poll_interval=60,
@@ -1358,7 +1301,6 @@ class TestThreeTierCachingStrategy:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=pool,
@@ -1396,7 +1338,6 @@ class TestThreeTierCachingStrategy:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=pool,
@@ -1425,7 +1366,6 @@ class TestThreeTierCachingStrategy:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -1460,7 +1400,6 @@ class TestThreeTierCachingStrategy:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -1498,7 +1437,6 @@ class TestThreeTierCachingStrategy:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -1547,7 +1485,6 @@ class TestPoolPathConsistency:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="baseline_pdac",
             scenario="gvax",  # Custom scenario
             cache_dir=temp_dir / "cache",
@@ -1607,7 +1544,6 @@ class TestPoolPathConsistency:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             scenario="control",
             cache_dir=temp_dir / "cache",
@@ -1659,7 +1595,6 @@ class TestPoolPathConsistency:
         sim_gvax = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             scenario="gvax",
             cache_dir=temp_dir / "cache",
@@ -1670,7 +1605,6 @@ class TestPoolPathConsistency:
         sim_control = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             scenario="control",
             cache_dir=temp_dir / "cache",
@@ -1750,7 +1684,6 @@ class TestFullSimulationReturn:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=fake_pool,
@@ -1812,7 +1745,6 @@ class TestFullSimulationReturn:
             sim = QSPSimulator(
                 test_stats_csv=sample_test_stats_csv,
                 priors_csv=sample_priors_csv,
-                project_name="test_project",
                 model_version="v1",
                 cache_dir=temp_dir / "cache",
                 pool=fake_pool,
@@ -1868,7 +1800,6 @@ class TestFullSimulationReturn:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             scenario="gvax",  # Custom scenario
             cache_dir=temp_dir / "cache",
@@ -1915,7 +1846,6 @@ class TestParameterGenerationIntegration:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=pool,
@@ -1951,7 +1881,6 @@ class TestParameterGenerationIntegration:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=pool,
@@ -1975,7 +1904,6 @@ class TestParameterGenerationIntegration:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             seed=42,
@@ -2038,7 +1966,6 @@ class TestScenarioWorkflows:
         sim_gvax = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             scenario="gvax",
             cache_dir=temp_dir / "cache",
@@ -2048,7 +1975,6 @@ class TestScenarioWorkflows:
         sim_control = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             scenario="control",
             cache_dir=temp_dir / "cache",
@@ -2089,7 +2015,6 @@ class TestHashComputationIntegration:
         sim1 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=priors1,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache1",
         )
@@ -2097,7 +2022,6 @@ class TestHashComputationIntegration:
         sim2 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=priors2,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache2",
         )
@@ -2119,7 +2043,6 @@ class TestHashComputationIntegration:
         sim1 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_script="model_v1",
             model_version="v1",
             cache_dir=temp_dir / "cache1",
@@ -2128,7 +2051,6 @@ class TestHashComputationIntegration:
         sim2 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_script="model_v2",  # Different model script
             model_version="v1",
             cache_dir=temp_dir / "cache2",
@@ -2160,7 +2082,6 @@ class TestEndToEndIntegration:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=cache_dir,
             pool=pool,
@@ -2235,7 +2156,6 @@ class TestHashAndConfigMethods:
         sim1 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_script="script",
             model_version="v1",
             cache_dir=temp_dir / "cache1",
@@ -2244,7 +2164,6 @@ class TestHashAndConfigMethods:
         sim2 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_script="script",
             model_version="v2",  # Different version
             cache_dir=temp_dir / "cache2",
@@ -2260,7 +2179,6 @@ class TestHashAndConfigMethods:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
         )
@@ -2299,7 +2217,6 @@ class TestCallableInterface:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=pool,
@@ -2335,7 +2252,6 @@ class TestCallableInterface:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=pool,
@@ -2359,7 +2275,6 @@ class TestHelperMethodsRealExecution:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             seed=42,
@@ -2397,7 +2312,6 @@ class TestHelperMethodsRealExecution:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             pool=pool,
@@ -2423,7 +2337,6 @@ class TestLoggingAndVerbosity:
         sim_verbose = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             verbose=True,
@@ -2440,7 +2353,6 @@ class TestLoggingAndVerbosity:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             verbose=True,
@@ -2463,7 +2375,6 @@ class TestParameterNames:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
         )
@@ -2481,7 +2392,6 @@ class TestParameterNames:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
         )
@@ -2502,7 +2412,6 @@ class TestRNGState:
         sim1 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             seed=42,
@@ -2512,7 +2421,6 @@ class TestRNGState:
         sim2 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             seed=42,
@@ -2530,7 +2438,6 @@ class TestRNGState:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             seed=42,
@@ -2550,24 +2457,11 @@ class TestRNGState:
 class TestProjectConfiguration:
     """Test project-specific configuration."""
 
-    def test_project_name_stored(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
-        """Test that project_name is stored correctly."""
-        sim = QSPSimulator(
-            test_stats_csv=sample_test_stats_csv,
-            priors_csv=sample_priors_csv,
-            project_name="my_custom_project",
-            model_version="v1",
-            cache_dir=temp_dir / "cache",
-        )
-
-        assert sim.project_name == "my_custom_project"
-
     def test_model_description_stored(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
         """Test that model_description is stored."""
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             model_description="My test model description",
             cache_dir=temp_dir / "cache",
@@ -2580,7 +2474,6 @@ class TestProjectConfiguration:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="v1",
             cache_dir=temp_dir / "cache",
             max_tasks=50,
@@ -2622,7 +2515,6 @@ class TestPriorPPCSimulationReuse:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="baseline_pdac",
             scenario="default",
             cache_dir=temp_dir / "cache",
@@ -2683,7 +2575,6 @@ class TestPriorPPCSimulationReuse:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="baseline_pdac",
             scenario="default",
             cache_dir=temp_dir / "cache",
@@ -2732,7 +2623,6 @@ class TestPriorPPCSimulationReuse:
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
-            project_name="test_project",
             model_version="baseline_pdac",
             scenario="default",
             cache_dir=temp_dir / "cache",
@@ -2787,7 +2677,6 @@ class TestPriorPPCSimulationReuse:
             model_script="test_model",
             model_version="v1",
             scenario="default",
-            project_name="test_project",
             cache_dir=temp_dir,
             verbose=True,
             job_manager=fake_job_manager,
@@ -2839,7 +2728,6 @@ class TestLocalSimulation:
             model_script="test_model",
             model_version="v1",
             scenario="baseline",
-            project_name="test_project",
             cache_dir=temp_dir,
             matlab_runner=mock_matlab_runner,
             local_only=True,
@@ -2870,7 +2758,6 @@ class TestLocalSimulation:
             model_script="test_model",
             model_version="v1",
             scenario="baseline",
-            project_name="test_project",
             cache_dir=temp_dir,
             matlab_runner=mock_matlab_runner,
             local_only=True,
@@ -2898,7 +2785,6 @@ class TestLocalSimulation:
             model_script="test_model",
             model_version="v1",
             scenario="baseline",
-            project_name="test_project",
             cache_dir=temp_dir,
             matlab_runner=mock_matlab_runner,
             local_only=True,

@@ -54,7 +54,7 @@ def test_setup_remote_directories_requires_remote_root(base_config):
     transfer = HPCFileTransfer(bad_config, DummyTransport())
 
     with pytest.raises(ValueError, match="remote_project_path must be set"):
-        transfer.setup_remote_directories("proj")
+        transfer.setup_remote_directories()
 
 
 def test_sync_codebase_handles_ssh_config_alias_with_empty_user(monkeypatch, tmp_path):

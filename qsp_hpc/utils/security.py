@@ -1,6 +1,5 @@
 """Security utilities for path validation and command sanitization."""
 
-import re
 import shlex
 from pathlib import Path
 from typing import List, Optional
@@ -10,51 +9,6 @@ class SecurityError(Exception):
     """Raised when a security validation fails."""
 
     pass
-
-
-def validate_project_name(name: str) -> str:
-    """
-    Validate project name to prevent path traversal and command injection.
-
-    Args:
-        name: The project name to validate
-
-    Returns:
-        The validated project name (unchanged if valid)
-
-    Raises:
-        SecurityError: If the project name contains invalid characters
-
-    Examples:
-        >>> validate_project_name("my_project")
-        'my_project'
-        >>> validate_project_name("../etc/passwd")  # doctest: +SKIP
-        Traceback (most recent call last):
-        SecurityError: Invalid project name...
-    """
-    if not name:
-        raise SecurityError("Project name cannot be empty")
-
-    # Prevent hidden files (check before .. to get correct error message)
-    if name.startswith("."):
-        raise SecurityError(f"Invalid project name '{name}': cannot start with '.'")
-
-    # Check for path traversal attempts
-    if ".." in name:
-        raise SecurityError(f"Invalid project name '{name}': cannot contain '..'")
-
-    # Check for path separators
-    if "/" in name or "\\" in name:
-        raise SecurityError(f"Invalid project name '{name}': cannot contain path separators (/ \\)")
-
-    # Only allow safe characters: alphanumeric, underscore, hyphen, period
-    if not re.match(r"^[a-zA-Z0-9_.-]+$", name):
-        raise SecurityError(
-            f"Invalid project name '{name}': "
-            f"only alphanumeric characters, underscore, hyphen, and period allowed"
-        )
-
-    return name
 
 
 def validate_safe_path(base_dir: str, *path_components: str) -> Path:

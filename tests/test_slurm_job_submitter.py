@@ -11,7 +11,6 @@ import pytest
 
 from qsp_hpc.batch.hpc_job_manager import BatchConfig
 from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter, SubmissionError
-from qsp_hpc.utils.security import SecurityError
 
 
 @pytest.fixture
@@ -54,7 +53,7 @@ class TestJobSubmission:
         # Mock successful submission
         mock_transport.exec.return_value = (0, "Submitted batch job 12345\n")
 
-        job_id = submitter.submit_job(n_jobs=10, project_name="test_project")
+        job_id = submitter.submit_job(n_jobs=10)
 
         assert job_id == "12345"
 
@@ -72,7 +71,7 @@ class TestJobSubmission:
         mock_transport.exec.return_value = (1, "sbatch: error: Unable to allocate resources\n")
 
         with pytest.raises(SubmissionError, match="SLURM submission failed"):
-            submitter.submit_job(n_jobs=10, project_name="test_project")
+            submitter.submit_job(n_jobs=10)
 
     def test_submit_job_cannot_parse_job_id(self, submitter, mock_transport):
         """Test handling when job ID cannot be parsed."""
@@ -80,12 +79,7 @@ class TestJobSubmission:
         mock_transport.exec.return_value = (0, "Some unexpected output\n")
 
         with pytest.raises(SubmissionError, match="Could not parse job ID"):
-            submitter.submit_job(n_jobs=10, project_name="test_project")
-
-    def test_submit_job_invalid_project_name(self, submitter):
-        """Test rejection of invalid project names."""
-        with pytest.raises(SecurityError, match="Invalid project name"):
-            submitter.submit_job(n_jobs=10, project_name="../../../etc/passwd")
+            submitter.submit_job(n_jobs=10)
 
     def test_submit_job_generates_correct_script(self, submitter, mock_transport):
         """Test that generated script contains correct SLURM directives."""
@@ -100,7 +94,7 @@ class TestJobSubmission:
 
         mock_transport.upload.side_effect = capture_upload
 
-        submitter.submit_job(n_jobs=10, project_name="test_project")
+        submitter.submit_job(n_jobs=10)
 
         # Check that script was uploaded
         assert len(uploaded_files) == 1
@@ -112,7 +106,7 @@ class TestJobSubmission:
         assert "#SBATCH --mem=4G" in script_content
         assert "#SBATCH --array=0-9" in script_content  # 0-indexed, 10 tasks
         assert "module load matlab/R2024a" in script_content
-        assert "batch_worker('test_project')" in script_content
+        assert "batch_worker()" in script_content
 
     def test_submit_job_verbose_logging(self, mock_config, mock_transport):
         """Test that verbose mode enables debug logging."""
@@ -122,7 +116,7 @@ class TestJobSubmission:
 
         mock_transport.exec.return_value = (0, "Submitted batch job 12345\n")
 
-        job_id = submitter_verbose.submit_job(n_jobs=5, project_name="test_project")
+        job_id = submitter_verbose.submit_job(n_jobs=5)
 
         assert job_id == "12345"
 
@@ -139,7 +133,6 @@ class TestDerivationJobSubmission:
             test_stats_config="/scratch/test_stats.csv",
             derivation_dir="/scratch/derivation",
             n_batches=5,
-            project_name="test_project",
         )
 
         assert job_id == "67890"
@@ -160,7 +153,6 @@ class TestDerivationJobSubmission:
                 test_stats_config="/scratch/test_stats.csv",
                 derivation_dir="/scratch/derivation",
                 n_batches=5,
-                project_name="test_project",
             )
 
     def test_submit_derivation_job_cannot_parse_id(self, submitter, mock_transport):
@@ -173,7 +165,6 @@ class TestDerivationJobSubmission:
                 test_stats_config="/scratch/test_stats.csv",
                 derivation_dir="/scratch/derivation",
                 n_batches=5,
-                project_name="test_project",
             )
 
     def test_submit_derivation_job_generates_correct_script(self, submitter, mock_transport):
@@ -193,7 +184,6 @@ class TestDerivationJobSubmission:
             test_stats_config="/scratch/test_stats.csv",
             derivation_dir="/scratch/derivation",
             n_batches=5,
-            project_name="test_project",
         )
 
         # Verify script content
@@ -209,24 +199,13 @@ class TestDerivationJobSubmission:
         assert "qsp_hpc.batch.derive_test_stats_worker" in script_content
         assert '"/scratch/test_stats.csv"' in script_content  # Config JSON path
 
-    def test_submit_derivation_job_invalid_project_name(self, submitter):
-        """Test rejection of invalid project names in derivation jobs."""
-        with pytest.raises(SecurityError, match="Invalid project name"):
-            submitter.submit_derivation_job(
-                pool_path="/scratch/pool",
-                test_stats_config="/scratch/test_stats.csv",
-                derivation_dir="/scratch/derivation",
-                n_batches=5,
-                project_name="../../malicious",
-            )
-
 
 class TestScriptGeneration:
     """Tests for internal script generation methods."""
 
     def test_generate_slurm_script(self, submitter):
         """Test SLURM script generation."""
-        script = submitter._generate_slurm_script(n_jobs=20, project_name="my_project")
+        script = submitter._generate_slurm_script(n_jobs=20)
 
         # Check SLURM directives
         assert "#SBATCH --job-name=qsp_batch" in script
@@ -236,11 +215,11 @@ class TestScriptGeneration:
         assert "#SBATCH --array=0-19" in script  # 0-indexed, 20 tasks
 
         # Check log file paths
-        assert "/home/testuser/qsp-projects/projects/my_project/batch_jobs/logs" in script
+        assert "/home/testuser/qsp-projects/batch_jobs/logs" in script
 
         # Check MATLAB execution
         assert "module load matlab/R2024a" in script
-        assert "batch_worker('my_project')" in script
+        assert "batch_worker()" in script
 
         # Check environment exports
         assert 'export HPC_VENV_PATH="/home/testuser/.venv/hpc-qsp"' in script
@@ -253,7 +232,6 @@ class TestScriptGeneration:
             test_stats_config="/scratch/test_stats.csv",
             derivation_dir="/scratch/derive_output",
             n_batches=10,
-            project_name="my_project",
         )
 
         # Check SLURM directives
@@ -285,7 +263,6 @@ class TestDerivationWorkerCompatibility:
             test_stats_config="/scratch/config.json",
             derivation_dir="/scratch/derive",
             n_batches=5,
-            project_name="test_project",
         )
 
         # Should pass config as single positional argument

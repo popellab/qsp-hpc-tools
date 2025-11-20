@@ -10,76 +10,8 @@ from qsp_hpc.utils.security import (
     build_safe_ssh_command,
     safe_shell_quote,
     validate_pool_path,
-    validate_project_name,
     validate_safe_path,
 )
-
-
-class TestValidateProjectName:
-    """Tests for project name validation."""
-
-    def test_valid_names(self):
-        """Test that valid project names pass validation."""
-        valid_names = [
-            "myproject",
-            "my_project",
-            "my-project",
-            "project123",
-            "my.project",
-            "Project_2025",
-            "abc123_test-v2.1",
-        ]
-        for name in valid_names:
-            assert validate_project_name(name) == name
-
-    def test_empty_name(self):
-        """Test that empty name is rejected."""
-        with pytest.raises(SecurityError, match="cannot be empty"):
-            validate_project_name("")
-
-    def test_path_traversal_dotdot(self):
-        """Test that .. is rejected (path traversal)."""
-        # Starting with .. is caught by the "starts with ." check first
-        with pytest.raises(SecurityError):
-            validate_project_name("../etc/passwd")
-
-        # .. in the middle is caught correctly
-        with pytest.raises(SecurityError, match="cannot contain"):
-            validate_project_name("test/../secret")
-
-    def test_path_separators(self):
-        """Test that path separators are rejected."""
-        with pytest.raises(SecurityError, match="path separators"):
-            validate_project_name("test/path")
-
-        with pytest.raises(SecurityError, match="path separators"):
-            validate_project_name("test\\path")
-
-    def test_invalid_characters(self):
-        """Test that special characters are rejected."""
-        invalid_names = [
-            "test;rm -rf /",  # Contains / separator
-            "test$(whoami)",
-            "test`cat /etc/passwd`",  # Contains / separator
-            "test&& rm -rf",
-            "test|grep secret",
-            "test>output.txt",
-            "test$USER",
-            "test*wildcard",
-            "test with spaces",
-        ]
-        # All invalid names should raise SecurityError (regardless of specific message)
-        for name in invalid_names:
-            with pytest.raises(SecurityError):
-                validate_project_name(name)
-
-    def test_hidden_files(self):
-        """Test that names starting with . are rejected."""
-        with pytest.raises(SecurityError, match="cannot start with"):
-            validate_project_name(".hidden")
-
-        with pytest.raises(SecurityError, match="cannot start with"):
-            validate_project_name("..test")
 
 
 class TestValidateSafePath:
@@ -235,30 +167,20 @@ class TestValidatePoolPath:
 class TestSecurityIntegration:
     """Integration tests for security features."""
 
-    def test_project_name_in_path_construction(self):
-        """Test that validated project names work in path construction."""
+    def test_safe_path_construction(self):
+        """Test that safe path construction works correctly."""
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir).resolve()
-            # Valid project name should work
-            project = validate_project_name("test_project")
-            path = validate_safe_path(str(base), "projects", project, "data")
+            # Valid path should work
+            path = validate_safe_path(str(base), "batch_jobs", "data")
             assert path.is_relative_to(base)
 
-            # Invalid project name should fail early
+            # Invalid path with .. should fail
             with pytest.raises(SecurityError):
-                validate_project_name("../evil")
+                validate_safe_path(str(base), "..", "evil")
 
     def test_command_injection_prevention(self):
         """Test that command injection is prevented."""
-        # Try to inject commands via project name
-        # (Contains / so caught by path separator check)
-        with pytest.raises(SecurityError):
-            validate_project_name("test; rm -rf /")
-
-        # Try with no path separator but invalid char
-        with pytest.raises(SecurityError, match="only alphanumeric"):
-            validate_project_name("test;whoami")
-
         # Build safe command with dangerous input
         cmd = build_safe_ssh_command(
             ["ls", "file; rm -rf /"], cwd='/path"; cat /etc/passwd; echo "'
@@ -269,11 +191,7 @@ class TestSecurityIntegration:
     def test_path_traversal_prevention(self):
         """Test that path traversal is prevented at multiple layers."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Project name validation prevents ..
-            with pytest.raises(SecurityError):
-                validate_project_name("../etc")
-
-            # Path validation also prevents ..
+            # Path validation prevents ..
             with pytest.raises(SecurityError):
                 validate_safe_path(tmpdir, "..", "etc")
 

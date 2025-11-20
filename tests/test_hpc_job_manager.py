@@ -231,7 +231,6 @@ class TestHPCConfigLoading:
             state_file="",
             n_jobs=1,
             n_simulations=10,
-            project_name="proj",
             submission_time="now",
         )
 
@@ -241,9 +240,9 @@ class TestHPCConfigLoading:
 
         with patch.object(Path, "cwd", return_value=tmp_path):
             manager = HPCJobManager(config=cfg)
-            state_path = Path(manager._save_job_state(job_info, "proj"))
+            state_path = Path(manager._save_job_state(job_info))
 
-        assert state_path.parent == tmp_path / "projects/proj/batch_jobs"
+        assert state_path.parent == tmp_path / "batch_jobs"
         assert state_path.exists()
 
 
@@ -253,7 +252,7 @@ class TestSLURMScriptGeneration:
     def test_basic_script_generation(self, mock_hpc_config):
         """Test generation of basic SLURM script."""
         manager = HPCJobManager(config=mock_hpc_config)
-        script = manager._generate_slurm_script(n_jobs=3, project_name="proj")
+        script = manager._generate_slurm_script(n_jobs=3)
 
         assert "#SBATCH --job-name=qsp_batch" in script
         assert "#SBATCH --array=0-2" in script
@@ -262,31 +261,31 @@ class TestSLURMScriptGeneration:
         assert mock_hpc_config.simulation_pool_path in script
         assert mock_hpc_config.hpc_venv_path in script
         assert mock_hpc_config.matlab_module in script
-        assert "batch_worker('proj')" in script
+        assert "batch_worker()" in script
 
     def test_array_job_script(self, mock_hpc_config):
         """Test array job parameters in script."""
         manager = HPCJobManager(config=mock_hpc_config)
-        script = manager._generate_slurm_script(n_jobs=10, project_name="proj")
+        script = manager._generate_slurm_script(n_jobs=10)
         assert "#SBATCH --array=0-9" in script
 
     def test_module_loading_in_script(self, mock_hpc_config):
         """Test that MATLAB module load is included."""
         manager = HPCJobManager(config=mock_hpc_config)
-        script = manager._generate_slurm_script(n_jobs=1, project_name="proj")
+        script = manager._generate_slurm_script(n_jobs=1)
         assert f"module load {mock_hpc_config.matlab_module}" in script
 
     def test_environment_variables_in_script(self, mock_hpc_config):
         """Test that HPC_VENV_PATH and SIMULATION_POOL_PATH are exported."""
         manager = HPCJobManager(config=mock_hpc_config)
-        script = manager._generate_slurm_script(n_jobs=1, project_name="proj")
+        script = manager._generate_slurm_script(n_jobs=1)
         assert "export HPC_VENV_PATH" in script
         assert "export SIMULATION_POOL_PATH" in script
 
     def test_job_name_formatting(self, mock_hpc_config):
         """Test SLURM job name generation."""
         manager = HPCJobManager(config=mock_hpc_config)
-        script = manager._generate_slurm_script(n_jobs=4, project_name="proj")
+        script = manager._generate_slurm_script(n_jobs=4)
         assert "#SBATCH --job-name=qsp_batch" in script
 
 
@@ -300,7 +299,6 @@ class TestJobStateManagement:
             state_file="state.pkl",
             n_jobs=2,
             n_simulations=20,
-            project_name="proj",
             submission_time="now",
         )
         assert info.job_ids == ["123"]
@@ -313,7 +311,6 @@ class TestJobStateManagement:
             state_file="",
             n_jobs=1,
             n_simulations=10,
-            project_name="proj",
             submission_time="2025-01-01",
         )
         # Point remote path to a non-existent location; manager should fall back to cwd
@@ -329,13 +326,13 @@ class TestJobStateManagement:
 
         # Write inside temp directory to avoid polluting repo
         monkeypatch.chdir(tmp_path)
-        state_file = manager._save_job_state(info, project_name="proj")
+        state_file = manager._save_job_state(info)
 
         saved = pickle.load(open(state_file, "rb"))
         assert saved["job_ids"] == ["1"]
         assert saved["n_simulations"] == 10
         assert Path(state_file).parent.name == "batch_jobs"
-        assert str(tmp_path / "projects/proj") in state_file
+        assert str(tmp_path / "batch_jobs") in state_file
 
     def test_job_state_deserialization(self, tmp_path):
         """Test loading job state from pickle file."""
@@ -344,7 +341,6 @@ class TestJobStateManagement:
             "state_file": "state.pkl",
             "n_jobs": 1,
             "n_simulations": 5,
-            "project_name": "proj",
             "submission_time": "now",
         }
         state_file = tmp_path / "state.pkl"
@@ -363,8 +359,8 @@ class TestJobStateManagement:
 
         calls = {"combined": False, "downloaded": False}
 
-        manager._combine_chunks_remotely = lambda project_name: calls.__setitem__("combined", True)
-        manager._download_combined_results = lambda project_name: calls.__setitem__(
+        manager._combine_chunks_remotely = lambda: calls.__setitem__("combined", True)
+        manager._download_combined_results = lambda: calls.__setitem__(
             "downloaded", True
         ) or np.ones((1, 1))
 
@@ -376,13 +372,12 @@ class TestJobStateManagement:
         assert not state_file.exists()
 
     def test_job_state_file_naming(self, monkeypatch, tmp_path):
-        """Test job state filename includes timestamp and project name."""
+        """Test job state filename includes timestamp."""
         info = JobInfo(
             job_ids=["1"],
             state_file="",
             n_jobs=1,
             n_simulations=1,
-            project_name="proj",
             submission_time="now",
         )
         manager = HPCJobManager(
@@ -396,12 +391,12 @@ class TestJobStateManagement:
         )
 
         monkeypatch.chdir(tmp_path)
-        state_file = manager._save_job_state(info, "proj")
+        state_file = manager._save_job_state(info)
 
         assert "job_state_" in Path(state_file).name
         assert Path(state_file).parent.name == "batch_jobs"
         # Should fall back to cwd when remote path is missing
-        assert state_file.startswith(str(tmp_path / "projects/proj"))
+        assert state_file.startswith(str(tmp_path / "batch_jobs"))
 
 
 class TestPathConstruction:
@@ -411,7 +406,7 @@ class TestPathConstruction:
         """Test construction of remote project path."""
         manager = HPCJobManager(config=mock_hpc_config)
         with patch.object(manager.transport, "exec", return_value=(0, "")) as mock_exec:
-            manager._setup_remote_directories("proj")
+            manager._setup_remote_directories()
 
         # All calls should include the remote base directory
         assert all(
@@ -421,14 +416,14 @@ class TestPathConstruction:
     def test_remote_simulation_pool_path(self, mock_hpc_config):
         """Test construction of simulation pool path."""
         manager = HPCJobManager(config=mock_hpc_config)
-        script = manager._generate_slurm_script(1, "proj")
+        script = manager._generate_slurm_script(1)
         assert mock_hpc_config.simulation_pool_path in script
 
     def test_remote_log_path(self, mock_hpc_config):
         """Test construction of SLURM log file paths."""
         manager = HPCJobManager(config=mock_hpc_config)
-        script = manager._generate_slurm_script(2, "proj")
-        assert f"{mock_hpc_config.remote_project_path}/projects/proj/batch_jobs/logs" in script
+        script = manager._generate_slurm_script(2)
+        assert f"{mock_hpc_config.remote_project_path}/batch_jobs/logs" in script
 
 
 class TestSyncCodebase:
@@ -473,7 +468,7 @@ class TestCommandExecutionBehaviors:
         manager.transport.exec = Mock(return_value=(0, "no job id here"))
 
         with pytest.raises(SubmissionError):
-            manager._submit_slurm_job(1, "proj")
+            manager._submit_slurm_job(1)
 
     def test_submit_slurm_nonzero_raises(self, mock_hpc_config):
         manager = HPCJobManager(config=mock_hpc_config)
@@ -482,7 +477,7 @@ class TestCommandExecutionBehaviors:
         manager.transport.exec = Mock(return_value=(1, "error"))
 
         with pytest.raises(SubmissionError):
-            manager._submit_slurm_job(1, "proj")
+            manager._submit_slurm_job(1)
 
     def test_combine_chunks_missing_outputs(self, mock_hpc_config):
         manager = HPCJobManager(config=mock_hpc_config)
@@ -490,7 +485,7 @@ class TestCommandExecutionBehaviors:
         manager._ssh_exec = Mock(return_value=(0, "0"))
 
         with pytest.raises(MissingOutputError):
-            manager._combine_chunks_remotely("proj")
+            manager._combine_chunks_remotely()
 
     def test_combine_chunks_command_failure(self, mock_hpc_config):
         manager = HPCJobManager(config=mock_hpc_config)
@@ -498,7 +493,7 @@ class TestCommandExecutionBehaviors:
         manager.transport.exec = Mock(side_effect=[(0, "1"), (1, "bad")])
 
         with pytest.raises(RemoteCommandError):
-            manager._combine_chunks_remotely("proj")
+            manager._combine_chunks_remotely()
 
     def test_download_combined_missing_local(self, mock_hpc_config, tmp_path, monkeypatch):
         manager = HPCJobManager(config=mock_hpc_config)
@@ -509,7 +504,7 @@ class TestCommandExecutionBehaviors:
         monkeypatch.setenv("TMPDIR", str(tmp_path))
 
         with pytest.raises(MissingOutputError):
-            manager._download_combined_results("proj")
+            manager._download_combined_results()
 
     def test_scp_upload_wrapped_error(self, mock_hpc_config):
         """Test that SCP upload errors are wrapped in RemoteCommandError."""

@@ -467,19 +467,19 @@ class TestLogsCommand:
         """Test 'logs' command fails gracefully when no config exists."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        result = cli_runner.invoke(logs, ["test_project"])
+        result = cli_runner.invoke(logs, ["--job-id", "12345"])
 
         # Should fail
         assert result.exit_code == 1
 
     def test_logs_command_no_arguments(self, cli_runner, tmp_path, monkeypatch, mock_config_file):
-        """Test 'logs' command requires either project name or job ID."""
+        """Test 'logs' command requires job ID."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         result = cli_runner.invoke(logs)
 
-        # Should fail - missing required arguments
-        assert result.exit_code == 1
+        # Should fail - missing required job-id
+        assert result.exit_code != 0
 
     def test_logs_command_with_job_id(self, cli_runner, tmp_path, monkeypatch, mock_config_file):
         """Test 'logs' command retrieves logs for specific job ID."""
@@ -541,20 +541,6 @@ class TestLogsCommand:
             result = cli_runner.invoke(logs, ["--job-id", "99999"])
 
             # Should complete (not crash) even when log not found
-            assert result.exit_code == 0
-
-    def test_logs_command_with_project_name(
-        self, cli_runner, tmp_path, monkeypatch, mock_config_file
-    ):
-        """Test 'logs' command with project name."""
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
-            mock_mgr_cls.return_value = Mock()
-
-            result = cli_runner.invoke(logs, ["test_project"])
-
-            # Should complete
             assert result.exit_code == 0
 
 

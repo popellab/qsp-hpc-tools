@@ -68,7 +68,6 @@ try
     model_data = struct();
     model_data.config = struct();
     model_data.config.model_script = model_script;
-    model_data.project_name = project_name;
 
     % Recreate model on remote worker instead of using serialized model
     fprintf('   Recreating model on remote worker...\n');

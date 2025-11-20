@@ -2711,17 +2711,47 @@ class TestPriorPPCSimulationReuse:
 class TestLocalSimulation:
     """Test the run_local_simulation method for local MATLAB execution."""
 
-    def test_run_local_simulation_basic(self, temp_dir, sample_priors_csv, sample_test_stats_csv):
-        """Test basic local simulation with mocked MATLAB runner."""
+    def test_run_local_simulation_basic(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv, monkeypatch
+    ):
+        """Test basic local simulation with mocked batch_worker."""
+        from pathlib import Path
 
-        # Create a mock MATLAB runner
-        def mock_matlab_runner(params, seed=None):
-            """Mock MATLAB runner that returns fake test stats."""
-            n_sims = params.shape[0]
+        # Mock run_batch_worker to return a fake parquet file path
+        fake_parquet = Path(temp_dir) / "fake_output.parquet"
+
+        def mock_run_batch_worker(*args, **kwargs):
+            # Create fake parquet file
+            fake_parquet.touch()
+            return fake_parquet
+
+        # Mock read_parquet to return fake species data
+        def mock_read_parquet(path):
+            n_sims = 5  # Match test request
+            n_species = 10  # Arbitrary
+            return pd.DataFrame(np.random.rand(n_sims, n_species))
+
+        # Mock compute_test_statistics_batch to return fake test stats
+        def mock_compute_test_stats(species_df, test_stats_df, registry):
+            n_sims = len(species_df)
             n_test_stats = 12  # From sample_test_stats_csv
             return np.random.rand(n_sims, n_test_stats)
 
-        # Create simulator with injected mock runner
+        # Apply mocks
+        monkeypatch.setattr(
+            "qsp_hpc.simulation.batch_runner.run_batch_worker", mock_run_batch_worker
+        )
+        monkeypatch.setattr("pandas.read_parquet", mock_read_parquet)
+        monkeypatch.setattr(
+            "qsp_hpc.batch.derive_test_stats_worker.compute_test_statistics_batch",
+            mock_compute_test_stats,
+        )
+        monkeypatch.setattr(
+            "qsp_hpc.batch.derive_test_stats_worker.build_test_stat_registry",
+            lambda x: {},
+        )
+
+        # Create simulator
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
@@ -2729,7 +2759,6 @@ class TestLocalSimulation:
             model_version="v1",
             scenario="baseline",
             cache_dir=temp_dir,
-            matlab_runner=mock_matlab_runner,
             local_only=True,
         )
 
@@ -2744,13 +2773,39 @@ class TestLocalSimulation:
         assert np.all(params > 0)
 
     def test_run_local_simulation_seed_reproducibility(
-        self, temp_dir, sample_priors_csv, sample_test_stats_csv
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv, monkeypatch
     ):
         """Test that same seed produces same parameters."""
+        from pathlib import Path
 
-        def mock_matlab_runner(params, seed=None):
-            n_sims = params.shape[0]
+        fake_parquet = Path(temp_dir) / "fake_output.parquet"
+
+        def mock_run_batch_worker(*args, **kwargs):
+            fake_parquet.touch()
+            return fake_parquet
+
+        def mock_read_parquet(path):
+            n_sims = 3
+            n_species = 10
+            return pd.DataFrame(np.random.rand(n_sims, n_species))
+
+        def mock_compute_test_stats(species_df, test_stats_df, registry):
+            n_sims = len(species_df)
             return np.random.rand(n_sims, 12)
+
+        # Apply mocks
+        monkeypatch.setattr(
+            "qsp_hpc.simulation.batch_runner.run_batch_worker", mock_run_batch_worker
+        )
+        monkeypatch.setattr("pandas.read_parquet", mock_read_parquet)
+        monkeypatch.setattr(
+            "qsp_hpc.batch.derive_test_stats_worker.compute_test_statistics_batch",
+            mock_compute_test_stats,
+        )
+        monkeypatch.setattr(
+            "qsp_hpc.batch.derive_test_stats_worker.build_test_stat_registry",
+            lambda x: {},
+        )
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -2759,7 +2814,6 @@ class TestLocalSimulation:
             model_version="v1",
             scenario="baseline",
             cache_dir=temp_dir,
-            matlab_runner=mock_matlab_runner,
             local_only=True,
         )
 
@@ -2771,13 +2825,39 @@ class TestLocalSimulation:
         np.testing.assert_array_equal(params1, params2)
 
     def test_run_local_simulation_default_single_sim(
-        self, temp_dir, sample_priors_csv, sample_test_stats_csv
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv, monkeypatch
     ):
         """Test local simulation with default n_sims=1."""
+        from pathlib import Path
 
-        def mock_matlab_runner(params, seed=None):
-            n_sims = params.shape[0]
+        fake_parquet = Path(temp_dir) / "fake_output.parquet"
+
+        def mock_run_batch_worker(*args, **kwargs):
+            fake_parquet.touch()
+            return fake_parquet
+
+        def mock_read_parquet(path):
+            n_sims = 1
+            n_species = 10
+            return pd.DataFrame(np.random.rand(n_sims, n_species))
+
+        def mock_compute_test_stats(species_df, test_stats_df, registry):
+            n_sims = len(species_df)
             return np.random.rand(n_sims, 12)
+
+        # Apply mocks
+        monkeypatch.setattr(
+            "qsp_hpc.simulation.batch_runner.run_batch_worker", mock_run_batch_worker
+        )
+        monkeypatch.setattr("pandas.read_parquet", mock_read_parquet)
+        monkeypatch.setattr(
+            "qsp_hpc.batch.derive_test_stats_worker.compute_test_statistics_batch",
+            mock_compute_test_stats,
+        )
+        monkeypatch.setattr(
+            "qsp_hpc.batch.derive_test_stats_worker.build_test_stat_registry",
+            lambda x: {},
+        )
 
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
@@ -2786,7 +2866,6 @@ class TestLocalSimulation:
             model_version="v1",
             scenario="baseline",
             cache_dir=temp_dir,
-            matlab_runner=mock_matlab_runner,
             local_only=True,
         )
 

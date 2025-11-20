@@ -25,7 +25,7 @@ import hashlib
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -79,7 +79,6 @@ class QSPSimulator:
         verbose: bool = False,
         pool: Optional["SimulationPoolManager"] = None,
         job_manager: Any = None,
-        matlab_runner: Optional[Callable[..., np.ndarray]] = None,
         local_only: bool = False,
         project_root: Optional[Union[str, Path]] = None,
     ):
@@ -145,9 +144,6 @@ class QSPSimulator:
 
         # Store job_manager for lazy initialization (don't create until needed)
         self._job_manager = job_manager  # May be None or injected for testing
-
-        # Optional injected MATLAB runner for testing/mocking
-        self._matlab_runner = matlab_runner
 
         # Set up logging with scenario-specific hierarchical logger
         base_logger = setup_logger(__name__, verbose=self.verbose)
@@ -322,7 +318,8 @@ class QSPSimulator:
             >>> print(f"Parameters shape: {params.shape}")
             >>> print(f"Test stats shape: {test_stats.shape}")
         """
-        from qsp_hpc.simulation.local_matlab_runner import create_local_matlab_runner
+        import pandas as pd
+
         from qsp_hpc.utils.logging_config import log_section
 
         # Use provided seed or fall back to simulator's seed
@@ -354,8 +351,6 @@ class QSPSimulator:
             temp_rng = np.random.default_rng(seed)
 
             # Generate parameters using the temporary RNG
-            import pandas as pd
-
             priors_df = pd.read_csv(self.priors_csv)
             param_names = priors_df["name"].tolist()
             dist_types = priors_df["distribution"].tolist()
@@ -381,25 +376,37 @@ class QSPSimulator:
                 if len(param_names) > 5:
                     self.logger.debug(f"  ... and {len(param_names) - 5} more")
 
-            # Create or use injected MATLAB runner
-            if self._matlab_runner is None:
-                self.logger.info("Creating local MATLAB runner")
-                runner = create_local_matlab_runner(
-                    model_script=self.model_script or "default_model",
-                    priors_csv=self.priors_csv,
-                    test_stats_csv=self.test_stats_csv,
-                    project_root=self.project_root,
-                    model_version=self.model_version,
-                    scenario=self.scenario,
-                    matlab_path=matlab_path,
-                    verbose=self.verbose,
-                )
-            else:
-                self.logger.info("Using injected MATLAB runner")
-                runner = self._matlab_runner
+            # Run batch_worker.m locally
+            from qsp_hpc.batch.derive_test_stats_worker import (
+                build_test_stat_registry,
+                compute_test_statistics_batch,
+            )
+            from qsp_hpc.simulation.batch_runner import run_batch_worker
 
-            # Run simulations
-            test_stats = runner(params, seed=seed)
+            self.logger.info("Running batch_worker.m locally")
+
+            # Run simulations via batch_worker.m (same as HPC)
+            parquet_file = run_batch_worker(
+                params=params,
+                param_names=param_names,
+                model_script=self.model_script or "default_model",
+                test_stats_csv=self.test_stats_csv,
+                project_root=self.project_root,
+                seed=seed,
+                dose_schedule=None,  # TODO: support dose_schedule
+                sim_config=None,  # TODO: support sim_config
+                matlab_path=matlab_path,
+                verbose=self.verbose,
+            )
+
+            # Derive test stats from parquet (same as HPC derivation worker)
+            self.logger.info("Deriving test statistics from simulation data")
+            species_df = pd.read_parquet(parquet_file)
+            test_stats_df = pd.read_csv(self.test_stats_csv)
+            test_stat_registry = build_test_stat_registry(test_stats_df)
+            test_stats = compute_test_statistics_batch(
+                species_df, test_stats_df, test_stat_registry
+            )
 
             self.logger.info(
                 f"✓ Completed: {test_stats.shape[0]} sims × {test_stats.shape[1]} test stats"

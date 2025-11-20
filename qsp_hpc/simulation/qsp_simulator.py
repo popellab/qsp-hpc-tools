@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 
 from qsp_hpc.batch.batch_utils import calculate_batch_split
 from qsp_hpc.batch.hpc_job_manager import MissingOutputError, RemoteCommandError, SubmissionError
@@ -281,6 +282,60 @@ class QSPSimulator:
 
         return samples  # type: ignore[no-any-return]
 
+    def _log_test_statistics_table(
+        self, test_stats: np.ndarray, test_stats_df: pd.DataFrame, n_sims: int
+    ) -> None:
+        """
+        Log test statistics in a detailed table format.
+
+        Args:
+            test_stats: Computed test statistics array (n_sims, n_test_stats)
+            test_stats_df: DataFrame with test statistics metadata
+            n_sims: Number of simulations
+        """
+
+        self.logger.info("")
+        self.logger.info(f"Test Statistics ({n_sims} simulation{'s' if n_sims > 1 else ''}):")
+        self.logger.info("┌─────────────────────────────────────┬──────────────┐")
+        self.logger.info("│ Test Statistic                      │ Value        │")
+        self.logger.info("├─────────────────────────────────────┼──────────────┤")
+
+        nan_count = 0
+
+        for idx, row in test_stats_df.iterrows():
+            test_stat_id = row["test_statistic_id"]
+
+            # Compute value (mean if multiple sims, single value if n_sims=1)
+            if n_sims == 1:
+                computed_value = test_stats[0, idx]
+            else:
+                computed_value = test_stats[:, idx].mean()
+
+            # Format value
+            if np.isnan(computed_value):
+                value_str = "NaN"
+                nan_count += 1
+            else:
+                value_str = f"{computed_value:.6g}"
+
+            # Truncate test_stat_id if too long
+            display_id = test_stat_id if len(test_stat_id) <= 35 else test_stat_id[:32] + "..."
+
+            self.logger.info(f"│ {display_id:<35} │ {value_str:>12} │")
+
+        self.logger.info("└─────────────────────────────────────┴──────────────┘")
+
+        # Summary
+        total_stats = len(test_stats_df)
+        success_count = total_stats - nan_count
+        self.logger.info("")
+        if nan_count > 0:
+            self.logger.info(
+                f"✓ Computed {success_count}/{total_stats} test statistics ({nan_count} NaN)"
+            )
+        else:
+            self.logger.info(f"✓ Computed {total_stats} test statistics successfully")
+
     def run_local_simulation(
         self,
         n_sims: int = 1,
@@ -408,15 +463,8 @@ class QSPSimulator:
                 species_df, test_stats_df, test_stat_registry
             )
 
-            self.logger.info(
-                f"✓ Completed: {test_stats.shape[0]} sims × {test_stats.shape[1]} test stats"
-            )
-
-            # Log test stats summary
-            self.logger.debug("Test statistics summary:")
-            self.logger.debug(f"  Min: {test_stats.min(axis=0)[:3]}")
-            self.logger.debug(f"  Max: {test_stats.max(axis=0)[:3]}")
-            self.logger.debug(f"  Mean: {test_stats.mean(axis=0)[:3]}")
+            # Log detailed test statistics table
+            self._log_test_statistics_table(test_stats, test_stats_df, n_sims)
 
             return params, test_stats
 

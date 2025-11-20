@@ -69,6 +69,14 @@ try
     model_data.config = struct();
     model_data.config.model_script = model_script;
 
+    % Copy dose_schedule and sim_config from job_config if they exist
+    if isfield(job_config, 'dose_schedule')
+        model_data.dose_schedule = job_config.dose_schedule;
+    end
+    if isfield(job_config, 'sim_config')
+        model_data.sim_config = job_config.sim_config;
+    end
+
     % Recreate model on remote worker instead of using serialized model
     fprintf('   Recreating model on remote worker...\n');
 

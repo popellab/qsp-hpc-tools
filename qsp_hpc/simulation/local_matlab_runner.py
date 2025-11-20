@@ -159,7 +159,13 @@ def create_local_matlab_runner(
                 env["SIMULATION_POOL_PATH"] = str(pool_dir.absolute())
 
                 # Prepare MATLAB command
-                matlab_cmd = f"cd('{temp_path.absolute()}'); batch_worker('local_sim'); exit;"
+                # Add matlab directory to path, cd to temp dir, then run batch_worker
+                matlab_cmd = (
+                    f"addpath('{matlab_dir.absolute()}'); "
+                    f"cd('{temp_path.absolute()}'); "
+                    f"batch_worker('local_sim'); "
+                    f"exit;"
+                )
 
                 # Run MATLAB
                 logger.debug(f"Running MATLAB worker: {worker_script.name}")

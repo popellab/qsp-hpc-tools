@@ -296,11 +296,18 @@ class QSPSimulator:
 
         self.logger.info("")
         self.logger.info(f"Test Statistics ({n_sims} simulation{'s' if n_sims > 1 else ''}):")
-        self.logger.info("┌─────────────────────────────────────┬──────────────┐")
-        self.logger.info("│ Test Statistic                      │ Value        │")
-        self.logger.info("├─────────────────────────────────────┼──────────────┤")
+        self.logger.info(
+            "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┐"
+        )
+        self.logger.info(
+            "│ Test Statistic                      │ Computed     │ Observed     │ % Diff       │"
+        )
+        self.logger.info(
+            "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┤"
+        )
 
         nan_count = 0
+        large_diff_count = 0
 
         for idx, row in test_stats_df.iterrows():
             test_stat_id = row["test_statistic_id"]
@@ -311,30 +318,49 @@ class QSPSimulator:
             else:
                 computed_value = test_stats[:, idx].mean()
 
-            # Format value
+            # Get observed value from CSV
+            observed_value = row.get("mean", np.nan)
+
+            # Format computed value
             if np.isnan(computed_value):
-                value_str = "NaN"
+                computed_str = "NaN"
                 nan_count += 1
+                observed_str = f"{observed_value:.6g}" if not np.isnan(observed_value) else "—"
+                diff_str = "—"
             else:
-                value_str = f"{computed_value:.6g}"
+                computed_str = f"{computed_value:.6g}"
+                observed_str = f"{observed_value:.6g}" if not np.isnan(observed_value) else "—"
+
+                # Calculate percentage difference
+                if not np.isnan(observed_value) and observed_value != 0:
+                    pct_diff = ((computed_value - observed_value) / observed_value) * 100
+                    diff_str = f"{pct_diff:+.1f}%"
+                    if abs(pct_diff) > 100:
+                        large_diff_count += 1
+                else:
+                    diff_str = "—"
 
             # Truncate test_stat_id if too long
             display_id = test_stat_id if len(test_stat_id) <= 35 else test_stat_id[:32] + "..."
 
-            self.logger.info(f"│ {display_id:<35} │ {value_str:>12} │")
+            self.logger.info(
+                f"│ {display_id:<35} │ {computed_str:>12} │ {observed_str:>12} │ {diff_str:>12} │"
+            )
 
-        self.logger.info("└─────────────────────────────────────┴──────────────┘")
+        self.logger.info(
+            "└─────────────────────────────────────┴──────────────┴──────────────┴──────────────┘"
+        )
 
         # Summary
         total_stats = len(test_stats_df)
         success_count = total_stats - nan_count
         self.logger.info("")
+        summary_parts = [f"✓ Computed {success_count}/{total_stats} test statistics"]
         if nan_count > 0:
-            self.logger.info(
-                f"✓ Computed {success_count}/{total_stats} test statistics ({nan_count} NaN)"
-            )
-        else:
-            self.logger.info(f"✓ Computed {total_stats} test statistics successfully")
+            summary_parts.append(f"{nan_count} NaN")
+        if large_diff_count > 0:
+            summary_parts.append(f"{large_diff_count} >100% diff from observed")
+        self.logger.info(" (".join(summary_parts) + (")" if len(summary_parts) > 1 else ""))
 
     def _log_parameters_table(self, param_values: np.ndarray, param_names: list[str]) -> None:
         """

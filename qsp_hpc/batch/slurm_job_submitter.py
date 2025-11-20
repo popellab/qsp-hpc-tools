@@ -12,7 +12,6 @@ import time
 from pathlib import Path
 
 from qsp_hpc.utils.logging_config import setup_logger
-from qsp_hpc.utils.security import validate_project_name
 
 
 class SubmissionError(RuntimeError):
@@ -46,13 +45,12 @@ class SLURMJobSubmitter:
         self.verbose = verbose
         self.logger = setup_logger(__name__, verbose=verbose)
 
-    def submit_job(self, n_jobs: int, project_name: str) -> str:
+    def submit_job(self, n_jobs: int) -> str:
         """
         Generate and submit SLURM array job.
 
         Args:
             n_jobs: Number of array tasks
-            project_name: Project identifier
 
         Returns:
             Job ID string
@@ -60,9 +58,6 @@ class SLURMJobSubmitter:
         Raises:
             SubmissionError: If job submission fails or job ID cannot be parsed
         """
-        # Validate project name for security
-        project_name = validate_project_name(project_name)
-
         start_time = time.time()
 
         # Log SLURM configuration
@@ -73,7 +68,7 @@ class SLURMJobSubmitter:
         self.logger.info(f"  Array size: {n_jobs} tasks")
 
         # Generate SLURM script
-        script_content = self._generate_slurm_script(n_jobs, project_name)
+        script_content = self._generate_slurm_script(n_jobs)
 
         # Write to temp file
         with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
@@ -82,9 +77,7 @@ class SLURMJobSubmitter:
 
         try:
             # Upload script
-            remote_script_dir = (
-                f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/scripts"
-            )
+            remote_script_dir = f"{self.config.remote_project_path}/batch_jobs/scripts"
             remote_script = f"{remote_script_dir}/qsp_batch_job.sh"
 
             self.transport.upload(temp_script, remote_script)
@@ -109,10 +102,10 @@ class SLURMJobSubmitter:
         finally:
             Path(temp_script).unlink()
 
-    def _generate_slurm_script(self, n_jobs: int, project_name: str) -> str:
+    def _generate_slurm_script(self, n_jobs: int) -> str:
         """Generate SLURM batch script."""
         project_path = self.config.remote_project_path
-        log_dir = f"{project_path}/projects/{project_name}/batch_jobs/logs"
+        log_dir = f"{project_path}/batch_jobs/logs"
 
         script = f"""#!/bin/bash
 #SBATCH --job-name=qsp_batch
@@ -136,7 +129,7 @@ MATLAB_PATH=$("{self.config.hpc_venv_path}/bin/python" -c "import qsp_hpc.matlab
 
 module load {self.config.matlab_module}
 cd "{project_path}"
-matlab -nodisplay -nodesktop -nosplash -r "addpath('$MATLAB_PATH'); batch_worker('{project_name}'); exit"
+matlab -nodisplay -nodesktop -nosplash -r "addpath('$MATLAB_PATH'); batch_worker(); exit"
 echo "Job completed at $(date)"
 """
         return script
@@ -147,7 +140,6 @@ echo "Job completed at $(date)"
         test_stats_config: str,
         derivation_dir: str,
         n_batches: int,
-        project_name: str,
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -157,14 +149,10 @@ echo "Job completed at $(date)"
             test_stats_config: Path to test statistics config on HPC
             derivation_dir: Directory for derivation outputs
             n_batches: Number of array tasks (one per Parquet file)
-            project_name: Project identifier
 
         Returns:
             Job ID string
         """
-        # Validate project name for security
-        project_name = validate_project_name(project_name)
-
         # Log configuration
         self.logger.info("SLURM Derivation Configuration:")
         self.logger.info(f"  Partition: {self.config.partition}")
@@ -174,7 +162,7 @@ echo "Job completed at $(date)"
 
         # Generate SLURM script
         script_content = self._generate_derivation_slurm_script(
-            pool_path, test_stats_config, derivation_dir, n_batches, project_name
+            pool_path, test_stats_config, derivation_dir, n_batches
         )
 
         # Write to temp file
@@ -209,17 +197,17 @@ echo "Job completed at $(date)"
         test_stats_config: str,
         derivation_dir: str,
         n_batches: int,
-        project_name: str,
     ) -> str:
         """Generate SLURM script for test statistics derivation."""
+        log_dir = f"{self.config.remote_project_path}/batch_jobs/logs"
         return f"""#!/bin/bash
 #SBATCH --job-name=qsp_derive
 #SBATCH --partition={self.config.partition}
 #SBATCH --time=01:00:00
 #SBATCH --mem-per-cpu=4G
 #SBATCH --array=0-{n_batches-1}
-#SBATCH --output={self.config.remote_project_path}/projects/{project_name}/batch_jobs/logs/qsp_derive_%A_%a.out
-#SBATCH --error={self.config.remote_project_path}/projects/{project_name}/batch_jobs/logs/qsp_derive_%A_%a.err
+#SBATCH --output={log_dir}/qsp_derive_%A_%a.out
+#SBATCH --error={log_dir}/qsp_derive_%A_%a.err
 
 # Activate Python virtual environment
 source {self.config.hpc_venv_path}/bin/activate

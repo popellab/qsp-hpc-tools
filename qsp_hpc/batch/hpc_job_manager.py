@@ -22,8 +22,7 @@ Usage:
     job_info = manager.submit_jobs(
         samples_csv='path/to/samples.csv',
         model_config='path/to/model_config.mat',
-        num_simulations=100,
-        project_name='pdac_2025'
+        num_simulations=100
     )
 
     # Job info contains: job_ids, state_file
@@ -45,10 +44,7 @@ from qsp_hpc.batch.hpc_file_transfer import HPCFileTransfer
 from qsp_hpc.batch.result_collector import MissingOutputError, ResultCollector
 from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter, SubmissionError  # noqa: F401
 from qsp_hpc.utils.logging_config import format_config, log_operation, setup_logger
-from qsp_hpc.utils.security import (
-    build_safe_ssh_command,
-    validate_project_name,
-)
+from qsp_hpc.utils.security import build_safe_ssh_command
 
 
 @dataclass
@@ -59,7 +55,6 @@ class JobInfo:
     state_file: str
     n_jobs: int
     n_simulations: int
-    project_name: str
     submission_time: str
 
 
@@ -462,7 +457,6 @@ class HPCJobManager:
         test_stats_csv: str,
         model_script: str,
         num_simulations: int,
-        project_name: str,
         seed: int = 2025,
         jobs_per_chunk: Optional[int] = None,
         skip_sync: bool = False,
@@ -477,19 +471,13 @@ class HPCJobManager:
             test_stats_csv: Path to test statistics CSV (defines scenario/observables)
             model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
             num_simulations: Number of simulations
-            project_name: Project name (e.g., 'pdac_2025')
             seed: Random seed
             jobs_per_chunk: Simulations per job (default from config)
             skip_sync: Skip codebase sync (for testing)
 
         Returns:
             JobInfo object with job IDs and state file
-
-        Raises:
-            SecurityError: If project_name contains invalid characters
         """
-        # Validate project name for security (prevent path traversal/command injection)
-        project_name = validate_project_name(project_name)
 
         if jobs_per_chunk is None:
             jobs_per_chunk = self.config.jobs_per_chunk
@@ -501,7 +489,6 @@ class HPCJobManager:
         # Log job submission details
         self.logger.info("Preparing HPC job submission:")
         job_config = {
-            "project": project_name,
             "simulations": num_simulations,
             "array_tasks": n_jobs,
             "sims_per_task": jobs_per_chunk,
@@ -519,7 +506,7 @@ class HPCJobManager:
         self.ensure_hpc_venv()
 
         # Setup remote directories
-        self._setup_remote_directories(project_name)
+        self._setup_remote_directories()
 
         # Create and upload job config (JSON)
         self.logger.info("Uploading job configuration and inputs...")
@@ -529,20 +516,19 @@ class HPCJobManager:
             num_simulations=num_simulations,
             seed=seed,
             jobs_per_chunk=jobs_per_chunk,
-            project_name=project_name,
             save_full_simulations=save_full_simulations,
             simulation_pool_id=simulation_pool_id,
         )
 
         # Upload parameter CSV
-        self._upload_parameter_csv(samples_csv, project_name)
+        self._upload_parameter_csv(samples_csv)
 
         # Upload test statistics CSV and functions
-        self._upload_test_statistics(test_stats_csv, project_name)
+        self._upload_test_statistics(test_stats_csv)
 
         # Submit SLURM job
         self.logger.info(f"Submitting SLURM array job with {n_jobs} tasks...")
-        job_id = self._submit_slurm_job(n_jobs, project_name)
+        job_id = self._submit_slurm_job(n_jobs)
         self.logger.info(f"✓ Job submitted: {job_id}")
 
         # Save job state
@@ -551,18 +537,17 @@ class HPCJobManager:
             state_file="",  # Will be set below
             n_jobs=n_jobs,
             n_simulations=num_simulations,
-            project_name=project_name,
             submission_time=time.strftime("%Y-%m-%d %H:%M:%S"),
         )
 
-        state_file = self._save_job_state(job_info, project_name)
+        state_file = self._save_job_state(job_info)
         job_info.state_file = state_file
 
         return job_info
 
-    def _setup_remote_directories(self, project_name: str) -> None:
+    def _setup_remote_directories(self) -> None:
         """Create necessary directories on remote cluster and clean old files."""
-        return self.file_transfer.setup_remote_directories(project_name)
+        return self.file_transfer.setup_remote_directories()
 
     def _upload_job_config(
         self,
@@ -571,7 +556,6 @@ class HPCJobManager:
         num_simulations: int,
         seed: int,
         jobs_per_chunk: int,
-        project_name: str,
         save_full_simulations: bool = True,
         simulation_pool_id: Optional[str] = None,
     ) -> None:
@@ -582,28 +566,27 @@ class HPCJobManager:
             num_simulations,
             seed,
             jobs_per_chunk,
-            project_name,
             save_full_simulations,
             simulation_pool_id,
         )
 
-    def _upload_parameter_csv(self, csv_path: str, project_name: str) -> None:
+    def _upload_parameter_csv(self, csv_path: str) -> None:
         """Upload parameter samples CSV."""
-        return self.file_transfer.upload_parameter_csv(csv_path, project_name)
+        return self.file_transfer.upload_parameter_csv(csv_path)
 
-    def _upload_test_statistics(self, test_stats_csv: str, project_name: str) -> None:
+    def _upload_test_statistics(self, test_stats_csv: str) -> None:
         """Upload test statistics CSV and extract embedded functions as tarball."""
-        return self.file_transfer.upload_test_statistics(test_stats_csv, project_name)
+        return self.file_transfer.upload_test_statistics(test_stats_csv)
 
-    def _submit_slurm_job(self, n_jobs: int, project_name: str) -> str:
+    def _submit_slurm_job(self, n_jobs: int) -> str:
         """Generate and submit SLURM array job."""
-        return self.slurm_submitter.submit_job(n_jobs, project_name)
+        return self.slurm_submitter.submit_job(n_jobs)
 
-    def _generate_slurm_script(self, n_jobs: int, project_name: str) -> str:
+    def _generate_slurm_script(self, n_jobs: int) -> str:
         """Generate SLURM batch script."""
-        return self.slurm_submitter._generate_slurm_script(n_jobs, project_name)
+        return self.slurm_submitter._generate_slurm_script(n_jobs)
 
-    def _save_job_state(self, job_info: JobInfo, project_name: str) -> str:
+    def _save_job_state(self, job_info: JobInfo) -> str:
         """Save job state to file."""
         # Prefer local storage for state to avoid writing to remote-only paths
         state_root = (
@@ -612,7 +595,7 @@ class HPCJobManager:
             else Path.cwd()
         )
 
-        base_dir = state_root / f"projects/{project_name}/batch_jobs"
+        base_dir = state_root / "batch_jobs"
         base_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -636,31 +619,20 @@ class HPCJobManager:
         Returns:
             Numpy array of observables (test statistics)
         """
-        # Load job state
-        with open(state_file, "rb") as f:
-            job_state = pickle.load(f)
-
-        project_name = job_state["project_name"]
-
         # Combine chunks on HPC
-        self._combine_chunks_remotely(project_name)
+        self._combine_chunks_remotely()
 
         # Download combined results
-        observables = self._download_combined_results(project_name)
+        observables = self._download_combined_results()
 
         # Clean up state file
         Path(state_file).unlink(missing_ok=True)
 
         return observables
 
-    def _combine_chunks_remotely(self, project_name: str) -> None:
+    def _combine_chunks_remotely(self) -> None:
         """Combine chunk CSV files on HPC."""
-        # Validate project name for security
-        project_name = validate_project_name(project_name)
-
-        remote_output = (
-            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/output"
-        )
+        remote_output = f"{self.config.remote_project_path}/batch_jobs/output"
 
         # Check that chunk files exist - using safe command construction
         check_cmd = build_safe_ssh_command(
@@ -684,11 +656,9 @@ class HPCJobManager:
         if status != 0:
             raise RemoteCommandError(combine_cmd, status, output)
 
-    def _download_combined_results(self, project_name: str) -> np.ndarray:
+    def _download_combined_results(self) -> np.ndarray:
         """Download and load combined results."""
-        remote_output = (
-            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/output"
-        )
+        remote_output = f"{self.config.remote_project_path}/batch_jobs/output"
 
         # Create temp directory
         temp_dir = Path(tempfile.mkdtemp())
@@ -994,7 +964,6 @@ class HPCJobManager:
         pool_path: str,
         test_stats_csv: str,
         test_stats_hash: str,
-        project_name: str = "pdac_2025",
         num_simulations: Optional[int] = None,
     ) -> str:
         """
@@ -1007,7 +976,6 @@ class HPCJobManager:
             pool_path: Path to simulation pool on HPC (e.g., {simulation_pool_path}/baseline_pdac_abc12345)
             test_stats_csv: Local path to test statistics CSV
             test_stats_hash: Hash of test statistics CSV
-            project_name: Project name for logging
             num_simulations: Number of simulations needed (None = derive all batches)
 
         Returns:
@@ -1021,9 +989,7 @@ class HPCJobManager:
         self.ensure_hpc_venv()
 
         # Create persistent directory for derivation inputs (in batch_jobs)
-        derivation_dir = (
-            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/derivation"
-        )
+        derivation_dir = f"{self.config.remote_project_path}/batch_jobs/derivation"
         self.transport.exec(f'mkdir -p "{derivation_dir}"')
 
         # Upload test statistics CSV
@@ -1072,7 +1038,6 @@ class HPCJobManager:
             test_stats_config=remote_config,
             derivation_dir=derivation_dir,
             n_batches=n_batches,
-            project_name=project_name,
         )
 
         self.logger.info(f"   🚀 Derivation job {job_id} ({n_batches} tasks)")
@@ -1118,9 +1083,7 @@ class HPCJobManager:
                 self.logger.info(f"  {line}")
 
         if "DIRECTORY_NOT_FOUND" in output:
-            # Determine likely project name for better error message
-            project_name = "pdac_2025"  # Could be passed as parameter if needed
-            log_path = f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/logs"
+            log_path = f"{self.config.remote_project_path}/batch_jobs/logs"
 
             raise RuntimeError(
                 f"Test statistics directory not found on HPC: {test_stats_dir}\n"

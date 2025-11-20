@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from qsp_hpc.utils.logging_config import setup_logger
-from qsp_hpc.utils.security import safe_shell_quote, validate_project_name
+from qsp_hpc.utils.security import safe_shell_quote
 
 
 class HPCFileTransfer:
@@ -174,24 +174,20 @@ echo "Python venv setup complete!"
         else:
             self.logger.info("HPC Python environment configured")
 
-    def setup_remote_directories(self, project_name: str) -> None:
+    def setup_remote_directories(self) -> None:
         """Create necessary directories on remote cluster and clean old files."""
-        # Validate project name to prevent command injection
-        project_name = validate_project_name(project_name)
-
         remote_root = (self.config.remote_project_path or "").strip()
         if not remote_root or remote_root in {"/", ".", "//"}:
             raise ValueError(
                 "remote_project_path must be set to a non-root directory before deleting files"
             )
 
-        remote_base = f"{remote_root}/projects/{project_name}/batch_jobs"
+        remote_base = f"{remote_root}/batch_jobs"
         dirs = ["input", "output", "scripts", "logs"]
 
         for d in dirs:
             remote_dir = f"{remote_base}/{d}"
             # Remove all files in directory, then recreate it
-            # Use safe_shell_quote to prevent injection even though project_name is validated
             safe_dir = safe_shell_quote(remote_dir)
             self.transport.exec(f"rm -rf {safe_dir} && mkdir -p {safe_dir}")
 
@@ -202,7 +198,6 @@ echo "Python venv setup complete!"
         num_simulations: int,
         seed: int,
         jobs_per_chunk: int,
-        project_name: str,
         save_full_simulations: bool = True,
         simulation_pool_id: Optional[str] = None,
     ) -> None:
@@ -211,13 +206,12 @@ echo "Python venv setup complete!"
 
         # Create job config dictionary
         job_config = {
-            "project_name": project_name,
             "n_simulations": num_simulations,
             "seed": seed,
             "jobs_per_chunk": jobs_per_chunk,
             "model_script": model_script,
-            "test_stats_csv": f"projects/{project_name}/batch_jobs/input/test_stats.csv",  # Remote path
-            "param_csv": f"projects/{project_name}/batch_jobs/input/params.csv",  # Remote path
+            "test_stats_csv": "batch_jobs/input/test_stats.csv",  # Remote path
+            "param_csv": "batch_jobs/input/params.csv",  # Remote path
             "save_full_simulations": save_full_simulations,
             "simulation_pool_id": simulation_pool_id,
         }
@@ -228,9 +222,7 @@ echo "Python venv setup complete!"
             temp_file = f.name
 
         try:
-            remote_input_dir = (
-                f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
-            )
+            remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
             remote_file = f"{remote_input_dir}/job_config.json"
 
             self.transport.upload(temp_file, remote_file)
@@ -240,13 +232,11 @@ echo "Python venv setup complete!"
         finally:
             Path(temp_file).unlink()
 
-    def upload_parameter_csv(self, csv_path: str, project_name: str) -> None:
+    def upload_parameter_csv(self, csv_path: str) -> None:
         """Upload parameter samples CSV."""
         start_time = time.time()
 
-        remote_input_dir = (
-            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
-        )
+        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
         remote_file = f"{remote_input_dir}/params.csv"
 
         self.transport.upload(csv_path, remote_file)
@@ -254,13 +244,11 @@ echo "Python venv setup complete!"
             elapsed = time.time() - start_time
             self.logger.debug(f"Parameters uploaded ({elapsed:.1f}s)")
 
-    def upload_test_statistics(self, test_stats_csv: str, project_name: str) -> None:
+    def upload_test_statistics(self, test_stats_csv: str) -> None:
         """Upload test statistics CSV and extract embedded functions as tarball."""
         start_time = time.time()
 
-        remote_input_dir = (
-            f"{self.config.remote_project_path}/projects/{project_name}/batch_jobs/input"
-        )
+        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
 
         # Upload CSV file
         remote_csv = f"{remote_input_dir}/test_stats.csv"

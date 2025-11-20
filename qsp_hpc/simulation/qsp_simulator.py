@@ -66,7 +66,6 @@ class QSPSimulator:
         self,
         test_stats_csv: Union[str, Path],
         priors_csv: Union[str, Path],
-        project_name: str,
         model_script: str = "",
         model_version: str = "v1",
         model_description: str = "",
@@ -90,7 +89,6 @@ class QSPSimulator:
         Args:
             test_stats_csv: Path to test statistics CSV defining observables
             priors_csv: Path to priors CSV defining parameter names and distributions
-            project_name: Project identifier (e.g., 'pdac_2025') used for organizing HPC files
             model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
             model_version: Descriptive version name (e.g., 'baseline_gvax')
             model_description: Brief description of model configuration
@@ -121,7 +119,6 @@ class QSPSimulator:
         self.max_wait_time = max_wait_time
         self.verbose = verbose
         self.local_only = local_only
-        self.project_name = project_name
         self.project_root = Path(project_root) if project_root is not None else None
 
         if not self.test_stats_csv.exists():
@@ -319,7 +316,6 @@ class QSPSimulator:
             >>> simulator = QSPSimulator(
             ...     test_stats_csv='test_stats.csv',
             ...     priors_csv='priors.csv',
-            ...     project_name='my_project',
             ...     model_script='my_model'
             ... )
             >>> params, test_stats = simulator.run_local_simulation(n_sims=5, seed=123)
@@ -521,7 +517,6 @@ class QSPSimulator:
             hpc_pool_path,
             str(self.test_stats_csv),
             test_stats_hash,
-            project_name=self.project_name,
             num_simulations=num_simulations,
         )
         self.logger.info(f"Derivation job submitted: {job_id}")
@@ -535,7 +530,7 @@ class QSPSimulator:
 
         if not has_test_stats_now:
             # Derivation failed - check logs
-            log_path = f"{self.job_manager.config.remote_project_path}/projects/{self.project_name}/batch_jobs/logs"
+            log_path = f"{self.job_manager.config.remote_project_path}/batch_jobs/logs"
             log_cmd = f'ls -lt "{log_path}"/qsp_derive_*.err 2>/dev/null | head -3'
             status, log_output = self.job_manager.transport.exec(log_cmd)
 
@@ -877,7 +872,6 @@ class QSPSimulator:
             test_stats_csv=str(self.test_stats_csv),
             model_script=self.model_script,
             num_simulations=num_simulations,
-            project_name=self.project_name,
             seed=self.seed,
             jobs_per_chunk=jobs_per_chunk,
             skip_sync=False,  # Sync codebase first
@@ -1046,7 +1040,6 @@ def qsp_simulator(
     model_description: str = "",
     scenario: str = "default",
     cache_dir: Union[str, Path] = "cache/sbi_simulations",
-    project_name: Optional[str] = None,
     seed: int = 2025,
     cache_sampling_seed: Optional[int] = None,
     max_tasks: int = 10,
@@ -1115,7 +1108,6 @@ def qsp_simulator(
         model_description=model_description,
         scenario=scenario,
         cache_dir=cache_dir,
-        project_name=project_name,
         seed=seed,
         cache_sampling_seed=cache_sampling_seed,
         max_tasks=max_tasks,

@@ -30,6 +30,7 @@ def create_local_matlab_runner(
     priors_csv: Path,
     test_stats_csv: Path,
     project_root: Optional[Path] = None,
+    project_name: str = "local_sim",
     model_version: str = "v1",
     scenario: str = "default",
     dose_schedule: Optional[Dict[str, Any]] = None,
@@ -43,12 +44,17 @@ def create_local_matlab_runner(
     This factory function creates a callable that runs MATLAB simulations
     locally using the HPC batch_worker.m and test stats derivation code.
 
+    Uses the same directory structure as HPC:
+    {project_root}/projects/{project_name}/batch_jobs/input/
+    {project_root}/projects/{project_name}/batch_jobs/output/
+
     Args:
         model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
         priors_csv: Path to priors CSV (needed for parameter names)
         test_stats_csv: Path to test statistics CSV (defines what to extract)
-        project_root: Path to project root directory (containing startup.m). If None,
-                     startup.m will not be run (model must already be on MATLAB path)
+        project_root: Path to project root directory (containing startup.m and projects/)
+        project_name: Project identifier (e.g., 'pdac_2025') used for organizing batch files
+                     under projects/{project_name}/batch_jobs/
         model_version: Descriptive version name for logging
         scenario: Scenario name for therapy protocol
         dose_schedule: Optional dose schedule configuration
@@ -63,7 +69,9 @@ def create_local_matlab_runner(
         >>> runner = create_local_matlab_runner(
         ...     model_script='my_model',
         ...     priors_csv=Path('priors.csv'),
-        ...     test_stats_csv=Path('test_stats.csv')
+        ...     test_stats_csv=Path('test_stats.csv'),
+        ...     project_root=Path('.'),
+        ...     project_name='my_project'
         ... )
         >>> params = np.random.rand(5, 10)  # 5 sims, 10 params
         >>> test_stats = runner(params, seed=42)     # (5, n_test_stats) array
@@ -108,19 +116,29 @@ def create_local_matlab_runner(
             )
 
         with log_operation(logger, f"Local MATLAB simulation ({n_sims} sims)"):
-            # Create temp directory for this simulation (mimics HPC structure)
+            # Use actual project directory structure (like HPC does)
+            # batch_worker expects to run from project_root with projects/{project_name}/batch_jobs/
+            if project_root is None:
+                raise ValueError(
+                    "project_root is required for local simulation. "
+                    "Pass project_root=Path('.') if running from project directory."
+                )
+
+            # Create batch_jobs in actual project structure (mimics HPC)
+            # On HPC: {remote_project_path}/projects/{project_name}/batch_jobs/
+            # Locally: {project_root}/projects/{project_name}/batch_jobs/
+            project_dir = project_root / "projects" / project_name
+            batch_jobs_dir = project_dir / "batch_jobs"
+            input_dir = batch_jobs_dir / "input"
+            output_dir = batch_jobs_dir / "output"
+
+            # Create directories if they don't exist
+            input_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create temp directory only for pool output
             with tempfile.TemporaryDirectory(prefix="qsp_local_") as temp_dir:
                 temp_path = Path(temp_dir)
-
-                # Create HPC-like directory structure
-                # batch_worker expects: projects/{project_name}/batch_jobs/input/
-                project_dir = temp_path / "projects" / "local_sim"
-                batch_jobs_dir = project_dir / "batch_jobs"
-                input_dir = batch_jobs_dir / "input"
-                output_dir = batch_jobs_dir / "output"
-
-                input_dir.mkdir(parents=True)
-                output_dir.mkdir(parents=True)
 
                 # Write parameters to CSV
                 param_csv = input_dir / "params.csv"
@@ -136,7 +154,7 @@ def create_local_matlab_runner(
 
                 config = {
                     "model_script": model_script,
-                    "param_csv": str((input_dir / "params.csv").relative_to(temp_path)),
+                    "param_csv": str((input_dir / "params.csv").relative_to(project_root)),
                     "test_stats_csv": str(test_stats_csv.absolute()),
                     "n_simulations": int(n_sims),
                     "seed": int(seed) if seed is not None else 2025,
@@ -164,10 +182,10 @@ def create_local_matlab_runner(
                 # Prepare MATLAB command (mimicking HPC SLURM script)
                 # On HPC: cd to project, then run matlab with batch_worker
                 # Here: set cwd to project_root so startup.m is available
+                # batch_worker will find projects/{project_name}/batch_jobs/ from current dir
                 matlab_cmd = (
                     f"addpath('{matlab_dir.absolute()}'); "
-                    f"cd('{temp_path.absolute()}'); "
-                    f"batch_worker('local_sim'); "
+                    f"batch_worker('{project_name}'); "
                     f"exit;"
                 )
 

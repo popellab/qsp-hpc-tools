@@ -393,6 +393,7 @@ class QSPSimulator:
                     priors_csv=self.priors_csv,
                     test_stats_csv=self.test_stats_csv,
                     project_root=self.project_root,
+                    project_name=self.project_name,
                     model_version=self.model_version,
                     scenario=self.scenario,
                     matlab_path=matlab_path,

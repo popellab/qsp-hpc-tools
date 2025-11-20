@@ -1,22 +1,19 @@
-function batch_worker(project_name)
+function batch_worker()
 %BATCH_WORKER Execute PSA simulation for a chunk of patients (SLURM array job)
 %
 % This function runs on SLURM compute nodes to process a subset of patients.
 % It reads job configuration from JSON and extracts its assigned chunk based on
 % SLURM_ARRAY_TASK_ID.
 %
-% Inputs:
-%   project_name   - Project name (e.g., 'pdac_2025') - optional, will detect if not provided
-%
 % The function expects to find:
-%   - Job configuration in 'projects/{project_name}/batch_jobs/input/job_config.json'
+%   - Job configuration in 'batch_jobs/input/job_config.json'
 %   - Parameter samples CSV in the location specified by job_config.json
 %   - Test statistics CSV in the location specified by job_config.json
 %
 % Outputs:
-%   - Saves results to 'projects/{project_name}/batch_jobs/output/chunk_XXX_results.mat'
-%   - Saves test statistics to 'projects/{project_name}/batch_jobs/output/chunk_XXX_test_stats.csv'
-%   - Saves status to 'projects/{project_name}/batch_jobs/output/chunk_XXX_status.csv'
+%   - Saves results to 'batch_jobs/output/chunk_XXX_results.mat'
+%   - Saves test statistics to 'batch_jobs/output/chunk_XXX_test_stats.csv'
+%   - Saves status to 'batch_jobs/output/chunk_XXX_status.csv'
 
 try
     fprintf('🚀 PSA Worker starting (SLURM array job)\n');
@@ -33,17 +30,9 @@ try
     % Set up MATLAB environment
     startup; % Load project paths and settings
 
-    % Handle optional project name parameter
-    if nargin < 1 || isempty(project_name)
-        project_name = get_current_project_name();
-        fprintf('   Project name detected: %s\n', project_name);
-    else
-        fprintf('   Project name provided: %s\n', project_name);
-    end
-
     % Determine file paths using absolute paths
     current_dir = pwd;
-    base_dir = fullfile(current_dir, 'projects', project_name, 'batch_jobs');
+    base_dir = fullfile(current_dir, 'batch_jobs');
     input_dir = fullfile(base_dir, 'input');
     output_dir = fullfile(base_dir, 'output');
 
@@ -432,35 +421,6 @@ for j = 1:length(chunk_params.names)
         elseif ~isempty(compartment_obj)
             addcontent(variant, {'compartment', param_name, 'Capacity', param_value});
         end
-    end
-end
-
-end
-
-function project_name = get_current_project_name()
-%GET_CURRENT_PROJECT_NAME Determine current project name (worker version)
-%
-% This function mirrors the one in PSA_simulate.m but is optimized for
-% worker execution where we expect to be in the project directory.
-
-current_dir = pwd;
-
-% Look for projects/[project_name] pattern in path
-project_match = regexp(current_dir, '.*[/\\]projects[/\\]([^/\\]+)', 'tokens');
-
-if ~isempty(project_match) && ~isempty(project_match{1})
-    project_name = project_match{1}{1};
-else
-    % Fallback: check if we're in a subdirectory of a project
-    [parent_dir, ~] = fileparts(current_dir);
-    project_match = regexp(parent_dir, '.*[/\\]projects[/\\]([^/\\]+)', 'tokens');
-
-    if ~isempty(project_match) && ~isempty(project_match{1})
-        project_name = project_match{1}{1};
-    else
-        % Final fallback
-        project_name = 'default';
-        warning('Could not detect project name, using ''default''');
     end
 end
 

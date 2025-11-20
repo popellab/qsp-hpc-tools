@@ -30,7 +30,6 @@ def create_local_matlab_runner(
     priors_csv: Path,
     test_stats_csv: Path,
     project_root: Optional[Path] = None,
-    project_name: str = "local_sim",
     model_version: str = "v1",
     scenario: str = "default",
     dose_schedule: Optional[Dict[str, Any]] = None,
@@ -44,17 +43,15 @@ def create_local_matlab_runner(
     This factory function creates a callable that runs MATLAB simulations
     locally using the HPC batch_worker.m and test stats derivation code.
 
-    Uses the same directory structure as HPC:
-    {project_root}/projects/{project_name}/batch_jobs/input/
-    {project_root}/projects/{project_name}/batch_jobs/output/
+    Directory structure:
+    {project_root}/batch_jobs/input/   (params.csv, job_config.json)
+    {project_root}/batch_jobs/output/  (simulation outputs)
 
     Args:
         model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
         priors_csv: Path to priors CSV (needed for parameter names)
         test_stats_csv: Path to test statistics CSV (defines what to extract)
-        project_root: Path to project root directory (containing startup.m and projects/)
-        project_name: Project identifier (e.g., 'pdac_2025') used for organizing batch files
-                     under projects/{project_name}/batch_jobs/
+        project_root: Path to project root directory (containing startup.m and batch_jobs/)
         model_version: Descriptive version name for logging
         scenario: Scenario name for therapy protocol
         dose_schedule: Optional dose schedule configuration
@@ -70,8 +67,7 @@ def create_local_matlab_runner(
         ...     model_script='my_model',
         ...     priors_csv=Path('priors.csv'),
         ...     test_stats_csv=Path('test_stats.csv'),
-        ...     project_root=Path('.'),
-        ...     project_name='my_project'
+        ...     project_root=Path('.')
         ... )
         >>> params = np.random.rand(5, 10)  # 5 sims, 10 params
         >>> test_stats = runner(params, seed=42)     # (5, n_test_stats) array
@@ -116,19 +112,17 @@ def create_local_matlab_runner(
             )
 
         with log_operation(logger, f"Local MATLAB simulation ({n_sims} sims)"):
-            # Use actual project directory structure (like HPC does)
-            # batch_worker expects to run from project_root with projects/{project_name}/batch_jobs/
+            # Use actual project directory structure
+            # batch_worker expects to run from project_root with batch_jobs/ directory
             if project_root is None:
                 raise ValueError(
                     "project_root is required for local simulation. "
                     "Pass project_root=Path('.') if running from project directory."
                 )
 
-            # Create batch_jobs in actual project structure (mimics HPC)
-            # On HPC: {remote_project_path}/projects/{project_name}/batch_jobs/
-            # Locally: {project_root}/projects/{project_name}/batch_jobs/
-            project_dir = project_root / "projects" / project_name
-            batch_jobs_dir = project_dir / "batch_jobs"
+            # Create batch_jobs directory structure
+            # Structure: {project_root}/batch_jobs/input/ and /output/
+            batch_jobs_dir = project_root / "batch_jobs"
             input_dir = batch_jobs_dir / "input"
             output_dir = batch_jobs_dir / "output"
 
@@ -182,12 +176,8 @@ def create_local_matlab_runner(
                 # Prepare MATLAB command (mimicking HPC SLURM script)
                 # On HPC: cd to project, then run matlab with batch_worker
                 # Here: set cwd to project_root so startup.m is available
-                # batch_worker will find projects/{project_name}/batch_jobs/ from current dir
-                matlab_cmd = (
-                    f"addpath('{matlab_dir.absolute()}'); "
-                    f"batch_worker('{project_name}'); "
-                    f"exit;"
-                )
+                # batch_worker will find batch_jobs/ in current directory
+                matlab_cmd = f"addpath('{matlab_dir.absolute()}'); " f"batch_worker(); " f"exit;"
 
                 # Set working directory for MATLAB (like HPC does with cd before matlab)
                 matlab_cwd = project_root.absolute() if project_root is not None else None

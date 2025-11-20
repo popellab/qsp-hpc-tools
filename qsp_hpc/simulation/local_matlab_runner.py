@@ -161,31 +161,25 @@ def create_local_matlab_runner(
                 env["SLURMD_NODENAME"] = "localhost"
                 env["SIMULATION_POOL_PATH"] = str(pool_dir.absolute())
 
-                # Prepare MATLAB command
-                # Option B: Run startup from project root to load paths, then run batch_worker
-                if project_root is not None:
-                    # cd to project, run startup to load paths, then proceed
-                    matlab_cmd = (
-                        f"addpath('{matlab_dir.absolute()}'); "
-                        f"cd('{project_root.absolute()}'); "
-                        f"startup; "  # Load project paths from startup.m
-                        f"cd('{temp_path.absolute()}'); "
-                        f"batch_worker('local_sim'); "
-                        f"exit;"
-                    )
-                else:
-                    # No project_root - skip startup (model must be on path already)
-                    matlab_cmd = (
-                        f"addpath('{matlab_dir.absolute()}'); "
-                        f"cd('{temp_path.absolute()}'); "
-                        f"batch_worker('local_sim'); "
-                        f"exit;"
-                    )
+                # Prepare MATLAB command (mimicking HPC SLURM script)
+                # On HPC: cd to project, then run matlab with batch_worker
+                # Here: set cwd to project_root so startup.m is available
+                matlab_cmd = (
+                    f"addpath('{matlab_dir.absolute()}'); "
+                    f"cd('{temp_path.absolute()}'); "
+                    f"batch_worker('local_sim'); "
+                    f"exit;"
+                )
+
+                # Set working directory for MATLAB (like HPC does with cd before matlab)
+                matlab_cwd = project_root.absolute() if project_root is not None else None
 
                 # Run MATLAB
                 logger.debug(f"Running MATLAB worker: {worker_script.name}")
                 logger.debug(f"Config: {config_json}")
                 logger.debug(f"Pool dir: {pool_dir}")
+                if matlab_cwd:
+                    logger.debug(f"MATLAB working directory: {matlab_cwd}")
 
                 try:
                     result = subprocess.run(
@@ -194,6 +188,7 @@ def create_local_matlab_runner(
                         text=True,
                         timeout=300,  # 5 minute timeout
                         env=env,
+                        cwd=matlab_cwd,  # Start MATLAB from project directory (like HPC)
                     )
 
                     # Always show MATLAB stdout for debugging

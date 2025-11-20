@@ -148,14 +148,20 @@ def run_batch_worker(
         cwd=project_root.absolute(),
     )
 
-    # Show MATLAB output
+    # Show MATLAB output if verbose
     if verbose and result.stdout:
         logger.debug("MATLAB stdout:")
         for line in result.stdout.split("\n"):
             if line.strip():
                 logger.debug(f"  {line}")
 
+    # Check for MATLAB execution errors
     if result.returncode != 0:
+        logger.error("MATLAB execution failed!")
+        logger.error("MATLAB stdout:")
+        for line in result.stdout.split("\n"):
+            if line.strip():
+                logger.error(f"  {line}")
         logger.error("MATLAB stderr:")
         for line in result.stderr.split("\n"):
             if line.strip():
@@ -163,11 +169,34 @@ def run_batch_worker(
         raise RuntimeError(f"MATLAB execution failed with return code {result.returncode}")
 
     # Find output parquet file
+    logger.debug(f"Looking for parquet files in: {pool_dir / simulation_pool_id}")
     parquet_files = list((pool_dir / simulation_pool_id).glob("batch_*.parquet"))
+
     if not parquet_files:
+        # Show all MATLAB output to help diagnose the issue
+        logger.error("MATLAB did not produce expected parquet file!")
+        logger.error(f"Expected location: {pool_dir / simulation_pool_id}")
+        logger.error("MATLAB stdout:")
+        for line in result.stdout.split("\n"):
+            if line.strip():
+                logger.error(f"  {line}")
+        if result.stderr:
+            logger.error("MATLAB stderr:")
+            for line in result.stderr.split("\n"):
+                if line.strip():
+                    logger.error(f"  {line}")
+
+        # Check if directory exists and what files are there
+        pool_subdir = pool_dir / simulation_pool_id
+        if pool_subdir.exists():
+            all_files = list(pool_subdir.glob("*"))
+            logger.error(f"Files found in {pool_subdir}: {[f.name for f in all_files]}")
+        else:
+            logger.error(f"Directory does not exist: {pool_subdir}")
+
         raise RuntimeError(
             f"MATLAB did not produce parquet file in {pool_dir / simulation_pool_id}\n"
-            f"Check MATLAB output above for errors."
+            f"See MATLAB output above for details."
         )
 
     parquet_file = parquet_files[0]

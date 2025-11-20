@@ -145,6 +145,64 @@ class TestSimulationPoolManagerInit:
         )
         assert pool1.config_hash != pool2.config_hash
 
+    def test_config_hash_changes_with_scenario(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv
+    ):
+        """Test that config hash changes when scenario changes."""
+        pool1 = SimulationPoolManager(
+            cache_dir=temp_dir / "cache",
+            model_version="test_v1",
+            model_description="Test model",
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv,
+            model_script="test_model",
+            scenario="baseline_no_treatment",
+        )
+        pool2 = SimulationPoolManager(
+            cache_dir=temp_dir / "cache",
+            model_version="test_v1",
+            model_description="Test model",
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv,
+            model_script="test_model",
+            scenario="gvax_standard_regimen",
+        )
+        assert pool1.config_hash != pool2.config_hash
+
+    def test_different_scenarios_create_different_pool_directories(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv
+    ):
+        """Test that different scenarios create separate pool directories."""
+        pool1 = SimulationPoolManager(
+            cache_dir=temp_dir / "cache",
+            model_version="test_v1",
+            model_description="Test model",
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv,
+            model_script="test_model",
+            scenario="baseline_no_treatment",
+        )
+        pool2 = SimulationPoolManager(
+            cache_dir=temp_dir / "cache",
+            model_version="test_v1",
+            model_description="Test model",
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv,
+            model_script="test_model",
+            scenario="gvax_standard_regimen",
+        )
+
+        # Different pool directories
+        assert pool1.pool_dir != pool2.pool_dir
+
+        # Both directories should exist
+        assert pool1.pool_dir.exists()
+        assert pool2.pool_dir.exists()
+
+        # Pool names should include scenario
+        assert "baseline_no_treatment" in pool1.pool_dir.name
+        assert "gvax_standard_regimen" in pool2.pool_dir.name
+
 
 class TestBatchScanning:
     """Tests for batch file scanning functionality."""

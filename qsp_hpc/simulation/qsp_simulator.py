@@ -286,6 +286,134 @@ class QSPSimulator:
 
         return samples  # type: ignore[no-any-return]
 
+    def run_local_simulation(
+        self,
+        n_sims: int = 1,
+        seed: Optional[int] = None,
+        matlab_path: str = "matlab",
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Run simulations locally using MATLAB (no HPC required).
+
+        This method is useful for testing, debugging, and small-scale simulations.
+        It samples parameters from the prior, runs MATLAB simulations locally,
+        and returns both parameters and test statistics.
+
+        Args:
+            n_sims: Number of simulations to run (default: 1)
+            seed: Random seed for parameter sampling (default: use simulator's seed)
+            matlab_path: Path to MATLAB executable (default: 'matlab' from PATH)
+
+        Returns:
+            Tuple of (params, test_stats):
+            - params: numpy array of shape (n_sims, num_params)
+            - test_stats: numpy array of shape (n_sims, num_test_stats)
+
+        Raises:
+            RuntimeError: If MATLAB execution fails or local worker script not found
+            ValueError: If parameter dimensions don't match
+
+        Example:
+            >>> simulator = QSPSimulator(
+            ...     test_stats_csv='test_stats.csv',
+            ...     priors_csv='priors.csv',
+            ...     project_name='my_project',
+            ...     model_script='my_model'
+            ... )
+            >>> params, test_stats = simulator.run_local_simulation(n_sims=5, seed=123)
+            >>> print(f"Parameters shape: {params.shape}")
+            >>> print(f"Test stats shape: {test_stats.shape}")
+        """
+        from qsp_hpc.simulation.local_matlab_runner import create_local_matlab_runner
+        from qsp_hpc.utils.logging_config import log_section
+
+        # Use provided seed or fall back to simulator's seed
+        if seed is None:
+            seed = self.seed
+
+        # Log the operation
+        with log_section(
+            self.logger,
+            f"Local MATLAB Simulation: {self.scenario}",
+            separator_width=80,
+        ):
+            config_info = {
+                "n_simulations": n_sims,
+                "seed": seed,
+                "model_script": self.model_script or "(default)",
+                "model_version": self.model_version,
+                "scenario": self.scenario,
+                "test_stats_csv": str(self.test_stats_csv),
+                "priors_csv": str(self.priors_csv),
+            }
+            for line in format_config(config_info):
+                self.logger.info(line)
+
+            # Sample parameters from prior
+            self.logger.info(f"Sampling {n_sims} parameter sets from prior (seed={seed})")
+
+            # Create temporary RNG with the specified seed
+            temp_rng = np.random.default_rng(seed)
+
+            # Generate parameters using the temporary RNG
+            import pandas as pd
+
+            priors_df = pd.read_csv(self.priors_csv)
+            param_names = priors_df["name"].tolist()
+            dist_types = priors_df["distribution"].tolist()
+            dist_param1 = priors_df["dist_param1"].values
+            dist_param2 = priors_df["dist_param2"].values
+
+            params = np.zeros((n_sims, len(param_names)))
+            for i in range(len(param_names)):
+                if dist_types[i] == "lognormal":
+                    params[:, i] = temp_rng.lognormal(
+                        mean=dist_param1[i], sigma=dist_param2[i], size=n_sims
+                    )
+                else:
+                    raise ValueError(f"Unsupported distribution: {dist_types[i]}")
+
+            self.logger.info(f"✓ Generated {params.shape[0]} × {params.shape[1]} parameter matrix")
+
+            # Log first parameter set (for verification)
+            if n_sims > 0:
+                self.logger.debug("First parameter set:")
+                for i, pname in enumerate(param_names[:5]):  # Show first 5
+                    self.logger.debug(f"  {pname}: {params[0, i]:.6e}")
+                if len(param_names) > 5:
+                    self.logger.debug(f"  ... and {len(param_names) - 5} more")
+
+            # Create or use injected MATLAB runner
+            if self._matlab_runner is None:
+                self.logger.info("Creating local MATLAB runner")
+                runner = create_local_matlab_runner(
+                    model_script=self.model_script or "default_model",
+                    priors_csv=self.priors_csv,
+                    test_stats_csv=self.test_stats_csv,
+                    model_version=self.model_version,
+                    scenario=self.scenario,
+                    matlab_path=matlab_path,
+                    verbose=self.verbose,
+                )
+            else:
+                self.logger.info("Using injected MATLAB runner")
+                runner = self._matlab_runner
+
+            # Run simulations
+            test_stats = runner(params, seed=seed)
+
+            self.logger.info(
+                f"✓ Completed: {test_stats.shape[0]} sims × {test_stats.shape[1]} test stats"
+            )
+
+            # Log test stats summary
+            self.logger.debug("Test statistics summary:")
+            self.logger.debug(f"  Min: {test_stats.min(axis=0)[:3]}")
+            self.logger.debug(f"  Max: {test_stats.max(axis=0)[:3]}")
+            self.logger.debug(f"  Mean: {test_stats.mean(axis=0)[:3]}")
+
+            return params, test_stats
+
     def _download_and_add_to_pool(
         self, hpc_pool_path: str, test_stats_hash: str, num_simulations: int
     ) -> Tuple[np.ndarray, np.ndarray]:

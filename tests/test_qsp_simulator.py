@@ -2812,3 +2812,101 @@ class TestPriorPPCSimulationReuse:
         # Verify we got results back
         assert test_stats.shape[0] == 200
         assert np.array_equal(test_stats, mock_observables)
+
+
+# ============================================================================
+# Local Simulation Tests
+# ============================================================================
+
+
+class TestLocalSimulation:
+    """Test the run_local_simulation method for local MATLAB execution."""
+
+    def test_run_local_simulation_basic(self, temp_dir, sample_priors_csv, sample_test_stats_csv):
+        """Test basic local simulation with mocked MATLAB runner."""
+
+        # Create a mock MATLAB runner
+        def mock_matlab_runner(params, seed=None):
+            """Mock MATLAB runner that returns fake test stats."""
+            n_sims = params.shape[0]
+            n_test_stats = 12  # From sample_test_stats_csv
+            return np.random.rand(n_sims, n_test_stats)
+
+        # Create simulator with injected mock runner
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_script="test_model",
+            model_version="v1",
+            scenario="baseline",
+            project_name="test_project",
+            cache_dir=temp_dir,
+            matlab_runner=mock_matlab_runner,
+            local_only=True,
+        )
+
+        # Run local simulation
+        params, test_stats = sim.run_local_simulation(n_sims=5, seed=42)
+
+        # Verify output shapes
+        assert params.shape == (5, 3)  # 5 sims, 3 params
+        assert test_stats.shape == (5, 12)  # 5 sims, 12 test stats
+
+        # Verify parameters are positive (lognormal distribution)
+        assert np.all(params > 0)
+
+    def test_run_local_simulation_seed_reproducibility(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv
+    ):
+        """Test that same seed produces same parameters."""
+
+        def mock_matlab_runner(params, seed=None):
+            n_sims = params.shape[0]
+            return np.random.rand(n_sims, 12)
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_script="test_model",
+            model_version="v1",
+            scenario="baseline",
+            project_name="test_project",
+            cache_dir=temp_dir,
+            matlab_runner=mock_matlab_runner,
+            local_only=True,
+        )
+
+        # Run with same seed twice
+        params1, _ = sim.run_local_simulation(n_sims=3, seed=123)
+        params2, _ = sim.run_local_simulation(n_sims=3, seed=123)
+
+        # Should get identical parameters
+        np.testing.assert_array_equal(params1, params2)
+
+    def test_run_local_simulation_default_single_sim(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv
+    ):
+        """Test local simulation with default n_sims=1."""
+
+        def mock_matlab_runner(params, seed=None):
+            n_sims = params.shape[0]
+            return np.random.rand(n_sims, 12)
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_script="test_model",
+            model_version="v1",
+            scenario="baseline",
+            project_name="test_project",
+            cache_dir=temp_dir,
+            matlab_runner=mock_matlab_runner,
+            local_only=True,
+        )
+
+        # Run with default (1 sim)
+        params, test_stats = sim.run_local_simulation()
+
+        # Should get single simulation
+        assert params.shape == (1, 3)
+        assert test_stats.shape == (1, 12)

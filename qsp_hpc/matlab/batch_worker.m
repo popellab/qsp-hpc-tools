@@ -290,9 +290,16 @@ catch ME
         fprintf('     %s (line %d)\n', ME.stack(i).name, ME.stack(i).line);
     end
 
-    % Save error information for debugging
-    error_file = fullfile(output_dir, sprintf('error_%s.mat', datestr(now, 'yyyymmdd_HHMMSS')));
-    save(error_file, 'ME');
+    % Save error information for debugging (if output_dir exists)
+    if exist('output_dir', 'var')
+        try
+            error_file = fullfile(output_dir, sprintf('error_%s.mat', datestr(now, 'yyyymmdd_HHMMSS')));
+            save(error_file, 'ME');
+            fprintf('   Error details saved to: %s\n', error_file);
+        catch
+            fprintf('   (Could not save error file)\n');
+        end
+    end
 
     rethrow(ME);
 end

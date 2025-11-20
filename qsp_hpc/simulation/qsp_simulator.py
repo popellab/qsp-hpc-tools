@@ -141,6 +141,7 @@ class QSPSimulator:
             priors_csv=priors_csv,
             test_stats_csv=test_stats_csv,
             model_script=model_script,
+            scenario=scenario,
         )
 
         # Store job_manager for lazy initialization (don't create until needed)
@@ -191,6 +192,11 @@ class QSPSimulator:
         }
         for line in format_config(config_info):
             self.logger.info(line)
+
+        # Log what's included in the config hash (helps understand cache invalidation)
+        self.logger.debug(
+            "Config hash includes: priors CSV, test stats CSV, model script, model version, scenario"
+        )
 
         # Random number generator for sampling from pool (use fixed seed for reproducibility)
         self.rng = np.random.default_rng(self.cache_sampling_seed)

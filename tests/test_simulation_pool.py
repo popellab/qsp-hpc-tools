@@ -72,7 +72,12 @@ class TestSimulationPoolManagerInit:
         """Test that pool directory follows naming convention."""
         pool_name = pool_manager.pool_dir.name
         assert pool_name.startswith("test_v1_")
-        assert len(pool_name) == len("test_v1_") + 8  # version + 8-char hash
+        # Format: {model_version}_{8-char hash}_{scenario}
+        # Example: test_v1_8018169b_default
+        parts = pool_name.split("_")
+        assert len(parts) >= 4  # test, v1, hash, scenario (scenario can have underscores)
+        assert len(parts[2]) == 8  # hash should be 8 characters
+        assert pool_name.endswith("_default")  # default scenario
 
     def test_missing_priors_csv_error(self, temp_dir, sample_test_stats_csv):
         """Test that missing priors CSV raises error."""

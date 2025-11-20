@@ -93,6 +93,7 @@ class SimulationPoolManager:
         priors_csv: Union[str, Path],
         test_stats_csv: Union[str, Path],
         model_script: str,
+        scenario: str = "default",
     ):
         """
         Initialize simulation pool manager.
@@ -104,6 +105,7 @@ class SimulationPoolManager:
             priors_csv: Path to priors CSV file
             test_stats_csv: Path to test statistics CSV file
             model_script: MATLAB model script name
+            scenario: Scenario name (e.g., 'baseline_no_treatment', 'gvax_standard_regimen')
         """
         self.cache_dir = Path(cache_dir)
         self.model_version = model_version
@@ -111,6 +113,7 @@ class SimulationPoolManager:
         self.priors_csv = Path(priors_csv)
         self.test_stats_csv = Path(test_stats_csv)
         self.model_script = model_script
+        self.scenario = scenario
 
         # Verify files exist
         if not self.priors_csv.exists():
@@ -121,8 +124,9 @@ class SimulationPoolManager:
         # Compute configuration hash
         self.config_hash = self._compute_config_hash()
 
-        # Pool directory: {model_version}_{config_hash[:HASH_PREFIX_LENGTH]}
-        pool_name = f"{model_version}_{self.config_hash[:HASH_PREFIX_LENGTH]}"
+        # Pool directory: {model_version}_{config_hash[:HASH_PREFIX_LENGTH]}_{scenario}
+        # This makes local pools consistent with HPC pool structure
+        pool_name = f"{model_version}_{self.config_hash[:HASH_PREFIX_LENGTH]}_{scenario}"
         self.pool_dir = self.cache_dir / pool_name
 
         # Ensure pool directory exists
@@ -158,6 +162,7 @@ class SimulationPoolManager:
         - Test statistics CSV content (observable definitions)
         - Model script name
         - Model version
+        - Scenario name
 
         Returns:
             SHA256 hash (full 64-character hex string)
@@ -177,6 +182,9 @@ class SimulationPoolManager:
 
         # Hash model version
         hasher.update(self.model_version.encode("utf-8"))
+
+        # Hash scenario name
+        hasher.update(self.scenario.encode("utf-8"))
 
         return hasher.hexdigest()
 

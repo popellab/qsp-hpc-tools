@@ -101,6 +101,14 @@ qsp-hpc-tools/
 - Updated README with development instructions
 - Added Click dependency for CLI
 
+### Pool Structure Consistency ✨ NEW (2025-01-19)
+- **Scenario included in config hash**: Local and HPC pools now use consistent directory structure
+  - Local: `{model_version}_{config_hash[:8]}_{scenario}/`
+  - HPC: `{model_version}_{priors_hash[:8]}_{scenario}/`
+  - Config hash now includes: priors CSV, test stats CSV, model script, model version, **scenario**
+  - Each scenario gets its own pool directory for clarity and consistency
+  - Eliminates confusion between local and HPC pool structures
+
 ### Logging Improvements ✨ NEW (2025-01-19)
 - **Enhanced `qsp_hpc/utils/logging_config.py`**: Added structured logging utilities
   - `separator()` - Visual section separators

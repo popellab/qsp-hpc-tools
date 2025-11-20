@@ -35,11 +35,11 @@ from qsp_hpc.utils.logging_config import setup_logger  # noqa: E402
 # This eliminates the need for separate test_stat_functions.py files
 def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
     """
-    Build test statistic function registry from CSV python_function column.
+    Build test statistic function registry from CSV model_output_code column.
 
     Each row in the CSV should have:
     - test_statistic_id: Unique identifier
-    - python_function: Python function code as string
+    - model_output_code: Python function code as string
 
     The function code should define a function named 'compute' with signature:
         def compute(time: np.ndarray, species1: np.ndarray, ...) -> float
@@ -115,7 +115,7 @@ def compute_test_statistics_batch(
         sim_df: DataFrame with full simulation data (from Parquet)
                 Columns: simulation_id, status, time, species_1, species_2, ...
         test_stats_df: DataFrame with test statistics configuration
-                       Columns: test_statistic_id, required_species, python_function
+                       Columns: test_statistic_id, required_species, model_output_code
         test_stat_registry: Dict mapping test_statistic_id -> compiled function
 
     Returns:

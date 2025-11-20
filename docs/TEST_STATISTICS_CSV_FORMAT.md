@@ -17,7 +17,7 @@ Test statistics are defined in a CSV file that serves as the single source of tr
   - Example: `"V_T.C1, V_T.CD8"`
   - Species names with dots will be converted to underscores in Parquet: `V_T.C1` → `V_T_C1`
 
-- **`python_function`** (string): Python function code to compute the test statistic
+- **`model_output_code`** (string): Python function code to compute the test statistic
   - Must define a function named `compute`
   - Signature: `def compute(time: np.ndarray, species1: np.ndarray, ...) -> float`
   - First argument is always `time`, followed by species in the order listed in `required_species`
@@ -36,7 +36,7 @@ Test statistics are defined in a CSV file that serves as the single source of tr
 ## CSV Example
 
 ```csv
-test_statistic_id,required_species,python_function,mean,variance,ci95_lower,ci95_upper,units,description
+test_statistic_id,required_species,model_output_code,mean,variance,ci95_lower,ci95_upper,units,description
 tumor_log_growth_rate_0_60d,V_T.C1,"def compute(time, V_T_C1):
     # Compute exponential growth rate from tumor cells over 0-60 days
     t0, t1 = 0, 60
@@ -228,14 +228,14 @@ When editing as plain text:
 
 1. **Draft functions in Python IDE** with syntax highlighting
 2. **Test functions** with sample data
-3. **Copy tested code** into CSV `python_function` column
+3. **Copy tested code** into CSV `model_output_code` column
 4. **Validate CSV** loads correctly: `pd.read_csv("test_stats.csv")`
 
 ## Backwards Compatibility
 
 The system maintains backwards compatibility:
 
-- **Legacy CSVs without `python_function`**: Worker will skip these and emit warnings
+- **Legacy CSVs without `model_output_code`**: Worker will skip these and emit warnings
 - **Old `model_output_code` column** (MATLAB): Ignored by derivation worker (deprecated)
 
 ## Migration from test_stat_functions.py
@@ -246,7 +246,7 @@ If you have an existing `test_stat_functions.py` file:
 2. **For each function**, add a row to CSV with:
    - `test_statistic_id` matching the function name in registry
    - `required_species` listing the species arguments
-   - `python_function` containing the function code
+   - `model_output_code` containing the function code
 3. **Remove** the old `test_stat_functions.py` file
 4. **Update** any documentation referencing the old approach
 

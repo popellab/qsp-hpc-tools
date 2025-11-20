@@ -993,7 +993,7 @@ class HPCJobManager:
         self.transport.exec(f'mkdir -p "{derivation_dir}"')
 
         # Upload test statistics CSV
-        # The CSV now contains Python function code in the python_function column,
+        # The CSV now contains Python function code in the model_output_code column,
         # eliminating the need for separate test_stat_functions.py files
         remote_test_stats_csv = f"{derivation_dir}/test_stats_{test_stats_hash[:8]}.csv"
         self.logger.info("Uploading test statistics CSV to HPC...")

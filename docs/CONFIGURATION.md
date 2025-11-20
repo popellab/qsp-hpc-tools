@@ -76,7 +76,6 @@ from qsp_hpc.batch import HPCJobManager
 manager = HPCJobManager()  # Reads ~/.config/qsp-hpc/credentials.yaml
 
 manager.submit_jobs(
-    project_name='pdac_2025',  # Creates /home/username/qsp-projects/pdac_2025
     ...
 )
 ```

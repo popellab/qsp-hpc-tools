@@ -106,8 +106,7 @@ sim = QSPSimulator(
     priors_csv='priors.csv',
     model_script='my_model',
     model_version='v1',
-    scenario='control',
-    project_name='pdac_2025'
+    scenario='control'
 )
 
 # 2. Request simulations (automatic caching)

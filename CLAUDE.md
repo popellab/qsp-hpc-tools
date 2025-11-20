@@ -78,7 +78,7 @@ qsp-hpc-tools/
 ### Configuration Refactor
 - **Global config**: `~/.config/qsp-hpc/credentials.yaml` (one config for all projects)
 - **Removed**: Project-specific `batch_credentials.yaml` pattern
-- **Project settings**: Now passed as method parameters (e.g., `project_name='pdac_2025'`)
+- **Simplified structure**: No nested `projects/{project_name}/` directories
 - **Updated template**: `credentials.yaml.template` matches new structure
 
 ### File Reorganization
@@ -145,8 +145,8 @@ qsp-hpc-tools/
 **Example Log Output**:
 ```
 2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO - Initializing QSP simulator for scenario: baseline_no_treatment
-2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Test Stats Csv: projects/pdac_2025/scenarios/test_statistics/baseline_no_treatment.csv
-2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Priors Csv: projects/pdac_2025/priors.csv
+2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Test Stats Csv: scenarios/test_statistics/baseline_no_treatment.csv
+2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Priors Csv: priors.csv
 2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Model Version: test_v1
 2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Config Hash: a3f7b2c8...
 2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO - Simulation request: 500 simulations (seed=42)
@@ -211,11 +211,6 @@ Created via:
 qsp-hpc setup  # Interactive wizard
 ```
 
-Project-specific settings passed as parameters:
-```python
-manager.submit_jobs(project_name='pdac_2025', ...)
-```
-
 ### Required Config Fields
 ```yaml
 ssh:
@@ -254,7 +249,7 @@ The setup wizard detects SSH config, creates directories, and can set up the HPC
 from qsp_hpc import HPCJobManager
 
 manager = HPCJobManager()  # Reads ~/.config/qsp-hpc/credentials.yaml
-manager.submit_jobs(project_name='pdac_2025', ...)
+manager.submit_jobs(...)
 ```
 
 ### Adding New Test Statistics

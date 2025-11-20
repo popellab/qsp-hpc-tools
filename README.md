@@ -36,8 +36,7 @@ simulator = QSPSimulator(
     priors_csv='path/to/priors.csv',
     model_script='my_qsp_model',
     model_version='v1',
-    scenario='control',
-    project_name='my_project'
+    scenario='control'
 )
 
 # Run simulations (automatically cached)

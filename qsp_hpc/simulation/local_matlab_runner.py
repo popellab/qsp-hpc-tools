@@ -3,18 +3,23 @@
 Local MATLAB Runner for QSP Simulations
 
 Provides utilities for running QSP simulations locally using MATLAB,
-without requiring HPC infrastructure. Useful for testing, debugging,
-and small-scale simulations.
+without requiring HPC infrastructure. Reuses HPC batch_worker.m and
+test stats derivation code for consistency.
 """
 
+import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 import pandas as pd
 
+from qsp_hpc.batch.derive_test_stats_worker import (
+    build_test_stat_registry,
+    compute_test_statistics_batch,
+)
 from qsp_hpc.utils.logging_config import get_logger, log_operation
 
 logger = get_logger(__name__)
@@ -30,12 +35,12 @@ def create_local_matlab_runner(
     sim_config: Optional[Dict[str, Any]] = None,
     matlab_path: str = "matlab",
     verbose: bool = False,
-) -> Callable[[np.ndarray], np.ndarray]:
+) -> Callable[[np.ndarray, Optional[int]], np.ndarray]:
     """
     Create a local MATLAB runner function for QSP simulations.
 
-    This factory function creates a callable that can run MATLAB simulations
-    locally, suitable for use with QSPSimulator's matlab_runner parameter.
+    This factory function creates a callable that runs MATLAB simulations
+    locally using the HPC batch_worker.m and test stats derivation code.
 
     Args:
         model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
@@ -58,25 +63,27 @@ def create_local_matlab_runner(
         ...     test_stats_csv=Path('test_stats.csv')
         ... )
         >>> params = np.random.rand(5, 10)  # 5 sims, 10 params
-        >>> test_stats = runner(params)     # (5, n_test_stats) array
+        >>> test_stats = runner(params, seed=42)     # (5, n_test_stats) array
     """
     # Load parameter names from priors CSV
     priors_df = pd.read_csv(priors_csv)
     param_names = priors_df["name"].tolist()
 
-    # Get absolute path to MATLAB worker script
+    # Get absolute path to MATLAB batch worker script
     matlab_dir = Path(__file__).parent.parent / "matlab"
-    worker_script = matlab_dir / "local_worker.m"
+    worker_script = matlab_dir / "batch_worker.m"
 
     if not worker_script.exists():
         raise FileNotFoundError(
-            f"Local worker script not found: {worker_script}\n"
+            f"Batch worker script not found: {worker_script}\n"
             f"Expected location: {worker_script.absolute()}"
         )
 
     def run_matlab_simulation(params: np.ndarray, seed: Optional[int] = None) -> np.ndarray:
         """
         Run MATLAB simulation locally with given parameters.
+
+        Uses HPC batch_worker.m and derive_test_stats_worker.py for consistency.
 
         Args:
             params: (n_sims, n_params) array of parameter values
@@ -98,24 +105,41 @@ def create_local_matlab_runner(
             )
 
         with log_operation(logger, f"Local MATLAB simulation ({n_sims} sims)"):
-            # Create temp directory for this simulation
+            # Create temp directory for this simulation (mimics HPC structure)
             with tempfile.TemporaryDirectory(prefix="qsp_local_") as temp_dir:
                 temp_path = Path(temp_dir)
 
+                # Create HPC-like directory structure
+                # batch_worker expects: projects/{project_name}/batch_jobs/input/
+                project_dir = temp_path / "projects" / "local_sim"
+                batch_jobs_dir = project_dir / "batch_jobs"
+                input_dir = batch_jobs_dir / "input"
+                output_dir = batch_jobs_dir / "output"
+
+                input_dir.mkdir(parents=True)
+                output_dir.mkdir(parents=True)
+
                 # Write parameters to CSV
-                param_csv = temp_path / "params.csv"
+                param_csv = input_dir / "params.csv"
                 params_df = pd.DataFrame(params, columns=param_names)
                 params_df.to_csv(param_csv, index=False)
 
-                # Write config JSON
+                # Set up simulation pool directory for Parquet output
+                pool_dir = temp_path / "simulation_pool"
+                pool_dir.mkdir()
+
+                # Write job config JSON (for batch_worker.m)
+                import json
+
                 config = {
                     "model_script": model_script,
-                    "param_csv": str(param_csv.absolute()),
+                    "param_csv": str((input_dir / "params.csv").relative_to(temp_path)),
                     "test_stats_csv": str(test_stats_csv.absolute()),
                     "n_simulations": int(n_sims),
                     "seed": int(seed) if seed is not None else 2025,
-                    "model_version": model_version,
-                    "scenario": scenario,
+                    "jobs_per_chunk": int(n_sims),  # Process all sims in one chunk
+                    "save_full_simulations": True,  # Enable Parquet saving
+                    "simulation_pool_id": "local_pool",  # Pool subdirectory name
                 }
 
                 if dose_schedule is not None:
@@ -123,42 +147,39 @@ def create_local_matlab_runner(
                 if sim_config is not None:
                     config["sim_config"] = sim_config
 
-                config_json = temp_path / "config.json"
-                import json
-
+                config_json = input_dir / "job_config.json"
                 with open(config_json, "w") as f:
                     json.dump(config, f, indent=2)
 
+                # Set SLURM environment variables (batch_worker expects these)
+                env = os.environ.copy()
+                env["SLURM_ARRAY_TASK_ID"] = "0"  # Single chunk, index 0
+                env["SLURM_JOB_ID"] = "local"
+                env["SLURMD_NODENAME"] = "localhost"
+                env["SIMULATION_POOL_PATH"] = str(pool_dir.absolute())
+
                 # Prepare MATLAB command
-                output_csv = temp_path / "test_stats.csv"
-                matlab_cmd = (
-                    f"cd('{matlab_dir.absolute()}'); "
-                    f"local_worker('{config_json.absolute()}', '{output_csv.absolute()}'); "
-                    f"exit;"
-                )
+                matlab_cmd = f"cd('{temp_path.absolute()}'); batch_worker('local_sim'); exit;"
 
                 # Run MATLAB
                 logger.debug(f"Running MATLAB worker: {worker_script.name}")
                 logger.debug(f"Config: {config_json}")
-                logger.debug(f"Output: {output_csv}")
+                logger.debug(f"Pool dir: {pool_dir}")
 
                 try:
                     result = subprocess.run(
-                        [
-                            matlab_path,
-                            "-batch",
-                            matlab_cmd,
-                        ],
+                        [matlab_path, "-batch", matlab_cmd],
                         capture_output=True,
                         text=True,
                         timeout=300,  # 5 minute timeout
+                        env=env,
                     )
 
-                    if verbose or result.returncode != 0:
-                        logger.info("MATLAB stdout:")
-                        for line in result.stdout.split("\n"):
-                            if line.strip():
-                                logger.info(f"  {line}")
+                    # Always show MATLAB stdout for debugging
+                    logger.info("MATLAB stdout:")
+                    for line in result.stdout.split("\n"):
+                        if line.strip():
+                            logger.info(f"  {line}")
 
                     if result.returncode != 0:
                         logger.error("MATLAB stderr:")
@@ -169,14 +190,39 @@ def create_local_matlab_runner(
                             f"MATLAB execution failed with return code {result.returncode}"
                         )
 
-                    # Read test statistics
-                    if not output_csv.exists():
+                    # Find the Parquet file that batch_worker created
+                    # Format: batch_{array_idx}_{timestamp}_{n_sims}sims_seed{seed}.parquet
+                    parquet_files = list((pool_dir / "local_pool").glob("batch_*.parquet"))
+
+                    if not parquet_files:
                         raise RuntimeError(
-                            f"MATLAB did not produce output file: {output_csv}\n"
+                            f"MATLAB did not produce Parquet file in {pool_dir / 'local_pool'}\n"
                             f"Check MATLAB output above for errors."
                         )
 
-                    test_stats = pd.read_csv(output_csv, header=None).values
+                    # Use the first (should be only) Parquet file
+                    parquet_file = parquet_files[0]
+                    logger.debug(f"Reading species data from: {parquet_file}")
+
+                    # Read species data from Parquet
+                    species_df = pd.read_parquet(parquet_file)
+                    logger.debug(
+                        f"Loaded species data: {len(species_df)} sims × "
+                        f"{len(species_df.columns)} columns"
+                    )
+
+                    # Load test stats CSV and build function registry
+                    logger.debug(f"Loading test stats functions from {test_stats_csv}")
+                    test_stats_df = pd.read_csv(test_stats_csv)
+
+                    # Build test stat registry (from derive_test_stats_worker)
+                    test_stat_registry = build_test_stat_registry(test_stats_df)
+
+                    # Compute test statistics (from derive_test_stats_worker)
+                    logger.debug(f"Computing {len(test_stats_df)} test statistics...")
+                    test_stats = compute_test_statistics_batch(
+                        species_df, test_stats_df, test_stat_registry
+                    )
 
                     # Validate shape
                     if test_stats.shape[0] != n_sims:
@@ -185,7 +231,7 @@ def create_local_matlab_runner(
                         )
 
                     logger.debug(
-                        f"Extracted test stats: {test_stats.shape[0]} sims × "
+                        f"Computed test stats: {test_stats.shape[0]} sims × "
                         f"{test_stats.shape[1]} stats"
                     )
 
@@ -203,7 +249,7 @@ def create_local_matlab_runner(
     return run_matlab_simulation
 
 
-def write_parameter_csv(params: np.ndarray, param_names: List[str], output_path: Path) -> None:
+def write_parameter_csv(params: np.ndarray, param_names: list[str], output_path: Path) -> None:
     """
     Write parameters to CSV file in MATLAB-compatible format.
 

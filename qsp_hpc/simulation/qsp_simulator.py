@@ -336,6 +336,31 @@ class QSPSimulator:
         else:
             self.logger.info(f"✓ Computed {total_stats} test statistics successfully")
 
+    def _log_parameters_table(self, param_values: np.ndarray, param_names: list[str]) -> None:
+        """
+        Log parameter values in a detailed table format.
+
+        Args:
+            param_values: Parameter values array (n_params,)
+            param_names: List of parameter names
+        """
+        self.logger.info("")
+        self.logger.info("Parameters:")
+        self.logger.info("┌─────────────────────────────────────┬──────────────┐")
+        self.logger.info("│ Parameter                           │ Value        │")
+        self.logger.info("├─────────────────────────────────────┼──────────────┤")
+
+        for param_name, param_value in zip(param_names, param_values):
+            # Format value
+            value_str = f"{param_value:.6g}"
+
+            # Truncate param_name if too long
+            display_name = param_name if len(param_name) <= 35 else param_name[:32] + "..."
+
+            self.logger.info(f"│ {display_name:<35} │ {value_str:>12} │")
+
+        self.logger.info("└─────────────────────────────────────┴──────────────┘")
+
     def run_local_simulation(
         self,
         n_sims: int = 1,
@@ -423,13 +448,9 @@ class QSPSimulator:
 
             self.logger.info(f"✓ Generated {params.shape[0]} × {params.shape[1]} parameter matrix")
 
-            # Log first parameter set (for verification)
+            # Log parameter table
             if n_sims > 0:
-                self.logger.debug("First parameter set:")
-                for i, pname in enumerate(param_names[:5]):  # Show first 5
-                    self.logger.debug(f"  {pname}: {params[0, i]:.6e}")
-                if len(param_names) > 5:
-                    self.logger.debug(f"  ... and {len(param_names) - 5} more")
+                self._log_parameters_table(params[0], param_names)
 
             # Run batch_worker.m locally
             from qsp_hpc.batch.derive_test_stats_worker import (

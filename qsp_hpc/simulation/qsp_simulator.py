@@ -82,6 +82,7 @@ class QSPSimulator:
         job_manager: Any = None,
         matlab_runner: Optional[Callable[..., np.ndarray]] = None,
         local_only: bool = False,
+        project_root: Optional[Union[str, Path]] = None,
     ):
         """
         Initialize QSP simulator.
@@ -121,6 +122,7 @@ class QSPSimulator:
         self.verbose = verbose
         self.local_only = local_only
         self.project_name = project_name
+        self.project_root = Path(project_root) if project_root is not None else None
 
         if not self.test_stats_csv.exists():
             raise FileNotFoundError(f"Test statistics CSV not found: {self.test_stats_csv}")
@@ -390,6 +392,7 @@ class QSPSimulator:
                     model_script=self.model_script or "default_model",
                     priors_csv=self.priors_csv,
                     test_stats_csv=self.test_stats_csv,
+                    project_root=self.project_root,
                     model_version=self.model_version,
                     scenario=self.scenario,
                     matlab_path=matlab_path,

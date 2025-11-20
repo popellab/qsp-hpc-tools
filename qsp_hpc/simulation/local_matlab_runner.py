@@ -29,6 +29,7 @@ def create_local_matlab_runner(
     model_script: str,
     priors_csv: Path,
     test_stats_csv: Path,
+    project_root: Optional[Path] = None,
     model_version: str = "v1",
     scenario: str = "default",
     dose_schedule: Optional[Dict[str, Any]] = None,
@@ -46,6 +47,8 @@ def create_local_matlab_runner(
         model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
         priors_csv: Path to priors CSV (needed for parameter names)
         test_stats_csv: Path to test statistics CSV (defines what to extract)
+        project_root: Path to project root directory (containing startup.m). If None,
+                     startup.m will not be run (model must already be on MATLAB path)
         model_version: Descriptive version name for logging
         scenario: Scenario name for therapy protocol
         dose_schedule: Optional dose schedule configuration
@@ -159,13 +162,25 @@ def create_local_matlab_runner(
                 env["SIMULATION_POOL_PATH"] = str(pool_dir.absolute())
 
                 # Prepare MATLAB command
-                # Add matlab directory to path, cd to temp dir, then run batch_worker
-                matlab_cmd = (
-                    f"addpath('{matlab_dir.absolute()}'); "
-                    f"cd('{temp_path.absolute()}'); "
-                    f"batch_worker('local_sim'); "
-                    f"exit;"
-                )
+                # Option B: Run startup from project root to load paths, then run batch_worker
+                if project_root is not None:
+                    # cd to project, run startup to load paths, then proceed
+                    matlab_cmd = (
+                        f"addpath('{matlab_dir.absolute()}'); "
+                        f"cd('{project_root.absolute()}'); "
+                        f"startup; "  # Load project paths from startup.m
+                        f"cd('{temp_path.absolute()}'); "
+                        f"batch_worker('local_sim'); "
+                        f"exit;"
+                    )
+                else:
+                    # No project_root - skip startup (model must be on path already)
+                    matlab_cmd = (
+                        f"addpath('{matlab_dir.absolute()}'); "
+                        f"cd('{temp_path.absolute()}'); "
+                        f"batch_worker('local_sim'); "
+                        f"exit;"
+                    )
 
                 # Run MATLAB
                 logger.debug(f"Running MATLAB worker: {worker_script.name}")

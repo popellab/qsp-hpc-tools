@@ -52,25 +52,28 @@ def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
     """
     registry = {}
 
-    # Validate required column exists
-    if "python_function" not in test_stats_df.columns:
+    # Check for model_output_code column
+    if "model_output_code" not in test_stats_df.columns:
         raise ValueError(
-            "Test statistics CSV missing required 'python_function' column. "
+            "Test statistics CSV missing required 'model_output_code' column. "
+            "This column should contain Python function code to compute test statistics. "
             "See docs/TEST_STATISTICS_CSV_FORMAT.md for format specification."
         )
+
+    function_col = "model_output_code"
 
     for _, row in test_stats_df.iterrows():
         test_stat_id = row["test_statistic_id"]
 
-        # Check if python_function is provided
-        if pd.isna(row["python_function"]):
+        # Check if function is provided
+        if pd.isna(row[function_col]):
             raise ValueError(
-                f"Test statistic '{test_stat_id}' has empty python_function. "
+                f"Test statistic '{test_stat_id}' has empty {function_col}. "
                 "All test statistics must define a Python function. "
                 "See docs/TEST_STATISTICS_CSV_FORMAT.md for examples."
             )
 
-        function_code = row["python_function"]
+        function_code = row[function_col]
 
         try:
             # Create isolated namespace for function
@@ -82,7 +85,7 @@ def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
             # Extract the 'compute' function
             if "compute" not in namespace:
                 raise ValueError(
-                    f"Test statistic '{test_stat_id}': python_function must define "
+                    f"Test statistic '{test_stat_id}': {function_col} must define "
                     "a function named 'compute'"
                 )
 

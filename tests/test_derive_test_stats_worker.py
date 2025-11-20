@@ -11,7 +11,7 @@ from qsp_hpc.batch.derive_test_stats_worker import (
 
 
 class TestBuildTestStatRegistry:
-    """Test building test statistic registry from CSV python_function column."""
+    """Test building test statistic registry from CSV model_output_code column."""
 
     def test_simple_function(self):
         """Test loading a simple test statistic function from CSV."""
@@ -19,7 +19,7 @@ class TestBuildTestStatRegistry:
             {
                 "test_statistic_id": ["simple_mean"],
                 "required_species": ["V_T.C1"],
-                "python_function": [
+                "model_output_code": [
                     """def compute(time, V_T_C1):
     return np.mean(V_T_C1)"""
                 ],
@@ -43,7 +43,7 @@ class TestBuildTestStatRegistry:
             {
                 "test_statistic_id": ["ratio_test"],
                 "required_species": ["V_T.CD8, V_T.Treg"],
-                "python_function": [
+                "model_output_code": [
                     """def compute(time, V_T_CD8, V_T_Treg):
     cd8_0 = np.interp(0.0, time, V_T_CD8)
     treg_0 = np.interp(0.0, time, V_T_Treg)
@@ -67,7 +67,7 @@ class TestBuildTestStatRegistry:
             {
                 "test_statistic_id": ["log_growth_rate"],
                 "required_species": ["V_T.C1"],
-                "python_function": [
+                "model_output_code": [
                     """def compute(time, V_T_C1):
     t0, t1 = 0, 60
     if len(time) == 0 or len(V_T_C1) == 0:
@@ -95,30 +95,30 @@ class TestBuildTestStatRegistry:
         result = registry["log_growth_rate"](time, tumor_cells)
         assert result == pytest.approx(r, rel=1e-2)
 
-    def test_missing_python_function_column(self):
-        """Test that missing python_function column raises error."""
+    def test_missing_model_output_code_column(self):
+        """Test that missing model_output_code column raises error."""
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["legacy_stat"],
                 "required_species": ["V_T.C1"],
-                # Missing python_function column
+                # Missing model_output_code column
             }
         )
 
-        with pytest.raises(ValueError, match="missing required 'python_function' column"):
+        with pytest.raises(ValueError, match="missing required 'model_output_code' column"):
             build_test_stat_registry(test_stats_df)
 
-    def test_nan_python_function(self):
-        """Test that NaN python_function raises error."""
+    def test_nan_model_output_code(self):
+        """Test that NaN model_output_code raises error."""
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["missing_func"],
                 "required_species": ["V_T.C1"],
-                "python_function": [np.nan],
+                "model_output_code": [np.nan],
             }
         )
 
-        with pytest.raises(ValueError, match="has empty python_function"):
+        with pytest.raises(ValueError, match="has empty model_output_code"):
             build_test_stat_registry(test_stats_df)
 
     def test_invalid_function_code(self):
@@ -127,7 +127,7 @@ class TestBuildTestStatRegistry:
             {
                 "test_statistic_id": ["bad_syntax"],
                 "required_species": ["V_T.C1"],
-                "python_function": ["def compute(time, V_T_C1)\n    return ???"],  # Syntax error
+                "model_output_code": ["def compute(time, V_T_C1)\n    return ???"],  # Syntax error
             }
         )
 
@@ -140,7 +140,7 @@ class TestBuildTestStatRegistry:
             {
                 "test_statistic_id": ["wrong_name"],
                 "required_species": ["V_T.C1"],
-                "python_function": [
+                "model_output_code": [
                     """def my_function(time, V_T_C1):
     return np.mean(V_T_C1)"""
                 ],  # Wrong function name
@@ -156,7 +156,7 @@ class TestBuildTestStatRegistry:
             {
                 "test_statistic_id": ["stat1", "stat2", "stat3"],
                 "required_species": ["V_T.C1", "V_T.C1", "V_T.C1"],
-                "python_function": [
+                "model_output_code": [
                     "def compute(time, V_T_C1):\n    return np.mean(V_T_C1)",
                     "def compute(time, V_T_C1):\n    return np.max(V_T_C1)",
                     "def compute(time, V_T_C1):\n    return np.min(V_T_C1)",
@@ -189,7 +189,7 @@ class TestComputeTestStatisticsBatch:
             {
                 "test_statistic_id": ["mean_tumor"],
                 "required_species": ["V_T_C1"],
-                "python_function": ["def compute(time, V_T_C1):\n    return np.mean(V_T_C1)"],
+                "model_output_code": ["def compute(time, V_T_C1):\n    return np.mean(V_T_C1)"],
             }
         )
 
@@ -218,7 +218,7 @@ class TestComputeTestStatisticsBatch:
             {
                 "test_statistic_id": ["mean_tumor"],
                 "required_species": ["V_T_C1"],
-                "python_function": ["def compute(time, V_T_C1):\n    return np.mean(V_T_C1)"],
+                "model_output_code": ["def compute(time, V_T_C1):\n    return np.mean(V_T_C1)"],
             }
         )
 
@@ -246,7 +246,7 @@ class TestComputeTestStatisticsBatch:
             {
                 "test_statistic_id": ["mean_tumor", "max_tumor", "min_tumor"],
                 "required_species": ["V_T_C1", "V_T_C1", "V_T_C1"],
-                "python_function": [
+                "model_output_code": [
                     "def compute(time, V_T_C1):\n    return np.mean(V_T_C1)",
                     "def compute(time, V_T_C1):\n    return np.max(V_T_C1)",
                     "def compute(time, V_T_C1):\n    return np.min(V_T_C1)",
@@ -278,7 +278,7 @@ class TestComputeTestStatisticsBatch:
             {
                 "test_statistic_id": ["cd8_treg_ratio"],
                 "required_species": ["V_T_CD8, V_T_Treg"],
-                "python_function": [
+                "model_output_code": [
                     """def compute(time, V_T_CD8, V_T_Treg):
     cd8_0 = np.interp(0.0, time, V_T_CD8)
     treg_0 = np.interp(0.0, time, V_T_Treg)
@@ -310,7 +310,7 @@ class TestComputeTestStatisticsBatch:
             {
                 "test_statistic_id": ["stat_not_in_registry"],
                 "required_species": ["V_T_C1"],
-                "python_function": ["def compute(time, V_T_C1):\n    return np.mean(V_T_C1)"],
+                "model_output_code": ["def compute(time, V_T_C1):\n    return np.mean(V_T_C1)"],
             }
         )
 
@@ -333,7 +333,7 @@ class TestComputeTestStatisticsBatch:
             {
                 "test_statistic_id": ["error_stat"],
                 "required_species": ["V_T_C1"],
-                "python_function": [
+                "model_output_code": [
                     """def compute(time, V_T_C1):
     raise ValueError("Test error")"""
                 ],

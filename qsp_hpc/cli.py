@@ -614,18 +614,16 @@ def info(show_secrets):
 
 
 @cli.command()
-@click.argument("project_name", required=False)
 @click.option("--task-id", type=int, help="Array task ID to show logs for")
 @click.option("--lines", default=50, help="Number of lines to show")
-@click.option("--job-id", help="Specific job ID to show logs for")
-def logs(project_name, task_id, lines, job_id):
+@click.option("--job-id", help="Specific job ID to show logs for (required)")
+def logs(task_id, lines, job_id):
     """
     View HPC SLURM job logs.
 
     Examples:
-        qsp-hpc logs pdac_2025              # Latest job for project
-        qsp-hpc logs pdac_2025 --task-id 3  # Task 3 of latest job
         qsp-hpc logs --job-id 12345         # Specific job ID
+        qsp-hpc logs --job-id 12345 --task-id 3  # Task 3 of job
     """
     from qsp_hpc.batch.hpc_job_manager import HPCJobManager
 
@@ -634,10 +632,9 @@ def logs(project_name, task_id, lines, job_id):
     click.echo("=" * 70)
     click.echo()
 
-    if not project_name and not job_id:
-        click.secho("✗ Must specify either PROJECT_NAME or --job-id", fg="red")
+    if not job_id:
+        click.secho("✗ Must specify --job-id", fg="red")
         click.echo("\nUsage:")
-        click.echo("  qsp-hpc logs pdac_2025")
         click.echo("  qsp-hpc logs --job-id 12345")
         sys.exit(1)
 
@@ -648,39 +645,30 @@ def logs(project_name, task_id, lines, job_id):
         click.echo(f"\n{e}")
         sys.exit(1)
 
-    if job_id:
-        # Show logs for specific job ID
-        click.echo(f"Fetching logs for job {job_id}...")
+    # Show logs for specific job ID
+    click.echo(f"Fetching logs for job {job_id}...")
 
-        task_suffix = f"_{task_id}" if task_id is not None else ""
-        log_pattern = f"slurm-{job_id}{task_suffix}.out"
+    task_suffix = f"_{task_id}" if task_id is not None else ""
+    log_pattern = f"slurm-{job_id}{task_suffix}.out"
 
-        # Try to find the log file
-        returncode, output = manager.transport.exec(
-            f"find {manager.config.remote_project_path} -name '{log_pattern}' 2>/dev/null | head -1",
-            timeout=10,
-        )
+    # Try to find the log file
+    returncode, output = manager.transport.exec(
+        f"find {manager.config.remote_project_path} -name '{log_pattern}' 2>/dev/null | head -1",
+        timeout=10,
+    )
 
-        if returncode == 0 and output.strip():
-            log_file = output.strip()
-            returncode, log_content = manager.transport.exec(
-                f"tail -n {lines} {log_file}", timeout=10
-            )
+    if returncode == 0 and output.strip():
+        log_file = output.strip()
+        returncode, log_content = manager.transport.exec(f"tail -n {lines} {log_file}", timeout=10)
 
-            if returncode == 0:
-                click.echo()
-                click.secho(f"=== {log_file} ===", fg="cyan")
-                click.echo(log_content)
-            else:
-                click.secho("✗ Could not read log file", fg="red")
+        if returncode == 0:
+            click.echo()
+            click.secho(f"=== {log_file} ===", fg="cyan")
+            click.echo(log_content)
         else:
-            click.secho(f"✗ Log file not found for job {job_id}", fg="red")
-
+            click.secho("✗ Could not read log file", fg="red")
     else:
-        # Show logs for project (need to implement job state tracking)
-        click.secho("⚠️  Project-based log viewing not yet implemented", fg="yellow")
-        click.echo("\nUse --job-id to view logs for a specific job:")
-        click.echo("  qsp-hpc logs --job-id 12345")
+        click.secho(f"✗ Log file not found for job {job_id}", fg="red")
 
     click.echo()
 

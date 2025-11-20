@@ -14,39 +14,31 @@ Usage:
 
     # Show last 100 lines instead of 50
     python -m qsp_hpc.batch.logs_show 3 --lines 100
-
-    # Use different project
-    python -m qsp_hpc.batch.logs_show 3 --project pdac_2024
 """
 
 import argparse
 import sys
 
 from qsp_hpc.batch.hpc_job_manager import HPCJobManager
-from qsp_hpc.utils.security import build_safe_ssh_command, validate_project_name
+from qsp_hpc.utils.security import build_safe_ssh_command
 
 
-def show_logs(array_task_id: int = 0, lines: int = 50, project: str = "pdac_2025"):
+def show_logs(array_task_id: int = 0, lines: int = 50):
     """
     Show logs from latest HPC derivation job.
 
     Args:
         array_task_id: Array task ID to show logs for (default: 0)
         lines: Number of lines to show from end of log (default: 50)
-        project: Project name (default: 'pdac_2025')
     """
-    # Validate project name for security
-    project = validate_project_name(project)
-
     print("📋 Fetching HPC derivation logs...")
-    print(f"   Project: {project}")
     print(f"   Task: {array_task_id}")
 
     # Initialize job manager
     job_manager = HPCJobManager()
 
     # Build log directory path
-    log_dir = f"{job_manager.config.remote_project_path}/projects/{project}/batch_jobs/logs"
+    log_dir = f"{job_manager.config.remote_project_path}/batch_jobs/logs"
 
     # Find the latest derivation log file
     print("   → Finding latest qsp_derive logs...")
@@ -167,14 +159,10 @@ Examples:
         help="Number of lines to show from end of log (default: 50)",
     )
 
-    parser.add_argument(
-        "--project", type=str, default="pdac_2025", help="Project name (default: pdac_2025)"
-    )
-
     args = parser.parse_args()
 
     try:
-        show_logs(array_task_id=args.task, lines=args.lines, project=args.project)
+        show_logs(array_task_id=args.task, lines=args.lines)
     except Exception as e:
         print(f"\n❌ Error: {e}")
         sys.exit(1)

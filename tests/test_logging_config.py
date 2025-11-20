@@ -58,7 +58,7 @@ class TestSetupLogger:
         logger.handlers.clear()
 
     def test_setup_logger_non_verbose_format(self):
-        """Test that non-verbose logger has simple format."""
+        """Test that non-verbose logger has full format with timestamp and name."""
         logger = setup_logger("test.simple", verbose=False)
 
         handler = logger.handlers[0]
@@ -76,8 +76,10 @@ class TestSetupLogger:
         )
         formatted = formatter.format(record)
 
-        # Simple format should just be "LEVEL: message"
-        assert formatted == "INFO: Test message"
+        # Full format should be "YYYY-MM-DD HH:MM:SS - name - LEVEL - message"
+        # Check that it contains the key components (timestamp format may vary)
+        assert " - test.simple - INFO - Test message" in formatted
+        assert len(formatted) > len("INFO: Test message")  # Should be longer than simple format
 
         # Clean up
         logger.handlers.clear()

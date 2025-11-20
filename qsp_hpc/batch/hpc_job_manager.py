@@ -44,7 +44,7 @@ import yaml
 from qsp_hpc.batch.hpc_file_transfer import HPCFileTransfer
 from qsp_hpc.batch.result_collector import MissingOutputError, ResultCollector
 from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter, SubmissionError  # noqa: F401
-from qsp_hpc.utils.logging_config import setup_logger
+from qsp_hpc.utils.logging_config import format_config, log_operation, setup_logger
 from qsp_hpc.utils.security import (
     build_safe_ssh_command,
     validate_project_name,
@@ -498,8 +498,22 @@ class HPCJobManager:
 
         n_jobs = calculate_num_tasks(num_simulations, jobs_per_chunk)
 
+        # Log job submission details
+        self.logger.info("Preparing HPC job submission:")
+        job_config = {
+            "project": project_name,
+            "simulations": num_simulations,
+            "array_tasks": n_jobs,
+            "sims_per_task": jobs_per_chunk,
+            "model_script": model_script,
+            "seed": seed,
+        }
+        for line in format_config(job_config):
+            self.logger.info(line)
+
         # Sync codebase
-        self.sync_codebase(skip_sync=skip_sync)
+        with log_operation(self.logger, "Syncing codebase to HPC", log_start=not skip_sync):
+            self.sync_codebase(skip_sync=skip_sync)
 
         # Ensure Python venv is set up on HPC
         self.ensure_hpc_venv()
@@ -508,6 +522,7 @@ class HPCJobManager:
         self._setup_remote_directories(project_name)
 
         # Create and upload job config (JSON)
+        self.logger.info("Uploading job configuration and inputs...")
         self._upload_job_config(
             test_stats_csv=test_stats_csv,
             model_script=model_script,
@@ -526,7 +541,9 @@ class HPCJobManager:
         self._upload_test_statistics(test_stats_csv, project_name)
 
         # Submit SLURM job
+        self.logger.info(f"Submitting SLURM array job with {n_jobs} tasks...")
         job_id = self._submit_slurm_job(n_jobs, project_name)
+        self.logger.info(f"✓ Job submitted: {job_id}")
 
         # Save job state
         job_info = JobInfo(
@@ -996,7 +1013,9 @@ class HPCJobManager:
         Returns:
             SLURM job ID
         """
-        self.logger.info("   Submitting test statistics derivation job...")
+        self.logger.info("Preparing derivation job:")
+        self.logger.info(f"  Pool: {pool_path}")
+        self.logger.info(f"  Test stats hash: {test_stats_hash[:8]}...")
 
         # Ensure Python venv is set up
         self.ensure_hpc_venv()
@@ -1011,6 +1030,7 @@ class HPCJobManager:
         # The CSV now contains Python function code in the python_function column,
         # eliminating the need for separate test_stat_functions.py files
         remote_test_stats_csv = f"{derivation_dir}/test_stats_{test_stats_hash[:8]}.csv"
+        self.logger.info("Uploading test statistics CSV to HPC...")
         self.transport.upload(test_stats_csv, remote_test_stats_csv)
 
         # Expand $HOME in pool_path (Python won't expand shell variables)
@@ -1018,8 +1038,6 @@ class HPCJobManager:
         status, home_dir = self.transport.exec("echo $HOME")
         home_dir = home_dir.strip()
         expanded_pool_path = pool_path.replace("$HOME", home_dir)
-
-        self.logger.info(f"   Expanded pool path: {expanded_pool_path}")
 
         # Create derivation config JSON
         config = {

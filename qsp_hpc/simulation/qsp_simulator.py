@@ -33,7 +33,12 @@ from qsp_hpc.batch.batch_utils import calculate_batch_split
 from qsp_hpc.batch.hpc_job_manager import MissingOutputError, RemoteCommandError, SubmissionError
 from qsp_hpc.constants import HASH_PREFIX_LENGTH, JOB_QUEUE_TIMEOUT, SLURM_REGISTRATION_DELAY
 from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
-from qsp_hpc.utils.logging_config import setup_logger
+from qsp_hpc.utils.logging_config import (
+    create_child_logger,
+    format_config,
+    log_operation,
+    setup_logger,
+)
 
 
 class QSPSimulatorError(RuntimeError):
@@ -144,8 +149,48 @@ class QSPSimulator:
         # Optional injected MATLAB runner for testing/mocking
         self._matlab_runner = matlab_runner
 
-        # Set up logging
-        self.logger = setup_logger(__name__, verbose=self.verbose)
+        # Set up logging with scenario-specific hierarchical logger
+        base_logger = setup_logger(__name__, verbose=self.verbose)
+        self.logger = create_child_logger(base_logger, self.scenario)
+
+        # Log initialization details (safely handle mock pools in tests)
+        self.logger.info(f"Initializing QSP simulator for scenario: {self.scenario}")
+        try:
+            pool_dir = self.pool.pool_dir
+            pool_dir_str = str(
+                pool_dir.relative_to(Path.cwd())
+                if pool_dir.is_relative_to(Path.cwd())
+                else pool_dir
+            )
+        except (AttributeError, TypeError):
+            pool_dir_str = "(mock pool)"
+
+        try:
+            config_hash_str = self.pool.config_hash[:8] + "..."
+        except (AttributeError, TypeError):
+            config_hash_str = "(mock)"
+
+        config_info = {
+            "test_stats_csv": str(
+                self.test_stats_csv.relative_to(Path.cwd())
+                if self.test_stats_csv.is_relative_to(Path.cwd())
+                else self.test_stats_csv
+            ),
+            "priors_csv": str(
+                self.priors_csv.relative_to(Path.cwd())
+                if self.priors_csv.is_relative_to(Path.cwd())
+                else self.priors_csv
+            ),
+            "model_version": self.model_version,
+            "model_script": self.model_script or "(default)",
+            "scenario": self.scenario,
+            "pool_directory": pool_dir_str,
+            "config_hash": config_hash_str,
+            "seed": self.seed,
+            "cache_sampling_seed": self.cache_sampling_seed,
+        }
+        for line in format_config(config_info):
+            self.logger.info(line)
 
         # Random number generator for sampling from pool (use fixed seed for reproducibility)
         self.rng = np.random.default_rng(self.cache_sampling_seed)
@@ -253,15 +298,15 @@ class QSPSimulator:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_cache_dir = Path(temp_dir)
 
-            self._info("Downloading test statistics from HPC...")
-            try:
-                params, test_stats = self.job_manager.download_test_stats(
-                    hpc_pool_path, test_stats_hash, temp_cache_dir
-                )
-            except (MissingOutputError, RemoteCommandError) as exc:
-                raise QSPSimulatorError(
-                    f"Failed to download test statistics from HPC: {exc}"
-                ) from exc
+            with log_operation(self.logger, "Downloading test statistics from HPC"):
+                try:
+                    params, test_stats = self.job_manager.download_test_stats(
+                        hpc_pool_path, test_stats_hash, temp_cache_dir
+                    )
+                except (MissingOutputError, RemoteCommandError) as exc:
+                    raise QSPSimulatorError(
+                        f"Failed to download test statistics from HPC: {exc}"
+                    ) from exc
 
             if params is None:
                 raise RuntimeError(
@@ -271,7 +316,7 @@ class QSPSimulator:
                 )
 
             # Add to SimulationPoolManager
-            self._info(f"Adding {params.shape[0]} simulations to pool (scenario='{self.scenario}')")
+            self.logger.info(f"Adding {params.shape[0]} simulations to local pool")
             self.pool.add_batch(
                 params_matrix=params,
                 observables_matrix=test_stats,
@@ -284,7 +329,7 @@ class QSPSimulator:
             n_requested=num_simulations, scenario=self.scenario, random_state=self.rng
         )
 
-        self._info(f"Complete: Returning {params_out.shape[0]} samples")
+        self.logger.info(f"✓ Returning {params_out.shape[0]} simulations")
         return params_out, obs_out
 
     def _check_hpc_simulations(
@@ -328,11 +373,11 @@ class QSPSimulator:
             raise QSPSimulatorError(f"Failed checking test stats on HPC: {exc}") from exc
 
         if has_test_stats:
-            self._info("Test statistics already derived")
+            self.logger.info("✓ Test statistics already derived")
             return
 
         # Need to derive test statistics
-        self._info("Deriving test statistics from full simulations...")
+        self.logger.info("Submitting derivation job to HPC...")
 
         # Launch derivation job (with selective batch processing)
         job_id = self.job_manager.submit_derivation_job(
@@ -342,11 +387,11 @@ class QSPSimulator:
             project_name=self.project_name,
             num_simulations=num_simulations,
         )
+        self.logger.info(f"Derivation job submitted: {job_id}")
 
         # Wait for derivation job to complete
-        self._info("Waiting for derivation to complete...")
-        self._wait_for_completion([job_id], num_simulations)
-        self._info("Derivation complete")
+        with log_operation(self.logger, "Waiting for derivation job", log_start=False):
+            self._wait_for_completion([job_id], num_simulations)
 
         # Verify that test stats were actually created
         has_test_stats_now = self.job_manager.check_hpc_test_stats(hpc_pool_path, test_stats_hash)
@@ -358,8 +403,8 @@ class QSPSimulator:
             status, log_output = self.job_manager.transport.exec(log_cmd)
 
             if status == 0 and log_output.strip():
-                self._error("Recent derivation error logs:")
-                self._error(f"  {log_output.strip()}")
+                self.logger.error("Recent derivation error logs:")
+                self.logger.error(f"  {log_output.strip()}")
 
             raise RuntimeError(
                 f"Derivation job completed but did not produce test statistics. "
@@ -436,28 +481,30 @@ class QSPSimulator:
         else:
             num_simulations = int(batch_size)
 
-        self._info(
-            f"QSP Simulator: {num_simulations} simulations (scenario='{self.scenario}', version={self.model_version})"
-        )
+        # Log simulation request
+        self.logger.info(f"Simulation request: {num_simulations} simulations (seed={self.seed})")
 
         # 1. Check SimulationPoolManager for cached test statistics (fast path)
         n_available = self.pool.get_available_simulations(scenario=self.scenario)
+
         if n_available >= num_simulations:
-            if self.verbose:
-                self._info(f"  Found {n_available} simulations in local pool (sufficient)")
+            self.logger.info(f"✓ Using local pool: {n_available} simulations available")
             params, observables = self.pool.load_simulations(
                 n_requested=num_simulations, scenario=self.scenario, random_state=self.rng
             )
+            self.logger.info(f"Returning {params.shape[0]} simulations from local pool")
             return params, observables
+
+        if n_available > 0:
+            self.logger.info(
+                f"Local pool has {n_available}/{num_simulations} simulations - checking HPC"
+            )
+        else:
+            self.logger.info("No local simulations - checking HPC")
 
         if self.local_only:
             raise QSPSimulatorError(
                 f"Local-only mode enabled but only {n_available}/{num_simulations} simulations available."
-            )
-
-        if self.verbose:
-            self._info(
-                f"  Local pool has {n_available}/{num_simulations} simulations - checking HPC"
             )
 
         # Compute hash keys for HPC lookups
@@ -466,8 +513,10 @@ class QSPSimulator:
 
         # Get HPC pool path (scenario-specific)
         hpc_pool_path = f"{self.job_manager.config.simulation_pool_path}/{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
+        self.logger.info(f"HPC pool path: {hpc_pool_path}")
 
         # 2. Check HPC for derived test statistics
+        self.logger.info("Checking HPC for pre-derived test statistics...")
         try:
             has_test_stats = self.job_manager.check_hpc_test_stats(
                 hpc_pool_path, test_stats_hash, expected_n_sims=num_simulations
@@ -476,17 +525,20 @@ class QSPSimulator:
             raise QSPSimulatorError(f"Failed checking HPC test stats: {exc}") from exc
 
         if has_test_stats:
-            self._info("Found derived test statistics on HPC")
+            self.logger.info("✓ Found pre-derived test statistics on HPC")
             try:
                 return self._download_and_add_to_pool(
                     hpc_pool_path, test_stats_hash, num_simulations
                 )
             except Exception as exc:
                 raise QSPSimulatorError(f"Failed downloading test stats from HPC: {exc}") from exc
+        else:
+            self.logger.info("No pre-derived test statistics found")
 
         # 3. Check HPC for full simulations (construct path explicitly to include scenario)
+        self.logger.info("Checking HPC for full simulations...")
         try:
-            # Use same path construction as when saving (line 463)
+            # Use same path construction as when saving
             hpc_full_sim_path = f"{self.job_manager.config.simulation_pool_path}/{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
             has_full_sims = self.job_manager.result_collector.check_pool_directory_exists(
                 hpc_full_sim_path
@@ -502,9 +554,8 @@ class QSPSimulator:
             raise QSPSimulatorError(f"Failed checking HPC full simulations: {exc}") from exc
 
         if has_full_sims:
-            self._info(
-                f"Found {n_hpc_available} full simulations on HPC - deriving test statistics"
-            )
+            self.logger.info(f"✓ Found {n_hpc_available} full simulations on HPC (sufficient)")
+            self.logger.info("Deriving test statistics from full simulations...")
             try:
                 self._derive_test_statistics(
                     hpc_pool_path, test_stats_hash, num_simulations, self.verbose
@@ -516,31 +567,35 @@ class QSPSimulator:
                 raise QSPSimulatorError(
                     f"Failed deriving/downloading test stats from HPC: {exc}"
                 ) from exc
+        elif n_hpc_available > 0:
+            self.logger.info(f"Found {n_hpc_available}/{num_simulations} full simulations on HPC")
+        else:
+            self.logger.info("No full simulations found on HPC")
 
         # 4. Run new full simulations on HPC
         n_needed = num_simulations - n_hpc_available
         if n_needed > 0:
-            self._info(f"Running {n_needed} new simulations on HPC (scenario='{self.scenario}')")
+            self.logger.info(f"Generating {n_needed} new simulations on HPC...")
             try:
                 # Run new simulations and add to pool
                 self._run_new_simulations(n_needed)
 
                 # Now load the full requested amount from pool (old + new)
-                self._info(
-                    f"Loading {num_simulations} simulations from pool after adding {n_needed} new ones"
+                self.logger.info(
+                    f"Loading {num_simulations} total simulations from pool ({n_needed} newly generated)"
                 )
                 params, observables = self.pool.load_simulations(
                     n_requested=num_simulations, scenario=self.scenario, random_state=self.rng
                 )
-                self._info(
-                    f"  Loaded {params.shape[0]} parameter sets and {observables.shape[0]} observable sets"
-                )
+                self.logger.info(f"✓ Returning {params.shape[0]} simulations")
                 return params, observables
             except (RemoteCommandError, MissingOutputError, SubmissionError) as exc:
                 raise QSPSimulatorError(f"Failed running new simulations on HPC: {exc}") from exc
 
         # If we have some HPC sims but not enough, derive from what we have
-        self._info(f"Deriving test statistics from {n_hpc_available} HPC simulations")
+        self.logger.info(
+            f"Deriving test statistics from {n_hpc_available} available HPC simulations"
+        )
         try:
             self._derive_test_statistics(
                 hpc_pool_path, test_stats_hash, n_hpc_available, self.verbose

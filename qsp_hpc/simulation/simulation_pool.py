@@ -57,7 +57,7 @@ import numpy as np
 from scipy.io import loadmat, savemat
 
 from qsp_hpc.constants import HASH_PREFIX_LENGTH
-from qsp_hpc.utils.logging_config import setup_logger
+from qsp_hpc.utils.logging_config import create_child_logger, setup_logger
 
 
 class SimulationPoolManager:
@@ -126,6 +126,7 @@ class SimulationPoolManager:
         self.pool_dir = self.cache_dir / pool_name
 
         # Ensure pool directory exists
+        pool_existed = self.pool_dir.exists()
         self.pool_dir.mkdir(parents=True, exist_ok=True)
 
         # Batch filename pattern for parsing
@@ -133,8 +134,20 @@ class SimulationPoolManager:
         # Note: scenario can contain underscores, so we use non-greedy match
         self.batch_pattern = re.compile(r"batch_(\d{8}_\d{6})_(.+?)_(\d+)sims_seed(\d+)\.mat")
 
-        # Setup logger
-        self.logger = setup_logger(__name__)
+        # Setup logger with pool name context
+        base_logger = setup_logger(__name__)
+        self.logger = create_child_logger(base_logger, model_version)
+
+        # Log pool initialization
+        if pool_existed:
+            self.logger.info(f"Using existing pool: {self.pool_dir.name}")
+        else:
+            self.logger.info(f"Creating new pool: {self.pool_dir}")
+
+        # Log pool configuration (verbose)
+        self.logger.debug(f"  Config hash: {self.config_hash[:16]}...")
+        self.logger.debug(f"  Priors: {self.priors_csv}")
+        self.logger.debug(f"  Test stats: {self.test_stats_csv}")
 
     def _compute_config_hash(self) -> str:
         """
@@ -308,13 +321,19 @@ class SimulationPoolManager:
 
         # Sample subset if we have more than requested
         if n_loaded > n_requested:
-            self.logger.info(f"  Pool has {n_loaded} simulations, sampling {n_requested}")
+            self.logger.info(
+                f"Sampling {n_requested} from {n_loaded} available simulations (scenario={scenario})"
+            )
             indices = random_state.choice(n_loaded, size=n_requested, replace=False)
             params_all = params_all[indices]
             observables_all = observables_all[indices]
             n_loaded = n_requested
+        elif n_loaded < n_requested:
+            self.logger.warning(
+                f"Only {n_loaded} simulations available (requested {n_requested}, scenario={scenario})"
+            )
         else:
-            self.logger.info(f"  Loaded {n_loaded} simulations from pool (requested {n_requested})")
+            self.logger.info(f"Loaded {n_loaded} simulations from pool (scenario={scenario})")
 
         return params_all, observables_all
 
@@ -391,6 +410,18 @@ class SimulationPoolManager:
                     "timestamp": timestamp,
                 },
             },
+        )
+
+        # Log batch addition with details
+        self.logger.info("Adding new batch to pool:")
+        self.logger.info(f"  File: {batch_filename}")
+        self.logger.info(f"  Simulations: {n_sims}")
+
+        # Get total simulations in pool for this scenario after adding
+        total_sims = self.get_available_simulations(scenario=scenario)
+        n_batches = len(self._scan_batches(scenario=scenario))
+        self.logger.info(
+            f"  Pool now contains {n_batches} batches, {total_sims} total sims (scenario={scenario})"
         )
 
         return batch_filename

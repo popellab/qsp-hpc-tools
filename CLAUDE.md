@@ -101,6 +101,51 @@ qsp-hpc-tools/
 - Updated README with development instructions
 - Added Click dependency for CLI
 
+### Logging Improvements ✨ NEW (2025-01-19)
+- **Enhanced `qsp_hpc/utils/logging_config.py`**: Added structured logging utilities
+  - `separator()` - Visual section separators
+  - `format_config()` - Format key-value pairs with indentation
+  - `create_child_logger()` - Hierarchical logger names (e.g., `QSPSimulator.baseline_no_treatment`)
+  - `log_section()` - Context manager for sections with separators
+  - `log_operation()` - Context manager for operations with timing
+  - `log_summary_section()` - Summary boxes with metrics
+  - Updated default format to always show timestamps and logger names
+
+- **QSPSimulator logging** (`qsp_hpc/simulation/qsp_simulator.py`)
+  - Hierarchical loggers by scenario (e.g., `QSPSimulator.baseline_no_treatment`)
+  - Initialization logs show: test stats path, priors path, model version, config hash, pool directory, seed
+  - Simulation requests show: requested count, local availability, HPC checks
+  - 3-tier cache checking with explicit status messages:
+    - ✓ marks for cache hits
+    - Clear progression through: local pool → HPC test stats → HPC full sims → new generation
+  - Timing information for downloads and derivations
+  - Summary of simulations returned
+
+- **SimulationPoolManager logging** (`qsp_hpc/simulation/simulation_pool.py`)
+  - Hierarchical loggers by model version
+  - Pool creation/reuse messages
+  - Batch addition details: filename, simulation count, total pool stats
+  - Loading messages show scenario and sampling behavior
+
+- **HPCJobManager logging** (`qsp_hpc/batch/hpc_job_manager.py`)
+  - Job submission shows: project, simulation count, array tasks, sims per task, model, seed
+  - Structured progression through: sync → upload → submit
+  - ✓ marks for successful operations
+  - Timing for codebase sync
+  - Derivation job details: pool path, test stats hash
+
+**Example Log Output**:
+```
+2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO - Initializing QSP simulator for scenario: baseline_no_treatment
+2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Test Stats Csv: projects/pdac_2025/scenarios/test_statistics/baseline_no_treatment.csv
+2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Priors Csv: projects/pdac_2025/priors.csv
+2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Model Version: test_v1
+2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Config Hash: a3f7b2c8...
+2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO - Simulation request: 500 simulations (seed=42)
+2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO - No local simulations - checking HPC
+2025-01-19 10:30:15 - SimulationPool.test_v1 - INFO - Creating new pool: cache/sbi_simulations/test_v1_a3f7b2c8
+```
+
 ## Testing Strategy
 
 ### Test Categories

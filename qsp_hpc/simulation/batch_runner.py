@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -126,6 +127,9 @@ def run_batch_worker(
     env["SLURM_JOB_ID"] = "local"
     env["SLURMD_NODENAME"] = "localhost"
     env["SIMULATION_POOL_PATH"] = str(pool_dir.absolute())
+
+    # Set HPC_VENV_PATH to current Python environment (for write_species_parquet.py)
+    env["HPC_VENV_PATH"] = sys.prefix  # Points to current venv or Python installation
 
     # Get MATLAB scripts path
     import qsp_hpc.matlab

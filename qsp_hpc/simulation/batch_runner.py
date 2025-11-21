@@ -152,12 +152,11 @@ def run_batch_worker(
         cwd=project_root.absolute(),
     )
 
-    # Show MATLAB output if verbose
-    if verbose and result.stdout:
-        logger.debug("MATLAB stdout:")
+    # Always show MATLAB output (includes per-simulation status)
+    if result.stdout:
         for line in result.stdout.split("\n"):
             if line.strip():
-                logger.debug(f"  {line}")
+                logger.info(f"  {line}")
 
     # Check for MATLAB execution errors
     if result.returncode != 0:

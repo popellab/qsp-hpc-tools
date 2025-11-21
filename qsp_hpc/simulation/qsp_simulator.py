@@ -296,15 +296,28 @@ class QSPSimulator:
 
         self.logger.info("")
         self.logger.info(f"Test Statistics ({n_sims} simulation{'s' if n_sims > 1 else ''}):")
-        self.logger.info(
-            "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┐"
-        )
-        self.logger.info(
-            "│ Test Statistic                      │ Computed     │ Observed     │ % Diff       │"
-        )
-        self.logger.info(
-            "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┤"
-        )
+
+        # Show individual values column only for multiple simulations
+        if n_sims > 1:
+            self.logger.info(
+                "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┬─────────────────────────────────────┐"
+            )
+            self.logger.info(
+                "│ Test Statistic                      │ Computed     │ Observed     │ % Diff       │ Individual Values                   │"
+            )
+            self.logger.info(
+                "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┼─────────────────────────────────────┤"
+            )
+        else:
+            self.logger.info(
+                "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┐"
+            )
+            self.logger.info(
+                "│ Test Statistic                      │ Computed     │ Observed     │ % Diff       │"
+            )
+            self.logger.info(
+                "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┤"
+            )
 
         nan_count = 0
         large_diff_count = 0
@@ -315,8 +328,11 @@ class QSPSimulator:
             # Compute value (mean if multiple sims, single value if n_sims=1)
             if n_sims == 1:
                 computed_value = test_stats[0, idx]
+                individual_values = None
             else:
                 computed_value = test_stats[:, idx].mean()
+                # Get all individual values for this test statistic
+                individual_values = test_stats[:, idx]
 
             # Get observed value from CSV
             observed_value = row.get("mean", np.nan)
@@ -340,16 +356,35 @@ class QSPSimulator:
                 else:
                     diff_str = "—"
 
+            # Format individual values (comma-separated)
+            if individual_values is not None:
+                values_str = ", ".join(
+                    f"{v:.4g}" if not np.isnan(v) else "NaN" for v in individual_values
+                )
+                # Truncate if too long
+                if len(values_str) > 35:
+                    values_str = values_str[:32] + "..."
+
             # Truncate test_stat_id if too long
             display_id = test_stat_id if len(test_stat_id) <= 35 else test_stat_id[:32] + "..."
 
-            self.logger.info(
-                f"│ {display_id:<35} │ {computed_str:>12} │ {observed_str:>12} │ {diff_str:>12} │"
-            )
+            if n_sims > 1:
+                self.logger.info(
+                    f"│ {display_id:<35} │ {computed_str:>12} │ {observed_str:>12} │ {diff_str:>12} │ {values_str:<35} │"
+                )
+            else:
+                self.logger.info(
+                    f"│ {display_id:<35} │ {computed_str:>12} │ {observed_str:>12} │ {diff_str:>12} │"
+                )
 
-        self.logger.info(
-            "└─────────────────────────────────────┴──────────────┴──────────────┴──────────────┘"
-        )
+        if n_sims > 1:
+            self.logger.info(
+                "└─────────────────────────────────────┴──────────────┴──────────────┴──────────────┴─────────────────────────────────────┘"
+            )
+        else:
+            self.logger.info(
+                "└─────────────────────────────────────┴──────────────┴──────────────┴──────────────┘"
+            )
 
         # Summary
         total_stats = len(test_stats_df)

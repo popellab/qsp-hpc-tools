@@ -36,7 +36,7 @@ repos:
     hooks:
       - id: pytest-fast
         name: pytest (fast tests only)
-        entry: bash -c 'pytest tests/ -q --tb=no -m "not hpc" || exit 0'
+        entry: bash -c 'pytest tests/ -q --tb=line -m "not hpc"'
         language: system
         pass_filenames: false
         always_run: true

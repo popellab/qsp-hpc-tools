@@ -56,14 +56,20 @@ def sample_test_stats_csv(temp_dir):
     """Create sample test statistics CSV file."""
     test_stats_csv = temp_dir / "test_stats.csv"
 
-    # Create test statistics definitions
+    # Create test statistics definitions (new format)
     test_stats_data = pd.DataFrame(
         {
-            "name": ["AUC", "Cmax", "Tmax"],
-            "observable": ["drug_concentration", "drug_concentration", "drug_concentration"],
-            "statistic": ["auc", "max", "argmax"],
-            "units": ["mg*hr/L", "mg/L", "hr"],
-            "description": ["Area under curve", "Maximum concentration", "Time to max"],
+            "test_statistic_id": ["stat1", "stat2", "stat3"],
+            "required_species": ["V_T.C1", "V_T.C1", "V_T.C1"],
+            "model_output_code": [
+                "def compute(time, V_T_C1):\n    return np.mean(V_T_C1)",
+                "def compute(time, V_T_C1):\n    return np.max(V_T_C1)",
+                "def compute(time, V_T_C1):\n    return np.min(V_T_C1)",
+            ],
+            "mean": [100.0, 200.0, 50.0],
+            "variance": [10.0, 20.0, 5.0],
+            "units": ["cells", "cells", "cells"],
+            "description": ["Mean tumor cells", "Max tumor cells", "Min tumor cells"],
         }
     )
     test_stats_data.to_csv(test_stats_csv, index=False)
@@ -2534,7 +2540,7 @@ class TestPriorPPCSimulationReuse:
         # Mock pool loading after running new sims - returns all 200
         fake_pool.load_simulations.return_value = (
             np.random.rand(200, 8),  # 200 params
-            np.random.rand(200, 12),  # 200 observables
+            np.random.rand(200, 3),  # 200 observables (3 test stats)
         )
 
         # Call simulator (like prior PPCs do)
@@ -2550,7 +2556,7 @@ class TestPriorPPCSimulationReuse:
 
         # Verify we got 200 samples back
         assert theta.shape == (200, 8)
-        assert obs.shape == (200, 12)
+        assert obs.shape == (200, 3)  # 200 sims, 3 test stats
 
     def test_prior_ppc_runs_all_when_pool_empty(
         self, sample_test_stats_csv, sample_priors_csv, temp_dir
@@ -2590,7 +2596,7 @@ class TestPriorPPCSimulationReuse:
         sim._run_new_simulations = MagicMock()
 
         # Mock pool loading
-        fake_pool.load_simulations.return_value = (np.random.rand(200, 8), np.random.rand(200, 12))
+        fake_pool.load_simulations.return_value = (np.random.rand(200, 8), np.random.rand(200, 3))
 
         # Call simulator
         theta, obs = sim(200)
@@ -2600,7 +2606,7 @@ class TestPriorPPCSimulationReuse:
 
         # Verify we got 200 samples back
         assert theta.shape == (200, 8)
-        assert obs.shape == (200, 12)
+        assert obs.shape == (200, 3)  # 200 sims, 3 test stats
 
     def test_prior_ppc_uses_all_when_pool_sufficient(
         self, sample_test_stats_csv, sample_priors_csv, temp_dir
@@ -2637,7 +2643,7 @@ class TestPriorPPCSimulationReuse:
         # Mock derivation and download
         sim._derive_test_statistics = MagicMock()
         sim._download_and_add_to_pool = MagicMock(
-            return_value=(np.random.rand(200, 8), np.random.rand(200, 12))
+            return_value=(np.random.rand(200, 8), np.random.rand(200, 3))
         )
 
         # Mock running new simulations (should NOT be called)
@@ -2655,7 +2661,7 @@ class TestPriorPPCSimulationReuse:
 
         # Verify we got 200 samples back
         assert theta.shape == (200, 8)
-        assert obs.shape == (200, 12)
+        assert obs.shape == (200, 3)  # 200 sims, 3 test stats
 
     def test_posterior_ppc_does_not_reuse_prior_simulations(
         self, temp_dir, sample_priors_csv, sample_test_stats_csv
@@ -2734,7 +2740,7 @@ class TestLocalSimulation:
         # Mock compute_test_statistics_batch to return fake test stats
         def mock_compute_test_stats(species_df, test_stats_df, registry):
             n_sims = len(species_df)
-            n_test_stats = 12  # From sample_test_stats_csv
+            n_test_stats = 3  # From sample_test_stats_csv
             return np.random.rand(n_sims, n_test_stats)
 
         # Apply mocks
@@ -2767,7 +2773,7 @@ class TestLocalSimulation:
 
         # Verify output shapes
         assert params.shape == (5, 3)  # 5 sims, 3 params
-        assert test_stats.shape == (5, 12)  # 5 sims, 12 test stats
+        assert test_stats.shape == (5, 3)  # 5 sims, 3 test stats
 
         # Verify parameters are positive (lognormal distribution)
         assert np.all(params > 0)
@@ -2791,7 +2797,7 @@ class TestLocalSimulation:
 
         def mock_compute_test_stats(species_df, test_stats_df, registry):
             n_sims = len(species_df)
-            return np.random.rand(n_sims, 12)
+            return np.random.rand(n_sims, 3)  # 3 test stats in fixture
 
         # Apply mocks
         monkeypatch.setattr(
@@ -2843,7 +2849,7 @@ class TestLocalSimulation:
 
         def mock_compute_test_stats(species_df, test_stats_df, registry):
             n_sims = len(species_df)
-            return np.random.rand(n_sims, 12)
+            return np.random.rand(n_sims, 3)  # 3 test stats in fixture
 
         # Apply mocks
         monkeypatch.setattr(
@@ -2874,4 +2880,4 @@ class TestLocalSimulation:
 
         # Should get single simulation
         assert params.shape == (1, 3)
-        assert test_stats.shape == (1, 12)
+        assert test_stats.shape == (1, 3)  # 1 sim, 3 test stats

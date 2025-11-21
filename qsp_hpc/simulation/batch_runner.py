@@ -10,7 +10,6 @@ All workflow logic lives in batch_worker.m - no duplication!
 """
 
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -19,6 +18,8 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
+
+from qsp_hpc.utils.logging_config import setup_logger
 
 
 def run_batch_worker(
@@ -61,9 +62,7 @@ def run_batch_worker(
     Raises:
         RuntimeError: If MATLAB execution fails
     """
-    logger = logging.getLogger(__name__)
-    if verbose:
-        logger.setLevel(logging.DEBUG)
+    logger = setup_logger(__name__, verbose=verbose)
 
     # Validate inputs
     if params.ndim == 1:

@@ -362,6 +362,74 @@ class QSPSimulator:
             summary_parts.append(f"{large_diff_count} >100% diff from observed")
         self.logger.info(" (".join(summary_parts) + (")" if len(summary_parts) > 1 else ""))
 
+    def print_test_statistic(self, test_stat_id: str) -> None:
+        """
+        Pretty print a test statistic function for inspection.
+
+        Args:
+            test_stat_id: ID of the test statistic to print
+        """
+        test_stats_df = pd.read_csv(self.test_stats_csv)
+
+        # Find the test statistic
+        row = test_stats_df[test_stats_df["test_statistic_id"] == test_stat_id]
+        if len(row) == 0:
+            print(f"❌ Test statistic '{test_stat_id}' not found")
+            print("\nAvailable test statistics:")
+            for tid in test_stats_df["test_statistic_id"]:
+                print(f"  - {tid}")
+            return
+
+        row = row.iloc[0]
+
+        # Print header
+        print(f"\n{'='*80}")
+        print(f"Test Statistic: {test_stat_id}")
+        print(f"{'='*80}")
+
+        # Print metadata
+        print(f"\nRequired Species: {row.get('required_species', '—')}")
+
+        observed_mean = row.get("mean", np.nan)
+        if not np.isnan(observed_mean):
+            print(f"Observed Mean: {observed_mean:.6g}")
+
+        observed_var = row.get("variance", np.nan)
+        if not np.isnan(observed_var):
+            print(f"Observed Variance: {observed_var:.6g}")
+
+        units = row.get("units", "")
+        if units:
+            print(f"Units: {units}")
+
+        # Print function code
+        print("\nFunction Code:")
+        print(f"{'-'*80}")
+        function_code = row.get("model_output_code", "")
+        if function_code:
+            print(function_code)
+        else:
+            print("(no function code)")
+        print(f"{'-'*80}\n")
+
+    def list_test_statistics(self) -> None:
+        """Print a list of all available test statistics."""
+        test_stats_df = pd.read_csv(self.test_stats_csv)
+
+        print(f"\nTest Statistics ({len(test_stats_df)} total):")
+        print(f"{'='*80}")
+
+        for _, row in test_stats_df.iterrows():
+            test_stat_id = row["test_statistic_id"]
+            required_species = row.get("required_species", "—")
+            observed_mean = row.get("mean", np.nan)
+
+            print(f"\n  {test_stat_id}")
+            print(f"    Required: {required_species}")
+            if not np.isnan(observed_mean):
+                print(f"    Observed: {observed_mean:.6g}")
+        print()
+
     def _log_parameters_table(self, param_values: np.ndarray, param_names: list[str]) -> None:
         """
         Log parameter values in a detailed table format.

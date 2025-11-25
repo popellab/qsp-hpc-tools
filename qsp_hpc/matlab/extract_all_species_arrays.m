@@ -77,27 +77,26 @@ for i = 1:n_sims
         time_arrays{i} = simdata.Time;
 
         % Extract each species/compartment
+        % Get list of available data names to avoid warnings from selectbyname
+        available_names = simdata.DataNames;
+
         for j = 1:n_species
             state_name = species_names{j};
-            try
+
+            % Check if state is available in simulation data
+            if any(strcmp(available_names, state_name))
+                % State found in simdata - extract it
                 [~, data, ~] = selectbyname(simdata, state_name);
-                if isempty(data) && isKey(compartment_capacities, state_name)
-                    % Compartment not in simdata - use constant Capacity from model
-                    capacity = compartment_capacities(state_name);
-                    data = repmat(capacity, size(simdata.Time));
-                end
                 species_arrays{i, j} = data;
-            catch
-                % State not found - check if it's a compartment with constant capacity
-                if isKey(compartment_capacities, state_name)
-                    capacity = compartment_capacities(state_name);
-                    species_arrays{i, j} = repmat(capacity, size(simdata.Time));
-                else
-                    % Unknown state - store NaN array
-                    species_arrays{i, j} = NaN(size(simdata.Time));
-                    fprintf('     ⚠️  Warning: Could not extract state %s for simulation %d\n', ...
-                        state_name, i);
-                end
+            elseif isKey(compartment_capacities, state_name)
+                % Compartment not logged - use constant Capacity from model
+                capacity = compartment_capacities(state_name);
+                species_arrays{i, j} = repmat(capacity, size(simdata.Time));
+            else
+                % Unknown state not in simdata - store NaN array
+                species_arrays{i, j} = NaN(size(simdata.Time));
+                fprintf('     ⚠️  Warning: Could not extract state %s for simulation %d\n', ...
+                    state_name, i);
             end
         end
     end

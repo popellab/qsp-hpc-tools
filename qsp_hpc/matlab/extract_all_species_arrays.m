@@ -93,10 +93,9 @@ for i = 1:n_sims
                 capacity = compartment_capacities(state_name);
                 species_arrays{i, j} = repmat(capacity, size(simdata.Time));
             else
-                % Unknown state not in simdata - store NaN array
-                species_arrays{i, j} = NaN(size(simdata.Time));
-                fprintf('     ⚠️  Warning: Could not extract state %s for simulation %d\n', ...
-                    state_name, i);
+                % Unknown state not in simdata - store empty array
+                % (NaN arrays get JSON-encoded as nulls, causing dtype issues in Python)
+                species_arrays{i, j} = [];
             end
         end
     end

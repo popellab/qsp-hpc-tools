@@ -282,6 +282,56 @@ class QSPSimulator:
 
         return samples  # type: ignore[no-any-return]
 
+    def _format_number(self, value: float) -> str:
+        """
+        Format a number for display in the test statistics table.
+
+        Uses scientific notation for very large/small numbers,
+        otherwise shows up to 3 significant figures.
+
+        Args:
+            value: The number to format
+
+        Returns:
+            Formatted string (max 12 chars)
+        """
+        if np.isnan(value):
+            return "—"
+
+        # For very small or very large numbers, use scientific notation
+        if abs(value) < 0.001 or abs(value) >= 1e6:
+            return f"{value:.2e}"
+
+        # For moderate numbers, use up to 3 significant figures
+        if abs(value) >= 100:
+            return f"{value:.1f}"
+        elif abs(value) >= 10:
+            return f"{value:.2f}"
+        elif abs(value) >= 1:
+            return f"{value:.3f}"
+        else:
+            return f"{value:.4f}"
+
+    def _format_percentage(self, pct_diff: float) -> str:
+        """
+        Format a percentage difference for display.
+
+        Caps extreme values to avoid unreadable numbers.
+
+        Args:
+            pct_diff: The percentage difference
+
+        Returns:
+            Formatted string (max 12 chars)
+        """
+        if abs(pct_diff) >= 1000:
+            # For extreme differences, show order of magnitude
+            sign = "+" if pct_diff > 0 else "-"
+            magnitude = int(np.log10(abs(pct_diff)))
+            return f"{sign}1e{magnitude}%"
+        else:
+            return f"{pct_diff:+.1f}%"
+
     def _log_test_statistics_table(
         self, test_stats: np.ndarray, test_stats_df: pd.DataFrame, n_sims: int
     ) -> None:
@@ -300,20 +350,20 @@ class QSPSimulator:
         # Show individual values column only for multiple simulations
         if n_sims > 1:
             self.logger.info(
-                "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┬─────────────────────────────────────┐"
+                "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┬────────┬────────────────────────────┐"
             )
             self.logger.info(
-                "│ Test Statistic                      │ Computed     │ Observed     │ % Diff       │ Individual Values                   │"
+                "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │ 95% CI │ [2.5%, 97.5%]              │"
             )
             self.logger.info(
-                "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┼─────────────────────────────────────┤"
+                "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┼────────┼────────────────────────────┤"
             )
         else:
             self.logger.info(
                 "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┐"
             )
             self.logger.info(
-                "│ Test Statistic                      │ Computed     │ Observed     │ % Diff       │"
+                "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │"
             )
             self.logger.info(
                 "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┤"
@@ -321,18 +371,25 @@ class QSPSimulator:
 
         nan_count = 0
         large_diff_count = 0
+        covered_count = 0
+        not_covered_count = 0
 
         for idx, row in test_stats_df.iterrows():
             test_stat_id = row["test_statistic_id"]
 
-            # Compute value (mean if multiple sims, single value if n_sims=1)
+            # Compute value (median if multiple sims, single value if n_sims=1)
             if n_sims == 1:
                 computed_value = test_stats[0, idx]
                 individual_values = None
+                ci_lower = ci_upper = None
             else:
-                computed_value = test_stats[:, idx].mean()
+                # Use nanmedian to ignore NaN values and be robust to outliers
+                computed_value = np.nanmedian(test_stats[:, idx])
                 # Get all individual values for this test statistic
                 individual_values = test_stats[:, idx]
+                # Compute 95% CI (2.5th and 97.5th percentiles)
+                ci_lower = np.nanpercentile(individual_values, 2.5)
+                ci_upper = np.nanpercentile(individual_values, 97.5)
 
             # Get observed value from CSV
             observed_value = row.get("mean", np.nan)
@@ -341,36 +398,43 @@ class QSPSimulator:
             if np.isnan(computed_value):
                 computed_str = "NaN"
                 nan_count += 1
-                observed_str = f"{observed_value:.6g}" if not np.isnan(observed_value) else "—"
+                observed_str = self._format_number(observed_value)
                 diff_str = "—"
+                coverage_str = "—"
+                ci_str = "—"
             else:
-                computed_str = f"{computed_value:.6g}"
-                observed_str = f"{observed_value:.6g}" if not np.isnan(observed_value) else "—"
+                computed_str = self._format_number(computed_value)
+                observed_str = self._format_number(observed_value)
 
                 # Calculate percentage difference
                 if not np.isnan(observed_value) and observed_value != 0:
                     pct_diff = ((computed_value - observed_value) / observed_value) * 100
-                    diff_str = f"{pct_diff:+.1f}%"
+                    diff_str = self._format_percentage(pct_diff)
                     if abs(pct_diff) > 100:
                         large_diff_count += 1
                 else:
                     diff_str = "—"
 
-            # Format individual values (comma-separated)
-            if individual_values is not None:
-                values_str = ", ".join(
-                    f"{v:.4g}" if not np.isnan(v) else "NaN" for v in individual_values
-                )
-                # Truncate if too long
-                if len(values_str) > 35:
-                    values_str = values_str[:32] + "..."
+                # Check 95% CI coverage (only for multiple sims)
+                if n_sims > 1 and ci_lower is not None and not np.isnan(observed_value):
+                    covers = ci_lower <= observed_value <= ci_upper
+                    if covers:
+                        coverage_str = "✓"
+                        covered_count += 1
+                    else:
+                        coverage_str = "✗"
+                        not_covered_count += 1
+                    ci_str = f"[{self._format_number(ci_lower)}, {self._format_number(ci_upper)}]"
+                else:
+                    coverage_str = "—"
+                    ci_str = "—"
 
             # Truncate test_stat_id if too long
             display_id = test_stat_id if len(test_stat_id) <= 35 else test_stat_id[:32] + "..."
 
             if n_sims > 1:
                 self.logger.info(
-                    f"│ {display_id:<35} │ {computed_str:>12} │ {observed_str:>12} │ {diff_str:>12} │ {values_str:<35} │"
+                    f"│ {display_id:<35} │ {computed_str:>12} │ {observed_str:>12} │ {diff_str:>12} │ {coverage_str:^6} │ {ci_str:<26} │"
                 )
             else:
                 self.logger.info(
@@ -379,7 +443,7 @@ class QSPSimulator:
 
         if n_sims > 1:
             self.logger.info(
-                "└─────────────────────────────────────┴──────────────┴──────────────┴──────────────┴─────────────────────────────────────┘"
+                "└─────────────────────────────────────┴──────────────┴──────────────┴──────────────┴────────┴────────────────────────────┘"
             )
         else:
             self.logger.info(
@@ -395,6 +459,10 @@ class QSPSimulator:
             summary_parts.append(f"{nan_count} NaN")
         if large_diff_count > 0:
             summary_parts.append(f"{large_diff_count} >100% diff from observed")
+        if n_sims > 1 and (covered_count + not_covered_count) > 0:
+            summary_parts.append(
+                f"{covered_count}/{covered_count + not_covered_count} 95% CI cover observed"
+            )
         self.logger.info(" (".join(summary_parts) + (")" if len(summary_parts) > 1 else ""))
 
     def print_test_statistic(self, test_stat_id: str) -> None:

@@ -1,8 +1,9 @@
 function species_data = extract_all_species_arrays(chunk_results, model)
-%EXTRACT_ALL_SPECIES_ARRAYS Extract time and all species from simulation results
+%EXTRACT_ALL_SPECIES_ARRAYS Extract time, species, and compartments from simulation results
 %
-% This function extracts full simulation outputs (time and all species)
-% from SimBiology simulation results for saving to persistent storage.
+% This function extracts full simulation outputs (time, all species, and
+% compartment volumes) from SimBiology simulation results for saving to
+% persistent storage.
 %
 % Inputs:
 %   chunk_results  - Struct array with .simData fields (SimData objects)
@@ -12,10 +13,10 @@ function species_data = extract_all_species_arrays(chunk_results, model)
 %   species_data   - Struct with fields:
 %                    .n_sims         - Number of simulations
 %                    .n_timepoints   - Number of time points per simulation
-%                    .n_species      - Number of species
-%                    .species_names  - Cell array of species names (1 x n_species)
+%                    .n_species      - Number of species + compartments
+%                    .species_names  - Cell array of names (1 x n_species)
 %                    .time_arrays    - Cell array of time vectors (n_sims x 1)
-%                    .species_arrays - Cell array of species matrices (n_sims x n_species)
+%                    .species_arrays - Cell array of data matrices (n_sims x n_species)
 %                    .status         - Status vector (n_sims x 1): 1=success, 0=failed IC, -1=failed sim
 %
 % Example:
@@ -34,9 +35,23 @@ for i = 1:length(all_species)
     species_name = species_obj.Name;
     species_names{i} = [compartment_name '.' species_name];
 end
-n_species = length(species_names);
 
-fprintf('   Extracting %d species from %d simulations...\n', n_species, n_sims);
+% Also get compartment volumes (e.g., V_T, V_C, V_LN, V_P)
+% These are needed for computing cell densities in test statistics
+all_compartments = sbioselect(model, 'Type', 'compartment');
+compartment_names = cell(1, length(all_compartments));
+for i = 1:length(all_compartments)
+    compartment_names{i} = all_compartments(i).Name;
+end
+
+% Combine species and compartment names
+% Compartments come after species for backwards compatibility
+species_names = [species_names, compartment_names];
+n_species = length(species_names);
+n_compartments = length(compartment_names);
+
+fprintf('   Extracting %d species + %d compartments from %d simulations...\n', ...
+    n_species - n_compartments, n_compartments, n_sims);
 
 % Initialize output arrays
 time_arrays = cell(n_sims, 1);
@@ -59,17 +74,17 @@ for i = 1:n_sims
         status(i) = 1;
         time_arrays{i} = simdata.Time;
 
-        % Extract each species
+        % Extract each species/compartment
         for j = 1:n_species
-            species_name = species_names{j};
+            state_name = species_names{j};
             try
-                [~, data, ~] = selectbyname(simdata, species_name);
+                [~, data, ~] = selectbyname(simdata, state_name);
                 species_arrays{i, j} = data;
             catch
-                % Species not found or error - store NaN array
+                % State not found or error - store NaN array
                 species_arrays{i, j} = NaN(size(simdata.Time));
-                fprintf('     ⚠️  Warning: Could not extract species %s for simulation %d\n', ...
-                    species_name, i);
+                fprintf('     ⚠️  Warning: Could not extract state %s for simulation %d\n', ...
+                    state_name, i);
             end
         end
     end

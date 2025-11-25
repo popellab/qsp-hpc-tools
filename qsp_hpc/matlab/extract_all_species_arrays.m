@@ -40,8 +40,10 @@ end
 % These are needed for computing cell densities in test statistics
 all_compartments = sbioselect(model, 'Type', 'compartment');
 compartment_names = cell(1, length(all_compartments));
+compartment_capacities = containers.Map();
 for i = 1:length(all_compartments)
     compartment_names{i} = all_compartments(i).Name;
+    compartment_capacities(all_compartments(i).Name) = all_compartments(i).Capacity;
 end
 
 % Combine species and compartment names
@@ -79,12 +81,23 @@ for i = 1:n_sims
             state_name = species_names{j};
             try
                 [~, data, ~] = selectbyname(simdata, state_name);
+                if isempty(data) && isKey(compartment_capacities, state_name)
+                    % Compartment not in simdata - use constant Capacity from model
+                    capacity = compartment_capacities(state_name);
+                    data = repmat(capacity, size(simdata.Time));
+                end
                 species_arrays{i, j} = data;
             catch
-                % State not found or error - store NaN array
-                species_arrays{i, j} = NaN(size(simdata.Time));
-                fprintf('     ⚠️  Warning: Could not extract state %s for simulation %d\n', ...
-                    state_name, i);
+                % State not found - check if it's a compartment with constant capacity
+                if isKey(compartment_capacities, state_name)
+                    capacity = compartment_capacities(state_name);
+                    species_arrays{i, j} = repmat(capacity, size(simdata.Time));
+                else
+                    % Unknown state - store NaN array
+                    species_arrays{i, j} = NaN(size(simdata.Time));
+                    fprintf('     ⚠️  Warning: Could not extract state %s for simulation %d\n', ...
+                        state_name, i);
+                end
             end
         end
     end

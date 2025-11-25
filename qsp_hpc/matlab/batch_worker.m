@@ -209,7 +209,7 @@ try
                                      array_idx, timestamp, length(patient_range), seed);
             output_file = fullfile(persistent_dir, output_filename);
 
-            save_species_to_parquet(species_data, output_file, current_dir, chunk_params);
+            save_species_to_parquet(species_data, output_file, chunk_params);
 
             fprintf('   ✓ Full simulations saved to: %s\n', output_file);
 

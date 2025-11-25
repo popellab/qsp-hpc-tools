@@ -1,4 +1,4 @@
-function save_species_to_parquet(species_data, output_file, project_root, chunk_params)
+function save_species_to_parquet(species_data, output_file, chunk_params)
 %SAVE_SPECIES_TO_PARQUET Save extracted species data to Parquet format via Python
 %
 % This function converts MATLAB species data to JSON, then calls a Python
@@ -9,19 +9,21 @@ function save_species_to_parquet(species_data, output_file, project_root, chunk_
 %                   .n_sims, .n_species, .species_names, .time_arrays,
 %                   .species_arrays, .status
 %   output_file   - Path to output Parquet file
-%   project_root  - Path to project root directory (for finding Python script)
 %   chunk_params  - (Optional) Struct with parameter names and values:
 %                   .names - Cell array of parameter names
 %                   .(param_name).LHS - Array of parameter values for each simulation
 %
 % Example:
-%   save_species_to_parquet(species_data, '/path/to/output.parquet', pwd, chunk_params);
+%   save_species_to_parquet(species_data, '/path/to/output.parquet', chunk_params);
 
 fprintf('   Saving species data to Parquet: %s\n', output_file);
 
 % Create temporary JSON file for data transfer
 temp_json = tempname;
 temp_json = [temp_json '.json'];
+
+% Set up cleanup to delete temp file when function exits (success or error)
+cleanupObj = onCleanup(@() deleteIfExists(temp_json));
 
 try
     % Convert MATLAB cell arrays to nested JSON structure
@@ -32,7 +34,7 @@ try
     json_data.status = species_data.status;
 
     % Extract and include parameter data if provided
-    if nargin >= 4 && ~isempty(chunk_params) && isfield(chunk_params, 'names')
+    if nargin >= 3 && ~isempty(chunk_params) && isfield(chunk_params, 'names')
         fprintf('   Including %d parameters in Parquet file\n', length(chunk_params.names));
         json_data.param_names = chunk_params.names;
 
@@ -80,30 +82,30 @@ try
     fprintf(fid, '%s', json_str);
     fclose(fid);
 
-    % Try to use HPC venv Python from environment variable first
+    % Find Python script relative to this MATLAB file
+    % save_species_to_parquet.m is at: qsp_hpc/matlab/
+    % write_species_parquet.py is at: qsp_hpc/simulation/
+    matlab_dir = fileparts(mfilename('fullpath'));
+    python_script = fullfile(matlab_dir, '..', 'simulation', 'write_species_parquet.py');
+
+    if ~exist(python_script, 'file')
+        error('Failed to locate write_species_parquet.py at: %s', python_script);
+    end
+
+    % Determine which Python to use
+    % 1. Try HPC venv from environment variable
+    % 2. Fall back to system Python
     hpc_venv_path = getenv('HPC_VENV_PATH');
     if ~isempty(hpc_venv_path)
         venv_python = fullfile(hpc_venv_path, 'bin', 'python');
+        if exist(venv_python, 'file')
+            python_cmd = venv_python;
+            fprintf('   Using HPC venv Python: %s\n', python_cmd);
+        else
+            python_cmd = 'python';
+            fprintf('   Using system Python\n');
+        end
     else
-        % Fallback to default location
-        home_dir = getenv('HOME');
-        venv_python = fullfile(home_dir, 'qspio_venv', 'bin', 'python');
-    end
-
-    % Get Python script path from installed qsp-hpc-tools package
-    cmd = sprintf('%s -c "import qsp_hpc.simulation; import os; print(os.path.join(os.path.dirname(qsp_hpc.simulation.__file__), ''write_species_parquet.py''))"', venv_python);
-    [status, python_script] = system(cmd);
-    if status ~= 0
-        error('Failed to locate write_species_parquet.py from qsp-hpc-tools package');
-    end
-    python_script = strtrim(python_script);
-
-    if exist(venv_python, 'file')
-        % Use venv Python (HPC)
-        python_cmd = venv_python;
-        fprintf('   Using HPC venv Python: %s\n', python_cmd);
-    else
-        % Fall back to system Python (local)
         python_cmd = 'python';
         fprintf('   Using system Python\n');
     end
@@ -120,12 +122,13 @@ try
 catch ME
     fprintf('   ⚠️  Error saving Parquet: %s\n', ME.message);
     rethrow(ME);
-
-finally
-    % Clean up temporary JSON file
-    if exist(temp_json, 'file')
-        delete(temp_json);
-    end
 end
 
+end
+
+function deleteIfExists(filepath)
+%DELETEIFEXISTS Delete file if it exists (helper for onCleanup)
+    if exist(filepath, 'file')
+        delete(filepath);
+    end
 end

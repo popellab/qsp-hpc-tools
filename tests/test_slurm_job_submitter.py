@@ -132,7 +132,6 @@ class TestDerivationJobSubmission:
             pool_path="/scratch/pool",
             test_stats_config="/scratch/test_stats.csv",
             derivation_dir="/scratch/derivation",
-            n_batches=5,
         )
 
         assert job_id == "67890"
@@ -152,7 +151,6 @@ class TestDerivationJobSubmission:
                 pool_path="/scratch/pool",
                 test_stats_config="/scratch/test_stats.csv",
                 derivation_dir="/scratch/derivation",
-                n_batches=5,
             )
 
     def test_submit_derivation_job_cannot_parse_id(self, submitter, mock_transport):
@@ -164,11 +162,14 @@ class TestDerivationJobSubmission:
                 pool_path="/scratch/pool",
                 test_stats_config="/scratch/test_stats.csv",
                 derivation_dir="/scratch/derivation",
-                n_batches=5,
             )
 
-    def test_submit_derivation_job_generates_correct_script(self, submitter, mock_transport):
-        """Test that derivation script is generated correctly."""
+    def test_submit_derivation_job_generates_single_task_script(self, submitter, mock_transport):
+        """Test that derivation submits single task, not array job.
+
+        Regression test: derivation should use a single SLURM task that
+        processes all batches, not one array task per batch file.
+        """
         mock_transport.exec.return_value = (0, "Submitted batch job 67890\n")
 
         uploaded_files = []
@@ -183,7 +184,6 @@ class TestDerivationJobSubmission:
             pool_path="/scratch/pool",
             test_stats_config="/scratch/test_stats.csv",
             derivation_dir="/scratch/derivation",
-            n_batches=5,
         )
 
         # Verify script content
@@ -193,8 +193,9 @@ class TestDerivationJobSubmission:
         assert "#SBATCH --job-name=qsp_derive" in script_content
         assert "#SBATCH --partition=normal" in script_content
         assert "#SBATCH --time=01:00:00" in script_content  # Fixed time for derivation
-        assert "#SBATCH --mem-per-cpu=4G" in script_content  # Fixed memory
-        assert "#SBATCH --array=0-4" in script_content  # 0-indexed (5 batches = 0-4)
+        assert "#SBATCH --mem=4G" in script_content  # Fixed memory (not --mem-per-cpu)
+        # Should NOT have array directive - single task processes all batches
+        assert "#SBATCH --array" not in script_content
         assert "source /home/testuser/.venv/hpc-qsp/bin/activate" in script_content
         assert "qsp_hpc.batch.derive_test_stats_worker" in script_content
         assert '"/scratch/test_stats.csv"' in script_content  # Config JSON path
@@ -225,21 +226,25 @@ class TestScriptGeneration:
         assert 'export HPC_VENV_PATH="/home/testuser/.venv/hpc-qsp"' in script
         assert 'export SIMULATION_POOL_PATH="/scratch/testuser/simulations"' in script
 
-    def test_generate_derivation_slurm_script(self, submitter):
-        """Test derivation SLURM script generation."""
+    def test_generate_derivation_slurm_script_single_task(self, submitter):
+        """Test derivation SLURM script generates single task, not array.
+
+        Regression test: derivation was incorrectly using array jobs with
+        one task per batch file. Now uses single task that processes all batches.
+        """
         script = submitter._generate_derivation_slurm_script(
             pool_path="/scratch/test_pool",
             test_stats_config="/scratch/test_stats.csv",
             derivation_dir="/scratch/derive_output",
-            n_batches=10,
         )
 
         # Check SLURM directives
         assert "#SBATCH --job-name=qsp_derive" in script
         assert "#SBATCH --partition=normal" in script
         assert "#SBATCH --time=01:00:00" in script
-        assert "#SBATCH --mem-per-cpu=4G" in script
-        assert "#SBATCH --array=0-9" in script  # 0-indexed (10 batches = 0-9)
+        assert "#SBATCH --mem=4G" in script  # Not --mem-per-cpu
+        # Should NOT have array directive
+        assert "#SBATCH --array" not in script
 
         # Check Python virtual environment activation
         assert "source /home/testuser/.venv/hpc-qsp/bin/activate" in script
@@ -262,7 +267,6 @@ class TestDerivationWorkerCompatibility:
             pool_path="/scratch/pool",
             test_stats_config="/scratch/config.json",
             derivation_dir="/scratch/derive",
-            n_batches=5,
         )
 
         # Should pass config as single positional argument

@@ -181,6 +181,73 @@ def compute_test_statistics_batch(
     return test_stats_matrix  # type: ignore[no-any-return]
 
 
+def process_single_batch(
+    batch_idx: int,
+    parquet_file: Path,
+    test_stats_df: pd.DataFrame,
+    test_stat_registry: dict,
+    test_stats_output_dir: Path,
+) -> int:
+    """
+    Process a single batch file and save results.
+
+    Args:
+        batch_idx: Index of this batch (for output file naming)
+        parquet_file: Path to the Parquet file to process
+        test_stats_df: DataFrame with test statistics configuration
+        test_stat_registry: Dict mapping test_statistic_id -> compiled function
+        test_stats_output_dir: Directory to save output files
+
+    Returns:
+        Number of simulations processed
+    """
+    logger.info(f"Processing batch {batch_idx}: {parquet_file.name}")
+
+    # Load simulation batch
+    sim_df = pd.read_parquet(parquet_file)
+    n_sims = len(sim_df)
+    logger.info(f"  Loaded {n_sims} simulations")
+
+    # Extract parameter columns
+    # Parameters are scalar columns (not lists) that are not metadata columns
+    metadata_cols = {"simulation_id", "status", "time"}
+    param_cols = []
+    for col in sim_df.columns:
+        if col not in metadata_cols:
+            # Check if column contains scalar values (not lists)
+            sample_val = sim_df[col].iloc[0]
+            if not isinstance(sample_val, (list, np.ndarray)):
+                param_cols.append(col)
+
+    if param_cols:
+        logger.debug(
+            f"  Found {len(param_cols)} parameter columns: "
+            f"{param_cols[:5]}{'...' if len(param_cols) > 5 else ''}"
+        )
+
+        # Save parameters to chunk_XXX_params.csv
+        params_output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_params.csv"
+
+        # Extract parameter values (n_sims x n_params)
+        params_df = sim_df[param_cols]
+        params_df.to_csv(params_output_file, index=False, float_format="%.12e")
+
+        logger.debug(f"  ✓ Parameters saved: {params_output_file.name}")
+
+    # Compute test statistics
+    test_stats_matrix = compute_test_statistics_batch(sim_df, test_stats_df, test_stat_registry)
+
+    # Save results
+    output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_test_stats.csv"
+
+    # Save as CSV (n_sims x n_test_stats)
+    np.savetxt(output_file, test_stats_matrix, delimiter=",", fmt="%.12e")
+
+    logger.info(f"  ✓ Saved: {output_file.name}")
+
+    return n_sims
+
+
 def main():
     """Main entry point for derivation worker."""
     if len(sys.argv) != 2:
@@ -192,7 +259,6 @@ def main():
     logger.info("🔬 Test Statistics Derivation Worker")
     logger.info(f"Node: {os.getenv('SLURMD_NODENAME', 'localhost')}")
     logger.info(f"Job ID: {os.getenv('SLURM_JOB_ID', 'local')}")
-    logger.info(f"Array Task ID: {os.getenv('SLURM_ARRAY_TASK_ID', '0')}")
 
     # Load configuration
     with open(config_file, "r") as f:
@@ -226,64 +292,23 @@ def main():
         logger.error(f"No simulation batches found in {simulation_pool_dir}")
         sys.exit(1)
 
-    logger.info(f"Found {len(parquet_files)} simulation batches")
+    logger.info(f"Found {len(parquet_files)} simulation batches to process")
 
-    # For array jobs, process only assigned batch
-    array_task_id = int(os.getenv("SLURM_ARRAY_TASK_ID", "0"))
-    if array_task_id >= len(parquet_files):
-        logger.error(f"Array task {array_task_id} exceeds number of batches {len(parquet_files)}")
-        sys.exit(1)
-
-    parquet_file = parquet_files[array_task_id]
-    logger.info(f"Processing batch {array_task_id}: {parquet_file.name}")
-
-    # Load simulation batch
-    logger.info("Loading simulation data...")
-    sim_df = pd.read_parquet(parquet_file)
-    n_sims = len(sim_df)
-    logger.info(f"Loaded {n_sims} simulations")
-    logger.debug(f"DataFrame columns ({len(sim_df.columns)}): {list(sim_df.columns)[:10]}...")
-
-    # Extract parameter columns
-    # Parameters are scalar columns (not lists) that are not metadata columns
-    metadata_cols = {"simulation_id", "status", "time"}
-    param_cols = []
-    for col in sim_df.columns:
-        if col not in metadata_cols:
-            # Check if column contains scalar values (not lists)
-            sample_val = sim_df[col].iloc[0]
-            if not isinstance(sample_val, (list, np.ndarray)):
-                param_cols.append(col)
-
-    if param_cols:
-        logger.debug(
-            f"Found {len(param_cols)} parameter columns: {param_cols[:5]}{'...' if len(param_cols) > 5 else ''}"
+    # Process ALL batches in a single task (no array job needed)
+    total_sims = 0
+    for batch_idx, parquet_file in enumerate(parquet_files):
+        n_sims = process_single_batch(
+            batch_idx=batch_idx,
+            parquet_file=parquet_file,
+            test_stats_df=test_stats_df,
+            test_stat_registry=test_stat_registry,
+            test_stats_output_dir=test_stats_output_dir,
         )
+        total_sims += n_sims
 
-        # Save parameters to chunk_XXX_params.csv
-        params_output_file = test_stats_output_dir / f"chunk_{array_task_id:03d}_params.csv"
-        logger.debug(f"Saving parameters to {params_output_file}...")
-
-        # Extract parameter values (n_sims x n_params)
-        params_df = sim_df[param_cols]
-        params_df.to_csv(params_output_file, index=False, float_format="%.12e")
-
-        logger.info(f"   ✓ Parameters saved: {params_output_file}")
-    else:
-        logger.info("   No parameter columns found in Parquet file (may be older format)")
-
-    # Compute test statistics
-    test_stats_matrix = compute_test_statistics_batch(sim_df, test_stats_df, test_stat_registry)
-
-    # Save results
-    output_file = test_stats_output_dir / f"chunk_{array_task_id:03d}_test_stats.csv"
-    logger.info(f"   Saving results to {output_file}...")
-
-    # Save as CSV (n_sims x n_test_stats)
-    np.savetxt(output_file, test_stats_matrix, delimiter=",", fmt="%.12e")
-
-    logger.info(f"   ✓ Test statistics saved: {output_file}")
-    logger.info("   Derivation complete!")
+    logger.info(
+        f"✓ Derivation complete! Processed {total_sims} simulations from {len(parquet_files)} batches"
+    )
 
 
 if __name__ == "__main__":

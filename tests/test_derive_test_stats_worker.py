@@ -7,6 +7,7 @@ import pytest
 from qsp_hpc.batch.derive_test_stats_worker import (
     build_test_stat_registry,
     compute_test_statistics_batch,
+    process_single_batch,
 )
 
 
@@ -351,3 +352,162 @@ class TestComputeTestStatisticsBatch:
         # Exception should result in NaN
         assert result.shape == (1, 1)
         assert np.isnan(result[0, 0])
+
+
+class TestProcessSingleBatch:
+    """Test process_single_batch function."""
+
+    @pytest.fixture
+    def test_stats_df(self):
+        """Create test statistics definition."""
+        return pd.DataFrame(
+            {
+                "test_statistic_id": ["mean_tumor", "max_tumor"],
+                "required_species": ["V_T_C1", "V_T_C1"],
+                "model_output_code": [
+                    "def compute(time, V_T_C1):\n    return np.mean(V_T_C1)",
+                    "def compute(time, V_T_C1):\n    return np.max(V_T_C1)",
+                ],
+            }
+        )
+
+    @pytest.fixture
+    def test_stat_registry(self, test_stats_df):
+        """Build test statistic registry."""
+        return build_test_stat_registry(test_stats_df)
+
+    def test_process_single_batch_returns_sim_count(
+        self, test_stats_df, test_stat_registry, tmp_path
+    ):
+        """Test that process_single_batch returns number of simulations."""
+        # Create parquet file with 3 simulations
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0, 1, 2],
+                "status": [1, 1, 1],
+                "time": [[0.0, 1.0, 2.0]] * 3,
+                "V_T_C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0], [10.0, 20.0, 30.0]],
+            }
+        )
+
+        parquet_file = tmp_path / "batch_test.parquet"
+        sim_df.to_parquet(parquet_file)
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        n_sims = process_single_batch(
+            batch_idx=0,
+            parquet_file=parquet_file,
+            test_stats_df=test_stats_df,
+            test_stat_registry=test_stat_registry,
+            test_stats_output_dir=output_dir,
+        )
+
+        assert n_sims == 3
+
+    def test_process_single_batch_creates_output_files(
+        self, test_stats_df, test_stat_registry, tmp_path
+    ):
+        """Test that process_single_batch creates correct output files."""
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0, 1],
+                "status": [1, 1],
+                "time": [[0.0, 1.0, 2.0]] * 2,
+                "V_T_C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],
+            }
+        )
+
+        parquet_file = tmp_path / "batch_test.parquet"
+        sim_df.to_parquet(parquet_file)
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        process_single_batch(
+            batch_idx=5,  # Test non-zero batch index
+            parquet_file=parquet_file,
+            test_stats_df=test_stats_df,
+            test_stat_registry=test_stat_registry,
+            test_stats_output_dir=output_dir,
+        )
+
+        # Check output file exists with correct name
+        test_stats_file = output_dir / "chunk_005_test_stats.csv"
+        assert test_stats_file.exists()
+
+        # Load and verify content
+        result = np.loadtxt(test_stats_file, delimiter=",")
+        assert result.shape == (2, 2)  # 2 sims, 2 test stats
+        # First test stat is mean: [200, 100]
+        assert result[0, 0] == pytest.approx(200.0)
+        assert result[1, 0] == pytest.approx(100.0)
+        # Second test stat is max: [300, 150]
+        assert result[0, 1] == pytest.approx(300.0)
+        assert result[1, 1] == pytest.approx(150.0)
+
+
+class TestSingleTaskDerivation:
+    """Regression tests for single-task derivation (not array job).
+
+    These tests verify that derivation processes ALL batches in a single
+    task, rather than using SLURM array jobs with one task per batch.
+    """
+
+    def test_worker_processes_all_batches_not_array_task(self, tmp_path):
+        """Verify worker processes all batches, not just SLURM_ARRAY_TASK_ID.
+
+        Regression test: Previously, the worker used SLURM_ARRAY_TASK_ID to
+        select a single batch to process. Now it should process ALL batches.
+        """
+        # Create test statistics
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["mean_val"],
+                "required_species": ["value"],
+                "model_output_code": ["def compute(time, value):\n    return np.mean(value)"],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+
+        # Create multiple batch files
+        pool_dir = tmp_path / "pool"
+        pool_dir.mkdir()
+
+        for i in range(3):
+            sim_df = pd.DataFrame(
+                {
+                    "simulation_id": [i * 10 + j for j in range(5)],
+                    "status": [1] * 5,
+                    "time": [[0.0, 1.0]] * 5,
+                    "value": [[float(i * 100 + j)] * 2 for j in range(5)],
+                }
+            )
+            sim_df.to_parquet(pool_dir / f"batch_{i:03d}.parquet")
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        # Process all batches (simulating what the worker does)
+        parquet_files = sorted(pool_dir.glob("batch_*.parquet"))
+        assert len(parquet_files) == 3  # Sanity check
+
+        total_sims = 0
+        for batch_idx, parquet_file in enumerate(parquet_files):
+            n_sims = process_single_batch(
+                batch_idx=batch_idx,
+                parquet_file=parquet_file,
+                test_stats_df=test_stats_df,
+                test_stat_registry=registry,
+                test_stats_output_dir=output_dir,
+            )
+            total_sims += n_sims
+
+        # Verify ALL batches were processed
+        assert total_sims == 15  # 3 batches x 5 sims each
+
+        # Verify output files for all batches
+        assert (output_dir / "chunk_000_test_stats.csv").exists()
+        assert (output_dir / "chunk_001_test_stats.csv").exists()
+        assert (output_dir / "chunk_002_test_stats.csv").exists()

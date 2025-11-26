@@ -1026,21 +1026,20 @@ class HPCJobManager:
         self.transport.upload(temp_config, remote_config)
         Path(temp_config).unlink()
 
-        # Calculate how many batches to derive (selective derivation)
+        # Log pool info for user visibility
         n_batches = self._calculate_batches_needed(pool_path, num_simulations)
 
         if n_batches == 0:
             raise ValueError(f"No Parquet batches found in {pool_path}")
 
-        # Submit derivation job via slurm_submitter (eliminates code duplication)
+        # Submit single derivation job that processes all batches
         job_id = self.slurm_submitter.submit_derivation_job(
             pool_path=pool_path,
             test_stats_config=remote_config,
             derivation_dir=derivation_dir,
-            n_batches=n_batches,
         )
 
-        self.logger.info(f"   🚀 Derivation job {job_id} ({n_batches} tasks)")
+        self.logger.info(f"   🚀 Derivation job {job_id} (single task, {n_batches} batches)")
         return job_id
 
     def download_test_stats(

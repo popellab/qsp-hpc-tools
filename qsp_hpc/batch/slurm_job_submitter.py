@@ -139,16 +139,20 @@ echo "Job completed at $(date)"
         pool_path: str,
         test_stats_config: str,
         derivation_dir: str,
-        n_batches: int,
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
+
+        Submits a single task that processes all batches sequentially.
+        This is more efficient than array jobs for derivation since:
+        - Derivation is I/O bound (reading Parquet) and fast
+        - Avoids SLURM scheduling overhead for many small tasks
+        - Single task processes all batches in one job
 
         Args:
             pool_path: Path to simulation pool on HPC
             test_stats_config: Path to test statistics config on HPC
             derivation_dir: Directory for derivation outputs
-            n_batches: Number of array tasks (one per Parquet file)
 
         Returns:
             Job ID string
@@ -157,12 +161,12 @@ echo "Job completed at $(date)"
         self.logger.info("SLURM Derivation Configuration:")
         self.logger.info(f"  Partition: {self.config.partition}")
         self.logger.info("  Time limit: 01:00:00 (fixed for derivation)")
-        self.logger.info("  Memory per job: 4G (fixed for derivation)")
-        self.logger.info(f"  Array size: {n_batches} tasks")
+        self.logger.info("  Memory: 4G (fixed for derivation)")
+        self.logger.info("  Single task (processes all batches)")
 
         # Generate SLURM script
         script_content = self._generate_derivation_slurm_script(
-            pool_path, test_stats_config, derivation_dir, n_batches
+            pool_path, test_stats_config, derivation_dir
         )
 
         # Write to temp file
@@ -196,7 +200,6 @@ echo "Job completed at $(date)"
         pool_path: str,
         test_stats_config: str,
         derivation_dir: str,
-        n_batches: int,
     ) -> str:
         """Generate SLURM script for test statistics derivation."""
         log_dir = f"{self.config.remote_project_path}/batch_jobs/logs"
@@ -204,15 +207,14 @@ echo "Job completed at $(date)"
 #SBATCH --job-name=qsp_derive
 #SBATCH --partition={self.config.partition}
 #SBATCH --time=01:00:00
-#SBATCH --mem-per-cpu=4G
-#SBATCH --array=0-{n_batches-1}
-#SBATCH --output={log_dir}/qsp_derive_%A_%a.out
-#SBATCH --error={log_dir}/qsp_derive_%A_%a.err
+#SBATCH --mem=4G
+#SBATCH --output={log_dir}/qsp_derive_%j.out
+#SBATCH --error={log_dir}/qsp_derive_%j.err
 
 # Activate Python virtual environment
 source {self.config.hpc_venv_path}/bin/activate
 
-# Run derivation worker with config JSON
+# Run derivation worker with config JSON (processes all batches)
 cd {self.config.remote_project_path}
 python3 -m qsp_hpc.batch.derive_test_stats_worker "{test_stats_config}"
 """

@@ -83,15 +83,15 @@ classdef test_extract_all_species_arrays < matlab.unittest.TestCase
                 'Expected V_P compartment in species names');
         end
 
-        function test_compartment_capacity_fallback(testCase)
-            % Test that compartment volumes use model Capacity when not logged in simdata
-            % This tests the fallback behavior when selectbyname returns empty for compartments
+        function test_constant_compartment_uses_capacity(testCase)
+            % Test that CONSTANT compartment volumes use model Capacity directly
+            % Constant compartments (ConstantCapacity=true) don't need selectbyname
             simData = sbiosimulate(testCase.Model);
             chunk_results(1).simData = simData;
 
             species_data = extract_all_species_arrays(chunk_results, testCase.Model);
 
-            % Find compartment indices
+            % Find constant compartment indices (V_C and V_P are constant)
             v_c_idx = find(strcmp(species_data.species_names, 'V_C'));
             v_p_idx = find(strcmp(species_data.species_names, 'V_P'));
 
@@ -109,10 +109,41 @@ classdef test_extract_all_species_arrays < matlab.unittest.TestCase
                 'V_P data should have correct number of timepoints');
 
             % Verify values match model Capacity (from create_mock_model: V_C=50, V_P=100)
+            % These are CONSTANT so all values should be identical
             testCase.verifyEqual(unique(v_c_data), 50, ...
                 'V_C values should equal model Capacity (50)');
             testCase.verifyEqual(unique(v_p_data), 100, ...
                 'V_P values should equal model Capacity (100)');
+        end
+
+        function test_nonconstant_compartment_extracted_from_simdata(testCase)
+            % Test that NON-CONSTANT compartment volumes are extracted from simdata
+            % Non-constant compartments (ConstantCapacity=false) must use selectbyname
+            simData = sbiosimulate(testCase.Model);
+            chunk_results(1).simData = simData;
+
+            species_data = extract_all_species_arrays(chunk_results, testCase.Model);
+
+            % Find non-constant compartment index (V_T is non-constant in mock model)
+            v_t_idx = find(strcmp(species_data.species_names, 'V_T'));
+            testCase.verifyNotEmpty(v_t_idx, 'V_T should be in species_names');
+
+            % Get compartment data
+            v_t_data = species_data.species_arrays{1, v_t_idx};
+
+            % Verify correct length
+            testCase.verifyEqual(length(v_t_data), species_data.n_timepoints, ...
+                'V_T data should have correct number of timepoints');
+
+            % V_T should NOT be constant - values should change over time
+            % (mock model has exponential growth: V_T = 1 * exp(0.01 * time))
+            testCase.verifyGreaterThan(length(unique(v_t_data)), 1, ...
+                'V_T should have changing values (non-constant compartment)');
+
+            % Verify the data matches expected growth pattern
+            testCase.verifyEqual(v_t_data(1), 1, 'V_T initial value should be 1');
+            testCase.verifyGreaterThan(v_t_data(end), v_t_data(1), ...
+                'V_T should grow over time');
         end
 
         function test_extracts_multiple_simulations(testCase)

@@ -16,8 +16,13 @@ function model = create_mock_model()
 model = sbiomodel('TestPKModel');
 
 % Add compartments
-central = addcompartment(model, 'V_C', 50);  % 50 L central volume
-peripheral = addcompartment(model, 'V_P', 100);  % 100 L peripheral volume
+central = addcompartment(model, 'V_C', 50);  % 50 L central volume (constant)
+peripheral = addcompartment(model, 'V_P', 100);  % 100 L peripheral volume (constant)
+
+% Add a non-constant compartment to test extraction from simdata
+% This mimics tumor volume (V_T) which can change during simulation
+tumor = addcompartment(model, 'V_T', 1);  % 1 L initial tumor volume
+tumor.ConstantCapacity = false;  % Mark as non-constant
 
 % Add species to compartments
 drug_central = addspecies(central, 'Drug', 0);  % Drug in central
@@ -46,5 +51,10 @@ r3.Name = 'PeripheralToCentral';
 
 % Set initial drug amount in central compartment
 drug_central.InitialAmount = 100;  % 100 units initial dose
+
+% Add a rule to make tumor volume change over time (exponential growth)
+% This ensures V_T is logged in simdata as a non-constant compartment
+tumor_growth = addrule(model, 'V_T = 1 * exp(0.01 * time)', 'repeatedAssignment');
+tumor_growth.Name = 'TumorGrowth';
 
 end

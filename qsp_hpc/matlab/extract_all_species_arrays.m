@@ -38,12 +38,18 @@ end
 
 % Also get compartment volumes (e.g., V_T, V_C, V_LN, V_P)
 % These are needed for computing cell densities in test statistics
+% Separate constant compartments (use Capacity) from non-constant ones (extract from simdata)
 all_compartments = sbioselect(model, 'Type', 'compartment');
 compartment_names = cell(1, length(all_compartments));
-compartment_capacities = containers.Map();
+constant_compartments = containers.Map();  % Maps name -> Capacity for constant compartments only
 for i = 1:length(all_compartments)
-    compartment_names{i} = all_compartments(i).Name;
-    compartment_capacities(all_compartments(i).Name) = all_compartments(i).Capacity;
+    comp = all_compartments(i);
+    compartment_names{i} = comp.Name;
+    % Check if compartment has constant capacity (ConstantCapacity property)
+    % If true, we can use the model's Capacity value directly without calling selectbyname
+    if comp.ConstantCapacity
+        constant_compartments(comp.Name) = comp.Capacity;
+    end
 end
 
 % Combine species and compartment names
@@ -52,8 +58,10 @@ species_names = [species_names, compartment_names];
 n_species = length(species_names);
 n_compartments = length(compartment_names);
 
-fprintf('   Extracting %d species + %d compartments from %d simulations...\n', ...
-    n_species - n_compartments, n_compartments, n_sims);
+n_constant = length(constant_compartments);
+n_nonconstant = n_compartments - n_constant;
+fprintf('   Extracting %d species + %d compartments (%d constant, %d non-constant) from %d simulations...\n', ...
+    n_species - n_compartments, n_compartments, n_constant, n_nonconstant, n_sims);
 
 % Initialize output arrays
 time_arrays = cell(n_sims, 1);
@@ -79,25 +87,19 @@ for i = 1:n_sims
         % Extract each species/compartment
         for j = 1:n_species
             state_name = species_names{j};
-            try
+
+            % Check if this is a constant compartment - use Capacity directly
+            % This avoids warnings from selectbyname for states not in simdata
+            if isKey(constant_compartments, state_name)
+                capacity = constant_compartments(state_name);
+                species_arrays{i, j} = repmat(capacity, size(simdata.Time));
+            else
+                % Species or non-constant compartment - extract from simdata
                 [~, data, ~] = selectbyname(simdata, state_name);
                 if ~isempty(data)
-                    % Data found - store it
                     species_arrays{i, j} = data;
-                elseif isKey(compartment_capacities, state_name)
-                    % Compartment not in simdata - use constant Capacity from model
-                    capacity = compartment_capacities(state_name);
-                    species_arrays{i, j} = repmat(capacity, size(simdata.Time));
                 else
-                    % State returned empty data - store empty array
-                    species_arrays{i, j} = [];
-                end
-            catch
-                % selectbyname threw an error
-                if isKey(compartment_capacities, state_name)
-                    capacity = compartment_capacities(state_name);
-                    species_arrays{i, j} = repmat(capacity, size(simdata.Time));
-                else
+                    % State not found in simdata - store empty array
                     species_arrays{i, j} = [];
                 end
             end

@@ -244,6 +244,38 @@ class TestMatlabExtractSpeciesArrays:
             pytest.skip(result["message"])
         assert result["passed"], result["message"]
 
+    def test_constant_compartment_uses_capacity(self, matlab_test_results):
+        """Test that constant compartments use model Capacity directly."""
+        result = next(
+            (
+                r
+                for r in matlab_test_results
+                if "test_constant_compartment_uses_capacity" in r["name"]
+            ),
+            None,
+        )
+        if result is None:
+            pytest.skip("Test not found in MATLAB results")
+        if result["passed"] is None:
+            pytest.skip(result["message"])
+        assert result["passed"], result["message"]
+
+    def test_nonconstant_compartment_extracted_from_simdata(self, matlab_test_results):
+        """Test that non-constant compartments are extracted from simdata."""
+        result = next(
+            (
+                r
+                for r in matlab_test_results
+                if "test_nonconstant_compartment_extracted_from_simdata" in r["name"]
+            ),
+            None,
+        )
+        if result is None:
+            pytest.skip("Test not found in MATLAB results")
+        if result["passed"] is None:
+            pytest.skip(result["message"])
+        assert result["passed"], result["message"]
+
 
 @pytest.mark.matlab
 class TestMatlabSaveSpeciesToParquet:

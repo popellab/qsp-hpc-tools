@@ -332,56 +332,44 @@ class QSPSimulator:
         else:
             return f"{pct_diff:+.1f}%"
 
-    def _log_test_statistics_table(
+    def compute_test_statistics_table(
         self, test_stats: np.ndarray, test_stats_df: pd.DataFrame, n_sims: int
-    ) -> None:
+    ) -> pd.DataFrame:
         """
-        Log test statistics in a detailed table format.
+        Compute test statistics comparison table.
+
+        This method computes summary statistics comparing simulated test statistics
+        to observed values, including median, percentage difference, 95% confidence
+        intervals, and coverage status.
 
         Args:
             test_stats: Computed test statistics array (n_sims, n_test_stats)
-            test_stats_df: DataFrame with test statistics metadata
+            test_stats_df: DataFrame with test statistics metadata (must have
+                'test_statistic_id' and 'mean' columns)
             n_sims: Number of simulations
+
+        Returns:
+            DataFrame with columns:
+                - test_statistic_id: str, identifier for the test statistic
+                - median: float, median of simulated values (NaN if all sims failed)
+                - observed: float, observed value from CSV
+                - pct_diff: float, percentage difference from observed (NaN if undefined)
+                - ci_lower: float, 2.5th percentile (NaN if n_sims=1)
+                - ci_upper: float, 97.5th percentile (NaN if n_sims=1)
+                - covers_observed: bool, True if observed in [ci_lower, ci_upper]
+                    (False if n_sims=1 or observed is NaN)
         """
-
-        self.logger.info("")
-        self.logger.info(f"Test Statistics ({n_sims} simulation{'s' if n_sims > 1 else ''}):")
-
-        # Show individual values column only for multiple simulations
-        if n_sims > 1:
-            self.logger.info(
-                "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┬────────┬────────────────────────────┐"
-            )
-            self.logger.info(
-                "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │ 95% CI │ [2.5%, 97.5%]              │"
-            )
-            self.logger.info(
-                "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┼────────┼────────────────────────────┤"
-            )
-        else:
-            self.logger.info(
-                "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┐"
-            )
-            self.logger.info(
-                "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │"
-            )
-            self.logger.info(
-                "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┤"
-            )
-
-        nan_count = 0
-        large_diff_count = 0
-        covered_count = 0
-        not_covered_count = 0
+        rows = []
 
         for idx, row in test_stats_df.iterrows():
             test_stat_id = row["test_statistic_id"]
+            observed_value = row.get("mean", np.nan)
 
             # Compute value (median if multiple sims, single value if n_sims=1)
             if n_sims == 1:
                 computed_value = test_stats[0, idx]
-                individual_values = None
-                ci_lower = ci_upper = None
+                ci_lower = np.nan
+                ci_upper = np.nan
             else:
                 # Use nanmedian to ignore NaN values and be robust to outliers
                 computed_value = np.nanmedian(test_stats[:, idx])
@@ -391,68 +379,209 @@ class QSPSimulator:
                 ci_lower = np.nanpercentile(individual_values, 2.5)
                 ci_upper = np.nanpercentile(individual_values, 97.5)
 
-            # Get observed value from CSV
-            observed_value = row.get("mean", np.nan)
-
-            # Format computed value
-            if np.isnan(computed_value):
-                computed_str = "NaN"
-                nan_count += 1
-                observed_str = self._format_number(observed_value)
-                diff_str = "—"
-                coverage_str = "—"
-                ci_str = "—"
+            # Calculate percentage difference
+            if (
+                not np.isnan(computed_value)
+                and not np.isnan(observed_value)
+                and observed_value != 0
+            ):
+                pct_diff = ((computed_value - observed_value) / observed_value) * 100
             else:
-                computed_str = self._format_number(computed_value)
-                observed_str = self._format_number(observed_value)
+                pct_diff = np.nan
 
-                # Calculate percentage difference
-                if not np.isnan(observed_value) and observed_value != 0:
-                    pct_diff = ((computed_value - observed_value) / observed_value) * 100
-                    diff_str = self._format_percentage(pct_diff)
-                    if abs(pct_diff) > 100:
-                        large_diff_count += 1
-                else:
+            # Check 95% CI coverage (only for multiple sims with valid observed)
+            if (
+                n_sims > 1
+                and not np.isnan(ci_lower)
+                and not np.isnan(ci_upper)
+                and not np.isnan(observed_value)
+            ):
+                covers_observed = ci_lower <= observed_value <= ci_upper
+            else:
+                covers_observed = False
+
+            rows.append(
+                {
+                    "test_statistic_id": test_stat_id,
+                    "median": computed_value,
+                    "observed": observed_value,
+                    "pct_diff": pct_diff,
+                    "ci_lower": ci_lower,
+                    "ci_upper": ci_upper,
+                    "covers_observed": covers_observed,
+                }
+            )
+
+        return pd.DataFrame(rows)
+
+    def _log_test_statistics_table(
+        self, test_stats: np.ndarray, test_stats_df: pd.DataFrame, n_sims: int
+    ) -> None:
+        """
+        Log test statistics in a detailed table format.
+
+        Shows passing tests (95% CI covers observed) first, then failing tests.
+
+        Args:
+            test_stats: Computed test statistics array (n_sims, n_test_stats)
+            test_stats_df: DataFrame with test statistics metadata
+            n_sims: Number of simulations
+        """
+        # Compute the statistics table
+        stats_table = self.compute_test_statistics_table(test_stats, test_stats_df, n_sims)
+
+        self.logger.info("")
+        self.logger.info(f"Test Statistics ({n_sims} simulation{'s' if n_sims > 1 else ''}):")
+
+        # Separate passing and failing tests (only for n_sims > 1)
+        if n_sims > 1:
+            # Valid rows have non-NaN observed and CI values
+            valid_mask = ~stats_table["observed"].isna() & ~stats_table["ci_lower"].isna()
+            passing_table = stats_table[valid_mask & stats_table["covers_observed"]]
+            failing_table = stats_table[valid_mask & ~stats_table["covers_observed"]]
+            invalid_table = stats_table[~valid_mask]
+        else:
+            passing_table = stats_table
+            failing_table = pd.DataFrame()
+            invalid_table = pd.DataFrame()
+
+        def log_table_rows(table: pd.DataFrame, is_multi_sim: bool) -> None:
+            """Log rows for a statistics table."""
+            for _, row in table.iterrows():
+                test_stat_id = row["test_statistic_id"]
+                computed_value = row["median"]
+                observed_value = row["observed"]
+                pct_diff = row["pct_diff"]
+                ci_lower = row["ci_lower"]
+                ci_upper = row["ci_upper"]
+                covers_observed = row["covers_observed"]
+
+                # Format computed value
+                if np.isnan(computed_value):
+                    computed_str = "NaN"
+                    observed_str = self._format_number(observed_value)
                     diff_str = "—"
-
-                # Check 95% CI coverage (only for multiple sims)
-                if n_sims > 1 and ci_lower is not None and not np.isnan(observed_value):
-                    covers = ci_lower <= observed_value <= ci_upper
-                    if covers:
-                        coverage_str = "✓"
-                        covered_count += 1
-                    else:
-                        coverage_str = "✗"
-                        not_covered_count += 1
-                    ci_str = f"[{self._format_number(ci_lower)}, {self._format_number(ci_upper)}]"
-                else:
                     coverage_str = "—"
                     ci_str = "—"
+                else:
+                    computed_str = self._format_number(computed_value)
+                    observed_str = self._format_number(observed_value)
 
-            # Truncate test_stat_id if too long
-            display_id = test_stat_id if len(test_stat_id) <= 35 else test_stat_id[:32] + "..."
+                    # Format percentage difference
+                    if not np.isnan(pct_diff):
+                        diff_str = self._format_percentage(pct_diff)
+                    else:
+                        diff_str = "—"
 
-            if n_sims > 1:
-                self.logger.info(
-                    f"│ {display_id:<35} │ {computed_str:>12} │ {observed_str:>12} │ {diff_str:>12} │ {coverage_str:^6} │ {ci_str:<26} │"
-                )
-            else:
-                self.logger.info(
-                    f"│ {display_id:<35} │ {computed_str:>12} │ {observed_str:>12} │ {diff_str:>12} │"
-                )
+                    # Format 95% CI coverage (only for multiple sims)
+                    if is_multi_sim and not np.isnan(ci_lower) and not np.isnan(observed_value):
+                        coverage_str = "✓" if covers_observed else "✗"
+                        ci_str = (
+                            f"[{self._format_number(ci_lower)}, {self._format_number(ci_upper)}]"
+                        )
+                    else:
+                        coverage_str = "—"
+                        ci_str = "—"
 
+                # Truncate test_stat_id if too long
+                display_id = test_stat_id if len(test_stat_id) <= 35 else test_stat_id[:32] + "..."
+
+                if is_multi_sim:
+                    self.logger.info(
+                        f"│ {display_id:<35} │ {computed_str:>12} │ {observed_str:>12} │ {diff_str:>12} │ {coverage_str:^6} │ {ci_str:<26} │"
+                    )
+                else:
+                    self.logger.info(
+                        f"│ {display_id:<35} │ {computed_str:>12} │ {observed_str:>12} │ {diff_str:>12} │"
+                    )
+
+        # Log passing tests table
         if n_sims > 1:
+            self.logger.info("")
+            self.logger.info(f"Passing ({len(passing_table)} tests - 95% CI covers observed):")
+            self.logger.info(
+                "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┬────────┬────────────────────────────┐"
+            )
+            self.logger.info(
+                "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │ 95% CI │ [2.5%, 97.5%]              │"
+            )
+            self.logger.info(
+                "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┼────────┼────────────────────────────┤"
+            )
+            log_table_rows(passing_table, is_multi_sim=True)
             self.logger.info(
                 "└─────────────────────────────────────┴──────────────┴──────────────┴──────────────┴────────┴────────────────────────────┘"
             )
+
+            # Log failing tests table (if any)
+            if len(failing_table) > 0:
+                self.logger.info("")
+                self.logger.info(
+                    f"Failing ({len(failing_table)} tests - 95% CI does NOT cover observed):"
+                )
+                self.logger.info(
+                    "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┬────────┬────────────────────────────┐"
+                )
+                self.logger.info(
+                    "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │ 95% CI │ [2.5%, 97.5%]              │"
+                )
+                self.logger.info(
+                    "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┼────────┼────────────────────────────┤"
+                )
+                log_table_rows(failing_table, is_multi_sim=True)
+                self.logger.info(
+                    "└─────────────────────────────────────┴──────────────┴──────────────┴──────────────┴────────┴────────────────────────────┘"
+                )
+
+            # Log invalid tests (NaN observed or CI) if any
+            if len(invalid_table) > 0:
+                self.logger.info("")
+                self.logger.info(f"Invalid ({len(invalid_table)} tests - missing observed or CI):")
+                self.logger.info(
+                    "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┬────────┬────────────────────────────┐"
+                )
+                self.logger.info(
+                    "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │ 95% CI │ [2.5%, 97.5%]              │"
+                )
+                self.logger.info(
+                    "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┼────────┼────────────────────────────┤"
+                )
+                log_table_rows(invalid_table, is_multi_sim=True)
+                self.logger.info(
+                    "└─────────────────────────────────────┴──────────────┴──────────────┴──────────────┴────────┴────────────────────────────┘"
+                )
         else:
+            # Single simulation - show all in one table
+            self.logger.info(
+                "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┐"
+            )
+            self.logger.info(
+                "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │"
+            )
+            self.logger.info(
+                "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┤"
+            )
+            log_table_rows(stats_table, is_multi_sim=False)
             self.logger.info(
                 "└─────────────────────────────────────┴──────────────┴──────────────┴──────────────┘"
             )
 
-        # Summary
-        total_stats = len(test_stats_df)
+        # Summary - compute from the stats table
+        total_stats = len(stats_table)
+        nan_count = stats_table["median"].isna().sum()
         success_count = total_stats - nan_count
+        large_diff_count = (stats_table["pct_diff"].abs() > 100).sum()
+
+        # Coverage stats (only for n_sims > 1)
+        if n_sims > 1:
+            # Only count rows with valid observed values for coverage
+            valid_coverage_mask = ~stats_table["observed"].isna() & ~stats_table["ci_lower"].isna()
+            covered_count = (stats_table.loc[valid_coverage_mask, "covers_observed"]).sum()
+            not_covered_count = valid_coverage_mask.sum() - covered_count
+        else:
+            covered_count = 0
+            not_covered_count = 0
+
         self.logger.info("")
         summary_parts = [f"✓ Computed {success_count}/{total_stats} test statistics"]
         if nan_count > 0:

@@ -328,3 +328,132 @@ class TestMatlabSaveSpeciesToParquet:
         if result["passed"] is None:
             pytest.skip(result["message"])
         assert result["passed"], result["message"]
+
+
+@pytest.mark.matlab
+class TestBatchWorkerIntegration:
+    """Integration tests for batch_worker postprocessing components."""
+
+    def test_extract_test_stats_with_mock_data(self, matlab_test_results):
+        """Test postproc_extract_test_statistics with mock simulation data."""
+        result = next(
+            (
+                r
+                for r in matlab_test_results
+                if "test_extract_test_stats_with_mock_data" in r["name"]
+            ),
+            None,
+        )
+        if result is None:
+            pytest.skip("Test not found in MATLAB results")
+        if result["passed"] is None:
+            pytest.skip(result["message"])
+        assert result["passed"], result["message"]
+
+    def test_extract_test_stats_handles_missing_function(self, matlab_test_results):
+        """Test graceful handling when test statistic function is missing."""
+        result = next(
+            (
+                r
+                for r in matlab_test_results
+                if "test_extract_test_stats_handles_missing_function" in r["name"]
+            ),
+            None,
+        )
+        if result is None:
+            pytest.skip("Test not found in MATLAB results")
+        if result["passed"] is None:
+            pytest.skip(result["message"])
+        assert result["passed"], result["message"]
+
+    def test_extract_test_stats_no_csv(self, matlab_test_results):
+        """Test behavior when no test_stats.csv exists."""
+        result = next(
+            (r for r in matlab_test_results if "test_extract_test_stats_no_csv" in r["name"]),
+            None,
+        )
+        if result is None:
+            pytest.skip("Test not found in MATLAB results")
+        if result["passed"] is None:
+            pytest.skip(result["message"])
+        assert result["passed"], result["message"]
+
+    def test_save_outputs_creates_csv(self, matlab_test_results):
+        """Test that postproc_save_outputs creates correct CSV files."""
+        result = next(
+            (r for r in matlab_test_results if "test_save_outputs_creates_csv" in r["name"]),
+            None,
+        )
+        if result is None:
+            pytest.skip("Test not found in MATLAB results")
+        if result["passed"] is None:
+            pytest.skip(result["message"])
+        assert result["passed"], result["message"]
+
+    def test_save_outputs_creates_header_for_chunk_zero(self, matlab_test_results):
+        """Test that header file is created only for chunk 0."""
+        result = next(
+            (
+                r
+                for r in matlab_test_results
+                if "test_save_outputs_creates_header_for_chunk_zero" in r["name"]
+            ),
+            None,
+        )
+        if result is None:
+            pytest.skip("Test not found in MATLAB results")
+        if result["passed"] is None:
+            pytest.skip(result["message"])
+        assert result["passed"], result["message"]
+
+    def test_save_outputs_no_header_for_chunk_nonzero(self, matlab_test_results):
+        """Test that header file is NOT created for chunk > 0."""
+        result = next(
+            (
+                r
+                for r in matlab_test_results
+                if "test_save_outputs_no_header_for_chunk_nonzero" in r["name"]
+            ),
+            None,
+        )
+        if result is None:
+            pytest.skip("Test not found in MATLAB results")
+        if result["passed"] is None:
+            pytest.skip(result["message"])
+        assert result["passed"], result["message"]
+
+    def test_save_outputs_skips_empty_data(self, matlab_test_results):
+        """Test that empty data is skipped."""
+        result = next(
+            (r for r in matlab_test_results if "test_save_outputs_skips_empty_data" in r["name"]),
+            None,
+        )
+        if result is None:
+            pytest.skip("Test not found in MATLAB results")
+        if result["passed"] is None:
+            pytest.skip(result["message"])
+        assert result["passed"], result["message"]
+
+    def test_save_outputs_multiple_types(self, matlab_test_results):
+        """Test saving multiple output types."""
+        result = next(
+            (r for r in matlab_test_results if "test_save_outputs_multiple_types" in r["name"]),
+            None,
+        )
+        if result is None:
+            pytest.skip("Test not found in MATLAB results")
+        if result["passed"] is None:
+            pytest.skip(result["message"])
+        assert result["passed"], result["message"]
+
+    def test_full_postprocessing_pipeline(self, matlab_test_results):
+        """End-to-end test of the postprocessing pipeline."""
+        result = next(
+            (r for r in matlab_test_results if "test_full_postprocessing_pipeline" in r["name"]),
+            None,
+        )
+        if result is None:
+            pytest.skip("Test not found in MATLAB results")
+        if result["passed"] is None:
+            pytest.skip(result["message"])
+        assert result["passed"], result["message"]

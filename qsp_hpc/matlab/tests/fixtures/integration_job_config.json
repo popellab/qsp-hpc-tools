@@ -1,0 +1,17 @@
+{
+    "n_simulations": 10,
+    "seed": 42,
+    "jobs_per_chunk": 5,
+    "model_script": "create_mock_model",
+    "param_csv": "batch_jobs/input/params.csv",
+    "test_stats_csv": "batch_jobs/input/test_stats.csv",
+    "save_full_simulations": false,
+    "sim_config": {
+        "solver": "sundials",
+        "start_time": 0,
+        "stop_time": 24,
+        "time_units": "hour",
+        "abs_tolerance": 1e-9,
+        "rel_tolerance": 1e-6
+    }
+}

@@ -1,0 +1,4 @@
+test_statistic_id,mean,variance,units,required_species,model_output_code
+peak_drug,100.0,25.0,ng/mL,V_C.Drug,"def compute(time, V_C_Drug): return float(max(V_C_Drug))"
+auc_drug,500.0,100.0,ng*h/mL,V_C.Drug,"def compute(time, V_C_Drug): return float(np.trapz(V_C_Drug, time))"
+trough_drug,10.0,4.0,ng/mL,V_C.Drug,"def compute(time, V_C_Drug): return float(V_C_Drug[-1])"

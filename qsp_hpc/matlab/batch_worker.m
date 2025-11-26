@@ -233,14 +233,6 @@ try
         postproc_config.test_stats.csv_file = test_stats_csv_file;
     end
 
-    % Extract metrics if configured
-    if isfield(postproc_config, 'metrics')
-        [metrics_data, metrics_names] = postproc_extract_metrics(chunk_results, model, postproc_config.metrics, input_dir);
-        if ~isempty(metrics_data)
-            outputs.metrics = struct('data', metrics_data, 'names', {metrics_names}, 'type', 'metrics');
-        end
-    end
-
     % Extract test statistics if configured
     if isfield(postproc_config, 'test_stats')
         [test_stats_data, test_stat_ids, ~] = postproc_extract_test_statistics(chunk_results, model, postproc_config.test_stats, input_dir);

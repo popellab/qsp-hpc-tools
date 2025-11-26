@@ -77,25 +77,29 @@ for i = 1:n_sims
         time_arrays{i} = simdata.Time;
 
         % Extract each species/compartment
-        % Get list of available data names to avoid warnings from selectbyname
-        available_names = simdata.DataNames;
-
         for j = 1:n_species
             state_name = species_names{j};
-
-            % Check if state is available in simulation data
-            if any(strcmp(available_names, state_name))
-                % State found in simdata - extract it
+            try
                 [~, data, ~] = selectbyname(simdata, state_name);
-                species_arrays{i, j} = data;
-            elseif isKey(compartment_capacities, state_name)
-                % Compartment not logged - use constant Capacity from model
-                capacity = compartment_capacities(state_name);
-                species_arrays{i, j} = repmat(capacity, size(simdata.Time));
-            else
-                % Unknown state not in simdata - store empty array
-                % (NaN arrays get JSON-encoded as nulls, causing dtype issues in Python)
-                species_arrays{i, j} = [];
+                if ~isempty(data)
+                    % Data found - store it
+                    species_arrays{i, j} = data;
+                elseif isKey(compartment_capacities, state_name)
+                    % Compartment not in simdata - use constant Capacity from model
+                    capacity = compartment_capacities(state_name);
+                    species_arrays{i, j} = repmat(capacity, size(simdata.Time));
+                else
+                    % State returned empty data - store empty array
+                    species_arrays{i, j} = [];
+                end
+            catch
+                % selectbyname threw an error
+                if isKey(compartment_capacities, state_name)
+                    capacity = compartment_capacities(state_name);
+                    species_arrays{i, j} = repmat(capacity, size(simdata.Time));
+                else
+                    species_arrays{i, j} = [];
+                end
             end
         end
     end

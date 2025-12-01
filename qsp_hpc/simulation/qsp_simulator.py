@@ -945,6 +945,41 @@ class QSPSimulator:
                 f"Check HPC logs at: {log_path}/qsp_derive_*.err"
             )
 
+    def _download_derived_test_stats(
+        self, hpc_pool_path: str, test_stats_hash: str, num_simulations: int
+    ) -> np.ndarray:
+        """
+        Download derived test statistics from HPC.
+
+        Args:
+            hpc_pool_path: Path to HPC pool directory
+            test_stats_hash: Hash of test statistics configuration
+            num_simulations: Number of simulations to download
+
+        Returns:
+            Numpy array of test statistics (num_simulations x num_observables)
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_cache_dir = Path(temp_dir)
+
+            with log_operation(self.logger, "Downloading derived test statistics"):
+                params, test_stats = self.job_manager.download_test_stats(
+                    hpc_pool_path, test_stats_hash, temp_cache_dir
+                )
+
+            if test_stats is None:
+                raise RuntimeError(
+                    "Failed to download derived test statistics from HPC. "
+                    "Check derivation job logs."
+                )
+
+            if test_stats.shape[0] != num_simulations:
+                self.logger.warning(
+                    f"Downloaded {test_stats.shape[0]} test stats but expected {num_simulations}"
+                )
+
+            return test_stats
+
     def _run_new_simulations(self, num_simulations: int) -> None:
         """
         Run new simulations on HPC and add to pool.
@@ -1281,11 +1316,22 @@ class QSPSimulator:
             simulation_pool_id=simulation_pool_id,  # Pool ID for HPC storage
         )
 
-        # Wait for jobs to complete
+        # Wait for MATLAB simulation jobs to complete (saves full sims to parquet)
         self._wait_for_completion(job_info.job_ids, num_simulations)
 
-        # Collect results via Python (no MATLAB needed!)
-        observables_matrix = self.job_manager.collect_results(state_file=job_info.state_file)
+        # Clean up state file from MATLAB jobs
+        Path(job_info.state_file).unlink(missing_ok=True)
+
+        # Now derive test statistics from the saved parquet files using Python
+        # This is the correct flow: MATLAB saves full sims → Python computes test stats
+        self.logger.info("Deriving test statistics from full simulations...")
+        test_stats_hash = self._compute_test_stats_hash()
+        self._derive_test_statistics(hpc_save_path, test_stats_hash, num_simulations)
+
+        # Download the derived test statistics
+        observables_matrix = self._download_derived_test_stats(
+            hpc_save_path, test_stats_hash, num_simulations
+        )
 
         return observables_matrix
 

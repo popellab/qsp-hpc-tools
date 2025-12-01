@@ -226,20 +226,15 @@ try
     % Build postproc_config from JSON configuration
     postproc_config = struct();
 
-    % Configure test statistics extraction if test_stats_csv was provided
-    if exist('test_stats_csv_file', 'var') && ~isempty(test_stats_csv_file) && exist(test_stats_csv_file, 'file')
-        fprintf('   Configuring test statistics from: %s\n', test_stats_csv_file);
-        postproc_config.test_stats = struct();
-        postproc_config.test_stats.csv_file = test_stats_csv_file;
-    end
-
-    % Extract test statistics if configured
-    if isfield(postproc_config, 'test_stats')
-        [test_stats_data, test_stat_ids, ~] = postproc_extract_test_statistics(chunk_results, model, postproc_config.test_stats, input_dir);
-        if ~isempty(test_stats_data)
-            outputs.test_stats = struct('data', test_stats_data, 'names', {test_stat_ids}, 'type', 'test_stats');
-        end
-    end
+    % NOTE: Test statistics extraction is now handled by Python derivation worker
+    % (qsp_hpc.batch.derive_test_stats_worker) which processes the saved Parquet files.
+    % The MATLAB postproc_extract_test_statistics function is deprecated because:
+    % 1. Test statistic functions in CSV are Python code, not MATLAB
+    % 2. Python derivation worker runs after all MATLAB jobs complete
+    % 3. This provides better error handling and performance
+    %
+    % The Parquet files saved above contain all species time series needed for
+    % Python-based test statistic computation.
 
     % Save all outputs using generic function
     if ~isempty(fieldnames(outputs))

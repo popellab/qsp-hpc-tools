@@ -192,7 +192,7 @@ class TestDerivationJobSubmission:
 
         assert "#SBATCH --job-name=qsp_derive" in script_content
         assert "#SBATCH --partition=normal" in script_content
-        assert "#SBATCH --time=01:00:00" in script_content  # Fixed time for derivation
+        assert "#SBATCH --time=00:15:00" in script_content  # Fixed time for derivation
         assert "#SBATCH --mem=4G" in script_content  # Fixed memory (not --mem-per-cpu)
         # Should NOT have array directive - single task processes all batches
         assert "#SBATCH --array" not in script_content
@@ -241,7 +241,7 @@ class TestScriptGeneration:
         # Check SLURM directives
         assert "#SBATCH --job-name=qsp_derive" in script
         assert "#SBATCH --partition=normal" in script
-        assert "#SBATCH --time=01:00:00" in script
+        assert "#SBATCH --time=00:15:00" in script
         assert "#SBATCH --mem=4G" in script  # Not --mem-per-cpu
         # Should NOT have array directive
         assert "#SBATCH --array" not in script

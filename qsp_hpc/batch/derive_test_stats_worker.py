@@ -12,6 +12,7 @@ Usage:
 The config JSON should contain:
     - simulation_pool_dir: Path to full simulation pool on HPC
     - test_stats_csv: Path to test statistics CSV
+    - species_units_file: Path to species_units.json (maps species names to unit strings)
     - output_dir: Path to output directory for derived test stats
     - test_stats_hash: Hash of test statistics configuration
 """
@@ -23,6 +24,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from qsp_hpc.utils.unit_registry import ureg
 
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
@@ -41,8 +44,13 @@ def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
     - test_statistic_id: Unique identifier
     - model_output_code: Python function code as string
 
-    The function code should define a function named 'compute' with signature:
-        def compute(time: np.ndarray, species1: np.ndarray, ...) -> float
+    The function code should define a function named 'compute_test_statistic' with signature:
+        def compute_test_statistic(time: np.ndarray, species_dict: dict, ureg) -> float
+
+    Where:
+        - time: numpy array of time points
+        - species_dict: maps species names (e.g., 'V_T.CD8') to numpy arrays
+        - ureg: Pint UnitRegistry for unit-aware calculations
 
     Args:
         test_stats_df: DataFrame with test statistics configuration
@@ -77,19 +85,21 @@ def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
 
         try:
             # Create isolated namespace for function
-            namespace = {"np": np, "numpy": np}
+            import pint
+
+            namespace = {"np": np, "numpy": np, "pint": pint, "ureg": ureg}
 
             # Compile and execute the function code
             exec(function_code, namespace)
 
-            # Extract the 'compute' function
-            if "compute" not in namespace:
+            # Extract the 'compute_test_statistic' function
+            if "compute_test_statistic" not in namespace:
                 raise ValueError(
                     f"Test statistic '{test_stat_id}': {function_col} must define "
-                    "a function named 'compute'"
+                    "a function named 'compute_test_statistic'"
                 )
 
-            registry[test_stat_id] = namespace["compute"]
+            registry[test_stat_id] = namespace["compute_test_statistic"]
             logger.debug(f"Loaded function for '{test_stat_id}'")
 
         except Exception as e:
@@ -106,7 +116,10 @@ logger = setup_logger(__name__, verbose=True)
 
 
 def compute_test_statistics_batch(
-    sim_df: pd.DataFrame, test_stats_df: pd.DataFrame, test_stat_registry: dict
+    sim_df: pd.DataFrame,
+    test_stats_df: pd.DataFrame,
+    test_stat_registry: dict,
+    species_units: dict,
 ) -> np.ndarray:
     """
     Compute test statistics for a batch of simulations.
@@ -117,6 +130,8 @@ def compute_test_statistics_batch(
         test_stats_df: DataFrame with test statistics configuration
                        Columns: test_statistic_id, required_species, model_output_code
         test_stat_registry: Dict mapping test_statistic_id -> compiled function
+                           Functions have signature: compute_test_statistic(time, species_dict, ureg)
+        species_units: Dict mapping species names to unit strings (e.g., {'V_T.CD8': 'cell'})
 
     Returns:
         test_stats_matrix: Array of shape (n_sims, n_test_stats)
@@ -132,9 +147,9 @@ def compute_test_statistics_batch(
         test_stat_id = row["test_statistic_id"]
         required_species_str = row["required_species"]
 
-        # Parse required species (comma-separated, dots replaced with underscores)
-        # Parquet columns have full names like V_T_C1 (compartment.species with dots -> underscores)
-        required_species = [s.strip().replace(".", "_") for s in required_species_str.split(",")]
+        # Parse required species (comma-separated)
+        # Species names use dots (e.g., V_T.CD8) in both CSV and parquet columns
+        required_species = [s.strip() for s in required_species_str.split(",")]
 
         # Get test statistic function from registry
         if test_stat_id not in test_stat_registry:
@@ -153,19 +168,37 @@ def compute_test_statistics_batch(
                 continue
 
             try:
-                # Extract time
-                time = np.array(sim_row["time"])
+                # Extract time with units (days)
+                time = np.array(sim_row["time"]) * ureg.day
 
-                # Extract required species
-                species_args = [time]
+                # Build species_dict with Pint Quantities
+                # Also supports scalar parameters (not just time-series species)
+                species_dict = {}
                 for species_name in required_species:
                     if species_name not in sim_df.columns:
                         raise ValueError(f"Species '{species_name}' not found in simulation data")
-                    species_data = np.array(sim_row[species_name])
-                    species_args.append(species_data)
+                    val = sim_row[species_name]
 
-                # Compute test statistic
-                test_stat_value = test_stat_func(*species_args)
+                    # Get unit string from species_units, default to dimensionless
+                    unit_str = species_units.get(species_name, "dimensionless")
+                    unit = ureg.parse_expression(unit_str)
+
+                    # Check if it's a scalar (parameter) or array (species time-series)
+                    if isinstance(val, (int, float, np.integer, np.floating)):
+                        # Scalar parameter - wrap with units
+                        species_dict[species_name] = float(val) * unit
+                    else:
+                        # Time-series species - convert to array with units
+                        species_dict[species_name] = np.array(val) * unit
+
+                # Compute test statistic (signature: time, species_dict, ureg)
+                result = test_stat_func(time, species_dict, ureg)
+
+                # Extract magnitude from Pint Quantity result
+                if hasattr(result, "magnitude"):
+                    test_stat_value = float(result.magnitude)
+                else:
+                    test_stat_value = float(result)
                 test_stats_matrix[i, j] = test_stat_value
 
             except Exception as e:
@@ -186,6 +219,7 @@ def process_single_batch(
     parquet_file: Path,
     test_stats_df: pd.DataFrame,
     test_stat_registry: dict,
+    species_units: dict,
     test_stats_output_dir: Path,
 ) -> int:
     """
@@ -196,6 +230,7 @@ def process_single_batch(
         parquet_file: Path to the Parquet file to process
         test_stats_df: DataFrame with test statistics configuration
         test_stat_registry: Dict mapping test_statistic_id -> compiled function
+        species_units: Dict mapping species names to unit strings
         test_stats_output_dir: Directory to save output files
 
     Returns:
@@ -235,7 +270,9 @@ def process_single_batch(
         logger.debug(f"  ✓ Parameters saved: {params_output_file.name}")
 
     # Compute test statistics
-    test_stats_matrix = compute_test_statistics_batch(sim_df, test_stats_df, test_stat_registry)
+    test_stats_matrix = compute_test_statistics_batch(
+        sim_df, test_stats_df, test_stat_registry, species_units
+    )
 
     # Save results
     output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_test_stats.csv"
@@ -268,14 +305,22 @@ def main():
     test_stats_csv = Path(config["test_stats_csv"])
     output_dir = Path(config["output_dir"])
     test_stats_hash = config["test_stats_hash"]
+    species_units_file = Path(config["species_units_file"])
 
     logger.info(f"Simulation pool: {simulation_pool_dir}")
     logger.info(f"Test stats CSV: {test_stats_csv}")
+    logger.info(f"Species units: {species_units_file}")
     logger.info(f"Output dir: {output_dir}")
 
     # Create output directory for this test stats hash
     test_stats_output_dir = output_dir / "test_stats" / test_stats_hash
     test_stats_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load species units
+    logger.info("Loading species units...")
+    with open(species_units_file, "r") as f:
+        species_units = json.load(f)
+    logger.info(f"Loaded units for {len(species_units)} species")
 
     # Load test statistics configuration
     logger.info("Loading test statistics configuration...")
@@ -302,6 +347,7 @@ def main():
             parquet_file=parquet_file,
             test_stats_df=test_stats_df,
             test_stat_registry=test_stat_registry,
+            species_units=species_units,
             test_stats_output_dir=test_stats_output_dir,
         )
         total_sims += n_sims

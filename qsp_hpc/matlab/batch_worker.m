@@ -58,7 +58,6 @@ try
     jobs_per_chunk = job_config.jobs_per_chunk;
     model_script = job_config.model_script;
     param_csv_file = fullfile(current_dir, job_config.param_csv);
-    test_stats_csv_file = fullfile(current_dir, job_config.test_stats_csv);
 
     fprintf('   Job config: %d patients, seed=%d, chunk size=%d\n', ...
         n_patients, seed, jobs_per_chunk);
@@ -69,9 +68,9 @@ try
     model_data.config = struct();
     model_data.config.model_script = model_script;
 
-    % Copy dose_schedule and sim_config from job_config if they exist
-    if isfield(job_config, 'dose_schedule')
-        model_data.dose_schedule = job_config.dose_schedule;
+    % Copy dosing and sim_config from job_config if they exist
+    if isfield(job_config, 'dosing')
+        model_data.dosing = job_config.dosing;
     end
     if isfield(job_config, 'sim_config')
         model_data.sim_config = job_config.sim_config;
@@ -83,19 +82,44 @@ try
     % Run the model setup script
     eval(model_data.config.model_script);  % Creates 'model' variable
 
-    % Use dose schedule from model_data (if provided), otherwise create default
-    if isfield(model_data, 'dose_schedule') && ~isempty(model_data.dose_schedule)
-        dose_schedule = model_data.dose_schedule;
-        fprintf('   Using uploaded dose schedule:\n');
-        % Log dose schedule details
-        for i = 1:length(dose_schedule)
-            fprintf('     Dose %d: Amount=%.2e, Time=%.1f, Rate=%.2e\n', ...
-                i, dose_schedule(i).Amount, dose_schedule(i).Time, dose_schedule(i).Rate);
+    % Create dose schedule from dosing config (if provided)
+    if isfield(model_data, 'dosing') && ~isempty(model_data.dosing)
+        dosing = model_data.dosing;
+        if isfield(dosing, 'drugs') && ~isempty(dosing.drugs)
+            fprintf('   Creating dose schedule for: %s\n', strjoin(dosing.drugs, ', '));
+
+            % Build name-value pairs for schedule_dosing()
+            dosing_args = {};
+            fields = fieldnames(dosing);
+            for i = 1:length(fields)
+                field = fields{i};
+                if ~strcmp(field, 'drugs')
+                    % Convert field name to schedule_dosing format (e.g., GVAX_dose)
+                    dosing_args{end+1} = field;
+                    dosing_args{end+1} = dosing.(field);
+                end
+            end
+
+            % Call schedule_dosing with drug names and parameters
+            dose_schedule = schedule_dosing(dosing.drugs, dosing_args{:});
+
+            % Log dose schedule details
+            fprintf('   Dose schedule created:\n');
+            for i = 1:length(dose_schedule)
+                fprintf('     %s: Amount=%.2e, StartTime=%.1f, Interval=%.1f, Repeat=%d\n', ...
+                    dose_schedule(i).Name, dose_schedule(i).Amount, ...
+                    dose_schedule(i).StartTime, dose_schedule(i).Interval, ...
+                    dose_schedule(i).RepeatCount);
+            end
+        else
+            % No drugs specified - baseline scenario
+            dose_schedule = [];
+            fprintf('   Using baseline dose schedule (no drugs)\n');
         end
     else
         % Fallback to baseline (no treatment)
         dose_schedule = [];
-        fprintf('   Using baseline dose schedule (no treatment)\n');
+        fprintf('   Using baseline dose schedule (no dosing config)\n');
     end
 
     % Apply simulation configuration from model_data or use defaults

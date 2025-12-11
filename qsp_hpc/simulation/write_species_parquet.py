@@ -83,16 +83,14 @@ def write_species_parquet(json_file: str, output_file: str) -> None:
         # Add time array
         record["time"] = time_arrays[i] if time_arrays[i] else []
 
-        # Add each species
+        # Add each species (keep dot notation to match SimBiology convention)
         for j, species_name in enumerate(species_names):
-            # Clean species name for column (replace dots with underscores)
-            col_name = species_name.replace(".", "_")
             species_data = (
                 species_arrays[i][j]
                 if (i < len(species_arrays) and j < len(species_arrays[i]))
                 else []
             )
-            record[col_name] = species_data if species_data else []
+            record[species_name] = species_data if species_data else []
 
         records.append(record)
 

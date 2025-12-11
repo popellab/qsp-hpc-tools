@@ -65,8 +65,9 @@ class QSPSimulator:
 
     def __init__(
         self,
-        test_stats_csv: Union[str, Path],
         priors_csv: Union[str, Path],
+        test_stats_csv: Optional[Union[str, Path]] = None,
+        species_units_file: Optional[Union[str, Path]] = None,
         model_script: str = "",
         model_version: str = "v1",
         model_description: str = "",
@@ -87,8 +88,12 @@ class QSPSimulator:
         Initialize QSP simulator.
 
         Args:
-            test_stats_csv: Path to test statistics CSV defining observables
             priors_csv: Path to priors CSV defining parameter names and distributions
+            test_stats_csv: Path to test statistics CSV defining observables (optional).
+                           If None, simulations run but no test statistics are derived.
+                           Use this for QC checks or when you only need raw species data.
+            species_units_file: Path to species_units.json mapping species names to unit strings.
+                               Required if test_stats_csv uses Pint units in model_output_code.
             model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
             model_version: Descriptive version name (e.g., 'baseline_gvax')
             model_description: Brief description of model configuration
@@ -105,7 +110,10 @@ class QSPSimulator:
             max_wait_time: Maximum wait time in seconds before timeout (default: None, no timeout)
             verbose: If True, print detailed progress information (default: False)
         """
-        self.test_stats_csv = Path(test_stats_csv)
+        self.test_stats_csv = Path(test_stats_csv) if test_stats_csv is not None else None
+        self.species_units_file = (
+            Path(species_units_file) if species_units_file is not None else None
+        )
         self.priors_csv = Path(priors_csv)
         self.model_script = model_script
         self.model_version = model_version
@@ -121,27 +129,36 @@ class QSPSimulator:
         self.local_only = local_only
         self.project_root = Path(project_root) if project_root is not None else None
 
-        if not self.test_stats_csv.exists():
+        if self.test_stats_csv is not None and not self.test_stats_csv.exists():
             raise FileNotFoundError(f"Test statistics CSV not found: {self.test_stats_csv}")
 
         if not self.priors_csv.exists():
             raise FileNotFoundError(f"Priors CSV not found: {self.priors_csv}")
+
+        # Load scenario config from YAML (infer path from scenario name)
+        self.sim_config, self.dosing = self._load_scenario_config()
 
         # Load parameter names from priors CSV
         with open(self.priors_csv, "r") as f:
             reader = csv.DictReader(f)
             self.param_names = [row["name"] for row in reader]
 
-        # Initialize SimulationPoolManager for local caching
-        self.pool = pool or SimulationPoolManager(
-            cache_dir=cache_dir,
-            model_version=model_version,
-            model_description=model_description,
-            priors_csv=priors_csv,
-            test_stats_csv=test_stats_csv,
-            model_script=model_script,
-            scenario=scenario,
-        )
+        # Initialize SimulationPoolManager for local caching (only if test_stats_csv is provided)
+        # Pool requires test_stats_csv for config hashing; skip pooling for QC-only runs
+        if pool is not None:
+            self.pool = pool
+        elif self.test_stats_csv is not None:
+            self.pool = SimulationPoolManager(
+                cache_dir=cache_dir,
+                model_version=model_version,
+                model_description=model_description,
+                priors_csv=priors_csv,
+                test_stats_csv=test_stats_csv,
+                model_script=model_script,
+                scenario=scenario,
+            )
+        else:
+            self.pool = None  # No pooling for QC-only simulations
 
         # Store job_manager for lazy initialization (don't create until needed)
         self._job_manager = job_manager  # May be None or injected for testing
@@ -150,29 +167,41 @@ class QSPSimulator:
         base_logger = setup_logger(__name__, verbose=self.verbose)
         self.logger = create_child_logger(base_logger, self.scenario)
 
-        # Log initialization details (safely handle mock pools in tests)
+        # Log initialization details (safely handle mock pools and None values)
         self.logger.info(f"Initializing QSP simulator for scenario: {self.scenario}")
-        try:
-            pool_dir = self.pool.pool_dir
-            pool_dir_str = str(
-                pool_dir.relative_to(Path.cwd())
-                if pool_dir.is_relative_to(Path.cwd())
-                else pool_dir
-            )
-        except (AttributeError, TypeError):
-            pool_dir_str = "(mock pool)"
 
-        try:
-            config_hash_str = self.pool.config_hash[:8] + "..."
-        except (AttributeError, TypeError):
-            config_hash_str = "(mock)"
+        # Handle pool directory logging
+        if self.pool is None:
+            pool_dir_str = "(no pooling - QC mode)"
+            config_hash_str = "(n/a)"
+        else:
+            try:
+                pool_dir = self.pool.pool_dir
+                pool_dir_str = str(
+                    pool_dir.relative_to(Path.cwd())
+                    if pool_dir.is_relative_to(Path.cwd())
+                    else pool_dir
+                )
+            except (AttributeError, TypeError):
+                pool_dir_str = "(mock pool)"
 
-        config_info = {
-            "test_stats_csv": str(
+            try:
+                config_hash_str = self.pool.config_hash[:8] + "..."
+            except (AttributeError, TypeError):
+                config_hash_str = "(mock)"
+
+        # Handle test_stats_csv logging
+        if self.test_stats_csv is not None:
+            test_stats_str = str(
                 self.test_stats_csv.relative_to(Path.cwd())
                 if self.test_stats_csv.is_relative_to(Path.cwd())
                 else self.test_stats_csv
-            ),
+            )
+        else:
+            test_stats_str = "(none - QC mode)"
+
+        config_info = {
+            "test_stats_csv": test_stats_str,
             "priors_csv": str(
                 self.priors_csv.relative_to(Path.cwd())
                 if self.priors_csv.is_relative_to(Path.cwd())
@@ -214,6 +243,75 @@ class QSPSimulator:
             f"  cache_sampling_seed={self.cache_sampling_seed}\n"
             f")"
         )
+
+    def _load_scenario_config(self) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        Load scenario configuration from YAML file.
+
+        Infers YAML path from scenario name: scenarios/{scenario}.yaml
+        relative to project_root.
+
+        Returns:
+            Tuple of (sim_config, dosing) dicts, or (None, None) if YAML not found.
+        """
+        import yaml
+
+        # Default config if no YAML found
+        default_sim_config = {
+            "start_time": 0,
+            "stop_time": 30,
+            "time_units": "day",
+            "solver": "sundials",
+            "abs_tolerance": 1e-9,
+            "rel_tolerance": 1e-6,
+        }
+
+        # Set up temporary logger for this method (main logger not yet initialized)
+        import logging
+
+        temp_logger = logging.getLogger(__name__)
+
+        # Infer YAML path from scenario name
+        if self.project_root is None:
+            temp_logger.warning(
+                "⚠️  No project_root specified - using DEFAULT sim_config (stop_time=30 days, no dosing)"
+            )
+            return default_sim_config, None
+
+        scenario_yaml = self.project_root / "scenarios" / f"{self.scenario}.yaml"
+
+        if not scenario_yaml.exists():
+            temp_logger.warning(
+                f"⚠️  Scenario YAML not found: {scenario_yaml}\n"
+                f"    Using DEFAULT sim_config (stop_time=30 days, no dosing)"
+            )
+            return default_sim_config, None
+
+        # Load YAML
+        with open(scenario_yaml, "r") as f:
+            scenario_data = yaml.safe_load(f)
+
+        # Extract sim_config (use defaults for missing fields)
+        sim_config = scenario_data.get("sim_config", {})
+        missing_fields = []
+        for key, value in default_sim_config.items():
+            if key not in sim_config:
+                sim_config[key] = value
+                missing_fields.append(key)
+
+        if missing_fields:
+            temp_logger.warning(
+                f"⚠️  Scenario YAML missing sim_config fields: {missing_fields} - using defaults"
+            )
+
+        # Extract dosing config
+        dosing = scenario_data.get("dosing", None)
+        if dosing is None:
+            temp_logger.warning(
+                "⚠️  Scenario YAML has no 'dosing' section - simulations will run without treatment"
+            )
+
+        return sim_config, dosing
 
     @property
     def job_manager(self):
@@ -312,25 +410,19 @@ class QSPSimulator:
         else:
             return f"{value:.4f}"
 
-    def _format_percentage(self, pct_diff: float) -> str:
+    def _format_log_ratio(self, log_ratio: float) -> str:
         """
-        Format a percentage difference for display.
+        Format a log10 ratio for display.
 
-        Caps extreme values to avoid unreadable numbers.
+        Shows the log10 ratio with sign (+1 = 10x higher, -1 = 10x lower).
 
         Args:
-            pct_diff: The percentage difference
+            log_ratio: The log10(simulated/observed) ratio
 
         Returns:
             Formatted string (max 12 chars)
         """
-        if abs(pct_diff) >= 1000:
-            # For extreme differences, show order of magnitude
-            sign = "+" if pct_diff > 0 else "-"
-            magnitude = int(np.log10(abs(pct_diff)))
-            return f"{sign}1e{magnitude}%"
-        else:
-            return f"{pct_diff:+.1f}%"
+        return f"{log_ratio:+.2f}"
 
     def compute_test_statistics_table(
         self, test_stats: np.ndarray, test_stats_df: pd.DataFrame, n_sims: int
@@ -345,7 +437,7 @@ class QSPSimulator:
         Args:
             test_stats: Computed test statistics array (n_sims, n_test_stats)
             test_stats_df: DataFrame with test statistics metadata (must have
-                'test_statistic_id' and 'mean' columns)
+                'test_statistic_id' and 'median' columns)
             n_sims: Number of simulations
 
         Returns:
@@ -353,7 +445,8 @@ class QSPSimulator:
                 - test_statistic_id: str, identifier for the test statistic
                 - median: float, median of simulated values (NaN if all sims failed)
                 - observed: float, observed value from CSV
-                - pct_diff: float, percentage difference from observed (NaN if undefined)
+                - log_ratio: float, log10(median/observed) - symmetric measure where
+                    +1 means 10x higher, -1 means 10x lower (NaN if undefined)
                 - ci_lower: float, 2.5th percentile (NaN if n_sims=1)
                 - ci_upper: float, 97.5th percentile (NaN if n_sims=1)
                 - covers_observed: bool, True if observed in [ci_lower, ci_upper]
@@ -363,7 +456,7 @@ class QSPSimulator:
 
         for idx, row in test_stats_df.iterrows():
             test_stat_id = row["test_statistic_id"]
-            observed_value = row.get("mean", np.nan)
+            observed_value = row.get("median", np.nan)
 
             # Compute value (median if multiple sims, single value if n_sims=1)
             if n_sims == 1:
@@ -379,15 +472,16 @@ class QSPSimulator:
                 ci_lower = np.nanpercentile(individual_values, 2.5)
                 ci_upper = np.nanpercentile(individual_values, 97.5)
 
-            # Calculate percentage difference
+            # Calculate log10 ratio (symmetric: +1 means 10x higher, -1 means 10x lower)
             if (
                 not np.isnan(computed_value)
                 and not np.isnan(observed_value)
-                and observed_value != 0
+                and observed_value > 0
+                and computed_value > 0
             ):
-                pct_diff = ((computed_value - observed_value) / observed_value) * 100
+                log_ratio = np.log10(computed_value / observed_value)
             else:
-                pct_diff = np.nan
+                log_ratio = np.nan
 
             # Check 95% CI coverage (only for multiple sims with valid observed)
             if (
@@ -405,7 +499,7 @@ class QSPSimulator:
                     "test_statistic_id": test_stat_id,
                     "median": computed_value,
                     "observed": observed_value,
-                    "pct_diff": pct_diff,
+                    "log_ratio": log_ratio,
                     "ci_lower": ci_lower,
                     "ci_upper": ci_upper,
                     "covers_observed": covers_observed,
@@ -437,8 +531,14 @@ class QSPSimulator:
         if n_sims > 1:
             # Valid rows have non-NaN observed and CI values
             valid_mask = ~stats_table["observed"].isna() & ~stats_table["ci_lower"].isna()
-            passing_table = stats_table[valid_mask & stats_table["covers_observed"]]
-            failing_table = stats_table[valid_mask & ~stats_table["covers_observed"]]
+            # Fail if: CI doesn't cover observed OR |log_ratio| > 2 (>100x difference)
+            large_diff_mask = stats_table["log_ratio"].abs() > 2
+            passing_table = stats_table[
+                valid_mask & stats_table["covers_observed"] & ~large_diff_mask
+            ]
+            failing_table = stats_table[
+                valid_mask & (~stats_table["covers_observed"] | large_diff_mask)
+            ]
             invalid_table = stats_table[~valid_mask]
         else:
             passing_table = stats_table
@@ -451,7 +551,7 @@ class QSPSimulator:
                 test_stat_id = row["test_statistic_id"]
                 computed_value = row["median"]
                 observed_value = row["observed"]
-                pct_diff = row["pct_diff"]
+                log_ratio = row["log_ratio"]
                 ci_lower = row["ci_lower"]
                 ci_upper = row["ci_upper"]
                 covers_observed = row["covers_observed"]
@@ -467,9 +567,9 @@ class QSPSimulator:
                     computed_str = self._format_number(computed_value)
                     observed_str = self._format_number(observed_value)
 
-                    # Format percentage difference
-                    if not np.isnan(pct_diff):
-                        diff_str = self._format_percentage(pct_diff)
+                    # Format log ratio
+                    if not np.isnan(log_ratio):
+                        diff_str = self._format_log_ratio(log_ratio)
                     else:
                         diff_str = "—"
 
@@ -498,12 +598,14 @@ class QSPSimulator:
         # Log passing tests table
         if n_sims > 1:
             self.logger.info("")
-            self.logger.info(f"Passing ({len(passing_table)} tests - 95% CI covers observed):")
+            self.logger.info(
+                f"Passing ({len(passing_table)} tests - 95% CI covers observed, <100x diff):"
+            )
             self.logger.info(
                 "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┬────────┬────────────────────────────┐"
             )
             self.logger.info(
-                "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │ 95% CI │ [2.5%, 97.5%]              │"
+                "│ Test Statistic                      │ Median       │ Observed     │ log₁₀(M/O)   │ 95% CI │ [2.5%, 97.5%]              │"
             )
             self.logger.info(
                 "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┼────────┼────────────────────────────┤"
@@ -517,13 +619,13 @@ class QSPSimulator:
             if len(failing_table) > 0:
                 self.logger.info("")
                 self.logger.info(
-                    f"Failing ({len(failing_table)} tests - 95% CI does NOT cover observed):"
+                    f"Failing ({len(failing_table)} tests - 95% CI misses observed OR >100x diff):"
                 )
                 self.logger.info(
                     "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┬────────┬────────────────────────────┐"
                 )
                 self.logger.info(
-                    "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │ 95% CI │ [2.5%, 97.5%]              │"
+                    "│ Test Statistic                      │ Median       │ Observed     │ log₁₀(M/O)   │ 95% CI │ [2.5%, 97.5%]              │"
                 )
                 self.logger.info(
                     "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┼────────┼────────────────────────────┤"
@@ -541,7 +643,7 @@ class QSPSimulator:
                     "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┬────────┬────────────────────────────┐"
                 )
                 self.logger.info(
-                    "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │ 95% CI │ [2.5%, 97.5%]              │"
+                    "│ Test Statistic                      │ Median       │ Observed     │ log₁₀(M/O)   │ 95% CI │ [2.5%, 97.5%]              │"
                 )
                 self.logger.info(
                     "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┼────────┼────────────────────────────┤"
@@ -556,7 +658,7 @@ class QSPSimulator:
                 "┌─────────────────────────────────────┬──────────────┬──────────────┬──────────────┐"
             )
             self.logger.info(
-                "│ Test Statistic                      │ Median       │ Observed     │ % Diff       │"
+                "│ Test Statistic                      │ Median       │ Observed     │ log₁₀(M/O)   │"
             )
             self.logger.info(
                 "├─────────────────────────────────────┼──────────────┼──────────────┼──────────────┤"
@@ -570,7 +672,8 @@ class QSPSimulator:
         total_stats = len(stats_table)
         nan_count = stats_table["median"].isna().sum()
         success_count = total_stats - nan_count
-        large_diff_count = (stats_table["pct_diff"].abs() > 100).sum()
+        # Count tests with |log_ratio| > 1 (i.e., >10x difference)
+        large_diff_count = (stats_table["log_ratio"].abs() > 1).sum()
 
         # Coverage stats (only for n_sims > 1)
         if n_sims > 1:
@@ -587,7 +690,7 @@ class QSPSimulator:
         if nan_count > 0:
             summary_parts.append(f"{nan_count} NaN")
         if large_diff_count > 0:
-            summary_parts.append(f"{large_diff_count} >100% diff from observed")
+            summary_parts.append(f"{large_diff_count} >10x diff from observed")
         if n_sims > 1 and (covered_count + not_covered_count) > 0:
             summary_parts.append(
                 f"{covered_count}/{covered_count + not_covered_count} 95% CI cover observed"
@@ -622,13 +725,13 @@ class QSPSimulator:
         # Print metadata
         print(f"\nRequired Species: {row.get('required_species', '—')}")
 
-        observed_mean = row.get("mean", np.nan)
-        if not np.isnan(observed_mean):
-            print(f"Observed Mean: {observed_mean:.6g}")
+        observed_median = row.get("median", np.nan)
+        if not np.isnan(observed_median):
+            print(f"Observed Median: {observed_median:.6g}")
 
-        observed_var = row.get("variance", np.nan)
-        if not np.isnan(observed_var):
-            print(f"Observed Variance: {observed_var:.6g}")
+        observed_iqr = row.get("iqr", np.nan)
+        if not np.isnan(observed_iqr):
+            print(f"Observed IQR: {observed_iqr:.6g}")
 
         units = row.get("units", "")
         if units:
@@ -654,12 +757,12 @@ class QSPSimulator:
         for _, row in test_stats_df.iterrows():
             test_stat_id = row["test_statistic_id"]
             required_species = row.get("required_species", "—")
-            observed_mean = row.get("mean", np.nan)
+            observed_median = row.get("median", np.nan)
 
             print(f"\n  {test_stat_id}")
             print(f"    Required: {required_species}")
-            if not np.isnan(observed_mean):
-                print(f"    Observed: {observed_mean:.6g}")
+            if not np.isnan(observed_median):
+                print(f"    Observed: {observed_median:.6g}")
         print()
 
     def _log_parameters_table(self, param_values: np.ndarray, param_names: list[str]) -> None:
@@ -692,13 +795,14 @@ class QSPSimulator:
         n_sims: int = 1,
         seed: Optional[int] = None,
         matlab_path: str = "matlab",
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, Union[np.ndarray, Path]]:
         """
         Run simulations locally using MATLAB (no HPC required).
 
         This method is useful for testing, debugging, and small-scale simulations.
         It samples parameters from the prior, runs MATLAB simulations locally,
-        and returns both parameters and test statistics.
+        and returns both parameters and test statistics (or parquet path if no
+        test_stats_csv was provided).
 
         Args:
             n_sims: Number of simulations to run (default: 1)
@@ -706,23 +810,32 @@ class QSPSimulator:
             matlab_path: Path to MATLAB executable (default: 'matlab' from PATH)
 
         Returns:
-            Tuple of (params, test_stats):
+            Tuple of (params, result):
             - params: numpy array of shape (n_sims, num_params)
-            - test_stats: numpy array of shape (n_sims, num_test_stats)
+            - result: If test_stats_csv was provided, numpy array of shape (n_sims, num_test_stats).
+                     If test_stats_csv was None, Path to parquet file with raw species data.
 
         Raises:
             RuntimeError: If MATLAB execution fails or local worker script not found
             ValueError: If parameter dimensions don't match
 
         Example:
+            >>> # With test statistics
             >>> simulator = QSPSimulator(
-            ...     test_stats_csv='test_stats.csv',
             ...     priors_csv='priors.csv',
+            ...     test_stats_csv='test_stats.csv',
             ...     model_script='my_model'
             ... )
             >>> params, test_stats = simulator.run_local_simulation(n_sims=5, seed=123)
-            >>> print(f"Parameters shape: {params.shape}")
             >>> print(f"Test stats shape: {test_stats.shape}")
+
+            >>> # Without test statistics (for QC or raw data access)
+            >>> simulator = QSPSimulator(
+            ...     priors_csv='priors.csv',
+            ...     model_script='my_model'
+            ... )
+            >>> params, parquet_path = simulator.run_local_simulation(n_sims=5, seed=123)
+            >>> species_df = pd.read_parquet(parquet_path)
         """
         import pandas as pd
 
@@ -744,7 +857,7 @@ class QSPSimulator:
                 "model_script": self.model_script or "(default)",
                 "model_version": self.model_version,
                 "scenario": self.scenario,
-                "test_stats_csv": str(self.test_stats_csv),
+                "test_stats_csv": str(self.test_stats_csv) if self.test_stats_csv else "(none)",
                 "priors_csv": str(self.priors_csv),
             }
             for line in format_config(config_info):
@@ -779,35 +892,59 @@ class QSPSimulator:
                 self._log_parameters_table(params[0], param_names)
 
             # Run batch_worker.m locally
-            from qsp_hpc.batch.derive_test_stats_worker import (
-                build_test_stat_registry,
-                compute_test_statistics_batch,
-            )
             from qsp_hpc.simulation.batch_runner import run_batch_worker
 
             self.logger.info("Running batch_worker.m locally")
+            self.logger.info(f"  sim_config: stop_time={self.sim_config.get('stop_time', 30)} days")
+            if self.dosing and self.dosing.get("drugs"):
+                self.logger.info(f"  dosing: {self.dosing.get('drugs')}")
+            else:
+                self.logger.info("  dosing: none (baseline)")
 
             # Run simulations via batch_worker.m (same as HPC)
             parquet_file = run_batch_worker(
                 params=params,
                 param_names=param_names,
                 model_script=self.model_script or "default_model",
-                test_stats_csv=self.test_stats_csv,
                 project_root=self.project_root,
                 seed=seed,
-                dose_schedule=None,  # TODO: support dose_schedule
-                sim_config=None,  # TODO: support sim_config
+                dosing=self.dosing,
+                sim_config=self.sim_config,
                 matlab_path=matlab_path,
                 verbose=self.verbose,
             )
 
+            # If no test_stats_csv, return parquet path for raw species access
+            if self.test_stats_csv is None:
+                self.logger.info(f"✓ Simulations complete. Parquet file: {parquet_file}")
+                return params, parquet_file
+
             # Derive test stats from parquet (same as HPC derivation worker)
+            import json
+
+            from qsp_hpc.batch.derive_test_stats_worker import (
+                build_test_stat_registry,
+                compute_test_statistics_batch,
+            )
+
             self.logger.info("Deriving test statistics from simulation data")
             species_df = pd.read_parquet(parquet_file)
             test_stats_df = pd.read_csv(self.test_stats_csv)
             test_stat_registry = build_test_stat_registry(test_stats_df)
+
+            # Load species units (required for Pint-aware test statistics)
+            if self.species_units_file is not None and self.species_units_file.exists():
+                with open(self.species_units_file, "r") as f:
+                    species_units = json.load(f)
+                self.logger.info(f"Loaded units for {len(species_units)} species")
+            else:
+                species_units = {}
+                self.logger.warning(
+                    "No species_units_file provided - using dimensionless for all species"
+                )
+
             test_stats = compute_test_statistics_batch(
-                species_df, test_stats_df, test_stat_registry
+                species_df, test_stats_df, test_stat_registry, species_units
             )
 
             # Log detailed test statistics table
@@ -1430,14 +1567,14 @@ class QSPSimulator:
 
 
 def get_observed_data(
-    test_stats_csv: Union[str, Path], value_column: str = "mean"
+    test_stats_csv: Union[str, Path], value_column: str = "median"
 ) -> Dict[str, np.ndarray]:
     """
     Extract observed data from test statistics CSV as dictionary.
 
     Args:
         test_stats_csv: Path to test statistics CSV file
-        value_column: Column name to use for observed values (default: 'mean')
+        value_column: Column name to use for observed values (default: 'median')
 
     Returns:
         Dictionary with observable names as keys and 2D numpy arrays as values.

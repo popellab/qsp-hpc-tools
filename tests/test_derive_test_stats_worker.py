@@ -21,8 +21,8 @@ class TestBuildTestStatRegistry:
                 "test_statistic_id": ["simple_mean"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    """def compute(time, V_T_C1):
-    return np.mean(V_T_C1)"""
+                    """def compute_test_statistic(time, species_dict, ureg):
+    return np.mean(species_dict['V_T.C1'].magnitude)"""
                 ],
             }
         )
@@ -32,10 +32,12 @@ class TestBuildTestStatRegistry:
         assert "simple_mean" in registry
         assert callable(registry["simple_mean"])
 
-        # Test the function works
-        time = np.array([0, 1, 2, 3])
-        species = np.array([10, 20, 30, 40])
-        result = registry["simple_mean"](time, species)
+        # Test the function works - now uses species_dict signature
+        from qsp_hpc.utils.unit_registry import ureg
+
+        time = np.array([0, 1, 2, 3]) * ureg.day
+        species_dict = {"V_T.C1": np.array([10, 20, 30, 40]) * ureg.cell}
+        result = registry["simple_mean"](time, species_dict, ureg)
         assert result == 25.0
 
     def test_multiple_species(self):
@@ -45,9 +47,9 @@ class TestBuildTestStatRegistry:
                 "test_statistic_id": ["ratio_test"],
                 "required_species": ["V_T.CD8, V_T.Treg"],
                 "model_output_code": [
-                    """def compute(time, V_T_CD8, V_T_Treg):
-    cd8_0 = np.interp(0.0, time, V_T_CD8)
-    treg_0 = np.interp(0.0, time, V_T_Treg)
+                    """def compute_test_statistic(time, species_dict, ureg):
+    cd8_0 = np.interp(0.0, time.magnitude, species_dict['V_T.CD8'].magnitude)
+    treg_0 = np.interp(0.0, time.magnitude, species_dict['V_T.Treg'].magnitude)
     return cd8_0 / max(treg_0, 1e-12)"""
                 ],
             }
@@ -55,11 +57,15 @@ class TestBuildTestStatRegistry:
 
         registry = build_test_stat_registry(test_stats_df)
 
-        time = np.array([0.0, 1.0, 2.0])
-        cd8 = np.array([100.0, 110.0, 120.0])
-        treg = np.array([50.0, 55.0, 60.0])
+        from qsp_hpc.utils.unit_registry import ureg
 
-        result = registry["ratio_test"](time, cd8, treg)
+        time = np.array([0.0, 1.0, 2.0]) * ureg.day
+        species_dict = {
+            "V_T.CD8": np.array([100.0, 110.0, 120.0]) * ureg.cell,
+            "V_T.Treg": np.array([50.0, 55.0, 60.0]) * ureg.cell,
+        }
+
+        result = registry["ratio_test"](time, species_dict, ureg)
         assert result == pytest.approx(2.0, rel=1e-6)
 
     def test_growth_rate_calculation(self):
@@ -69,13 +75,15 @@ class TestBuildTestStatRegistry:
                 "test_statistic_id": ["log_growth_rate"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    """def compute(time, V_T_C1):
+                    """def compute_test_statistic(time, species_dict, ureg):
     t0, t1 = 0, 60
-    if len(time) == 0 or len(V_T_C1) == 0:
+    time_vals = time.magnitude
+    V_T_C1 = species_dict['V_T.C1'].magnitude
+    if len(time_vals) == 0 or len(V_T_C1) == 0:
         return np.nan
 
     t_eval = np.arange(t0, t1 + 1, 1.0)
-    c1_interp = np.interp(t_eval, time, V_T_C1)
+    c1_interp = np.interp(t_eval, time_vals, V_T_C1)
     c1_interp = np.maximum(c1_interp, np.finfo(float).eps)
 
     y = np.log(c1_interp)
@@ -87,13 +95,16 @@ class TestBuildTestStatRegistry:
 
         registry = build_test_stat_registry(test_stats_df)
 
+        from qsp_hpc.utils.unit_registry import ureg
+
         # Exponential growth: C(t) = c0 * exp(r*t) with r=0.01
-        time = np.linspace(0, 60, 61)
+        time = np.linspace(0, 60, 61) * ureg.day
         c0 = 1e6
         r = 0.01
-        tumor_cells = c0 * np.exp(r * time)
+        tumor_cells = c0 * np.exp(r * np.linspace(0, 60, 61)) * ureg.cell
+        species_dict = {"V_T.C1": tumor_cells}
 
-        result = registry["log_growth_rate"](time, tumor_cells)
+        result = registry["log_growth_rate"](time, species_dict, ureg)
         assert result == pytest.approx(r, rel=1e-2)
 
     def test_missing_model_output_code_column(self):
@@ -128,7 +139,9 @@ class TestBuildTestStatRegistry:
             {
                 "test_statistic_id": ["bad_syntax"],
                 "required_species": ["V_T.C1"],
-                "model_output_code": ["def compute(time, V_T_C1)\n    return ???"],  # Syntax error
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg)\n    return ???"
+                ],  # Syntax error
             }
         )
 
@@ -136,19 +149,21 @@ class TestBuildTestStatRegistry:
             build_test_stat_registry(test_stats_df)
 
     def test_missing_compute_function(self):
-        """Test that code without 'compute' function raises error."""
+        """Test that code without 'compute_test_statistic' function raises error."""
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["wrong_name"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    """def my_function(time, V_T_C1):
-    return np.mean(V_T_C1)"""
+                    """def my_function(time, species_dict, ureg):
+    return np.mean(species_dict['V_T.C1'].magnitude)"""
                 ],  # Wrong function name
             }
         )
 
-        with pytest.raises(ValueError, match="must define a function named 'compute'"):
+        with pytest.raises(
+            ValueError, match="must define a function named 'compute_test_statistic'"
+        ):
             build_test_stat_registry(test_stats_df)
 
     def test_multiple_functions(self):
@@ -158,9 +173,9 @@ class TestBuildTestStatRegistry:
                 "test_statistic_id": ["stat1", "stat2", "stat3"],
                 "required_species": ["V_T.C1", "V_T.C1", "V_T.C1"],
                 "model_output_code": [
-                    "def compute(time, V_T_C1):\n    return np.mean(V_T_C1)",
-                    "def compute(time, V_T_C1):\n    return np.max(V_T_C1)",
-                    "def compute(time, V_T_C1):\n    return np.min(V_T_C1)",
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.max(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.min(species_dict['V_T.C1'].magnitude)",
                 ],
             }
         )
@@ -172,12 +187,14 @@ class TestBuildTestStatRegistry:
         assert "stat2" in registry
         assert "stat3" in registry
 
-        time = np.array([0, 1, 2])
-        species = np.array([10, 20, 30])
+        from qsp_hpc.utils.unit_registry import ureg
 
-        assert registry["stat1"](time, species) == 20.0
-        assert registry["stat2"](time, species) == 30.0
-        assert registry["stat3"](time, species) == 10.0
+        time = np.array([0, 1, 2]) * ureg.day
+        species_dict = {"V_T.C1": np.array([10, 20, 30]) * ureg.cell}
+
+        assert registry["stat1"](time, species_dict, ureg) == 20.0
+        assert registry["stat2"](time, species_dict, ureg) == 30.0
+        assert registry["stat3"](time, species_dict, ureg) == 10.0
 
 
 class TestComputeTestStatisticsBatch:
@@ -185,29 +202,34 @@ class TestComputeTestStatisticsBatch:
 
     def test_basic_computation(self):
         """Test basic test statistic computation from simulation data."""
-        # Create test statistics definition
+        # Create test statistics definition (using dot notation for species names)
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["mean_tumor"],
-                "required_species": ["V_T_C1"],
-                "model_output_code": ["def compute(time, V_T_C1):\n    return np.mean(V_T_C1)"],
+                "required_species": ["V_T.C1"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)"
+                ],
             }
         )
 
         # Build registry
         registry = build_test_stat_registry(test_stats_df)
 
-        # Create simulation data (2 sims, 1 test stat)
+        # Create simulation data (2 sims, 1 test stat) - species names use dots
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0, 1],
                 "status": [1, 1],  # Both successful
                 "time": [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]],
-                "V_T_C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],  # Mean = 200  # Mean = 100
+                "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],  # Mean = 200  # Mean = 100
             }
         )
 
-        result = compute_test_statistics_batch(sim_df, test_stats_df, registry)
+        # Species units mapping
+        species_units = {"V_T.C1": "cell"}
+
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
 
         assert result.shape == (2, 1)
         assert result[0, 0] == pytest.approx(200.0)
@@ -218,8 +240,10 @@ class TestComputeTestStatisticsBatch:
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["mean_tumor"],
-                "required_species": ["V_T_C1"],
-                "model_output_code": ["def compute(time, V_T_C1):\n    return np.mean(V_T_C1)"],
+                "required_species": ["V_T.C1"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)"
+                ],
             }
         )
 
@@ -231,11 +255,13 @@ class TestComputeTestStatisticsBatch:
                 "simulation_id": [0, 1],
                 "status": [1, 0],  # Second simulation failed
                 "time": [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]],
-                "V_T_C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],
+                "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],
             }
         )
 
-        result = compute_test_statistics_batch(sim_df, test_stats_df, registry)
+        species_units = {"V_T.C1": "cell"}
+
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
 
         assert result.shape == (2, 1)
         assert result[0, 0] == pytest.approx(200.0)
@@ -246,11 +272,11 @@ class TestComputeTestStatisticsBatch:
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["mean_tumor", "max_tumor", "min_tumor"],
-                "required_species": ["V_T_C1", "V_T_C1", "V_T_C1"],
+                "required_species": ["V_T.C1", "V_T.C1", "V_T.C1"],
                 "model_output_code": [
-                    "def compute(time, V_T_C1):\n    return np.mean(V_T_C1)",
-                    "def compute(time, V_T_C1):\n    return np.max(V_T_C1)",
-                    "def compute(time, V_T_C1):\n    return np.min(V_T_C1)",
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.max(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.min(species_dict['V_T.C1'].magnitude)",
                 ],
             }
         )
@@ -262,11 +288,13 @@ class TestComputeTestStatisticsBatch:
                 "simulation_id": [0],
                 "status": [1],
                 "time": [[0.0, 1.0, 2.0]],
-                "V_T_C1": [[100.0, 200.0, 300.0]],
+                "V_T.C1": [[100.0, 200.0, 300.0]],
             }
         )
 
-        result = compute_test_statistics_batch(sim_df, test_stats_df, registry)
+        species_units = {"V_T.C1": "cell"}
+
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
 
         assert result.shape == (1, 3)
         assert result[0, 0] == pytest.approx(200.0)  # mean
@@ -278,11 +306,11 @@ class TestComputeTestStatisticsBatch:
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["cd8_treg_ratio"],
-                "required_species": ["V_T_CD8, V_T_Treg"],
+                "required_species": ["V_T.CD8, V_T.Treg"],
                 "model_output_code": [
-                    """def compute(time, V_T_CD8, V_T_Treg):
-    cd8_0 = np.interp(0.0, time, V_T_CD8)
-    treg_0 = np.interp(0.0, time, V_T_Treg)
+                    """def compute_test_statistic(time, species_dict, ureg):
+    cd8_0 = np.interp(0.0, time.magnitude, species_dict['V_T.CD8'].magnitude)
+    treg_0 = np.interp(0.0, time.magnitude, species_dict['V_T.Treg'].magnitude)
     return cd8_0 / max(treg_0, 1e-12)"""
                 ],
             }
@@ -295,12 +323,14 @@ class TestComputeTestStatisticsBatch:
                 "simulation_id": [0],
                 "status": [1],
                 "time": [[0.0, 1.0, 2.0]],
-                "V_T_CD8": [[100.0, 110.0, 120.0]],
-                "V_T_Treg": [[50.0, 55.0, 60.0]],
+                "V_T.CD8": [[100.0, 110.0, 120.0]],
+                "V_T.Treg": [[50.0, 55.0, 60.0]],
             }
         )
 
-        result = compute_test_statistics_batch(sim_df, test_stats_df, registry)
+        species_units = {"V_T.CD8": "cell", "V_T.Treg": "cell"}
+
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
 
         assert result.shape == (1, 1)
         assert result[0, 0] == pytest.approx(2.0, rel=1e-6)
@@ -310,8 +340,10 @@ class TestComputeTestStatisticsBatch:
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["stat_not_in_registry"],
-                "required_species": ["V_T_C1"],
-                "model_output_code": ["def compute(time, V_T_C1):\n    return np.mean(V_T_C1)"],
+                "required_species": ["V_T.C1"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)"
+                ],
             }
         )
 
@@ -319,10 +351,12 @@ class TestComputeTestStatisticsBatch:
         registry = {}
 
         sim_df = pd.DataFrame(
-            {"simulation_id": [0], "status": [1], "time": [[0.0, 1.0]], "V_T_C1": [[100.0, 200.0]]}
+            {"simulation_id": [0], "status": [1], "time": [[0.0, 1.0]], "V_T.C1": [[100.0, 200.0]]}
         )
 
-        result = compute_test_statistics_batch(sim_df, test_stats_df, registry)
+        species_units = {"V_T.C1": "cell"}
+
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
 
         # Should return NaN for missing test stat in registry
         assert result.shape == (1, 1)
@@ -333,9 +367,9 @@ class TestComputeTestStatisticsBatch:
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["error_stat"],
-                "required_species": ["V_T_C1"],
+                "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    """def compute(time, V_T_C1):
+                    """def compute_test_statistic(time, species_dict, ureg):
     raise ValueError("Test error")"""
                 ],
             }
@@ -344,10 +378,12 @@ class TestComputeTestStatisticsBatch:
         registry = build_test_stat_registry(test_stats_df)
 
         sim_df = pd.DataFrame(
-            {"simulation_id": [0], "status": [1], "time": [[0.0, 1.0]], "V_T_C1": [[100.0, 200.0]]}
+            {"simulation_id": [0], "status": [1], "time": [[0.0, 1.0]], "V_T.C1": [[100.0, 200.0]]}
         )
 
-        result = compute_test_statistics_batch(sim_df, test_stats_df, registry)
+        species_units = {"V_T.C1": "cell"}
+
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
 
         # Exception should result in NaN
         assert result.shape == (1, 1)
@@ -363,10 +399,10 @@ class TestProcessSingleBatch:
         return pd.DataFrame(
             {
                 "test_statistic_id": ["mean_tumor", "max_tumor"],
-                "required_species": ["V_T_C1", "V_T_C1"],
+                "required_species": ["V_T.C1", "V_T.C1"],
                 "model_output_code": [
-                    "def compute(time, V_T_C1):\n    return np.mean(V_T_C1)",
-                    "def compute(time, V_T_C1):\n    return np.max(V_T_C1)",
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.max(species_dict['V_T.C1'].magnitude)",
                 ],
             }
         )
@@ -376,17 +412,22 @@ class TestProcessSingleBatch:
         """Build test statistic registry."""
         return build_test_stat_registry(test_stats_df)
 
+    @pytest.fixture
+    def species_units(self):
+        """Create species units mapping."""
+        return {"V_T.C1": "cell"}
+
     def test_process_single_batch_returns_sim_count(
-        self, test_stats_df, test_stat_registry, tmp_path
+        self, test_stats_df, test_stat_registry, species_units, tmp_path
     ):
         """Test that process_single_batch returns number of simulations."""
-        # Create parquet file with 3 simulations
+        # Create parquet file with 3 simulations (using dot notation for species)
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0, 1, 2],
                 "status": [1, 1, 1],
                 "time": [[0.0, 1.0, 2.0]] * 3,
-                "V_T_C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0], [10.0, 20.0, 30.0]],
+                "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0], [10.0, 20.0, 30.0]],
             }
         )
 
@@ -401,13 +442,14 @@ class TestProcessSingleBatch:
             parquet_file=parquet_file,
             test_stats_df=test_stats_df,
             test_stat_registry=test_stat_registry,
+            species_units=species_units,
             test_stats_output_dir=output_dir,
         )
 
         assert n_sims == 3
 
     def test_process_single_batch_creates_output_files(
-        self, test_stats_df, test_stat_registry, tmp_path
+        self, test_stats_df, test_stat_registry, species_units, tmp_path
     ):
         """Test that process_single_batch creates correct output files."""
         sim_df = pd.DataFrame(
@@ -415,7 +457,7 @@ class TestProcessSingleBatch:
                 "simulation_id": [0, 1],
                 "status": [1, 1],
                 "time": [[0.0, 1.0, 2.0]] * 2,
-                "V_T_C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],
+                "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],
             }
         )
 
@@ -430,6 +472,7 @@ class TestProcessSingleBatch:
             parquet_file=parquet_file,
             test_stats_df=test_stats_df,
             test_stat_registry=test_stat_registry,
+            species_units=species_units,
             test_stats_output_dir=output_dir,
         )
 
@@ -466,10 +509,13 @@ class TestSingleTaskDerivation:
             {
                 "test_statistic_id": ["mean_val"],
                 "required_species": ["value"],
-                "model_output_code": ["def compute(time, value):\n    return np.mean(value)"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['value'].magnitude)"
+                ],
             }
         )
         registry = build_test_stat_registry(test_stats_df)
+        species_units = {"value": "dimensionless"}
 
         # Create multiple batch files
         pool_dir = tmp_path / "pool"
@@ -500,6 +546,7 @@ class TestSingleTaskDerivation:
                 parquet_file=parquet_file,
                 test_stats_df=test_stats_df,
                 test_stat_registry=registry,
+                species_units=species_units,
                 test_stats_output_dir=output_dir,
             )
             total_sims += n_sims

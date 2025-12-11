@@ -26,10 +26,9 @@ def run_batch_worker(
     params: np.ndarray,
     param_names: list[str],
     model_script: str,
-    test_stats_csv: Path,
     project_root: Path,
     seed: int = 2025,
-    dose_schedule: Optional[Dict[str, Any]] = None,
+    dosing: Optional[Dict[str, Any]] = None,
     sim_config: Optional[Dict[str, Any]] = None,
     matlab_path: str = "matlab",
     simulation_pool_path: Optional[Path] = None,
@@ -46,11 +45,11 @@ def run_batch_worker(
         params: Parameter array (n_sims, n_params)
         param_names: List of parameter names
         model_script: MATLAB model script name
-        test_stats_csv: Path to test statistics CSV
         project_root: Project root directory (must contain batch_jobs/)
         seed: Random seed
-        dose_schedule: Optional dose schedule configuration
-        sim_config: Optional simulation configuration
+        dosing: Optional dosing configuration dict with 'drugs' list and drug-specific params.
+                Passed to MATLAB schedule_dosing() function.
+        sim_config: Optional simulation configuration dict with solver settings and time span.
         matlab_path: Path to MATLAB executable
         simulation_pool_path: Where to write parquet files (default: batch_jobs/simulation_pool)
         simulation_pool_id: Subdirectory name within simulation_pool_path
@@ -102,7 +101,6 @@ def run_batch_worker(
     config = {
         "model_script": model_script,
         "param_csv": str((input_dir / "params.csv").relative_to(project_root)),
-        "test_stats_csv": str(test_stats_csv.absolute()),
         "n_simulations": int(n_sims),
         "seed": int(seed),
         "jobs_per_chunk": int(n_sims),
@@ -110,8 +108,8 @@ def run_batch_worker(
         "simulation_pool_id": simulation_pool_id,
     }
 
-    if dose_schedule is not None:
-        config["dose_schedule"] = dose_schedule
+    if dosing is not None:
+        config["dosing"] = dosing
     if sim_config is not None:
         config["sim_config"] = sim_config
 

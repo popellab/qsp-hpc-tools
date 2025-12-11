@@ -116,7 +116,7 @@ class TestWriteSpeciesParquet:
         assert df.loc[0, "k_death"] == 0.05
 
     def test_species_names_with_dots(self, temp_dir):
-        """Test that dots in species names are replaced with underscores."""
+        """Test that dots in species names are preserved (SimBiology convention)."""
         json_data = {
             "n_sims": 1,
             "n_species": 2,
@@ -135,8 +135,9 @@ class TestWriteSpeciesParquet:
         write_species_parquet(str(json_file), str(output_file))
 
         df = pd.read_parquet(output_file)
-        assert "Cancer_Tumor" in df.columns
-        assert "Immune_TCell" in df.columns
+        # Species names now preserve dots (SimBiology convention)
+        assert "Cancer.Tumor" in df.columns
+        assert "Immune.TCell" in df.columns
 
     def test_empty_arrays_for_failed_sims(self, temp_dir):
         """Test handling of empty arrays for failed simulations."""

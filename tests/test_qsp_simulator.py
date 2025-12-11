@@ -56,17 +56,17 @@ def sample_test_stats_csv(temp_dir):
     """Create sample test statistics CSV file."""
     test_stats_csv = temp_dir / "test_stats.csv"
 
-    # Create test statistics definitions (new format)
+    # Create test statistics definitions (new format with compute_test_statistic signature)
     test_stats_data = pd.DataFrame(
         {
             "test_statistic_id": ["stat1", "stat2", "stat3"],
             "required_species": ["V_T.C1", "V_T.C1", "V_T.C1"],
             "model_output_code": [
-                "def compute(time, V_T_C1):\n    return np.mean(V_T_C1)",
-                "def compute(time, V_T_C1):\n    return np.max(V_T_C1)",
-                "def compute(time, V_T_C1):\n    return np.min(V_T_C1)",
+                "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)",
+                "def compute_test_statistic(time, species_dict, ureg):\n    return np.max(species_dict['V_T.C1'].magnitude)",
+                "def compute_test_statistic(time, species_dict, ureg):\n    return np.min(species_dict['V_T.C1'].magnitude)",
             ],
-            "mean": [100.0, 200.0, 50.0],
+            "median": [100.0, 200.0, 50.0],  # Changed from 'mean' to 'median'
             "variance": [10.0, 20.0, 5.0],
             "units": ["cells", "cells", "cells"],
             "description": ["Mean tumor cells", "Max tumor cells", "Min tumor cells"],
@@ -2738,7 +2738,7 @@ class TestLocalSimulation:
             return pd.DataFrame(np.random.rand(n_sims, n_species))
 
         # Mock compute_test_statistics_batch to return fake test stats
-        def mock_compute_test_stats(species_df, test_stats_df, registry):
+        def mock_compute_test_stats(species_df, test_stats_df, registry, species_units):
             n_sims = len(species_df)
             n_test_stats = 3  # From sample_test_stats_csv
             return np.random.rand(n_sims, n_test_stats)
@@ -2795,7 +2795,7 @@ class TestLocalSimulation:
             n_species = 10
             return pd.DataFrame(np.random.rand(n_sims, n_species))
 
-        def mock_compute_test_stats(species_df, test_stats_df, registry):
+        def mock_compute_test_stats(species_df, test_stats_df, registry, species_units):
             n_sims = len(species_df)
             return np.random.rand(n_sims, 3)  # 3 test stats in fixture
 
@@ -2847,7 +2847,7 @@ class TestLocalSimulation:
             n_species = 10
             return pd.DataFrame(np.random.rand(n_sims, n_species))
 
-        def mock_compute_test_stats(species_df, test_stats_df, registry):
+        def mock_compute_test_stats(species_df, test_stats_df, registry, species_units):
             n_sims = len(species_df)
             return np.random.rand(n_sims, 3)  # 3 test stats in fixture
 

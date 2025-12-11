@@ -305,7 +305,8 @@ def main():
     test_stats_csv = Path(config["test_stats_csv"])
     output_dir = Path(config["output_dir"])
     test_stats_hash = config["test_stats_hash"]
-    species_units_file = Path(config["species_units_file"])
+    species_units_file_str = config.get("species_units_file")
+    species_units_file = Path(species_units_file_str) if species_units_file_str else None
 
     logger.info(f"Simulation pool: {simulation_pool_dir}")
     logger.info(f"Test stats CSV: {test_stats_csv}")
@@ -316,11 +317,15 @@ def main():
     test_stats_output_dir = output_dir / "test_stats" / test_stats_hash
     test_stats_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load species units
-    logger.info("Loading species units...")
-    with open(species_units_file, "r") as f:
-        species_units = json.load(f)
-    logger.info(f"Loaded units for {len(species_units)} species")
+    # Load species units (optional - use empty dict if not provided)
+    if species_units_file and species_units_file.exists():
+        logger.info("Loading species units...")
+        with open(species_units_file, "r") as f:
+            species_units = json.load(f)
+        logger.info(f"Loaded units for {len(species_units)} species")
+    else:
+        logger.info("No species units file provided - using dimensionless for all species")
+        species_units = {}
 
     # Load test statistics configuration
     logger.info("Loading test statistics configuration...")

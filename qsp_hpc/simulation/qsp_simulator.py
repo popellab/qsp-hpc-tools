@@ -1056,6 +1056,7 @@ class QSPSimulator:
             hpc_pool_path,
             str(self.test_stats_csv),
             test_stats_hash,
+            species_units_file=str(self.species_units_file) if self.species_units_file else None,
             num_simulations=num_simulations,
         )
         self.logger.info(f"Derivation job submitted: {job_id}")

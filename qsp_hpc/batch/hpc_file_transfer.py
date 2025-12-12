@@ -200,6 +200,8 @@ echo "Python venv setup complete!"
         jobs_per_chunk: int,
         save_full_simulations: bool = True,
         simulation_pool_id: Optional[str] = None,
+        sim_config: Optional[dict] = None,
+        dosing: Optional[dict] = None,
     ) -> None:
         """Create and upload job configuration as JSON."""
         start_time = time.time()
@@ -215,6 +217,14 @@ echo "Python venv setup complete!"
             "save_full_simulations": save_full_simulations,
             "simulation_pool_id": simulation_pool_id,
         }
+
+        # Add sim_config if provided (critical for stop_time, solver settings)
+        if sim_config is not None:
+            job_config["sim_config"] = sim_config
+
+        # Add dosing if provided (for treatment scenarios)
+        if dosing is not None:
+            job_config["dosing"] = dosing
 
         # Write to temp file
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:

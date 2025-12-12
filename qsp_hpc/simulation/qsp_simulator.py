@@ -1452,6 +1452,8 @@ class QSPSimulator:
             skip_sync=False,  # Sync codebase first
             save_full_simulations=True,  # Enable full simulation saving
             simulation_pool_id=simulation_pool_id,  # Pool ID for HPC storage
+            sim_config=self.sim_config,  # Simulation settings (stop_time, solver, etc.)
+            dosing=self.dosing,  # Treatment dosing schedule (if any)
         )
 
         # Wait for MATLAB simulation jobs to complete (saves full sims to parquet)
@@ -1481,8 +1483,8 @@ class QSPSimulator:
             RuntimeError: If SSH connection cannot be established
         """
         try:
-            # Validate SSH connection (fast - should return in 1-2s)
-            self.job_manager.validate_ssh_connection(timeout=5)
+            # Validate SSH connection (typically 1-2s, but allow up to 15s for slow connections)
+            self.job_manager.validate_ssh_connection(timeout=15)
 
         except FileNotFoundError as e:
             raise FileNotFoundError(str(e))

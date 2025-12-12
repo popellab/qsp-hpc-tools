@@ -965,9 +965,6 @@ class HPCJobManager:
             f"   Pool has {total_sims} sims in {total_batches} batches "
             f"(~{avg_sims_per_batch:.1f} sims/batch)"
         )
-        self.logger.info(
-            f"   Need {num_simulations} sims → will derive first {batches_needed} batches"
-        )
 
         return batches_needed
 
@@ -1026,17 +1023,20 @@ class HPCJobManager:
         home_dir = home_dir.strip()
         expanded_pool_path = pool_path.replace("$HOME", home_dir)
 
-        # Calculate how many batches to process (moved before config creation)
-        n_batches = self._calculate_batches_needed(pool_path, num_simulations)
+        # Log pool info (for visibility, but always derive all batches)
+        n_batches = self._calculate_batches_needed(pool_path, num_simulations=None)
 
         # Create derivation config JSON
+        # Always derive ALL batches to handle incremental pool growth correctly.
+        # Trying to derive only "first N batches" breaks when new batches are added
+        # because we'd re-derive old batches instead of processing new ones.
         config = {
             "simulation_pool_dir": expanded_pool_path,
             "test_stats_csv": remote_test_stats_csv,
             "output_dir": expanded_pool_path,
             "test_stats_hash": test_stats_hash,
             "species_units_file": remote_species_units_file,
-            "max_batches": n_batches if num_simulations is not None else None,
+            "max_batches": None,  # Always derive all batches
         }
 
         # Write config locally then upload

@@ -114,12 +114,12 @@ class TestMaxBatchesInDerivationConfig:
     See: https://github.com/jeliason/qsp-hpc-tools/issues/XXX
     """
 
-    def test_max_batches_included_in_derivation_config(self, tmp_path):
-        """Test that max_batches is included in derivation config JSON.
+    def test_max_batches_always_none_for_full_derivation(self, tmp_path):
+        """Test that max_batches is always None to derive all batches.
 
-        Regression test: The derivation config must include max_batches so the
-        worker knows how many batches to process. Without this, the worker
-        processes all batches and returns more test stats than expected.
+        We always derive ALL batches to handle incremental pool growth correctly.
+        Trying to derive only "first N batches" breaks when new batches are added
+        because we'd re-derive old batches instead of processing new ones.
         """
         manager = self._create_manager()
 
@@ -153,6 +153,7 @@ class TestMaxBatchesInDerivationConfig:
         test_stats_csv.write_text("test_statistic_id,required_species\nstat1,V_T.C1\n")
 
         # Call submit_derivation_job with num_simulations=4500
+        # Even though we only need 4500, we should derive ALL batches
         manager.submit_derivation_job(
             pool_path="/pool/path",
             test_stats_csv=str(test_stats_csv),
@@ -160,16 +161,11 @@ class TestMaxBatchesInDerivationConfig:
             num_simulations=4500,
         )
 
-        # Verify max_batches was included in the uploaded config
+        # Verify max_batches is None (derive all batches)
         assert len(uploaded_configs) == 1
         config = uploaded_configs[0]
-        assert "max_batches" in config, "max_batches must be in derivation config"
-
-        # Verify max_batches is the calculated value (72 batches for 4500/5000 sims)
-        # 5000 sims / 79 batches = ~63.3 sims/batch
-        # ceil(4500 / 63.3) = 72 batches
-        expected_batches = math.ceil(4500 / (5000 / 79))
-        assert config["max_batches"] == expected_batches
+        assert "max_batches" in config
+        assert config["max_batches"] is None, "max_batches should be None to derive all batches"
 
     def test_max_batches_none_when_num_simulations_none(self, tmp_path):
         """Test that max_batches is None when num_simulations is not specified.

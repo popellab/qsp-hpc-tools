@@ -462,6 +462,8 @@ class HPCJobManager:
         skip_sync: bool = False,
         save_full_simulations: bool = False,
         simulation_pool_id: Optional[str] = None,
+        sim_config: Optional[Dict] = None,
+        dosing: Optional[Dict] = None,
     ) -> JobInfo:
         """
         Submit batch jobs to HPC cluster.
@@ -474,6 +476,10 @@ class HPCJobManager:
             seed: Random seed
             jobs_per_chunk: Simulations per job (default from config)
             skip_sync: Skip codebase sync (for testing)
+            save_full_simulations: Save full simulation trajectories to Parquet
+            simulation_pool_id: Pool ID for HPC storage
+            sim_config: Simulation configuration (stop_time, solver, tolerances, etc.)
+            dosing: Dosing configuration for treatment scenarios
 
         Returns:
             JobInfo object with job IDs and state file
@@ -518,6 +524,8 @@ class HPCJobManager:
             jobs_per_chunk=jobs_per_chunk,
             save_full_simulations=save_full_simulations,
             simulation_pool_id=simulation_pool_id,
+            sim_config=sim_config,
+            dosing=dosing,
         )
 
         # Upload parameter CSV
@@ -558,6 +566,8 @@ class HPCJobManager:
         jobs_per_chunk: int,
         save_full_simulations: bool = True,
         simulation_pool_id: Optional[str] = None,
+        sim_config: Optional[Dict] = None,
+        dosing: Optional[Dict] = None,
     ) -> None:
         """Create and upload job configuration as JSON."""
         return self.file_transfer.upload_job_config(
@@ -568,6 +578,8 @@ class HPCJobManager:
             jobs_per_chunk,
             save_full_simulations,
             simulation_pool_id,
+            sim_config,
+            dosing,
         )
 
     def _upload_parameter_csv(self, csv_path: str) -> None:
@@ -1014,6 +1026,9 @@ class HPCJobManager:
         home_dir = home_dir.strip()
         expanded_pool_path = pool_path.replace("$HOME", home_dir)
 
+        # Calculate how many batches to process (moved before config creation)
+        n_batches = self._calculate_batches_needed(pool_path, num_simulations)
+
         # Create derivation config JSON
         config = {
             "simulation_pool_dir": expanded_pool_path,
@@ -1021,6 +1036,7 @@ class HPCJobManager:
             "output_dir": expanded_pool_path,
             "test_stats_hash": test_stats_hash,
             "species_units_file": remote_species_units_file,
+            "max_batches": n_batches if num_simulations is not None else None,
         }
 
         # Write config locally then upload
@@ -1035,9 +1051,6 @@ class HPCJobManager:
         remote_config = f"{derivation_dir}/derive_config_{test_stats_hash[:8]}.json"
         self.transport.upload(temp_config, remote_config)
         Path(temp_config).unlink()
-
-        # Log pool info for user visibility
-        n_batches = self._calculate_batches_needed(pool_path, num_simulations)
 
         if n_batches == 0:
             raise ValueError(f"No Parquet batches found in {pool_path}")

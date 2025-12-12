@@ -307,11 +307,14 @@ def main():
     test_stats_hash = config["test_stats_hash"]
     species_units_file_str = config.get("species_units_file")
     species_units_file = Path(species_units_file_str) if species_units_file_str else None
+    max_batches = config.get("max_batches")  # None means process all batches
 
     logger.info(f"Simulation pool: {simulation_pool_dir}")
     logger.info(f"Test stats CSV: {test_stats_csv}")
     logger.info(f"Species units: {species_units_file}")
     logger.info(f"Output dir: {output_dir}")
+    if max_batches is not None:
+        logger.info(f"Max batches to process: {max_batches}")
 
     # Create output directory for this test stats hash
     test_stats_output_dir = output_dir / "test_stats" / test_stats_hash
@@ -342,9 +345,17 @@ def main():
         logger.error(f"No simulation batches found in {simulation_pool_dir}")
         sys.exit(1)
 
-    logger.info(f"Found {len(parquet_files)} simulation batches to process")
+    # Limit to max_batches if specified
+    total_available = len(parquet_files)
+    if max_batches is not None and max_batches < total_available:
+        parquet_files = parquet_files[:max_batches]
+        logger.info(
+            f"Processing {len(parquet_files)} of {total_available} batches (limited by max_batches)"
+        )
+    else:
+        logger.info(f"Found {len(parquet_files)} simulation batches to process")
 
-    # Process ALL batches in a single task (no array job needed)
+    # Process batches in a single task (no array job needed)
     total_sims = 0
     for batch_idx, parquet_file in enumerate(parquet_files):
         n_sims = process_single_batch(

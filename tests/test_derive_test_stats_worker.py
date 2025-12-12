@@ -491,6 +491,144 @@ class TestProcessSingleBatch:
         assert result[1, 1] == pytest.approx(150.0)
 
 
+class TestMaxBatchesLimit:
+    """Regression tests for max_batches limiting derivation scope.
+
+    Bug fix: Previously, the derivation worker always processed ALL batches in
+    the pool directory. When the pool contained pre-existing batches plus newly
+    generated ones, this caused a mismatch between params (new only) and
+    test_stats (all batches).
+
+    The fix adds max_batches to the config, which limits how many batches
+    the worker processes.
+    """
+
+    def test_worker_respects_max_batches_limit(self, tmp_path):
+        """Test that worker only processes max_batches files when specified.
+
+        Regression test: With 5 batches in pool but max_batches=3, worker
+        should only process the first 3 batches.
+        """
+        # Create test statistics
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["mean_val"],
+                "required_species": ["value"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['value'].magnitude)"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        species_units = {"value": "dimensionless"}
+
+        # Create 5 batch files
+        pool_dir = tmp_path / "pool"
+        pool_dir.mkdir()
+
+        for i in range(5):
+            sim_df = pd.DataFrame(
+                {
+                    "simulation_id": [i * 10 + j for j in range(10)],
+                    "status": [1] * 10,
+                    "time": [[0.0, 1.0]] * 10,
+                    "value": [[float(i * 100 + j)] * 2 for j in range(10)],
+                }
+            )
+            sim_df.to_parquet(pool_dir / f"batch_{i:03d}.parquet")
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        # Simulate what the worker does with max_batches=3
+        parquet_files = sorted(pool_dir.glob("batch_*.parquet"))
+        assert len(parquet_files) == 5  # Sanity check
+
+        max_batches = 3
+        parquet_files = parquet_files[:max_batches]  # Limit to first 3
+
+        total_sims = 0
+        for batch_idx, parquet_file in enumerate(parquet_files):
+            n_sims = process_single_batch(
+                batch_idx=batch_idx,
+                parquet_file=parquet_file,
+                test_stats_df=test_stats_df,
+                test_stat_registry=registry,
+                species_units=species_units,
+                test_stats_output_dir=output_dir,
+            )
+            total_sims += n_sims
+
+        # Should only process 3 batches x 10 sims = 30 sims (not 50)
+        assert total_sims == 30
+
+        # Only 3 output files should exist
+        assert (output_dir / "chunk_000_test_stats.csv").exists()
+        assert (output_dir / "chunk_001_test_stats.csv").exists()
+        assert (output_dir / "chunk_002_test_stats.csv").exists()
+        assert not (output_dir / "chunk_003_test_stats.csv").exists()
+        assert not (output_dir / "chunk_004_test_stats.csv").exists()
+
+    def test_worker_processes_all_when_max_batches_none(self, tmp_path):
+        """Test that worker processes all batches when max_batches is None."""
+        # Create test statistics
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["mean_val"],
+                "required_species": ["value"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['value'].magnitude)"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        species_units = {"value": "dimensionless"}
+
+        # Create 4 batch files
+        pool_dir = tmp_path / "pool"
+        pool_dir.mkdir()
+
+        for i in range(4):
+            sim_df = pd.DataFrame(
+                {
+                    "simulation_id": [i * 5 + j for j in range(5)],
+                    "status": [1] * 5,
+                    "time": [[0.0, 1.0]] * 5,
+                    "value": [[float(i * 100 + j)] * 2 for j in range(5)],
+                }
+            )
+            sim_df.to_parquet(pool_dir / f"batch_{i:03d}.parquet")
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        # Simulate what the worker does with max_batches=None (process all)
+        parquet_files = sorted(pool_dir.glob("batch_*.parquet"))
+        max_batches = None
+
+        if max_batches is not None:
+            parquet_files = parquet_files[:max_batches]
+
+        total_sims = 0
+        for batch_idx, parquet_file in enumerate(parquet_files):
+            n_sims = process_single_batch(
+                batch_idx=batch_idx,
+                parquet_file=parquet_file,
+                test_stats_df=test_stats_df,
+                test_stat_registry=registry,
+                species_units=species_units,
+                test_stats_output_dir=output_dir,
+            )
+            total_sims += n_sims
+
+        # Should process all 4 batches x 5 sims = 20 sims
+        assert total_sims == 20
+
+        # All 4 output files should exist
+        for i in range(4):
+            assert (output_dir / f"chunk_{i:03d}_test_stats.csv").exists()
+
+
 class TestSingleTaskDerivation:
     """Regression tests for single-task derivation (not array job).
 

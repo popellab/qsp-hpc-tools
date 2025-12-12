@@ -1,5 +1,6 @@
 """Tests for selective batch derivation optimization."""
 
+import json
 import math
 from unittest.mock import MagicMock, Mock
 
@@ -99,4 +100,139 @@ class TestCheckHPCTestStatsValidation:
         manager = HPCJobManager.__new__(HPCJobManager)
         manager.transport = MagicMock()
         manager.logger = MagicMock()
+        return manager
+
+
+class TestMaxBatchesInDerivationConfig:
+    """Regression tests for max_batches being passed to derivation config.
+
+    Bug fix: Previously, _calculate_batches_needed computed the correct number
+    of batches, but this value was never passed to the derivation worker config.
+    This caused the worker to process ALL batches instead of just the needed ones,
+    leading to params/test_stats count mismatches.
+
+    See: https://github.com/jeliason/qsp-hpc-tools/issues/XXX
+    """
+
+    def test_max_batches_included_in_derivation_config(self, tmp_path):
+        """Test that max_batches is included in derivation config JSON.
+
+        Regression test: The derivation config must include max_batches so the
+        worker knows how many batches to process. Without this, the worker
+        processes all batches and returns more test stats than expected.
+        """
+        manager = self._create_manager()
+
+        # Mock transport to capture uploaded config
+        uploaded_configs = []
+
+        def capture_upload(local_path, remote_path):
+            if local_path.endswith(".json"):
+                with open(local_path, "r") as f:
+                    uploaded_configs.append(json.load(f))
+
+        manager.transport.upload = Mock(side_effect=capture_upload)
+
+        # Mock exec to handle different commands appropriately
+        def mock_exec(cmd, timeout=None):
+            if "echo $HOME" in cmd:
+                return (0, "/home/user")
+            elif "batch_*.parquet" in cmd and "wc -l" in cmd:
+                return (0, "79")
+            elif "mkdir" in cmd:
+                return (0, "")
+            return (0, "")
+
+        manager.transport.exec = Mock(side_effect=mock_exec)
+        manager.result_collector.count_pool_simulations = Mock(return_value=5000)
+        manager.slurm_submitter.submit_derivation_job = Mock(return_value="12345")
+        manager.file_transfer.ensure_hpc_venv = Mock()
+
+        # Create a dummy test_stats CSV
+        test_stats_csv = tmp_path / "test_stats.csv"
+        test_stats_csv.write_text("test_statistic_id,required_species\nstat1,V_T.C1\n")
+
+        # Call submit_derivation_job with num_simulations=4500
+        manager.submit_derivation_job(
+            pool_path="/pool/path",
+            test_stats_csv=str(test_stats_csv),
+            test_stats_hash="abc123",
+            num_simulations=4500,
+        )
+
+        # Verify max_batches was included in the uploaded config
+        assert len(uploaded_configs) == 1
+        config = uploaded_configs[0]
+        assert "max_batches" in config, "max_batches must be in derivation config"
+
+        # Verify max_batches is the calculated value (72 batches for 4500/5000 sims)
+        # 5000 sims / 79 batches = ~63.3 sims/batch
+        # ceil(4500 / 63.3) = 72 batches
+        expected_batches = math.ceil(4500 / (5000 / 79))
+        assert config["max_batches"] == expected_batches
+
+    def test_max_batches_none_when_num_simulations_none(self, tmp_path):
+        """Test that max_batches is None when num_simulations is not specified.
+
+        When num_simulations is None, we want to derive ALL batches, so
+        max_batches should be None (not a number).
+        """
+        manager = self._create_manager()
+
+        # Mock transport to capture uploaded config
+        uploaded_configs = []
+
+        def capture_upload(local_path, remote_path):
+            if local_path.endswith(".json"):
+                with open(local_path, "r") as f:
+                    uploaded_configs.append(json.load(f))
+
+        manager.transport.upload = Mock(side_effect=capture_upload)
+
+        # Mock exec to handle different commands appropriately
+        def mock_exec(cmd, timeout=None):
+            if "echo $HOME" in cmd:
+                return (0, "/home/user")
+            elif "batch_*.parquet" in cmd and "wc -l" in cmd:
+                return (0, "10")
+            elif "mkdir" in cmd:
+                return (0, "")
+            return (0, "")
+
+        manager.transport.exec = Mock(side_effect=mock_exec)
+        manager.result_collector.count_pool_simulations = Mock(return_value=1000)
+        manager.slurm_submitter.submit_derivation_job = Mock(return_value="12345")
+        manager.file_transfer.ensure_hpc_venv = Mock()
+
+        # Create a dummy test_stats CSV
+        test_stats_csv = tmp_path / "test_stats.csv"
+        test_stats_csv.write_text("test_statistic_id,required_species\nstat1,V_T.C1\n")
+
+        # Call submit_derivation_job WITHOUT num_simulations
+        manager.submit_derivation_job(
+            pool_path="/pool/path",
+            test_stats_csv=str(test_stats_csv),
+            test_stats_hash="abc123",
+            num_simulations=None,  # Derive all
+        )
+
+        # Verify max_batches is None
+        assert len(uploaded_configs) == 1
+        config = uploaded_configs[0]
+        assert "max_batches" in config
+        assert config["max_batches"] is None
+
+    @staticmethod
+    def _create_manager():
+        """Create mock HPCJobManager with all required attributes."""
+        manager = HPCJobManager.__new__(HPCJobManager)
+        manager.transport = MagicMock()
+        manager.logger = MagicMock()
+        manager.result_collector = MagicMock()
+        manager.slurm_submitter = MagicMock()
+        manager.file_transfer = MagicMock()
+        manager.config = MagicMock()
+        manager.config.remote_project_path = "/home/user/project"
+        manager.config.hpc_venv_path = "/home/user/.venv"
+        manager.verbose = False
         return manager

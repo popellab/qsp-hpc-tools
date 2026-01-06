@@ -112,6 +112,10 @@ def run_batch_worker(
         config["dosing"] = dosing
     if sim_config is not None:
         config["sim_config"] = sim_config
+        # Debug: Log sim_config contents
+        logger.info("DEBUG: sim_config being passed to MATLAB:")
+        for key, value in sim_config.items():
+            logger.info(f"  {key}: {value}")
 
     config_json = input_dir / "job_config.json"
     with open(config_json, "w") as f:

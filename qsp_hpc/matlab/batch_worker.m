@@ -360,26 +360,42 @@ for i = 1:n_patients
         model_copy = copyobj(model);
         variant = create_parameter_variant_worker(model_copy, chunk_params, i);
 
-        % Set initial conditions
-        try
-            [model_copy, ic_success, ~] = initial_conditions(model_copy, 'Variant', variant);
+        % Initialize model (if initialization function specified)
+        if isfield(model_data, 'sim_config') && isfield(model_data.sim_config, 'initialization_function')
+            init_func = model_data.sim_config.initialization_function;
+            fprintf('DEBUG: Calling initialization function: %s (patient %d)\n', init_func, i);
 
-            if ~ic_success
-                fprintf('IC failed (no steady state)\n');
+            try
+                [model_copy, ic_success, ~] = feval(init_func, model_copy, 'Variant', variant);
+
+                if ~ic_success
+                    fprintf('Initialization failed (%s)\n', init_func);
+                    chunk_metadata.status(i) = 0;  % Failed IC
+                    chunk_results(i).simData = [];
+                    continue;
+                else
+                    fprintf('DEBUG: Initialization succeeded (%s)\n', init_func);
+                end
+
+            catch ic_err
+                fprintf('Initialization error (%s): %s\n', init_func, ic_err.message);
                 chunk_metadata.status(i) = 0;  % Failed IC
                 chunk_results(i).simData = [];
                 continue;
             end
-
-        catch ic_err
-            fprintf('IC error: %s\n', ic_err.message);
-            chunk_metadata.status(i) = 0;  % Failed IC
-            chunk_results(i).simData = [];
-            continue;
         end
 
         % Run simulation
         try
+            % Debug: check C1 initial condition before main simulation
+            c1_species = sbioselect(model_copy, 'Type', 'species', 'Name', 'C1');
+            if isempty(c1_species)
+                c1_species = sbioselect(model_copy, 'Type', 'species', 'Name', 'V_T.C1');
+            end
+            if ~isempty(c1_species)
+                fprintf('DEBUG: C1 before main sim: %.2e cells (%.3f cm)\n', c1_species.InitialAmount, ((6*c1_species.InitialAmount/1e9/pi)^(1/3)));
+            end
+
             sim_data = sbiosimulate(model_copy, [], variant, dose_schedule);
             t_patient = toc(t_patient_start);
             chunk_metadata.status(i) = 1;   % Success

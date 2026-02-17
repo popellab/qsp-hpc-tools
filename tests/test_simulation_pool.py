@@ -520,3 +520,156 @@ class TestListPools:
         assert "gvax_pd1" in info["scenarios"]
         assert info["n_batches"] == 1
         assert info["total_simulations"] == 1
+
+
+# ============================================================================
+# Calibration Targets Integration Tests
+# ============================================================================
+
+
+@pytest.fixture
+def sample_calibration_targets_dir(temp_dir):
+    """Create a temp dir with a simple calibration target YAML."""
+    import yaml
+
+    cal_dir = temp_dir / "calibration_targets"
+    cal_dir.mkdir()
+
+    target = {
+        "calibration_target_id": "test_observable",
+        "observable": {
+            "code": (
+                "def compute_observable(time, species_dict, constants, ureg):\n"
+                "    return species_dict['V_T.C1']\n"
+            ),
+            "units": "cell",
+            "species": ["V_T.C1"],
+            "constants": [],
+        },
+        "empirical_data": {
+            "median": [100.0],
+            "ci95": [[50.0, 200.0]],
+            "units": "cell",
+            "sample_size": 20,
+            "index_values": None,
+        },
+    }
+
+    with open(cal_dir / "test_observable.yaml", "w") as f:
+        yaml.dump(target, f)
+
+    return cal_dir
+
+
+class TestSimulationPoolCalibrationTargets:
+    """Tests for SimulationPoolManager with calibration_targets parameter."""
+
+    def test_init_with_calibration_targets(
+        self, temp_dir, sample_priors_csv, sample_calibration_targets_dir
+    ):
+        """Pool manager accepts calibration_targets and initializes correctly."""
+        pool = SimulationPoolManager(
+            cache_dir=temp_dir / "cache",
+            model_version="test_v1",
+            model_description="Test model",
+            priors_csv=sample_priors_csv,
+            calibration_targets=sample_calibration_targets_dir,
+            model_script="test_model",
+        )
+
+        assert pool.pool_dir.exists()
+        assert pool._calibration_targets_dir == sample_calibration_targets_dir
+        assert pool.test_stats_csv is None
+
+    def test_both_csv_and_yaml_raises(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv, sample_calibration_targets_dir
+    ):
+        """Providing both test_stats_csv and calibration_targets raises ValueError."""
+        with pytest.raises(ValueError, match="Provide test_stats_csv OR calibration_targets"):
+            SimulationPoolManager(
+                cache_dir=temp_dir / "cache",
+                model_version="test_v1",
+                model_description="Test model",
+                priors_csv=sample_priors_csv,
+                test_stats_csv=sample_test_stats_csv,
+                calibration_targets=sample_calibration_targets_dir,
+                model_script="test_model",
+            )
+
+    def test_neither_csv_nor_yaml_raises(self, temp_dir, sample_priors_csv):
+        """Providing neither test_stats_csv nor calibration_targets raises ValueError."""
+        with pytest.raises(ValueError, match="Must provide either"):
+            SimulationPoolManager(
+                cache_dir=temp_dir / "cache",
+                model_version="test_v1",
+                model_description="Test model",
+                priors_csv=sample_priors_csv,
+                model_script="test_model",
+            )
+
+    def test_config_hash_differs_from_csv(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv, sample_calibration_targets_dir
+    ):
+        """Config hash for calibration_targets differs from CSV-based hash."""
+        pool_csv = SimulationPoolManager(
+            cache_dir=temp_dir / "cache_csv",
+            model_version="test_v1",
+            model_description="Test model",
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv,
+            model_script="test_model",
+        )
+        pool_yaml = SimulationPoolManager(
+            cache_dir=temp_dir / "cache_yaml",
+            model_version="test_v1",
+            model_description="Test model",
+            priors_csv=sample_priors_csv,
+            calibration_targets=sample_calibration_targets_dir,
+            model_script="test_model",
+        )
+
+        assert pool_csv.config_hash != pool_yaml.config_hash
+
+    def test_config_hash_deterministic_with_yaml(
+        self, temp_dir, sample_priors_csv, sample_calibration_targets_dir
+    ):
+        """Config hash is deterministic for same calibration_targets."""
+        pool1 = SimulationPoolManager(
+            cache_dir=temp_dir / "cache1",
+            model_version="test_v1",
+            model_description="Test model",
+            priors_csv=sample_priors_csv,
+            calibration_targets=sample_calibration_targets_dir,
+            model_script="test_model",
+        )
+        pool2 = SimulationPoolManager(
+            cache_dir=temp_dir / "cache2",
+            model_version="test_v1",
+            model_description="Test model",
+            priors_csv=sample_priors_csv,
+            calibration_targets=sample_calibration_targets_dir,
+            model_script="test_model",
+        )
+
+        assert pool1.config_hash == pool2.config_hash
+
+    def test_add_and_load_with_calibration_targets(
+        self, temp_dir, sample_priors_csv, sample_calibration_targets_dir
+    ):
+        """Can add and load simulations from a calibration_targets-based pool."""
+        pool = SimulationPoolManager(
+            cache_dir=temp_dir / "cache",
+            model_version="test_v1",
+            model_description="Test model",
+            priors_csv=sample_priors_csv,
+            calibration_targets=sample_calibration_targets_dir,
+            model_script="test_model",
+        )
+
+        params = np.array([[1.0, 2.0, 3.0]])
+        obs = np.array([[10.0]])
+        pool.add_batch(params, obs, seed=42, scenario="default")
+
+        loaded_params, loaded_obs = pool.load_simulations(n_requested=1, scenario="default")
+        np.testing.assert_array_equal(loaded_params, params)
+        np.testing.assert_array_equal(loaded_obs, obs)

@@ -46,6 +46,44 @@ class QSPSimulatorError(RuntimeError):
     """Raised when simulator orchestration fails (wraps lower-level errors)."""
 
 
+def _run_worker_batch(
+    worker_id: int,
+    worker_params: np.ndarray,
+    worker_seed: int,
+    param_names: List[str],
+    model_script: str,
+    project_root: Path,
+    dosing: Optional[Dict[str, Any]],
+    sim_config: Dict[str, Any],
+    matlab_path: str,
+    temp_path: Path,
+) -> Path:
+    """
+    Run a single worker batch for parallel execution.
+
+    This is a module-level function to enable proper pickling with ProcessPoolExecutor.
+    """
+    from qsp_hpc.simulation.batch_runner import run_batch_worker
+
+    worker_pool_id = f"worker_{worker_id}"
+    worker_pool_path = temp_path / worker_pool_id
+    worker_pool_path.mkdir(exist_ok=True)
+
+    return run_batch_worker(
+        params=worker_params,
+        param_names=param_names,
+        model_script=model_script,
+        project_root=project_root,
+        seed=worker_seed,
+        dosing=dosing,
+        sim_config=sim_config,
+        matlab_path=matlab_path,
+        simulation_pool_path=temp_path,
+        simulation_pool_id=worker_pool_id,
+        verbose=False,  # Reduce noise from workers
+    )
+
+
 class QSPSimulator:
     """
     QSP Simulator for SBI workflows.
@@ -67,6 +105,7 @@ class QSPSimulator:
         self,
         priors_csv: Union[str, Path],
         test_stats_csv: Optional[Union[str, Path]] = None,
+        calibration_targets: Optional[Union[str, Path]] = None,
         species_units_file: Optional[Union[str, Path]] = None,
         model_script: str = "",
         model_version: str = "v1",
@@ -92,6 +131,9 @@ class QSPSimulator:
             test_stats_csv: Path to test statistics CSV defining observables (optional).
                            If None, simulations run but no test statistics are derived.
                            Use this for QC checks or when you only need raw species data.
+            calibration_targets: Path to directory of calibration target YAML files
+                                (from qsp-llm-workflows). Alternative to test_stats_csv.
+                                Cannot be used together with test_stats_csv.
             species_units_file: Path to species_units.json mapping species names to unit strings.
                                Required if test_stats_csv uses Pint units in model_output_code.
             model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
@@ -110,6 +152,24 @@ class QSPSimulator:
             max_wait_time: Maximum wait time in seconds before timeout (default: None, no timeout)
             verbose: If True, print detailed progress information (default: False)
         """
+        # Validate mutually exclusive observables sources
+        if test_stats_csv is not None and calibration_targets is not None:
+            raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
+
+        # Handle calibration_targets: load YAMLs, serialize to temp CSV for downstream use
+        self._calibration_targets_dir = None
+        self._temp_csv = None
+        if calibration_targets is not None:
+            from qsp_hpc.calibration import load_calibration_targets
+
+            cal_dir = Path(calibration_targets)
+            self._calibration_targets_dir = cal_dir
+            self._test_stats_df = load_calibration_targets(cal_dir)
+            # Serialize to temp CSV for internal use + HPC upload
+            self._temp_csv = Path(tempfile.mktemp(suffix=".csv"))
+            self._test_stats_df.to_csv(self._temp_csv, index=False)
+            test_stats_csv = self._temp_csv
+
         self.test_stats_csv = Path(test_stats_csv) if test_stats_csv is not None else None
         self.species_units_file = (
             Path(species_units_file) if species_units_file is not None else None
@@ -148,15 +208,19 @@ class QSPSimulator:
         if pool is not None:
             self.pool = pool
         elif self.test_stats_csv is not None:
-            self.pool = SimulationPoolManager(
+            pool_kwargs = dict(
                 cache_dir=cache_dir,
                 model_version=model_version,
                 model_description=model_description,
                 priors_csv=priors_csv,
-                test_stats_csv=test_stats_csv,
                 model_script=model_script,
                 scenario=scenario,
             )
+            if self._calibration_targets_dir is not None:
+                pool_kwargs["calibration_targets"] = self._calibration_targets_dir
+            else:
+                pool_kwargs["test_stats_csv"] = test_stats_csv
+            self.pool = SimulationPoolManager(**pool_kwargs)
         else:
             self.pool = None  # No pooling for QC-only simulations
 
@@ -697,6 +761,27 @@ class QSPSimulator:
             )
         self.logger.info(" (".join(summary_parts) + (")" if len(summary_parts) > 1 else ""))
 
+    def log_test_statistics_summary(self, test_stats: np.ndarray) -> None:
+        """
+        Log test statistics summary table (public API).
+
+        Shows passing tests (95% CI covers observed) first, then failing tests.
+        Useful for inspecting results after running simulations.
+
+        Args:
+            test_stats: Computed test statistics array (n_sims, n_test_stats)
+
+        Example:
+            >>> params, test_stats = simulator.run_local_simulation(n_sims=100)
+            >>> simulator.log_test_statistics_summary(test_stats)
+        """
+        if self.test_stats_csv is None:
+            raise ValueError("No test_stats_csv configured for this simulator")
+
+        test_stats_df = pd.read_csv(self.test_stats_csv)
+        n_sims = test_stats.shape[0]
+        self._log_test_statistics_table(test_stats, test_stats_df, n_sims)
+
     def print_test_statistic(self, test_stat_id: str) -> None:
         """
         Pretty print a test statistic function for inspection.
@@ -795,6 +880,8 @@ class QSPSimulator:
         n_sims: int = 1,
         seed: Optional[int] = None,
         matlab_path: str = "matlab",
+        n_workers: int = 1,
+        accelerate: bool = False,
     ) -> Tuple[np.ndarray, Union[np.ndarray, Path]]:
         """
         Run simulations locally using MATLAB (no HPC required).
@@ -808,6 +895,8 @@ class QSPSimulator:
             n_sims: Number of simulations to run (default: 1)
             seed: Random seed for parameter sampling (default: use simulator's seed)
             matlab_path: Path to MATLAB executable (default: 'matlab' from PATH)
+            n_workers: Number of parallel MATLAB processes (default: 1, no parallelization)
+            accelerate: Use sbioaccelerate for faster simulations (default: False)
 
         Returns:
             Tuple of (params, result):
@@ -829,13 +918,10 @@ class QSPSimulator:
             >>> params, test_stats = simulator.run_local_simulation(n_sims=5, seed=123)
             >>> print(f"Test stats shape: {test_stats.shape}")
 
-            >>> # Without test statistics (for QC or raw data access)
-            >>> simulator = QSPSimulator(
-            ...     priors_csv='priors.csv',
-            ...     model_script='my_model'
+            >>> # Parallel execution with acceleration
+            >>> params, test_stats = simulator.run_local_simulation(
+            ...     n_sims=100, seed=123, n_workers=4, accelerate=True
             ... )
-            >>> params, parquet_path = simulator.run_local_simulation(n_sims=5, seed=123)
-            >>> species_df = pd.read_parquet(parquet_path)
         """
         import pandas as pd
 
@@ -844,6 +930,9 @@ class QSPSimulator:
         # Use provided seed or fall back to simulator's seed
         if seed is None:
             seed = self.seed
+
+        # Adjust n_workers if we have fewer sims than workers
+        n_workers = min(n_workers, n_sims)
 
         # Log the operation
         with log_section(
@@ -859,6 +948,8 @@ class QSPSimulator:
                 "scenario": self.scenario,
                 "test_stats_csv": str(self.test_stats_csv) if self.test_stats_csv else "(none)",
                 "priors_csv": str(self.priors_csv),
+                "n_workers": n_workers,
+                "accelerate": accelerate,
             }
             for line in format_config(config_info):
                 self.logger.info(line)
@@ -896,23 +987,101 @@ class QSPSimulator:
 
             self.logger.info("Running batch_worker.m locally")
             self.logger.info(f"  sim_config: stop_time={self.sim_config.get('stop_time', 30)} days")
+            self.logger.info(f"  accelerate: {accelerate}")
             if self.dosing and self.dosing.get("drugs"):
                 self.logger.info(f"  dosing: {self.dosing.get('drugs')}")
             else:
                 self.logger.info("  dosing: none (baseline)")
 
-            # Run simulations via batch_worker.m (same as HPC)
-            parquet_file = run_batch_worker(
-                params=params,
-                param_names=param_names,
-                model_script=self.model_script or "default_model",
-                project_root=self.project_root,
-                seed=seed,
-                dosing=self.dosing,
-                sim_config=self.sim_config,
-                matlab_path=matlab_path,
-                verbose=self.verbose,
-            )
+            # Prepare sim_config with acceleration flag
+            sim_config_with_accel = dict(self.sim_config) if self.sim_config else {}
+            sim_config_with_accel["accelerate_model"] = accelerate
+
+            if n_workers == 1:
+                # Single worker - run all simulations in one batch
+                parquet_file = run_batch_worker(
+                    params=params,
+                    param_names=param_names,
+                    model_script=self.model_script or "default_model",
+                    project_root=self.project_root,
+                    seed=seed,
+                    dosing=self.dosing,
+                    sim_config=sim_config_with_accel,
+                    matlab_path=matlab_path,
+                    verbose=self.verbose,
+                )
+            else:
+                # Parallel execution - split across workers
+                from concurrent.futures import ProcessPoolExecutor, as_completed
+
+                self.logger.info(f"  Splitting {n_sims} sims across {n_workers} parallel workers")
+
+                # Split parameters into chunks
+                chunk_size = n_sims // n_workers
+                remainder = n_sims % n_workers
+                chunks = []
+                start = 0
+                for i in range(n_workers):
+                    end = start + chunk_size + (1 if i < remainder else 0)
+                    chunks.append((i, params[start:end], seed + i * 10000))
+                    start = end
+
+                self.logger.info(f"  Chunk sizes: {[c[1].shape[0] for c in chunks]}")
+
+                # Create temp directory for worker outputs
+                with tempfile.TemporaryDirectory(prefix="qsp_parallel_") as temp_dir:
+                    temp_path = Path(temp_dir)
+
+                    # Run workers in parallel using module-level function (picklable)
+                    parquet_files = []
+                    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                        futures = {
+                            executor.submit(
+                                _run_worker_batch,
+                                wid,
+                                wparams,
+                                wseed,
+                                param_names,
+                                self.model_script or "default_model",
+                                self.project_root,
+                                self.dosing,
+                                sim_config_with_accel,
+                                matlab_path,
+                                temp_path,
+                            ): wid
+                            for wid, wparams, wseed in chunks
+                        }
+
+                        for future in as_completed(futures):
+                            worker_id = futures[future]
+                            try:
+                                pq_file = future.result()
+                                parquet_files.append((worker_id, pq_file))
+                                self.logger.info(f"  Worker {worker_id} complete")
+                            except Exception as e:
+                                self.logger.error(f"  Worker {worker_id} failed: {e}")
+                                raise
+
+                    # Combine parquet files
+                    self.logger.info("  Combining results from all workers...")
+                    dfs = []
+                    for worker_id, pq_file in sorted(parquet_files, key=lambda x: x[0]):
+                        df = pd.read_parquet(pq_file)
+                        # Renumber patient_id to be globally unique
+                        base_id = sum(chunks[i][1].shape[0] for i in range(worker_id))
+                        if 'patient_id' in df.columns:
+                            df['patient_id'] = df['patient_id'] + base_id
+                        dfs.append(df)
+
+                    combined_df = pd.concat(dfs, ignore_index=True)
+
+                    # Write combined output
+                    output_dir = self.project_root / "batch_jobs" / "simulation_pool" / "parallel_combined"
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    parquet_file = output_dir / f"batch_{n_sims}sims_combined.parquet"
+                    combined_df.to_parquet(parquet_file)
+
+                    self.logger.info(f"  ✓ Combined {n_sims} simulations")
 
             # If no test_stats_csv, return parquet path for raw species access
             if self.test_stats_csv is None:
@@ -1570,13 +1739,19 @@ class QSPSimulator:
 
 
 def get_observed_data(
-    test_stats_csv: Union[str, Path], value_column: str = "median"
+    test_stats_csv: Optional[Union[str, Path]] = None,
+    calibration_targets: Optional[Union[str, Path]] = None,
+    value_column: str = "median",
 ) -> Dict[str, np.ndarray]:
     """
-    Extract observed data from test statistics CSV as dictionary.
+    Extract observed data from test statistics CSV or calibration target YAMLs.
+
+    Accepts either a CSV path or a directory of calibration target YAMLs.
+    Exactly one must be provided.
 
     Args:
         test_stats_csv: Path to test statistics CSV file
+        calibration_targets: Path to directory of calibration target YAML files
         value_column: Column name to use for observed values (default: 'median')
 
     Returns:
@@ -1584,17 +1759,27 @@ def get_observed_data(
         Each array has shape (1, 1) for compatibility with BayesFlow workflow.
 
     Example:
-        obs = get_observed_data('projects/pdac_2025/cache/test_stats.csv')
+        obs = get_observed_data(test_stats_csv='cache/test_stats.csv')
+        obs = get_observed_data(calibration_targets='calibration_targets/')
         posterior_samples = workflow.sample(conditions=obs, num_samples=1000)
     """
     import pandas as pd
 
-    test_stats_csv = Path(test_stats_csv)
-    if not test_stats_csv.exists():
-        raise FileNotFoundError(f"Test statistics CSV not found: {test_stats_csv}")
+    if test_stats_csv is not None and calibration_targets is not None:
+        raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
 
-    # Read CSV
-    df = pd.read_csv(test_stats_csv)
+    if test_stats_csv is None and calibration_targets is None:
+        raise ValueError("Must provide either test_stats_csv or calibration_targets")
+
+    if calibration_targets is not None:
+        from qsp_hpc.calibration import load_calibration_targets
+
+        df = load_calibration_targets(Path(calibration_targets))
+    else:
+        test_stats_csv = Path(test_stats_csv)
+        if not test_stats_csv.exists():
+            raise FileNotFoundError(f"Test statistics CSV not found: {test_stats_csv}")
+        df = pd.read_csv(test_stats_csv)
 
     if value_column not in df.columns:
         raise ValueError(
@@ -1621,8 +1806,9 @@ def get_observed_data(
 
 
 def qsp_simulator(
-    test_stats_csv: Union[str, Path],
     priors_csv: Union[str, Path],
+    test_stats_csv: Optional[Union[str, Path]] = None,
+    calibration_targets: Optional[Union[str, Path]] = None,
     model_script: str = "",
     model_version: str = "v1",
     model_description: str = "",
@@ -1647,8 +1833,10 @@ def qsp_simulator(
     from the pool, enabling efficient iteration and exploration.
 
     Args:
-        test_stats_csv: Path to test statistics CSV defining observables
         priors_csv: Path to priors CSV defining parameter names and distributions
+        test_stats_csv: Path to test statistics CSV defining observables
+        calibration_targets: Path to directory of calibration target YAML files
+                            (alternative to test_stats_csv; cannot use both)
         model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
         model_version: Descriptive version name (e.g., 'baseline_gvax')
         model_description: Brief description of model configuration
@@ -1674,10 +1862,10 @@ def qsp_simulator(
         priors_csv = 'projects/pdac_2025/cache/pdac_sbi_priors.csv'
         prior = load_prior(priors_csv)
 
-        # Create simulator (for HPC with max 20 parallel tasks)
+        # Create simulator with calibration target YAMLs
         simulator = qsp_simulator(
-            test_stats_csv='projects/pdac_2025/cache/test_stats.csv',
             priors_csv=priors_csv,
+            calibration_targets='calibration_targets/',
             model_script='immune_oncology_model_PDAC',
             model_version='baseline_gvax',
             model_description='PDAC baseline: 8 params, 12 obs, GVAX',
@@ -1690,6 +1878,7 @@ def qsp_simulator(
     """
     return QSPSimulator(
         test_stats_csv=test_stats_csv,
+        calibration_targets=calibration_targets,
         priors_csv=priors_csv,
         model_script=model_script,
         model_version=model_version,

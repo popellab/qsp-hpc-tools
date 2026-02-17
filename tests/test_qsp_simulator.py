@@ -2881,3 +2881,141 @@ class TestLocalSimulation:
         # Should get single simulation
         assert params.shape == (1, 3)
         assert test_stats.shape == (1, 3)  # 1 sim, 3 test stats
+
+
+# ============================================================================
+# Calibration Targets YAML Integration Tests
+# ============================================================================
+
+
+@pytest.fixture
+def sample_calibration_targets_dir(temp_dir):
+    """Create a temp dir with a simple calibration target YAML."""
+    import yaml
+
+    cal_dir = temp_dir / "calibration_targets"
+    cal_dir.mkdir()
+
+    target = {
+        "calibration_target_id": "test_ratio",
+        "observable": {
+            "code": (
+                "def compute_observable(time, species_dict, constants, ureg):\n"
+                "    return species_dict['V_T.C1']\n"
+            ),
+            "units": "cell",
+            "species": ["V_T.C1"],
+            "constants": [],
+        },
+        "empirical_data": {
+            "median": [100.0],
+            "ci95": [[50.0, 200.0]],
+            "units": "cell",
+            "sample_size": 20,
+            "index_values": None,
+        },
+    }
+
+    with open(cal_dir / "test_ratio.yaml", "w") as f:
+        yaml.dump(target, f)
+
+    return cal_dir
+
+
+class TestCalibrationTargetsIntegration:
+    """Tests for QSPSimulator with calibration_targets parameter."""
+
+    def test_init_with_calibration_targets(
+        self, sample_calibration_targets_dir, sample_priors_csv, temp_dir
+    ):
+        """QSPSimulator accepts calibration_targets and initializes correctly."""
+        sim = QSPSimulator(
+            priors_csv=sample_priors_csv,
+            calibration_targets=sample_calibration_targets_dir,
+            model_version="v1",
+            cache_dir=temp_dir / "cache",
+            local_only=True,
+        )
+
+        assert sim.test_stats_csv is not None
+        assert sim.test_stats_csv.exists()
+        assert sim._calibration_targets_dir == sample_calibration_targets_dir
+
+    def test_both_csv_and_yaml_raises(
+        self, sample_calibration_targets_dir, sample_test_stats_csv, sample_priors_csv, temp_dir
+    ):
+        """Providing both test_stats_csv and calibration_targets raises ValueError."""
+        with pytest.raises(ValueError, match="Provide test_stats_csv OR calibration_targets"):
+            QSPSimulator(
+                priors_csv=sample_priors_csv,
+                test_stats_csv=sample_test_stats_csv,
+                calibration_targets=sample_calibration_targets_dir,
+                model_version="v1",
+                cache_dir=temp_dir / "cache",
+                local_only=True,
+            )
+
+    def test_calibration_targets_creates_pool(
+        self, sample_calibration_targets_dir, sample_priors_csv, temp_dir
+    ):
+        """Pool is created when using calibration_targets."""
+        sim = QSPSimulator(
+            priors_csv=sample_priors_csv,
+            calibration_targets=sample_calibration_targets_dir,
+            model_version="v1",
+            cache_dir=temp_dir / "cache",
+            local_only=True,
+        )
+
+        assert sim.pool is not None
+        assert sim.pool.pool_dir.exists()
+
+    def test_calibration_targets_temp_csv_has_correct_columns(
+        self, sample_calibration_targets_dir, sample_priors_csv, temp_dir
+    ):
+        """Temp CSV generated from YAML has expected columns."""
+        sim = QSPSimulator(
+            priors_csv=sample_priors_csv,
+            calibration_targets=sample_calibration_targets_dir,
+            model_version="v1",
+            cache_dir=temp_dir / "cache",
+            local_only=True,
+        )
+
+        df = pd.read_csv(sim.test_stats_csv)
+        assert "test_statistic_id" in df.columns
+        assert "model_output_code" in df.columns
+        assert "median" in df.columns
+        assert df.iloc[0]["test_statistic_id"] == "test_ratio"
+
+
+class TestGetObservedDataCalibrationTargets:
+    """Tests for get_observed_data with calibration_targets."""
+
+    def test_get_observed_data_from_yaml(self, sample_calibration_targets_dir):
+        """get_observed_data works with calibration_targets kwarg."""
+        from qsp_hpc.simulation.qsp_simulator import get_observed_data
+
+        obs = get_observed_data(calibration_targets=sample_calibration_targets_dir)
+        assert "test_ratio" in obs
+        assert obs["test_ratio"].shape == (1, 1)
+        assert obs["test_ratio"][0, 0] == pytest.approx(100.0)
+
+    def test_get_observed_data_both_raises(
+        self, sample_calibration_targets_dir, sample_test_stats_csv
+    ):
+        """Providing both sources raises ValueError."""
+        from qsp_hpc.simulation.qsp_simulator import get_observed_data
+
+        with pytest.raises(ValueError, match="Provide test_stats_csv OR calibration_targets"):
+            get_observed_data(
+                test_stats_csv=sample_test_stats_csv,
+                calibration_targets=sample_calibration_targets_dir,
+            )
+
+    def test_get_observed_data_neither_raises(self):
+        """Providing neither source raises ValueError."""
+        from qsp_hpc.simulation.qsp_simulator import get_observed_data
+
+        with pytest.raises(ValueError, match="Must provide either"):
+            get_observed_data()

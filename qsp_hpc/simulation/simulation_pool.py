@@ -91,8 +91,9 @@ class SimulationPoolManager:
         model_version: str,
         model_description: str,
         priors_csv: Union[str, Path],
-        test_stats_csv: Union[str, Path],
-        model_script: str,
+        test_stats_csv: Optional[Union[str, Path]] = None,
+        calibration_targets: Optional[Union[str, Path]] = None,
+        model_script: str = "",
         scenario: str = "default",
     ):
         """
@@ -103,23 +104,41 @@ class SimulationPoolManager:
             model_version: Descriptive version name (e.g., 'baseline_gvax')
             model_description: Brief description of model configuration
             priors_csv: Path to priors CSV file
-            test_stats_csv: Path to test statistics CSV file
+            test_stats_csv: Path to test statistics CSV file (mutually exclusive
+                           with calibration_targets)
+            calibration_targets: Path to directory of calibration target YAML files
+                                (mutually exclusive with test_stats_csv)
             model_script: MATLAB model script name
             scenario: Scenario name (e.g., 'baseline_no_treatment', 'gvax_standard_regimen')
         """
+        if test_stats_csv is not None and calibration_targets is not None:
+            raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
+        if test_stats_csv is None and calibration_targets is None:
+            raise ValueError("Must provide either test_stats_csv or calibration_targets")
+
         self.cache_dir = Path(cache_dir)
         self.model_version = model_version
         self.model_description = model_description
         self.priors_csv = Path(priors_csv)
-        self.test_stats_csv = Path(test_stats_csv)
         self.model_script = model_script
         self.scenario = scenario
+        self._calibration_targets_dir = None
+
+        if calibration_targets is not None:
+            self._calibration_targets_dir = Path(calibration_targets)
+            if not self._calibration_targets_dir.exists():
+                raise FileNotFoundError(
+                    f"Calibration targets directory not found: {self._calibration_targets_dir}"
+                )
+            self.test_stats_csv = None  # Not used when calibration_targets provided
+        else:
+            self.test_stats_csv = Path(test_stats_csv)
+            if not self.test_stats_csv.exists():
+                raise FileNotFoundError(f"Test statistics CSV not found: {self.test_stats_csv}")
 
         # Verify files exist
         if not self.priors_csv.exists():
             raise FileNotFoundError(f"Priors CSV not found: {self.priors_csv}")
-        if not self.test_stats_csv.exists():
-            raise FileNotFoundError(f"Test statistics CSV not found: {self.test_stats_csv}")
 
         # Compute configuration hash
         self.config_hash = self._compute_config_hash()
@@ -151,7 +170,10 @@ class SimulationPoolManager:
         # Log pool configuration (verbose)
         self.logger.debug(f"  Config hash: {self.config_hash[:16]}...")
         self.logger.debug(f"  Priors: {self.priors_csv}")
-        self.logger.debug(f"  Test stats: {self.test_stats_csv}")
+        if self._calibration_targets_dir is not None:
+            self.logger.debug(f"  Calibration targets: {self._calibration_targets_dir}")
+        else:
+            self.logger.debug(f"  Test stats: {self.test_stats_csv}")
 
     def _compute_config_hash(self) -> str:
         """
@@ -159,7 +181,7 @@ class SimulationPoolManager:
 
         Hash is based on:
         - Priors CSV content (parameter names, distributions, ranges)
-        - Test statistics CSV content (observable definitions)
+        - Test statistics CSV content OR calibration target YAML contents
         - Model script name
         - Model version
         - Scenario name
@@ -173,9 +195,15 @@ class SimulationPoolManager:
         priors_content = self.priors_csv.read_text()
         hasher.update(priors_content.encode("utf-8"))
 
-        # Hash test statistics CSV content
-        test_stats_content = self.test_stats_csv.read_text()
-        hasher.update(test_stats_content.encode("utf-8"))
+        # Hash observables source (either CSV or YAML directory)
+        if self._calibration_targets_dir is not None:
+            from qsp_hpc.calibration import hash_calibration_targets
+
+            cal_hash = hash_calibration_targets(self._calibration_targets_dir)
+            hasher.update(cal_hash.encode("utf-8"))
+        else:
+            test_stats_content = self.test_stats_csv.read_text()
+            hasher.update(test_stats_content.encode("utf-8"))
 
         # Hash model script name
         hasher.update(self.model_script.encode("utf-8"))

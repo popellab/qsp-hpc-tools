@@ -1,9 +1,9 @@
 function species_data = extract_all_species_arrays(chunk_results, model)
-%EXTRACT_ALL_SPECIES_ARRAYS Extract time, species, and compartments from simulation results
+%EXTRACT_ALL_SPECIES_ARRAYS Extract time, species, rule params, and compartments from simulation results
 %
-% This function extracts full simulation outputs (time, all species, and
-% compartment volumes) from SimBiology simulation results for saving to
-% persistent storage.
+% This function extracts full simulation outputs (time, all species,
+% non-constant parameters from repeatedAssignment rules, and compartment
+% volumes) from SimBiology simulation results for saving to persistent storage.
 %
 % Inputs:
 %   chunk_results  - Struct array with .simData fields (SimData objects)
@@ -13,7 +13,7 @@ function species_data = extract_all_species_arrays(chunk_results, model)
 %   species_data   - Struct with fields:
 %                    .n_sims         - Number of simulations
 %                    .n_timepoints   - Number of time points per simulation
-%                    .n_species      - Number of species + compartments
+%                    .n_species      - Number of species + rule params + compartments
 %                    .species_names  - Cell array of names (1 x n_species)
 %                    .time_arrays    - Cell array of time vectors (n_sims x 1)
 %                    .species_arrays - Cell array of data matrices (n_sims x n_species)
@@ -52,16 +52,30 @@ for i = 1:length(all_compartments)
     end
 end
 
-% Combine species and compartment names
-% Compartments come after species for backwards compatibility
-species_names = [species_names, compartment_names];
+% Also get non-constant parameters (repeatedAssignment rule targets like pO2, HIF, glc)
+% These are algebraic parameters that appear in simData but are not type 'species'.
+% They are created with addparameter(..., 'ConstantValue', false) + addrule(..., 'repeatedAssignment').
+all_params = sbioselect(model, 'Type', 'parameter');
+rule_param_names = {};
+for i = 1:length(all_params)
+    if ~all_params(i).ConstantValue
+        rule_param_names{end+1} = all_params(i).Name; %#ok<AGROW>
+    end
+end
+
+% Combine species, rule parameters, and compartment names
+species_names = [species_names, rule_param_names, compartment_names];
 n_species = length(species_names);
 n_compartments = length(compartment_names);
+n_rule_params = length(rule_param_names);
 
 n_constant = length(constant_compartments);
 n_nonconstant = n_compartments - n_constant;
-fprintf('   Extracting %d species + %d compartments (%d constant, %d non-constant) from %d simulations...\n', ...
-    n_species - n_compartments, n_compartments, n_constant, n_nonconstant, n_sims);
+fprintf('   Extracting %d species + %d rule params + %d compartments (%d constant, %d non-constant) from %d simulations...\n', ...
+    n_species - n_compartments - n_rule_params, n_rule_params, n_compartments, n_constant, n_nonconstant, n_sims);
+if n_rule_params > 0
+    fprintf('   Rule parameters: %s\n', strjoin(rule_param_names, ', '));
+end
 
 % Initialize output arrays
 time_arrays = cell(n_sims, 1);

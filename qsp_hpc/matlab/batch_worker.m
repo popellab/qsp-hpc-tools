@@ -150,6 +150,19 @@ try
             'rel_tolerance', 1e-9);
     end
 
+    % Apply model acceleration if requested (compile to C for faster simulation)
+    if isfield(model_data, 'sim_config') && isfield(model_data.sim_config, 'accelerate_model') && model_data.sim_config.accelerate_model
+        fprintf('   Accelerating model with sbioaccelerate...\n');
+        t_accel_start = tic;
+        try
+            sbioaccelerate(model);
+            t_accel = toc(t_accel_start);
+            fprintf('   ✓ Model accelerated in %.1f seconds\n', t_accel);
+        catch accel_err
+            fprintf('   ⚠️  sbioaccelerate failed: %s (continuing without acceleration)\n', accel_err.message);
+        end
+    end
+
     % Update model_data with fresh objects
     model_data.model = model;
     model_data.dose_schedule = dose_schedule;

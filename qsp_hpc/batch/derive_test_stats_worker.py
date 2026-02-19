@@ -180,7 +180,9 @@ def compute_test_statistics_batch(
                     val = sim_row[species_name]
 
                     # Get unit string from species_units, default to dimensionless
-                    unit_str = species_units.get(species_name, "dimensionless")
+                    # Handle both flat format ("cell") and nested format ({"units": "cell", ...})
+                    unit_info = species_units.get(species_name, "dimensionless")
+                    unit_str = unit_info["units"] if isinstance(unit_info, dict) else unit_info
                     unit = ureg.parse_expression(unit_str)
 
                     # Check if it's a scalar (parameter) or array (species time-series)

@@ -147,12 +147,12 @@ classdef test_save_species_to_parquet < matlab.unittest.TestCase
 
             testCase.verifyTrue(exist(output_file, 'file') == 2);
 
-            % Verify parameters are in columns
+            % Verify parameters are in columns (with param: prefix)
             columns = testCase.getParquetColumns(output_file);
-            testCase.verifyTrue(any(strcmp(columns, 'k_elimination')), ...
-                'k_elimination parameter should be a column');
-            testCase.verifyTrue(any(strcmp(columns, 'V_distribution')), ...
-                'V_distribution parameter should be a column');
+            testCase.verifyTrue(any(strcmp(columns, 'param:k_elimination')), ...
+                'param:k_elimination parameter should be a column');
+            testCase.verifyTrue(any(strcmp(columns, 'param:V_distribution')), ...
+                'param:V_distribution parameter should be a column');
         end
 
         function test_species_columns_created(testCase)

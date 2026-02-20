@@ -1293,9 +1293,12 @@ class HPCJobManager:
 
         self.logger.info(f"   Time points: {len(time)} ({time[0]:.1f} to {time[-1]:.1f})")
 
-        # Get species columns (exclude metadata: simulation_id, status, time)
+        # Get species columns (exclude metadata and param: prefixed columns)
         metadata_cols = {"simulation_id", "status", "time"}
-        species_names = [col for col in df.columns if col not in metadata_cols]
+        species_names = [
+            col for col in df.columns
+            if col not in metadata_cols and not col.startswith("param:")
+        ]
 
         self.logger.info(f"   Species: {len(species_names)} total")
 

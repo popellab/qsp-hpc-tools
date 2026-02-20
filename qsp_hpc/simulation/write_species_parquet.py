@@ -67,18 +67,20 @@ def write_species_parquet(json_file: str, output_file: str) -> None:
             param_values = param_values.reshape(n_sims, len(param_names))
 
     # Build Parquet table
-    # Schema: simulation_id | param_1 | param_2 | ... | status | time | species_1 | species_2 | ...
-    # Parameters come first (as scalars), then time + species (as list columns)
+    # Schema: simulation_id | param:name_1 | param:name_2 | ... | status | time | species_1 | ...
+    # Parameter columns are prefixed with "param:" to avoid name collisions with species
+    # columns (e.g., "k_C1_growth" exists as both a parameter and a SimBiology species).
+    # Without the prefix, species list columns overwrite parameter scalar columns.
+    param_prefix = "param:"
 
     records = []
     for i in range(n_sims):
         record = {"simulation_id": i, "status": status[i]}
 
-        # Add parameters (if provided) - use actual parameter names as column names
+        # Add parameters (if provided) - prefix with "param:" to avoid species collisions
         if param_names and len(param_values) > 0:
             for j, param_name in enumerate(param_names):
-                # Use actual parameter name directly (e.g., "k_C1_growth", "gamma_CAF")
-                record[param_name] = float(param_values[i][j])
+                record[f"{param_prefix}{param_name}"] = float(param_values[i][j])
 
         # Add time array
         record["time"] = time_arrays[i] if time_arrays[i] else []

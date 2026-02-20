@@ -85,10 +85,10 @@ class TestWriteSpeciesParquet:
         write_species_parquet(str(json_file), str(output_file))
 
         df = pd.read_parquet(output_file)
-        assert "k_growth" in df.columns
-        assert "k_death" in df.columns
-        assert df.loc[0, "k_growth"] == 0.1
-        assert df.loc[1, "k_death"] == 0.08
+        assert "param:k_growth" in df.columns
+        assert "param:k_death" in df.columns
+        assert df.loc[0, "param:k_growth"] == 0.1
+        assert df.loc[1, "param:k_death"] == 0.08
 
     def test_parameter_reshaping_1d_to_2d(self, temp_dir):
         """Test parameter value reshaping for single simulation."""
@@ -112,8 +112,8 @@ class TestWriteSpeciesParquet:
         write_species_parquet(str(json_file), str(output_file))
 
         df = pd.read_parquet(output_file)
-        assert df.loc[0, "k_growth"] == 0.1
-        assert df.loc[0, "k_death"] == 0.05
+        assert df.loc[0, "param:k_growth"] == 0.1
+        assert df.loc[0, "param:k_death"] == 0.05
 
     def test_species_names_with_dots(self, temp_dir):
         """Test that dots in species names are preserved (SimBiology convention)."""

@@ -245,28 +245,21 @@ def process_single_batch(
     n_sims = len(sim_df)
     logger.info(f"  Loaded {n_sims} simulations")
 
-    # Extract parameter columns
-    # Parameters are scalar columns (not lists) that are not metadata columns
-    metadata_cols = {"simulation_id", "status", "time"}
-    param_cols = []
-    for col in sim_df.columns:
-        if col not in metadata_cols:
-            # Check if column contains scalar values (not lists)
-            sample_val = sim_df[col].iloc[0]
-            if not isinstance(sample_val, (list, np.ndarray)):
-                param_cols.append(col)
+    # Extract parameter columns (identified by "param:" prefix in parquet)
+    param_prefix = "param:"
+    param_cols = [col for col in sim_df.columns if col.startswith(param_prefix)]
+    clean_names = [col[len(param_prefix):] for col in param_cols]
 
     if param_cols:
         logger.debug(
             f"  Found {len(param_cols)} parameter columns: "
-            f"{param_cols[:5]}{'...' if len(param_cols) > 5 else ''}"
+            f"{clean_names[:5]}{'...' if len(clean_names) > 5 else ''}"
         )
 
-        # Save parameters to chunk_XXX_params.csv
+        # Save parameters to chunk_XXX_params.csv (strip prefix for clean names)
         params_output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_params.csv"
-
-        # Extract parameter values (n_sims x n_params)
-        params_df = sim_df[param_cols]
+        params_df = sim_df[param_cols].copy()
+        params_df.columns = clean_names
         params_df.to_csv(params_output_file, index=False, float_format="%.12e")
 
         logger.debug(f"  ✓ Parameters saved: {params_output_file.name}")

@@ -369,6 +369,13 @@ for i = 1:n_patients
     if i > 1, delete(model_copy); end
 
     try
+        % Suppress SimBiology complex-number warning during ODE integration.
+        % This fires millions of times per batch (e.g., 700k in a single task)
+        % due to the TCR quadratic discriminant and cancer_module ^(2/3) terms.
+        % The solver drops the imaginary part and continues; suppressing the
+        % warning prevents massive stdout bloat and speeds up straggler tasks.
+        warning('off', 'SimBiology:SimFunction:COMPLEX_DATA');
+
         % Create model copy and parameter variant
         model_copy = copyobj(model);
         variant = create_parameter_variant_worker(model_copy, chunk_params, i);

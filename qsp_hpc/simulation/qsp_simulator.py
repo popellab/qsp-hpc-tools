@@ -413,17 +413,66 @@ class QSPSimulator:
         """Log error message."""
         self.logger.error(msg)
 
-    def _generate_parameters(self, n_samples: int) -> np.ndarray:
+    @staticmethod
+    def _sample_truncated_lognormal(
+        rng: np.random.Generator,
+        mu: float,
+        sigma: float,
+        size: int,
+        lb: float = 0.0,
+        ub: float = np.inf,
+    ) -> np.ndarray:
         """
-        Generate parameter samples from priors.
+        Sample from a truncated lognormal via inverse CDF.
+
+        Works in log-space: lognormal(mu, sigma) = exp(Normal(mu, sigma)),
+        so truncating [lb, ub] in real space = truncating [log(lb), log(ub)]
+        in normal space.
+
+        Args:
+            rng: numpy random Generator
+            mu: Mean of the underlying normal (log-space)
+            sigma: Std dev of the underlying normal (log-space)
+            size: Number of samples
+            lb: Lower bound in real space (must be > 0)
+            ub: Upper bound in real space (can be inf)
+
+        Returns:
+            Array of shape (size,) with values in [lb, ub]
+        """
+        from scipy.stats import truncnorm
+
+        # Convert bounds to standardized normal space: z = (log(x) - mu) / sigma
+        a = (np.log(lb) - mu) / sigma if lb > 0 else -np.inf
+        b = (np.log(ub) - mu) / sigma if np.isfinite(ub) else np.inf
+
+        z = truncnorm.rvs(a, b, loc=mu, scale=sigma, size=size, random_state=rng)
+        return np.exp(z)
+
+    def _generate_parameters(
+        self, n_samples: int, rng: Optional[np.random.Generator] = None
+    ) -> np.ndarray:
+        """
+        Generate parameter samples from priors with analytical constraint enforcement.
+
+        Uses truncated lognormal sampling (inverse CDF) to enforce bounds from the
+        priors CSV, and conditional truncated sampling to enforce k_C1_growth > k_C1_death.
+        No rejection loops needed — all constraints are satisfied in one pass.
 
         Args:
             n_samples: Number of parameter sets to generate
+            rng: Optional numpy random Generator to use (default: self.param_rng)
 
         Returns:
             numpy array of shape (n_samples, num_params)
         """
         import pandas as pd
+
+        if rng is None:
+            rng = self.param_rng
+
+        if n_samples == 0:
+            return np.zeros((0, len(self.param_names)))
 
         # Load priors CSV
         priors_df = pd.read_csv(self.priors_csv)
@@ -432,15 +481,65 @@ class QSPSimulator:
         dist_param1 = priors_df["dist_param1"].values
         dist_param2 = priors_df["dist_param2"].values
 
-        # Generate samples
+        # Extract bounds (may not exist in all CSVs)
+        has_bounds = "lower_bound" in priors_df.columns and "upper_bound" in priors_df.columns
+        lower_bounds = priors_df["lower_bound"].values if has_bounds else None
+        upper_bounds = priors_df["upper_bound"].values if has_bounds else None
+
+        # Identify growth/death indices for conditional sampling
+        has_growth_death = "k_C1_growth" in param_names and "k_C1_death" in param_names
+        if has_growth_death:
+            gi = param_names.index("k_C1_growth")
+            di = param_names.index("k_C1_death")
+
+        # --- Sample all parameters (truncated if bounds exist) ---
         samples = np.zeros((n_samples, len(param_names)))
         for i in range(len(param_names)):
-            if dist_types[i] == "lognormal":
-                samples[:, i] = self.param_rng.lognormal(
-                    mean=dist_param1[i], sigma=dist_param2[i], size=n_samples
+            if dist_types[i] != "lognormal":
+                raise ValueError(f"Unsupported distribution: {dist_types[i]}")
+
+            lb = lower_bounds[i] if lower_bounds is not None and np.isfinite(lower_bounds[i]) else 0.0
+            ub = upper_bounds[i] if upper_bounds is not None and np.isfinite(upper_bounds[i]) else np.inf
+
+            # Skip k_C1_growth — will be sampled conditionally after k_C1_death
+            if has_growth_death and i == gi:
+                continue
+
+            if lb > 0 or np.isfinite(ub):
+                samples[:, i] = self._sample_truncated_lognormal(
+                    rng, dist_param1[i], dist_param2[i], n_samples, lb=lb, ub=ub,
                 )
             else:
-                raise ValueError(f"Unsupported distribution: {dist_types[i]}")
+                samples[:, i] = rng.lognormal(
+                    mean=dist_param1[i], sigma=dist_param2[i], size=n_samples
+                )
+
+        # --- Conditional sampling: k_C1_growth > k_C1_death (vectorized) ---
+        if has_growth_death:
+            from scipy.stats import norm
+
+            growth_lb_base = lower_bounds[gi] if lower_bounds is not None and np.isfinite(lower_bounds[gi]) else 0.0
+            growth_ub = upper_bounds[gi] if upper_bounds is not None and np.isfinite(upper_bounds[gi]) else np.inf
+            mu_g, sig_g = dist_param1[gi], dist_param2[gi]
+
+            # Per-row lower bound in real space: growth > max(csv_lb, death_value)
+            effective_lb = np.maximum(growth_lb_base, samples[:, di])
+
+            # Convert to standardized normal CDF values for inverse CDF sampling
+            a = (np.log(effective_lb) - mu_g) / sig_g  # per-row lower bound in z-space
+            b = (np.log(growth_ub) - mu_g) / sig_g if np.isfinite(growth_ub) else np.inf
+
+            # Sample U ~ Uniform(Phi(a), Phi(b)), then z = Phi^{-1}(U), x = exp(mu + sigma*z)
+            cdf_a = norm.cdf(a)  # vectorized over rows
+            cdf_b = norm.cdf(b)  # scalar
+            u = rng.uniform(cdf_a, cdf_b)
+            z = norm.ppf(u)
+            samples[:, gi] = np.exp(mu_g + sig_g * z)
+
+            self._info(
+                f"Growth > death constraint: sampled k_C1_growth conditionally "
+                f"(min ratio={np.min(samples[:, gi] / samples[:, di]):.3f})"
+            )
 
         return samples  # type: ignore[no-any-return]
 
@@ -954,27 +1053,11 @@ class QSPSimulator:
             for line in format_config(config_info):
                 self.logger.info(line)
 
-            # Sample parameters from prior
+            # Sample parameters from prior (with constraint enforcement)
             self.logger.info(f"Sampling {n_sims} parameter sets from prior (seed={seed})")
-
-            # Create temporary RNG with the specified seed
             temp_rng = np.random.default_rng(seed)
-
-            # Generate parameters using the temporary RNG
-            priors_df = pd.read_csv(self.priors_csv)
-            param_names = priors_df["name"].tolist()
-            dist_types = priors_df["distribution"].tolist()
-            dist_param1 = priors_df["dist_param1"].values
-            dist_param2 = priors_df["dist_param2"].values
-
-            params = np.zeros((n_sims, len(param_names)))
-            for i in range(len(param_names)):
-                if dist_types[i] == "lognormal":
-                    params[:, i] = temp_rng.lognormal(
-                        mean=dist_param1[i], sigma=dist_param2[i], size=n_sims
-                    )
-                else:
-                    raise ValueError(f"Unsupported distribution: {dist_types[i]}")
+            params = self._generate_parameters(n_sims, rng=temp_rng)
+            param_names = self.param_names
 
             self.logger.info(f"✓ Generated {params.shape[0]} × {params.shape[1]} parameter matrix")
 

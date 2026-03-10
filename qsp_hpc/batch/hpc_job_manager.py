@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 import yaml
 
 from qsp_hpc.batch.hpc_file_transfer import HPCFileTransfer
@@ -930,7 +931,13 @@ class HPCJobManager:
         status, output = self.transport.exec(
             f'ls "{pool_path}"/batch_*.parquet 2>/dev/null | wc -l'
         )
-        total_batches = int(output.strip()) if output.strip().isdigit() else 0
+        # Extract numeric count robustly (HPC login wrapper may inject error text)
+        total_batches = 0
+        for line in reversed(output.strip().split("\n")):
+            line = line.strip()
+            if line.isdigit():
+                total_batches = int(line)
+                break
 
         if total_batches == 0:
             self.logger.warning(f"No Parquet batches found in {pool_path}")
@@ -1064,6 +1071,117 @@ class HPCJobManager:
 
         self.logger.info(f"   🚀 Derivation job {job_id} (single task, {n_batches} batches)")
         return job_id
+
+    def submit_trajectory_grid_job(
+        self,
+        pool_path: str,
+        species_list: list | str,
+        time_grid: list[float] | str,
+        output_subdir: str = "trajectory_grid",
+        scenario_name: str = "",
+        stop_time: float = 21.0,
+    ) -> str:
+        """Submit SLURM job to extract trajectory grid from full simulations.
+
+        Args:
+            pool_path: Path to simulation pool on HPC
+            species_list: List of species to extract, or "all"
+            time_grid: List of timepoints (days), or "daily"
+            output_subdir: Subdirectory name within pool for output
+            scenario_name: Label for the scenario
+            stop_time: Used with time_grid="daily" to set endpoint
+
+        Returns:
+            SLURM job ID
+        """
+        self.logger.info("Preparing trajectory grid extraction job:")
+        self.logger.info(f"  Pool: {pool_path}")
+        self.logger.info(
+            f"  Species: {species_list if isinstance(species_list, str) else f'{len(species_list)} species'}"
+        )
+        self.logger.info(f"  Time grid: {time_grid}")
+
+        self.ensure_hpc_venv()
+
+        derivation_dir = f"{self.config.remote_project_path}/batch_jobs/derivation"
+        self.transport.exec(f'mkdir -p "{derivation_dir}"')
+
+        # Expand $HOME
+        status, home_dir = self.transport.exec("echo $HOME")
+        home_dir = home_dir.strip()
+        expanded_pool_path = pool_path.replace("$HOME", home_dir)
+
+        # Build config
+        config = {
+            "simulation_pool_dir": expanded_pool_path,
+            "species_list": species_list,
+            "time_grid": time_grid,
+            "output_dir": f"{expanded_pool_path}/{output_subdir}",
+            "scenario_name": scenario_name,
+            "stop_time": stop_time,
+        }
+
+        import tempfile as _tempfile
+
+        with _tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            import json as _json
+
+            _json.dump(config, f, indent=2)
+            temp_config = f.name
+
+        remote_config = f"{derivation_dir}/traj_grid_config_{scenario_name or 'default'}.json"
+        self.transport.upload(temp_config, remote_config)
+        Path(temp_config).unlink()
+
+        job_id = self.slurm_submitter.submit_trajectory_grid_job(
+            grid_config=remote_config,
+            derivation_dir=derivation_dir,
+        )
+
+        self.logger.info(f"   🚀 Trajectory grid job {job_id}")
+        return job_id
+
+    def download_trajectory_grid(
+        self,
+        pool_path: str,
+        output_subdir: str,
+        local_dest: Path,
+    ) -> tuple:
+        """Download trajectory grid from HPC.
+
+        Args:
+            pool_path: Path to simulation pool on HPC
+            output_subdir: Subdirectory within pool containing the grid
+            local_dest: Local directory to download to
+
+        Returns:
+            Tuple of (grid_df, meta) — DataFrame and metadata dict
+        """
+        import json as _json
+
+        if "$HOME" in pool_path:
+            status, home_dir = self.transport.exec("echo $HOME")
+            pool_path = pool_path.replace("$HOME", home_dir.strip())
+
+        remote_dir = f"{pool_path}/{output_subdir}"
+        local_dest.mkdir(parents=True, exist_ok=True)
+
+        # Download parquet and metadata
+        remote_parquet = f"{remote_dir}/trajectory_grid.parquet"
+        remote_meta = f"{remote_dir}/trajectory_meta.json"
+        local_parquet = local_dest / "trajectory_grid.parquet"
+        local_meta = local_dest / "trajectory_meta.json"
+
+        self.logger.info(f"Downloading trajectory grid from {remote_dir}...")
+        self.transport.download(remote_parquet, str(local_parquet))
+        self.transport.download(remote_meta, str(local_meta))
+
+        grid_df = pd.read_parquet(local_parquet)
+        with open(local_meta) as f:
+            meta = _json.load(f)
+
+        self.logger.info(f"  Downloaded: {grid_df.shape[0]} sims × {grid_df.shape[1]} columns")
+        return grid_df, meta
 
     def download_test_stats(
         self, pool_path: str, test_stats_hash: str, local_dest: Path
@@ -1296,8 +1414,7 @@ class HPCJobManager:
         # Get species columns (exclude metadata and param: prefixed columns)
         metadata_cols = {"simulation_id", "status", "time"}
         species_names = [
-            col for col in df.columns
-            if col not in metadata_cols and not col.startswith("param:")
+            col for col in df.columns if col not in metadata_cols and not col.startswith("param:")
         ]
 
         self.logger.info(f"   Species: {len(species_names)} total")

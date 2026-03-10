@@ -34,6 +34,7 @@ def run_batch_worker(
     simulation_pool_path: Optional[Path] = None,
     simulation_pool_id: str = "local_pool",
     verbose: bool = False,
+    work_dir: Optional[Path] = None,
 ) -> Path:
     """
     Run batch_worker.m and return path to output parquet file.
@@ -68,13 +69,20 @@ def run_batch_worker(
         params = params.reshape(1, -1)
     n_sims = params.shape[0]
 
-    # Set up directory structure (same as HPC)
-    batch_jobs_dir = project_root / "batch_jobs"
-    input_dir = batch_jobs_dir / "input"
-    output_dir = batch_jobs_dir / "output"
+    # Set up directory structure
+    # When work_dir is provided (parallel workers), use isolated input/output dirs
+    # to avoid race conditions on params.csv and job_config.json
+    if work_dir is not None:
+        input_dir = work_dir / "input"
+        output_dir = work_dir / "output"
+    else:
+        batch_jobs_dir = project_root / "batch_jobs"
+        input_dir = batch_jobs_dir / "input"
+        output_dir = batch_jobs_dir / "output"
 
     # Use provided simulation_pool_path or default to batch_jobs/simulation_pool
     if simulation_pool_path is None:
+        batch_jobs_dir = project_root / "batch_jobs"
         pool_dir = batch_jobs_dir / "simulation_pool"
     else:
         pool_dir = simulation_pool_path
@@ -100,7 +108,7 @@ def run_batch_worker(
     # Write job config (same format as HPC)
     config = {
         "model_script": model_script,
-        "param_csv": str((input_dir / "params.csv").relative_to(project_root)),
+        "param_csv": str((input_dir / "params.csv").absolute()),
         "n_simulations": int(n_sims),
         "seed": int(seed),
         "jobs_per_chunk": int(n_sims),
@@ -128,6 +136,7 @@ def run_batch_worker(
     env["SLURM_JOB_ID"] = "local"
     env["SLURMD_NODENAME"] = "localhost"
     env["SIMULATION_POOL_PATH"] = str(pool_dir.absolute())
+    env["BATCH_INPUT_DIR"] = str(input_dir.absolute())
 
     # Set HPC_VENV_PATH to current Python environment (for write_species_parquet.py)
     env["HPC_VENV_PATH"] = sys.prefix  # Points to current venv or Python installation

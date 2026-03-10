@@ -679,6 +679,7 @@ class TestHelperFunctions:
 
     def test_update_pool_with_results(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
         fake_pool = Mock()
+        fake_pool._scan_batches.return_value = []  # No stale batches to remove
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
@@ -2666,7 +2667,12 @@ class TestPriorPPCSimulationReuse:
     def test_posterior_ppc_does_not_reuse_prior_simulations(
         self, temp_dir, sample_priors_csv, sample_test_stats_csv
     ):
-        """Test that posterior PPCs with specific parameters do NOT reuse prior simulations."""
+        """Test that posterior PPCs with specific parameters do NOT reuse prior simulations.
+
+        The suffix pool (keyed by theta hash) is checked on HPC, not the shared pool.
+        Since the suffix pool is empty, it falls through to running new simulations
+        and persisting them to the suffix pool.
+        """
         # Create mock job manager that simulates having prior simulations available
         fake_job_manager = MagicMock()
         fake_job_manager.config.simulation_pool_path = "/fake/pool"
@@ -2674,6 +2680,7 @@ class TestPriorPPCSimulationReuse:
         # Simulate that shared pool has 200 prior simulations available
         fake_job_manager.result_collector.check_pool_directory_exists = MagicMock(return_value=True)
         fake_job_manager.result_collector.count_pool_simulations = MagicMock(return_value=200)
+        # HPC suffix pool has no test stats for this theta hash
         fake_job_manager.check_hpc_test_stats = MagicMock(return_value=False)
 
         # Create simulator
@@ -2688,9 +2695,10 @@ class TestPriorPPCSimulationReuse:
             job_manager=fake_job_manager,
         )
 
-        # Mock the actual simulation execution
+        # Mock the actual simulation execution (returns (params, observables) tuple)
+        mock_params = np.random.randn(200, 8)
         mock_observables = np.random.randn(200, 12)
-        sim._run_matlab_simulation = MagicMock(return_value=mock_observables)
+        sim._run_matlab_simulation = MagicMock(return_value=(mock_params, mock_observables))
 
         # Create specific posterior parameter values
         posterior_params = np.random.randn(200, 8)
@@ -2701,12 +2709,197 @@ class TestPriorPPCSimulationReuse:
         # Verify we ran MATLAB simulation instead of reusing from shared pool
         sim._run_matlab_simulation.assert_called_once()
 
-        # Verify we did NOT check/download from HPC pool
-        fake_job_manager.check_hpc_test_stats.assert_not_called()
+        # Verify the HPC check was on the SUFFIX pool path (contains theta hash),
+        # not the shared pool path
+        hpc_call_args = fake_job_manager.check_hpc_test_stats.call_args
+        assert hpc_call_args is not None, "Expected HPC check on suffix pool"
+        suffix_pool_path = hpc_call_args[0][0]
+        assert (
+            "posterior_ppc_" in suffix_pool_path
+        ), f"HPC check should target suffix pool, got: {suffix_pool_path}"
 
         # Verify we got results back
         assert test_stats.shape[0] == 200
         assert np.array_equal(test_stats, mock_observables)
+
+    def test_simulate_with_params_local_pool_hit(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv
+    ):
+        """When the local suffix pool already has enough sims, skip HPC entirely."""
+        fake_job_manager = MagicMock()
+        fake_job_manager.config.simulation_pool_path = "/fake/pool"
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_script="test_model",
+            model_version="v1",
+            scenario="default",
+            cache_dir=temp_dir,
+            job_manager=fake_job_manager,
+        )
+
+        posterior_params = np.random.randn(50, 3)
+        mock_observables = np.random.randn(50, 3)
+
+        # Pre-populate the suffix pool via the internal helper
+        suffix_pool = MagicMock()
+        suffix_pool.get_available_simulations.return_value = 50
+        suffix_pool.load_simulations.return_value = (posterior_params, mock_observables)
+        sim._get_or_create_suffix_pool = MagicMock(return_value=suffix_pool)
+
+        # Mock _run_matlab_simulation — should NOT be called
+        sim._run_matlab_simulation = MagicMock()
+
+        result = sim.simulate_with_parameters(posterior_params, pool_suffix="ppc")
+
+        # No HPC check, no MATLAB run
+        fake_job_manager.check_hpc_test_stats.assert_not_called()
+        sim._run_matlab_simulation.assert_not_called()
+
+        # Got results from local pool
+        assert np.array_equal(result, mock_observables)
+
+    def test_simulate_with_params_hpc_recovery(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv
+    ):
+        """When HPC suffix pool has test stats, download and persist to local pool."""
+        fake_job_manager = MagicMock()
+        fake_job_manager.config.simulation_pool_path = "/fake/pool"
+
+        # HPC has derived test stats for this theta hash
+        fake_job_manager.check_hpc_test_stats.return_value = True
+
+        # Mock download_test_stats
+        n_sims, n_params, n_obs = 50, 3, 3
+        hpc_params = np.random.randn(n_sims, n_params)
+        hpc_test_stats = np.random.randn(n_sims, n_obs)
+        fake_job_manager.download_test_stats.return_value = (hpc_params, hpc_test_stats)
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_script="test_model",
+            model_version="v1",
+            scenario="default",
+            cache_dir=temp_dir,
+            job_manager=fake_job_manager,
+        )
+
+        posterior_params = np.random.randn(n_sims, n_params)
+
+        # Suffix pool starts empty, then returns data after add_batch
+        suffix_pool = MagicMock()
+        suffix_pool.get_available_simulations.return_value = 0
+        suffix_pool.load_simulations.return_value = (hpc_params, hpc_test_stats)
+        sim._get_or_create_suffix_pool = MagicMock(return_value=suffix_pool)
+
+        # _run_matlab_simulation should NOT be called
+        sim._run_matlab_simulation = MagicMock()
+
+        result = sim.simulate_with_parameters(posterior_params, pool_suffix="ppc")
+
+        # Verify HPC was checked and downloaded
+        fake_job_manager.check_hpc_test_stats.assert_called_once()
+        fake_job_manager.download_test_stats.assert_called_once()
+
+        # Verify add_batch was called on the suffix pool
+        suffix_pool.add_batch.assert_called_once()
+
+        # No MATLAB run
+        sim._run_matlab_simulation.assert_not_called()
+
+        assert np.array_equal(result, hpc_test_stats)
+
+    def test_simulate_with_params_persists_to_pool(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv
+    ):
+        """After running new sims, results are persisted to the local suffix pool."""
+        fake_job_manager = MagicMock()
+        fake_job_manager.config.simulation_pool_path = "/fake/pool"
+        fake_job_manager.check_hpc_test_stats.return_value = False
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_script="test_model",
+            model_version="v1",
+            scenario="default",
+            cache_dir=temp_dir,
+            job_manager=fake_job_manager,
+        )
+
+        n_sims, n_params, n_obs = 50, 3, 3
+        posterior_params = np.random.randn(n_sims, n_params)
+        mock_hpc_params = np.random.randn(n_sims, n_params)
+        mock_observables = np.random.randn(n_sims, n_obs)
+
+        sim._run_matlab_simulation = MagicMock(return_value=(mock_hpc_params, mock_observables))
+
+        # Suffix pool starts empty
+        suffix_pool = MagicMock()
+        suffix_pool.get_available_simulations.return_value = 0
+        sim._get_or_create_suffix_pool = MagicMock(return_value=suffix_pool)
+
+        result = sim.simulate_with_parameters(posterior_params, pool_suffix="ppc")
+
+        # Verify MATLAB was called
+        sim._run_matlab_simulation.assert_called_once()
+
+        # Verify add_batch was called on the suffix pool with HPC params
+        suffix_pool.add_batch.assert_called_once()
+        call_kwargs = suffix_pool.add_batch.call_args[1]
+        assert np.array_equal(call_kwargs["params_matrix"], mock_hpc_params)
+        assert np.array_equal(call_kwargs["observables_matrix"], mock_observables)
+
+        assert np.array_equal(result, mock_observables)
+
+    def test_simulate_with_params_different_theta_misses(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv
+    ):
+        """Two calls with different theta produce different pool scenarios (no cross-contamination)."""
+        fake_job_manager = MagicMock()
+        fake_job_manager.config.simulation_pool_path = "/fake/pool"
+        fake_job_manager.check_hpc_test_stats.return_value = False
+
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_script="test_model",
+            model_version="v1",
+            scenario="default",
+            cache_dir=temp_dir,
+            job_manager=fake_job_manager,
+        )
+
+        n_sims, n_params, n_obs = 20, 3, 3
+        theta_a = np.random.randn(n_sims, n_params)
+        theta_b = np.random.randn(n_sims, n_params)
+
+        sim._run_matlab_simulation = MagicMock(
+            return_value=(np.random.randn(n_sims, n_params), np.random.randn(n_sims, n_obs))
+        )
+
+        # Track which pool scenarios are created
+        created_scenarios = []
+
+        def tracking_get_or_create(pool_scenario):
+            created_scenarios.append(pool_scenario)
+            pool = MagicMock()
+            pool.get_available_simulations.return_value = 0
+            return pool
+
+        sim._get_or_create_suffix_pool = tracking_get_or_create
+
+        sim.simulate_with_parameters(theta_a, pool_suffix="ppc")
+        sim.simulate_with_parameters(theta_b, pool_suffix="ppc")
+
+        # Two different pool scenarios should have been created
+        assert len(created_scenarios) == 2
+        assert created_scenarios[0] != created_scenarios[1]
+        # Both should start with the same prefix
+        assert created_scenarios[0].startswith("ppc_")
+        assert created_scenarios[1].startswith("ppc_")
 
 
 # ============================================================================

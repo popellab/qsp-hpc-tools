@@ -30,14 +30,17 @@ try
     % Set up MATLAB environment
     startup; % Load project paths and settings
 
-    % Determine file paths using absolute paths
+    % Determine file paths
     current_dir = pwd;
     base_dir = fullfile(current_dir, 'batch_jobs');
-    input_dir = fullfile(base_dir, 'input');
+    input_dir = getenv('BATCH_INPUT_DIR');
+    if isempty(input_dir)
+        input_dir = fullfile(base_dir, 'input');
+    end
     output_dir = fullfile(base_dir, 'output');
 
     fprintf('   Working directory: %s\n', current_dir);
-    fprintf('   Base directory: %s\n', base_dir);
+    fprintf('   Input directory: %s\n', input_dir);
 
     % Load job configuration from JSON (replaces PSA setup script and model config)
     job_config_file = fullfile(input_dir, 'job_config.json');
@@ -57,7 +60,11 @@ try
     seed = job_config.seed;
     jobs_per_chunk = job_config.jobs_per_chunk;
     model_script = job_config.model_script;
-    param_csv_file = fullfile(current_dir, job_config.param_csv);
+    if startsWith(job_config.param_csv, '/')
+        param_csv_file = job_config.param_csv;
+    else
+        param_csv_file = fullfile(current_dir, job_config.param_csv);
+    end
 
     fprintf('   Job config: %d patients, seed=%d, chunk size=%d\n', ...
         n_patients, seed, jobs_per_chunk);
@@ -127,13 +134,13 @@ try
         sim_config = model_data.sim_config;
         fprintf('   Using passed simulation config:\n');
         fprintf('     Solver: %s\n', sim_config.solver);
-        fprintf('     Time: %.0f-%.0f %s (daily intervals)\n', ...
+        fprintf('     Time: %.0f-%.0f %s (half-day intervals)\n', ...
             sim_config.start_time, sim_config.stop_time, sim_config.time_units);
         fprintf('     Tolerances: abs=%.2e, rel=%.2e\n', ...
             sim_config.abs_tolerance, sim_config.rel_tolerance);
 
-        % Create time vector - assuming daily intervals
-        time_vector = sim_config.start_time:1:sim_config.stop_time;
+        % Create time vector with half-day intervals (matches run_median_simulation)
+        time_vector = sim_config.start_time:0.5:sim_config.stop_time;
 
         model = simulation_config(model, ...
             'solver', sim_config.solver, ...

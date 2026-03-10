@@ -68,6 +68,8 @@ def _run_worker_batch(
     worker_pool_id = f"worker_{worker_id}"
     worker_pool_path = temp_path / worker_pool_id
     worker_pool_path.mkdir(exist_ok=True)
+    worker_work_dir = temp_path / f"work_{worker_id}"
+    worker_work_dir.mkdir(exist_ok=True)
 
     return run_batch_worker(
         params=worker_params,
@@ -81,6 +83,7 @@ def _run_worker_batch(
         simulation_pool_path=temp_path,
         simulation_pool_id=worker_pool_id,
         verbose=False,  # Reduce noise from workers
+        work_dir=worker_work_dir,
     )
 
 
@@ -122,6 +125,9 @@ class QSPSimulator:
         job_manager: Any = None,
         local_only: bool = False,
         project_root: Optional[Union[str, Path]] = None,
+        matlab_path: str = "matlab",
+        n_local_workers: int = 1,
+        accelerate: bool = False,
     ):
         """
         Initialize QSP simulator.
@@ -188,6 +194,9 @@ class QSPSimulator:
         self.verbose = verbose
         self.local_only = local_only
         self.project_root = Path(project_root) if project_root is not None else None
+        self.matlab_path = matlab_path
+        self.n_local_workers = n_local_workers
+        self.accelerate = accelerate
 
         if self.test_stats_csv is not None and not self.test_stats_csv.exists():
             raise FileNotFoundError(f"Test statistics CSV not found: {self.test_stats_csv}")
@@ -1069,14 +1078,16 @@ class QSPSimulator:
                         df = pd.read_parquet(pq_file)
                         # Renumber patient_id to be globally unique
                         base_id = sum(chunks[i][1].shape[0] for i in range(worker_id))
-                        if 'patient_id' in df.columns:
-                            df['patient_id'] = df['patient_id'] + base_id
+                        if "patient_id" in df.columns:
+                            df["patient_id"] = df["patient_id"] + base_id
                         dfs.append(df)
 
                     combined_df = pd.concat(dfs, ignore_index=True)
 
                     # Write combined output
-                    output_dir = self.project_root / "batch_jobs" / "simulation_pool" / "parallel_combined"
+                    output_dir = (
+                        self.project_root / "batch_jobs" / "simulation_pool" / "parallel_combined"
+                    )
                     output_dir.mkdir(parents=True, exist_ok=True)
                     parquet_file = output_dir / f"batch_{n_sims}sims_combined.parquet"
                     combined_df.to_parquet(parquet_file)
@@ -1156,7 +1167,11 @@ class QSPSimulator:
                     "Please re-run simulations."
                 )
 
-            # Add to SimulationPoolManager
+            # Replace local pool for this scenario with the full HPC data
+            for batch in self.pool._scan_batches(scenario=self.scenario):
+                batch_path = self.pool.pool_dir / batch["filename"]
+                batch_path.unlink(missing_ok=True)
+                self.logger.info(f"Removed stale batch: {batch['filename']}")
             self.logger.info(f"Adding {params.shape[0]} simulations to local pool")
             self.pool.add_batch(
                 params_matrix=params,
@@ -1254,17 +1269,19 @@ class QSPSimulator:
 
     def _download_derived_test_stats(
         self, hpc_pool_path: str, test_stats_hash: str, num_simulations: int
-    ) -> np.ndarray:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Download derived test statistics from HPC.
+        Download derived test statistics and parameters from HPC.
 
         Args:
             hpc_pool_path: Path to HPC pool directory
             test_stats_hash: Hash of test statistics configuration
-            num_simulations: Number of simulations to download
+            num_simulations: Number of simulations expected
 
         Returns:
-            Numpy array of test statistics (num_simulations x num_observables)
+            Tuple of (params, test_stats):
+            - params: Numpy array of parameters (n_sims x n_params)
+            - test_stats: Numpy array of test statistics (n_sims x n_observables)
         """
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_cache_dir = Path(temp_dir)
@@ -1280,16 +1297,31 @@ class QSPSimulator:
                     "Check derivation job logs."
                 )
 
-            if test_stats.shape[0] != num_simulations:
-                self.logger.warning(
-                    f"Downloaded {test_stats.shape[0]} test stats but expected {num_simulations}"
+            if params is None:
+                raise RuntimeError(
+                    "Failed to download parameters from HPC. " "Check derivation job output."
                 )
 
-            return test_stats
+            if test_stats.shape[0] != params.shape[0]:
+                raise RuntimeError(
+                    f"Row mismatch: {params.shape[0]} params vs {test_stats.shape[0]} test stats"
+                )
+
+            if test_stats.shape[0] != num_simulations:
+                self.logger.info(
+                    f"Downloaded {test_stats.shape[0]} simulations from HPC "
+                    f"(requested {num_simulations} new, pool has accumulated more)"
+                )
+
+            return params, test_stats
 
     def _run_new_simulations(self, num_simulations: int) -> None:
         """
         Run new simulations on HPC and add to pool.
+
+        The HPC derivation processes ALL batches in the pool (old + new),
+        so we download the full params + test_stats and replace the local
+        pool with the complete set.
 
         Results are added to the pool, not returned directly.
         Caller should use pool.load_simulations() to get results.
@@ -1304,8 +1336,11 @@ class QSPSimulator:
         theta_np, samples_csv = self._stage_parameters_to_csv(num_simulations)
 
         try:
-            observables_np = self._run_matlab_simulation(samples_csv, num_simulations)
-            self._update_pool_with_results(theta_np, observables_np)
+            params_np, observables_np = self._run_matlab_simulation(samples_csv, num_simulations)
+            # Use the HPC-returned params (covers full pool: old + new batches)
+            # instead of the locally-generated theta_np, to stay aligned with
+            # the derived test statistics which span all batches.
+            self._update_pool_with_results(params_np, observables_np)
         finally:
             Path(samples_csv).unlink(missing_ok=True)
 
@@ -1321,7 +1356,12 @@ class QSPSimulator:
         return theta_np, samples_csv
 
     def _update_pool_with_results(self, params: np.ndarray, observables: np.ndarray) -> None:
-        """Add completed simulations to the local pool."""
+        """Replace local pool for this scenario with the full HPC results."""
+        # Remove old batches for this scenario before adding the complete set
+        for batch in self.pool._scan_batches(scenario=self.scenario):
+            batch_path = self.pool.pool_dir / batch["filename"]
+            batch_path.unlink(missing_ok=True)
+            self.logger.info(f"Removed stale batch: {batch['filename']}")
         self._info(f"Adding {params.shape[0]} simulations to pool (scenario='{self.scenario}')")
         self.pool.add_batch(
             params_matrix=params,
@@ -1484,23 +1524,26 @@ class QSPSimulator:
         self, theta: np.ndarray, pool_suffix: str = "posterior_predictive"
     ) -> np.ndarray:
         """
-        Run QSP simulations for given parameter samples with caching.
+        Run QSP simulations for given parameter samples with persistent caching.
 
-        This method provides the same caching and pooling benefits as __call__(),
-        but accepts pre-specified parameter values (e.g., posterior samples).
+        Uses a theta-hashed suffix pool so that identical parameter matrices
+        produce cache hits without row-by-row matching. Each unique theta gets
+        its own isolated pool; count-based lookup is safe because the hash
+        guarantees the pool only contains sims for this exact theta.
 
         Workflow:
-        1. Check local cache for this parameter set + pool suffix
-        2. Check HPC for full simulations in this pool
-        3. Check HPC for derived test statistics
-        4. Download and cache if available
-        5. Run new simulations only if needed
+        1. Compute theta_hash from the parameter matrix
+        2. Check local suffix pool (count-based — hash guarantees correctness)
+        3. If not local_only: check HPC suffix pool for derived test stats
+        4. If HPC hit: download, add to local suffix pool, return
+        5. Run new sims via _run_matlab_simulation (with pool ID override)
+        6. Add results to local suffix pool
+        7. Return observables
 
         Args:
             theta: Parameter matrix (n_samples, n_params)
             pool_suffix: Suffix for pool identification (default: 'posterior_predictive')
-                        This creates a separate pool for posterior predictive sims
-                        while still allowing reuse across multiple PPC runs
+                        Combined with theta hash to create unique pool per parameter set
 
         Returns:
             Test statistics array (n_samples, n_test_stats)
@@ -1508,16 +1551,65 @@ class QSPSimulator:
         n_samples = theta.shape[0]
         self._info(f"QSP Simulator ({pool_suffix}): {n_samples} samples ({self.model_version})")
 
-        # Run new simulations with the provided parameter values
-        #
-        # NOTE: We do NOT check the shared HPC pool here because this function is called
-        # with SPECIFIC parameter values (e.g., posterior samples) that must be simulated
-        # exactly as provided. The shared pool contains simulations from prior sampling
-        # which have different parameter values and cannot be reused.
-        #
-        # Use __call__(n_samples) instead if you want to sample from prior and reuse existing.
+        # 1. Compute theta hash for pool isolation
+        theta_hash = hashlib.sha256(theta.tobytes()).hexdigest()[:HASH_PREFIX_LENGTH]
+        pool_scenario = f"{pool_suffix}_{theta_hash}"
+        self._info(f"Theta hash: {theta_hash} → pool scenario: {pool_scenario}")
+
+        # Get or create the suffix pool for this theta
+        suffix_pool = self._get_or_create_suffix_pool(pool_scenario)
+
+        # 2. Check local suffix pool (count-based — hash guarantees correctness)
+        n_available = suffix_pool.get_available_simulations(scenario=pool_scenario)
+        if n_available >= n_samples:
+            self._info(f"Local suffix pool hit: {n_available} simulations available")
+            _, observables = suffix_pool.load_simulations(
+                n_requested=n_samples, scenario=pool_scenario, random_state=self.rng
+            )
+            return observables
+
+        # 3. Check HPC for derived test stats in the suffix pool
+        if not self.local_only:
+            hpc_pool_id = self._compute_hpc_pool_id(scenario_override=pool_scenario)
+            hpc_pool_path = f"{self.job_manager.config.simulation_pool_path}/{hpc_pool_id}"
+            test_stats_hash = self._compute_test_stats_hash()
+
+            try:
+                has_test_stats = self.job_manager.check_hpc_test_stats(
+                    hpc_pool_path, test_stats_hash, expected_n_sims=n_samples
+                )
+            except (RemoteCommandError, MissingOutputError):
+                has_test_stats = False
+
+            if has_test_stats:
+                self._info("HPC suffix pool hit — downloading test statistics")
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    params, test_stats = self.job_manager.download_test_stats(
+                        hpc_pool_path, test_stats_hash, Path(temp_dir)
+                    )
+                if params is not None and test_stats is not None:
+                    suffix_pool.add_batch(
+                        params_matrix=params,
+                        observables_matrix=test_stats,
+                        seed=self.seed,
+                        scenario=pool_scenario,
+                    )
+                    self._info(f"Added {params.shape[0]} sims to local suffix pool from HPC")
+                    _, observables = suffix_pool.load_simulations(
+                        n_requested=n_samples,
+                        scenario=pool_scenario,
+                        random_state=self.rng,
+                    )
+                    return observables
+
+        # 4. Run new simulations with the provided parameter values
         self._info(f"Running {n_samples} new simulations...")
 
+        if self.local_only:
+            # Local mode: run MATLAB on this machine with parallel workers
+            return self._run_local_with_params(theta, pool_scenario, suffix_pool)
+
+        # HPC mode: submit to cluster
         # Create temporary CSV with provided parameters
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as tmp:
             samples_csv = tmp.name
@@ -1527,16 +1619,141 @@ class QSPSimulator:
                 writer.writerow(row)
 
         try:
-            # Run MATLAB simulations - they go to shared pool (no suffix)
-            observables = self._run_matlab_simulation(samples_csv, n_samples)
+            # Run MATLAB simulations — use suffix pool ID so HPC also persists separately
+            hpc_pool_id = self._compute_hpc_pool_id(scenario_override=pool_scenario)
+            hpc_params, observables = self._run_matlab_simulation(
+                samples_csv, n_samples, simulation_pool_id_override=hpc_pool_id
+            )
 
-            # Caching handled by SimulationPoolManager
+            # 5. Persist to local suffix pool (use HPC params to stay aligned)
+            suffix_pool.add_batch(
+                params_matrix=hpc_params,
+                observables_matrix=observables,
+                seed=self.seed,
+                scenario=pool_scenario,
+            )
 
-            self._info(f"Complete: {observables.shape[0]} simulations finished")
+            self._info(f"Complete: {observables.shape[0]} simulations persisted to suffix pool")
             return observables
 
         finally:
             Path(samples_csv).unlink(missing_ok=True)
+
+    def _run_local_with_params(
+        self, theta: np.ndarray, pool_scenario: str, suffix_pool
+    ) -> np.ndarray:
+        """
+        Run simulations locally with specific parameter values, derive test stats,
+        cache in suffix pool, and return observables.
+
+        Mirrors _run_matlab_simulation but uses local MATLAB processes instead of HPC.
+
+        Args:
+            theta: Parameter matrix (n_samples, n_params) in original space
+            pool_scenario: Scenario name for suffix pool caching
+            suffix_pool: SimulationPoolManager instance for caching
+
+        Returns:
+            Test statistics array (n_samples, n_test_stats)
+        """
+        import json
+
+        import pandas as pd
+
+        from qsp_hpc.batch.derive_test_stats_worker import (
+            build_test_stat_registry,
+            compute_test_statistics_batch,
+        )
+        from qsp_hpc.simulation.batch_runner import run_batch_worker
+
+        n_samples = theta.shape[0]
+        n_workers = min(self.n_local_workers, n_samples)
+
+        sim_config = dict(self.sim_config) if self.sim_config else {}
+        sim_config["accelerate_model"] = self.accelerate
+
+        if n_workers <= 1:
+            parquet_file = run_batch_worker(
+                params=theta,
+                param_names=self.param_names,
+                model_script=self.model_script or "default_model",
+                project_root=self.project_root,
+                seed=self.seed,
+                dosing=self.dosing,
+                sim_config=sim_config,
+                matlab_path=self.matlab_path,
+                verbose=self.verbose,
+            )
+            species_df = pd.read_parquet(parquet_file)
+        else:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+
+            self._info(f"Splitting {n_samples} sims across {n_workers} local workers")
+            chunk_size = n_samples // n_workers
+            remainder = n_samples % n_workers
+            chunks = []
+            start = 0
+            for i in range(n_workers):
+                end = start + chunk_size + (1 if i < remainder else 0)
+                chunks.append((i, theta[start:end], self.seed + i * 10000))
+                start = end
+
+            with tempfile.TemporaryDirectory(prefix="qsp_local_swp_") as temp_dir:
+                temp_path = Path(temp_dir)
+                parquet_files = []
+                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                    futures = {
+                        executor.submit(
+                            _run_worker_batch,
+                            wid,
+                            wparams,
+                            wseed,
+                            self.param_names,
+                            self.model_script or "default_model",
+                            self.project_root,
+                            self.dosing,
+                            sim_config,
+                            self.matlab_path,
+                            temp_path,
+                        ): wid
+                        for wid, wparams, wseed in chunks
+                    }
+                    for future in as_completed(futures):
+                        wid = futures[future]
+                        parquet_files.append((wid, future.result()))
+                        self._info(f"Local worker {wid} complete")
+
+                dfs = []
+                for wid, pq_file in sorted(parquet_files, key=lambda x: x[0]):
+                    df = pd.read_parquet(pq_file)
+                    base_id = sum(chunks[i][1].shape[0] for i in range(wid))
+                    if "patient_id" in df.columns:
+                        df["patient_id"] = df["patient_id"] + base_id
+                    dfs.append(df)
+                species_df = pd.concat(dfs, ignore_index=True)
+
+        # Derive test statistics
+        test_stats_df = pd.read_csv(self.test_stats_csv)
+        test_stat_registry = build_test_stat_registry(test_stats_df)
+
+        species_units = {}
+        if self.species_units_file is not None and self.species_units_file.exists():
+            with open(self.species_units_file, "r") as f:
+                species_units = json.load(f)
+
+        observables = compute_test_statistics_batch(
+            species_df, test_stats_df, test_stat_registry, species_units
+        )
+
+        # Cache in suffix pool
+        suffix_pool.add_batch(
+            params_matrix=theta,
+            observables_matrix=observables,
+            seed=self.seed,
+            scenario=pool_scenario,
+        )
+        self._info(f"Complete: {observables.shape[0]} local simulations persisted to suffix pool")
+        return observables
 
     def _compute_priors_hash(self) -> str:
         """
@@ -1569,19 +1786,72 @@ class QSPSimulator:
         test_stats_content = self.test_stats_csv.read_text()
         return hashlib.sha256(test_stats_content.encode("utf-8")).hexdigest()
 
-    def _run_matlab_simulation(self, samples_csv: str, num_simulations: int) -> np.ndarray:
+    def _compute_hpc_pool_id(self, scenario_override: Optional[str] = None) -> str:
+        """
+        Compute the HPC pool identifier string.
+
+        Args:
+            scenario_override: If provided, use this instead of self.scenario
+                              (e.g., for suffix pools like 'posterior_predictive_a3f7c2e1')
+
+        Returns:
+            Pool ID string like '{model_version}_{priors_hash[:8]}_{scenario}'
+        """
+        priors_hash = self._compute_priors_hash()
+        scenario = scenario_override if scenario_override is not None else self.scenario
+        return f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{scenario}"
+
+    def _get_or_create_suffix_pool(self, pool_scenario: str) -> "SimulationPoolManager":
+        """
+        Lazily create and cache a SimulationPoolManager for a suffix pool.
+
+        Each unique pool_scenario gets its own local directory under cache_dir.
+
+        Args:
+            pool_scenario: Scenario string for the suffix pool
+                          (e.g., 'posterior_predictive_a3f7c2e1')
+
+        Returns:
+            SimulationPoolManager for the suffix pool
+        """
+        if not hasattr(self, "_suffix_pools"):
+            self._suffix_pools: Dict[str, SimulationPoolManager] = {}
+        if pool_scenario not in self._suffix_pools:
+            pool_kwargs = dict(
+                cache_dir=self.cache_dir,
+                model_version=self.model_version,
+                model_description=self.model_description,
+                priors_csv=self.priors_csv,
+                model_script=self.model_script,
+                scenario=pool_scenario,
+            )
+            if self._calibration_targets_dir is not None:
+                pool_kwargs["calibration_targets"] = self._calibration_targets_dir
+            else:
+                pool_kwargs["test_stats_csv"] = self.test_stats_csv
+            self._suffix_pools[pool_scenario] = SimulationPoolManager(**pool_kwargs)
+        return self._suffix_pools[pool_scenario]
+
+    def _run_matlab_simulation(
+        self,
+        samples_csv: str,
+        num_simulations: int,
+        simulation_pool_id_override: Optional[str] = None,
+    ) -> np.ndarray:
         """
         Run MATLAB simulation for parameter samples on HPC.
 
-        Full simulations are ALWAYS saved to the shared pool (no suffix).
-        This allows training, prior PPCs, and posterior PPCs to reuse the same
-        expensive full simulations. Test statistics are cached separately by caller.
+        By default, full simulations go to the shared pool (no suffix).
+        When simulation_pool_id_override is provided, simulations go to
+        a separate HPC pool (e.g., for posterior predictive checks).
 
         Uses Python job submission via HPCJobManager for efficient batch execution.
 
         Args:
             samples_csv: Path to CSV file with parameter samples
             num_simulations: Number of simulations
+            simulation_pool_id_override: If provided, use this as the HPC pool ID
+                                        instead of the default scenario-based ID
 
         Returns:
             Numpy array of observables (num_simulations x num_observables)
@@ -1589,16 +1859,11 @@ class QSPSimulator:
         # Validate SSH connection before submitting jobs
         self._validate_hpc_connection()
 
-        # Compute simulation pool ID for full simulations
-        # IMPORTANT: Full simulations always go to the SHARED pool (no suffix)
-        # This allows training, prior PPCs, and posterior PPCs to reuse the same expensive simulations
-        priors_hash = self._compute_priors_hash()
-        simulation_pool_id = (
-            f"{self.model_version}_{priors_hash[:HASH_PREFIX_LENGTH]}_{self.scenario}"
-        )
-
-        # NOTE: We do NOT append pool_suffix here - full sims are shared
-        # The suffix is only used for local test stats caching
+        # Compute simulation pool ID
+        if simulation_pool_id_override is not None:
+            simulation_pool_id = simulation_pool_id_override
+        else:
+            simulation_pool_id = self._compute_hpc_pool_id()
 
         # Log HPC save path
         hpc_save_path = f"{self.job_manager.config.simulation_pool_path}/{simulation_pool_id}"
@@ -1637,12 +1902,85 @@ class QSPSimulator:
         test_stats_hash = self._compute_test_stats_hash()
         self._derive_test_statistics(hpc_save_path, test_stats_hash, num_simulations)
 
-        # Download the derived test statistics
-        observables_matrix = self._download_derived_test_stats(
+        # Download the derived test statistics AND parameters from HPC.
+        # The derivation processes ALL batches in the pool (old + new), so we
+        # return the full set to keep params/observables aligned.
+        params_matrix, observables_matrix = self._download_derived_test_stats(
             hpc_save_path, test_stats_hash, num_simulations
         )
 
-        return observables_matrix
+        return params_matrix, observables_matrix
+
+    def extract_trajectory_grid(
+        self,
+        species_list: Union[list, str] = "all",
+        time_grid: Union[list, str] = "daily",
+        output_subdir: str = "trajectory_grid",
+        local_dest: Optional[Path] = None,
+        scenario_override: Optional[str] = None,
+    ) -> Tuple[pd.DataFrame, dict]:
+        """
+        Extract dense species × timepoint grid from HPC simulation pool.
+
+        Computes the HPC pool path from the current simulator config, submits
+        a SLURM trajectory grid extraction job, waits for completion, and
+        downloads the resulting Parquet DataFrame.
+
+        Args:
+            species_list: Species to extract — list of names or "all"
+            time_grid: Timepoints in days — list of floats or "daily"
+            output_subdir: Subdirectory name within pool for output
+            local_dest: Local directory to download grid into.
+                        Defaults to cache_dir / "trajectory_grids" / pool_id
+            scenario_override: If provided, use this pool scenario instead of self.scenario
+
+        Returns:
+            Tuple of (grid_df, meta):
+                grid_df: DataFrame with columns like "V_T.CD8__t14.0", one row per simulation
+                meta: Dict with species list, time grid, shape info
+        """
+        self._validate_hpc_connection()
+
+        # Compute HPC pool path
+        pool_id = self._compute_hpc_pool_id(scenario_override=scenario_override)
+        hpc_pool_path = f"{self.job_manager.config.simulation_pool_path}/{pool_id}"
+
+        # Resolve stop_time from sim_config
+        stop_time = 21.0
+        if self.sim_config and "stop_time" in self.sim_config:
+            stop_time = float(self.sim_config["stop_time"])
+
+        scenario_name = scenario_override or self.scenario or "default"
+
+        # Submit trajectory grid extraction job
+        self.logger.info(f"Submitting trajectory grid extraction for pool {pool_id}...")
+        job_id = self.job_manager.submit_trajectory_grid_job(
+            pool_path=hpc_pool_path,
+            species_list=species_list,
+            time_grid=time_grid,
+            output_subdir=output_subdir,
+            scenario_name=scenario_name,
+            stop_time=stop_time,
+        )
+
+        # Wait for completion (single SLURM task)
+        self._wait_for_completion([job_id], 1)
+
+        # Download results
+        if local_dest is None:
+            local_dest = self.cache_dir / "trajectory_grids" / pool_id
+        local_dest = Path(local_dest)
+
+        grid_df, meta = self.job_manager.download_trajectory_grid(
+            pool_path=hpc_pool_path,
+            output_subdir=output_subdir,
+            local_dest=local_dest,
+        )
+
+        self.logger.info(
+            f"Trajectory grid ready: {grid_df.shape[0]} sims × {grid_df.shape[1]} features"
+        )
+        return grid_df, meta
 
     def _validate_hpc_connection(self) -> None:
         """

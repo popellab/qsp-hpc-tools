@@ -218,3 +218,62 @@ source {self.config.hpc_venv_path}/bin/activate
 cd {self.config.remote_project_path}
 python3 -m qsp_hpc.batch.derive_test_stats_worker "{test_stats_config}"
 """
+
+    def submit_trajectory_grid_job(
+        self,
+        grid_config: str,
+        derivation_dir: str,
+    ) -> str:
+        """Submit SLURM job to extract trajectory grids from full simulations.
+
+        Args:
+            grid_config: Path to trajectory grid config JSON on HPC
+            derivation_dir: Directory for job scripts/logs
+
+        Returns:
+            Job ID string
+        """
+        self.logger.info("SLURM Trajectory Grid Configuration:")
+        self.logger.info(f"  Partition: {self.config.partition}")
+        self.logger.info("  Time limit: 00:15:00 (fixed for grid extraction)")
+        self.logger.info("  Memory: 8G")
+
+        log_dir = f"{self.config.remote_project_path}/batch_jobs/logs"
+        script_content = f"""#!/bin/bash
+#SBATCH --job-name=qsp_traj_grid
+#SBATCH --partition={self.config.partition}
+#SBATCH --time=00:15:00
+#SBATCH --mem=8G
+#SBATCH --output={log_dir}/qsp_traj_grid_%j.out
+#SBATCH --error={log_dir}/qsp_traj_grid_%j.err
+
+# Activate Python virtual environment
+source {self.config.hpc_venv_path}/bin/activate
+
+# Run trajectory grid worker
+cd {self.config.remote_project_path}
+python3 -m qsp_hpc.batch.derive_trajectory_grid_worker "{grid_config}"
+"""
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
+            f.write(script_content)
+            temp_script = f.name
+
+        try:
+            remote_script = f"{derivation_dir}/traj_grid_script.sh"
+            self.transport.upload(temp_script, remote_script)
+
+            submit_cmd = f'cd "{self.config.remote_project_path}" && sbatch "{remote_script}"'
+            returncode, output = self.transport.exec(submit_cmd, timeout=30)
+
+            if returncode != 0:
+                raise SubmissionError(f"Trajectory grid job submission failed: {output}")
+
+            match = re.search(r"Submitted batch job (\d+)", output)
+            if not match:
+                raise SubmissionError(f"Could not parse job ID from: {output}")
+
+            return match.group(1)
+
+        finally:
+            Path(temp_script).unlink()

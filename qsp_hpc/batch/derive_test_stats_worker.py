@@ -175,9 +175,14 @@ def compute_test_statistics_batch(
                 # Also supports scalar parameters (not just time-series species)
                 species_dict = {}
                 for species_name in required_species:
-                    if species_name not in sim_df.columns:
+                    # Resolve column name: try bare name first, then param:-prefixed
+                    if species_name in sim_df.columns:
+                        col_name = species_name
+                    elif f"param:{species_name}" in sim_df.columns:
+                        col_name = f"param:{species_name}"
+                    else:
                         raise ValueError(f"Species '{species_name}' not found in simulation data")
-                    val = sim_row[species_name]
+                    val = sim_row[col_name]
 
                     # Get unit string from species_units, default to dimensionless
                     # Handle both flat format ("cell") and nested format ({"units": "cell", ...})
@@ -248,7 +253,7 @@ def process_single_batch(
     # Extract parameter columns (identified by "param:" prefix in parquet)
     param_prefix = "param:"
     param_cols = [col for col in sim_df.columns if col.startswith(param_prefix)]
-    clean_names = [col[len(param_prefix):] for col in param_cols]
+    clean_names = [col[len(param_prefix) :] for col in param_cols]
 
     if param_cols:
         logger.debug(

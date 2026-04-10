@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "QSP HPC Tools"
+abstract: "A Python package for running quantitative systems pharmacology (QSP) simulations on HPC clusters with intelligent caching and pooling."
+authors:
+  - family-names: Eliason
+    given-names: Joel
+    email: joel.eliason119@gmail.com
+    orcid: "https://orcid.org/0000-0003-2227-8727"
+    affiliation: "Johns Hopkins University, Department of Biomedical Engineering"
+repository-code: "https://github.com/jeliason/qsp-hpc-tools"
+license: MIT
+version: 0.1.0
+date-released: 2025-01-14
+keywords:
+  - quantitative-systems-pharmacology
+  - high-performance-computing
+  - simulation-based-inference
+  - slurm
+  - caching

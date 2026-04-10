@@ -1,7 +1,7 @@
 # QSP HPC Tools
 
 [![CI](https://github.com/jeliason/qsp-hpc-tools/workflows/CI/badge.svg)](https://github.com/jeliason/qsp-hpc-tools/actions)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A Python package for running quantitative systems pharmacology (QSP) simulations on HPC clusters with intelligent caching and pooling.
@@ -61,7 +61,7 @@ qsp-hpc logs      # View HPC job logs
 
 ## Requirements
 
-- Python ≥3.9
+- Python ≥3.11
 - SSH access to SLURM HPC cluster
 - MATLAB installed on HPC cluster
 - QSP model implemented in MATLAB

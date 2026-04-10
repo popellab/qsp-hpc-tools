@@ -1467,17 +1467,3 @@ class HPCJobManager:
             "simulation_ids": simulation_ids[success_mask],
             "statuses": statuses[success_mask],
         }
-
-
-# Convenience function
-def create_hpc_manager() -> HPCJobManager:
-    """
-    Create HPC job manager using global configuration.
-
-    Configuration is loaded from ~/.config/qsp-hpc/credentials.yaml
-    Run 'qsp-hpc setup' to configure.
-
-    Returns:
-        HPCJobManager instance
-    """
-    return HPCJobManager()

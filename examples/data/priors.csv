@@ -1,0 +1,7 @@
+name,distribution,dist_param1,dist_param2,units,description
+k_tumor_growth,lognormal,-2.3,0.5,1/day,Tumor growth rate
+k_tumor_death,lognormal,-3.0,0.4,1/day,Tumor natural death rate
+k_immune_kill,lognormal,-4.0,0.8,1/day,Immune-mediated kill rate
+k_immune_recruit,lognormal,-3.5,0.6,1/day,Immune cell recruitment rate
+k_drug_effect,lognormal,-1.5,0.5,1/day,Drug efficacy multiplier
+V_tumor_carrying_capacity,lognormal,4.5,0.3,cells,Tumor carrying capacity

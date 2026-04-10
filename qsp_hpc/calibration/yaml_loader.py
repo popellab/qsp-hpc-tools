@@ -1,7 +1,7 @@
 """
 YAML Calibration Target Loader
 
-Loads calibration target YAML files (from qsp-llm-workflows) and converts them
+Loads calibration target YAML files (from MAPLE) and converts them
 into the DataFrame format expected by the qsp-hpc-tools pipeline. Each YAML
 contains a 4-arg `compute_observable` function, optional constants, and empirical
 data with CI95 bounds. The loader generates 3-arg `compute_test_statistic` wrapper
@@ -195,9 +195,7 @@ def _generate_wrapper_code(
     lines.append("    if hasattr(_result, 'magnitude'):")
     lines.append("        _mag = _result.magnitude")
     lines.append("        if hasattr(_mag, '__len__') and len(_mag) > 1:")
-    lines.append(
-        "            return np.interp(_target_t, time.magnitude, _mag) * _result.units"
-    )
+    lines.append("            return np.interp(_target_t, time.magnitude, _mag) * _result.units")
     lines.append(
         "        return _mag.item() * _result.units if hasattr(_mag, '__len__') else _result"
     )

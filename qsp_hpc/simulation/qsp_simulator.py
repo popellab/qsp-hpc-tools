@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """
-QSP Simulator for Simulation-Based Inference (SBI)
+QSP Simulator
 
-This module provides a simulator function that interfaces between Python SBI workflows
+This module provides a callable simulator that interfaces between Python workflows
 and MATLAB QSP models. It generates parameter samples from priors, runs QSP model
-simulations via MATLAB, and returns model observables for training neural density estimators.
+simulations via MATLAB (locally or on HPC), and returns model observables.
 
 The simulator handles:
-  - Parameter sampling from torch distributions
+  - Parameter sampling from prior distributions
   - CSV generation for MATLAB interface
   - MATLAB batch execution (local or HPC)
-  - Results caching and retrieval
+  - Three-tier results caching and retrieval
   - Observable extraction and formatting
 
 Usage:
-    from qsp_hpc.simulation.qsp_simulator import qsp_simulator
+    from qsp_hpc import QSPSimulator
 
-    # For use with sbi.inference.simulate_for_sbi
-    theta, x = simulate_for_sbi(qsp_simulator, prior, num_simulations)
+    sim = QSPSimulator(
+        priors_csv='priors.csv',
+        calibration_targets='calibration_targets/',
+        model_script='my_model',
+        model_version='v1',
+        scenario='control',
+    )
+    theta, x = sim(1000)
 """
 
 import csv
@@ -89,15 +95,16 @@ def _run_worker_batch(
 
 class QSPSimulator:
     """
-    QSP Simulator for SBI workflows.
+    QSP Simulator with three-tier caching and HPC integration.
 
-    This class wraps MATLAB QSP model execution and provides a callable interface
-    compatible with sbi.inference.simulate_for_sbi.
+    Wraps a MATLAB QSP model as a Python callable that returns
+    (parameters, observables) pairs. Manages simulation caching,
+    HPC job submission, and multi-scenario support transparently.
 
     Attributes:
-        test_stats_csv: Path to test statistics CSV (defines observables)
-        priors_csv: Path to priors CSV (defines parameter names)
-        model_script: MATLAB model script name (optional)
+        priors_csv: Path to priors CSV (defines parameter names and distributions)
+        calibration_targets: Path to calibration target YAMLs (defines observables)
+        model_script: MATLAB model script name
         model_version: Descriptive version name for simulation pooling
         cache_dir: Directory for caching results
         seed: Random seed for reproducibility
@@ -134,14 +141,10 @@ class QSPSimulator:
 
         Args:
             priors_csv: Path to priors CSV defining parameter names and distributions
-            test_stats_csv: Path to test statistics CSV defining observables (optional).
-                           If None, simulations run but no test statistics are derived.
-                           Use this for QC checks or when you only need raw species data.
             calibration_targets: Path to directory of calibration target YAML files
-                                (from qsp-llm-workflows). Alternative to test_stats_csv.
-                                Cannot be used together with test_stats_csv.
+                                (from MAPLE). Defines the observables to extract from
+                                each simulation.
             species_units_file: Path to species_units.json mapping species names to unit strings.
-                               Required if test_stats_csv uses Pint units in model_output_code.
             model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
             model_version: Descriptive version name (e.g., 'baseline_gvax')
             model_description: Brief description of model configuration
@@ -172,7 +175,9 @@ class QSPSimulator:
             self._calibration_targets_dir = cal_dir
             self._test_stats_df = load_calibration_targets(cal_dir)
             # Serialize to temp CSV for internal use + HPC upload
-            self._temp_csv = Path(tempfile.mktemp(suffix=".csv"))
+            tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+            tmp.close()
+            self._temp_csv = Path(tmp.name)
             self._test_stats_df.to_csv(self._temp_csv, index=False)
             test_stats_csv = self._temp_csv
 
@@ -300,6 +305,12 @@ class QSPSimulator:
         self.rng = np.random.default_rng(self.cache_sampling_seed)
         # RNG for parameter generation; seeded once so successive batches differ
         self.param_rng = np.random.default_rng(self.seed)
+
+    def __del__(self):
+        """Clean up temporary CSV file if created from calibration targets."""
+        temp_csv = getattr(self, "_temp_csv", None)
+        if temp_csv is not None and temp_csv.exists():
+            temp_csv.unlink()
 
     def __repr__(self) -> str:
         """Return string representation of simulator."""
@@ -2082,13 +2093,9 @@ def get_observed_data(
     value_column: str = "median",
 ) -> Dict[str, np.ndarray]:
     """
-    Extract observed data from test statistics CSV or calibration target YAMLs.
-
-    Accepts either a CSV path or a directory of calibration target YAMLs.
-    Exactly one must be provided.
+    Extract observed data from calibration target YAMLs.
 
     Args:
-        test_stats_csv: Path to test statistics CSV file
         calibration_targets: Path to directory of calibration target YAML files
         value_column: Column name to use for observed values (default: 'median')
 
@@ -2097,7 +2104,6 @@ def get_observed_data(
         Each array has shape (1, 1) for compatibility with BayesFlow workflow.
 
     Example:
-        obs = get_observed_data(test_stats_csv='cache/test_stats.csv')
         obs = get_observed_data(calibration_targets='calibration_targets/')
         posterior_samples = workflow.sample(conditions=obs, num_samples=1000)
     """
@@ -2141,92 +2147,3 @@ def get_observed_data(
         obs_dict[obs_name] = observed_values[i : i + 1].reshape(1, 1)
 
     return obs_dict
-
-
-def qsp_simulator(
-    priors_csv: Union[str, Path],
-    test_stats_csv: Optional[Union[str, Path]] = None,
-    calibration_targets: Optional[Union[str, Path]] = None,
-    model_script: str = "",
-    model_version: str = "v1",
-    model_description: str = "",
-    scenario: str = "default",
-    cache_dir: Union[str, Path] = "cache/sbi_simulations",
-    seed: int = 2025,
-    cache_sampling_seed: Optional[int] = None,
-    max_tasks: int = 10,
-    poll_interval: int = 30,
-    max_wait_time: Optional[int] = None,
-    verbose: bool = False,
-) -> QSPSimulator:
-    """
-    Create a QSP simulator for SBI workflows.
-
-    This function returns a callable simulator that can be used with
-    sbi.inference.simulate_for_sbi to generate training data for neural
-    density estimators.
-
-    Simulations are cached in pools organized by model version, configuration, and scenario.
-    Multiple runs with the same configuration will accumulate and reuse simulations
-    from the pool, enabling efficient iteration and exploration.
-
-    Args:
-        priors_csv: Path to priors CSV defining parameter names and distributions
-        test_stats_csv: Path to test statistics CSV defining observables
-        calibration_targets: Path to directory of calibration target YAML files
-                            (alternative to test_stats_csv; cannot use both)
-        model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
-        model_version: Descriptive version name (e.g., 'baseline_gvax')
-        model_description: Brief description of model configuration
-        scenario: Scenario name for therapy protocol (e.g., 'gvax', 'control', 'gvax_anti_pd1')
-        cache_dir: Base directory for simulation pools (default: cache/sbi_simulations)
-        seed: Random seed for reproducibility (used for new simulations)
-        cache_sampling_seed: Fixed seed for reproducible cache sampling (default: None, uses seed)
-                            Set to fixed value to ensure consistent correlations across runs
-        max_tasks: Maximum number of parallel SLURM array tasks (default: 10)
-        poll_interval: Seconds between job status checks on HPC (default: 30)
-        max_wait_time: Maximum wait time in seconds before timeout (default: None, no timeout)
-        verbose: If True, print detailed progress information (default: False)
-
-    Returns:
-        Callable simulator compatible with simulate_for_sbi
-
-    Example:
-        from sbi.inference import simulate_for_sbi
-        from qsp_hpc.simulation.qsp_simulator import qsp_simulator
-        from qsp_hpc.priors.load_sbi_priors import load_prior
-
-        # Load prior
-        priors_csv = 'projects/pdac_2025/cache/pdac_sbi_priors.csv'
-        prior = load_prior(priors_csv)
-
-        # Create simulator with calibration target YAMLs
-        simulator = qsp_simulator(
-            priors_csv=priors_csv,
-            calibration_targets='calibration_targets/',
-            model_script='immune_oncology_model_PDAC',
-            model_version='baseline_gvax',
-            model_description='PDAC baseline: 8 params, 12 obs, GVAX',
-            max_tasks=20,
-            poll_interval=60  # Check every minute
-        )
-
-        # Generate training data (will reuse from pool if available)
-        theta, x = simulate_for_sbi(simulator, prior, num_simulations=100)
-    """
-    return QSPSimulator(
-        test_stats_csv=test_stats_csv,
-        calibration_targets=calibration_targets,
-        priors_csv=priors_csv,
-        model_script=model_script,
-        model_version=model_version,
-        model_description=model_description,
-        scenario=scenario,
-        cache_dir=cache_dir,
-        seed=seed,
-        cache_sampling_seed=cache_sampling_seed,
-        max_tasks=max_tasks,
-        poll_interval=poll_interval,
-        max_wait_time=max_wait_time,
-        verbose=verbose,
-    )

@@ -1,0 +1,21 @@
+calibration_target_id: tumor_growth_rate
+
+observable:
+  species:
+    - V_T.Tumor
+  units: 1/day
+  code: |
+    def compute_observable(time, species_dict, constants, ureg):
+        tumor = species_dict['V_T.Tumor']
+        t = time.magnitude
+        idx_0 = np.argmin(np.abs(t - 0))
+        idx_60 = np.argmin(np.abs(t - 60))
+        if tumor[idx_0] > 0:
+            rate = np.log(tumor[idx_60] / tumor[idx_0]) / 60
+            return float(rate) / ureg.day
+        return float('nan') / ureg.day
+
+empirical_data:
+  median: [0.02]
+  ci95: [[0.005, 0.05]]
+  sample_size: 100

@@ -1,0 +1,16 @@
+calibration_target_id: tumor_volume_day60
+
+observable:
+  species:
+    - V_T.Tumor
+  units: cell
+  code: |
+    def compute_observable(time, species_dict, constants, ureg):
+        tumor = species_dict['V_T.Tumor']
+        idx = np.argmin(np.abs(time.magnitude - 60))
+        return float(tumor[idx]) * ureg.cell
+
+empirical_data:
+  median: [1.0e+06]
+  ci95: [[5.0e+05, 2.0e+06]]
+  sample_size: 50

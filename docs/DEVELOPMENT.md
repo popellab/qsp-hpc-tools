@@ -112,12 +112,11 @@ qsp-hpc-tools/
 ├── qsp_hpc/                    # Main package
 │   ├── simulation/             # Simulation pool and QSP simulator
 │   ├── batch/                  # HPC job management
+│   ├── calibration/            # MAPLE YAML target loading
+│   ├── matlab/                 # MATLAB HPC workers
 │   └── utils/                  # Hash utilities, logging
-├── qsp_hpc/matlab/            # MATLAB HPC workers
-├── scripts/                    # Setup and utility scripts
-│   ├── setup_credentials.py   # Interactive credential setup
-│   └── hpc/                   # HPC environment setup
 ├── tests/                      # Test suite
+├── examples/                   # Example notebooks and data
 ├── docs/                       # Documentation
 └── pyproject.toml             # Package configuration
 ```
@@ -156,7 +155,7 @@ qsp-hpc-tools/
 ## CI/CD
 
 GitHub Actions runs on every push and PR:
-- Tests on Python 3.9, 3.10, 3.11, 3.12
+- Tests on Python 3.11, 3.12, 3.13
 - Code quality checks (ruff, black)
 - Coverage reporting
 

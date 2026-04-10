@@ -115,6 +115,7 @@ TREATMENT_YAML = {
 # Fixtures
 # ============================================================================
 
+
 @pytest.fixture
 def temp_dir():
     """Create a temporary directory for tests."""
@@ -356,7 +357,11 @@ class TestGenerateWrapperCode:
                 "    return species_dict['V_T.C1']\n"
             ),
             constants=[
-                {"name": "pdac_cancer_cell_cross_section", "value": 0.000227, "units": "mm**2/cell"},
+                {
+                    "name": "pdac_cancer_cell_cross_section",
+                    "value": 0.000227,
+                    "units": "mm**2/cell",
+                },
                 {"name": "pdac_cellularity_fraction", "value": 0.25, "units": "dimensionless"},
             ],
             index_values=None,
@@ -398,8 +403,7 @@ class TestGenerateWrapperCode:
         """Wrapper with no constants still passes _constants={} to observable."""
         code = _generate_wrapper_code(
             observable_code=(
-                "def compute_observable(time, species_dict, constants, ureg):\n"
-                "    return 42\n"
+                "def compute_observable(time, species_dict, constants, ureg):\n" "    return 42\n"
             ),
             constants=[],
             index_values=None,
@@ -412,8 +416,7 @@ class TestGenerateWrapperCode:
         """Wrapper that returns a plain scalar (no Pint) works correctly."""
         code = _generate_wrapper_code(
             observable_code=(
-                "def compute_observable(time, species_dict, constants, ureg):\n"
-                "    return 42.0\n"
+                "def compute_observable(time, species_dict, constants, ureg):\n" "    return 42.0\n"
             ),
             constants=[],
             index_values=None,

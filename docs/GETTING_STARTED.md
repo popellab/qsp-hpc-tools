@@ -231,22 +231,23 @@ sim = QSPSimulator(
 theta, x = sim(50)  # Small batch, runs locally
 ```
 
-## 5. Use results for inference
+## 5. Use the results
 
-The returned arrays plug directly into SBI frameworks:
+The returned arrays are standard numpy — use them however you need:
 
 ```python
-import torch
-from sbi.inference import SNPE
+import numpy as np
 
-# Convert to tensors
-theta_tensor = torch.tensor(theta, dtype=torch.float32)
-x_tensor = torch.tensor(x, dtype=torch.float32)
+# Filter virtual patients by clinical criteria
+valid = x[:, 0] < 1e7  # e.g., tumor volume below threshold
+theta_valid, x_valid = theta[valid], x[valid]
 
-# Train neural posterior estimator
-inference = SNPE()
-inference.append_simulations(theta_tensor, x_tensor)
-posterior = inference.train()
+# Feed into downstream analysis (Bayesian inference, sensitivity analysis, etc.)
+# Example with SBI:
+#   from sbi.inference import SNPE
+#   inference = SNPE()
+#   inference.append_simulations(torch.tensor(theta), torch.tensor(x))
+#   posterior = inference.train()
 ```
 
 ## Next steps

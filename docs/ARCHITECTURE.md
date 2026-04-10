@@ -2,7 +2,7 @@
 
 ## Overview
 
-QSP HPC Tools bridges Python-based simulation-based inference (SBI) workflows with MATLAB-based QSP models running on SLURM clusters.
+QSP HPC Tools manages large-scale MATLAB-based QSP simulation campaigns on SLURM clusters, with intelligent caching and a Python-callable interface.
 
 ## Core Components
 
@@ -18,7 +18,7 @@ Manages local simulation caching with scenario support.
 
 ### 2. QSPSimulator
 
-Main interface for SBI workflows. Implements 3-tier caching strategy and automatic HPC job submission.
+Main callable interface. Implements 3-tier caching strategy and automatic HPC job submission.
 
 **Location:** `qsp_hpc/simulation/qsp_simulator.py`
 

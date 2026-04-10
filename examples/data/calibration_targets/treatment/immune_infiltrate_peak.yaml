@@ -1,0 +1,15 @@
+calibration_target_id: immune_infiltrate_peak
+
+observable:
+  species:
+    - V_T.CD8
+  units: cell
+  code: |
+    def compute_observable(time, species_dict, constants, ureg):
+        cd8 = species_dict['V_T.CD8']
+        return float(np.max(cd8)) * ureg.cell
+
+empirical_data:
+  median: [5.0e+04]
+  ci95: [[1.0e+04, 1.0e+05]]
+  sample_size: 30

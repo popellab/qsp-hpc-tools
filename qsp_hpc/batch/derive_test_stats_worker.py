@@ -64,8 +64,7 @@ def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
     if "model_output_code" not in test_stats_df.columns:
         raise ValueError(
             "Test statistics CSV missing required 'model_output_code' column. "
-            "This column should contain Python function code to compute test statistics. "
-            "See docs/TEST_STATISTICS_CSV_FORMAT.md for format specification."
+            "This column should contain Python function code to compute test statistics."
         )
 
     function_col = "model_output_code"
@@ -77,8 +76,7 @@ def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
         if pd.isna(row[function_col]):
             raise ValueError(
                 f"Test statistic '{test_stat_id}' has empty {function_col}. "
-                "All test statistics must define a Python function. "
-                "See docs/TEST_STATISTICS_CSV_FORMAT.md for examples."
+                "All test statistics must define a Python function."
             )
 
         function_code = row[function_col]
@@ -89,7 +87,9 @@ def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
 
             namespace = {"np": np, "numpy": np, "pint": pint, "ureg": ureg}
 
-            # Compile and execute the function code
+            # Compile and execute the function code in an isolated namespace.
+            # Security note: function_code comes from user-authored calibration target
+            # definitions (YAML/CSV) and is trusted project input, not external user input.
             exec(function_code, namespace)
 
             # Extract the 'compute_test_statistic' function

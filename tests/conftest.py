@@ -4,8 +4,6 @@ import shutil
 import tempfile
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import pytest
 
 
@@ -40,55 +38,6 @@ def temp_dir():
 
 
 @pytest.fixture
-def sample_priors():
-    """Sample prior parameters for testing."""
-    return pd.DataFrame(
-        {"param1": [1.0, 2.0, 3.0], "param2": [0.5, 1.5, 2.5], "param3": [10.0, 20.0, 30.0]}
-    )
-
-
-@pytest.fixture
-def sample_test_stats():
-    """Sample test statistics for testing."""
-    return pd.DataFrame(
-        {"stat1": [0.1, 0.2, 0.3], "stat2": [1.0, 2.0, 3.0], "stat3": [100.0, 200.0, 300.0]}
-    )
-
-
-@pytest.fixture
-def sample_params():
-    """Sample parameter sets for simulation."""
-    return pd.DataFrame(
-        {
-            "param1": np.random.uniform(0, 1, 10),
-            "param2": np.random.uniform(0, 10, 10),
-            "param3": np.random.uniform(100, 1000, 10),
-        }
-    )
-
-
-@pytest.fixture
-def sample_simulation_batch(temp_dir):
-    """Create sample simulation batch files for testing."""
-    batch_dir = temp_dir / "simulations"
-    batch_dir.mkdir()
-
-    # Create some sample parquet files with typical naming pattern
-    for i in range(5):
-        df = pd.DataFrame(
-            {
-                "param1": [np.random.uniform(0, 1)],
-                "param2": [np.random.uniform(0, 10)],
-                "result": [np.random.uniform(0, 100)],
-            }
-        )
-        filename = f"batch_{i:04d}_scenario_default_task_0.parquet"
-        df.to_parquet(batch_dir / filename)
-
-    return batch_dir
-
-
-@pytest.fixture
 def mock_config():
     """Mock configuration for testing."""
     return {
@@ -102,17 +51,6 @@ def mock_config():
             "memory": "16GB",
             "time": "01:00:00",
         },
-    }
-
-
-@pytest.fixture
-def sample_model_context():
-    """Sample model context for hash testing."""
-    return {
-        "model_name": "test_model",
-        "solver": "ode45",
-        "tspan": [0, 100],
-        "parameters": {"param1": 1.0, "param2": 2.0},
     }
 
 

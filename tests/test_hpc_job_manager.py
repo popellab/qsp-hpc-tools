@@ -553,7 +553,7 @@ class TestHPCConnection:
         manager = HPCJobManager()
 
         # If we get here without hanging, SSH key auth is working
-        returncode, output = manager._ssh_exec("echo 'auth_test'", timeout=10)
+        returncode, output = manager.transport.exec("echo 'auth_test'", timeout=10)
         assert returncode == 0
         assert "auth_test" in output
 
@@ -561,7 +561,7 @@ class TestHPCConnection:
         """Test running whoami on remote system."""
         manager = HPCJobManager()
 
-        returncode, output = manager._ssh_exec("whoami", timeout=10)
+        returncode, output = manager.transport.exec("whoami", timeout=10)
         assert returncode == 0
 
         # Extract username from output
@@ -576,7 +576,7 @@ class TestHPCConnection:
         """Test getting working directory."""
         manager = HPCJobManager()
 
-        returncode, output = manager._ssh_exec("pwd", timeout=10)
+        returncode, output = manager.transport.exec("pwd", timeout=10)
         assert returncode == 0
 
         # Should get a valid path
@@ -588,7 +588,7 @@ class TestHPCConnection:
         """Test getting remote hostname."""
         manager = HPCJobManager()
 
-        returncode, output = manager._ssh_exec("hostname", timeout=10)
+        returncode, output = manager.transport.exec("hostname", timeout=10)
         assert returncode == 0
 
         hostname = output.strip()
@@ -599,7 +599,7 @@ class TestHPCConnection:
         manager = HPCJobManager()
 
         test_string = "test with spaces and $VARS and 'quotes'"
-        returncode, output = manager._ssh_exec(f"echo '{test_string}'", timeout=10)
+        returncode, output = manager.transport.exec(f"echo '{test_string}'", timeout=10)
         assert returncode == 0
         assert "test with spaces" in output
 
@@ -609,14 +609,14 @@ class TestHPCConnection:
 
         # This should timeout
         with pytest.raises(Exception):  # Could be RuntimeError or subprocess.TimeoutExpired
-            manager._ssh_exec("sleep 30", timeout=2)
+            manager.transport.exec("sleep 30", timeout=2)
 
     def test_failed_command_returns_nonzero(self, real_hpc_config):
         """Test that failed commands return non-zero exit code."""
         manager = HPCJobManager()
 
         # Run a command that should fail
-        returncode, output = manager._ssh_exec("exit 1", timeout=10)
+        returncode, output = manager.transport.exec("exit 1", timeout=10)
         assert returncode == 1
 
 
@@ -634,11 +634,11 @@ class TestRemoteFileOperations:
 
         try:
             # Create directory
-            returncode, output = manager._ssh_exec(f"mkdir -p {test_dir}", timeout=10)
+            returncode, output = manager.transport.exec(f"mkdir -p {test_dir}", timeout=10)
             assert returncode == 0
 
             # Verify it exists
-            returncode, output = manager._ssh_exec(
+            returncode, output = manager.transport.exec(
                 f"test -d {test_dir} && echo 'exists'", timeout=10
             )
             assert returncode == 0
@@ -646,7 +646,7 @@ class TestRemoteFileOperations:
 
         finally:
             # Cleanup
-            manager._ssh_exec(f"rm -rf {test_dir}", timeout=10)
+            manager.transport.exec(f"rm -rf {test_dir}", timeout=10)
 
     def test_upload_file_via_scp(self, real_hpc_config, tmp_path):
         """Test uploading file to HPC via SCP."""
@@ -664,19 +664,19 @@ class TestRemoteFileOperations:
 
         try:
             # Create remote directory
-            manager._ssh_exec(f"mkdir -p {remote_dir}", timeout=10)
+            manager.transport.exec(f"mkdir -p {remote_dir}", timeout=10)
 
             # Upload file
-            manager._ssh_upload(str(test_file), remote_file)
+            manager.transport.upload(str(test_file), remote_file)
 
             # Verify content
-            returncode, output = manager._ssh_exec(f"cat {remote_file}", timeout=10)
+            returncode, output = manager.transport.exec(f"cat {remote_file}", timeout=10)
             assert returncode == 0
             assert test_content in output
 
         finally:
             # Cleanup
-            manager._ssh_exec(f"rm -rf {remote_dir}", timeout=10)
+            manager.transport.exec(f"rm -rf {remote_dir}", timeout=10)
 
     def test_download_file_via_scp(self, real_hpc_config, tmp_path):
         """Test downloading file from HPC via SCP."""
@@ -689,14 +689,14 @@ class TestRemoteFileOperations:
 
         try:
             # Create parent directory and file on HPC
-            manager._ssh_exec(
+            manager.transport.exec(
                 f"mkdir -p ~/pytest_qsp_hpc && echo '{test_content}' > {remote_file}", timeout=10
             )
 
             # Download to local
             local_dir = tmp_path / "downloads"
             local_dir.mkdir()
-            manager._ssh_download(remote_file, str(local_dir))
+            manager.transport.download(remote_file, str(local_dir))
 
             # Verify file exists locally
             downloaded_file = local_dir / f"test_download_{timestamp}.txt"
@@ -705,7 +705,7 @@ class TestRemoteFileOperations:
 
         finally:
             # Cleanup remote file
-            manager._ssh_exec(f"rm -f {remote_file}", timeout=10)
+            manager.transport.exec(f"rm -f {remote_file}", timeout=10)
 
     def test_list_remote_files(self, real_hpc_config):
         """Test listing files in remote directory."""
@@ -718,18 +718,18 @@ class TestRemoteFileOperations:
         try:
             # Create directory and files in one command to avoid rate limiting
             setup_cmd = f"mkdir -p {test_dir} && touch {test_dir}/file1.txt {test_dir}/file2.txt"
-            rc_setup, out_setup = manager._ssh_exec(setup_cmd, timeout=10)
+            rc_setup, out_setup = manager.transport.exec(setup_cmd, timeout=10)
             assert rc_setup == 0, f"Setup failed: {out_setup}"
 
             # List files
-            returncode, output = manager._ssh_exec(f"ls {test_dir}", timeout=10)
+            returncode, output = manager.transport.exec(f"ls {test_dir}", timeout=10)
             assert returncode == 0, f"ls failed: {output}"
             assert "file1.txt" in output
             assert "file2.txt" in output
 
         finally:
             # Cleanup
-            manager._ssh_exec(f"rm -rf {test_dir}", timeout=10)
+            manager.transport.exec(f"rm -rf {test_dir}", timeout=10)
 
     def test_remove_remote_file(self, real_hpc_config):
         """Test removing file from HPC."""
@@ -740,13 +740,15 @@ class TestRemoteFileOperations:
         test_file = f"~/pytest_qsp_hpc/test_rm_{timestamp}.txt"
 
         # Create parent directory and file, then verify
-        returncode, _ = manager._ssh_exec(
+        returncode, _ = manager.transport.exec(
             f"mkdir -p ~/pytest_qsp_hpc && touch {test_file} && test -f {test_file}", timeout=10
         )
         assert returncode == 0
 
         # Remove file and verify it's gone
-        returncode, _ = manager._ssh_exec(f"rm -f {test_file} && ! test -f {test_file}", timeout=10)
+        returncode, _ = manager.transport.exec(
+            f"rm -f {test_file} && ! test -f {test_file}", timeout=10
+        )
         assert returncode == 0
 
     def test_write_and_read_file_content(self, real_hpc_config):
@@ -762,18 +764,18 @@ class TestRemoteFileOperations:
             write_cmd = (
                 f"mkdir -p ~/pytest_qsp_hpc && cat > {test_file} << 'EOF'\n{test_content}\nEOF"
             )
-            returncode, _ = manager._ssh_exec(write_cmd, timeout=10)
+            returncode, _ = manager.transport.exec(write_cmd, timeout=10)
             assert returncode == 0
 
             # Read content back
-            returncode, output = manager._ssh_exec(f"cat {test_file}", timeout=10)
+            returncode, output = manager.transport.exec(f"cat {test_file}", timeout=10)
             assert returncode == 0
             assert "Line 1" in output
             assert "Line 2" in output
             assert "Special chars" in output
 
         finally:
-            manager._ssh_exec(f"rm -f {test_file}", timeout=10)
+            manager.transport.exec(f"rm -f {test_file}", timeout=10)
 
 
 @pytest.mark.hpc
@@ -785,7 +787,7 @@ class TestSLURMCommands:
         manager = HPCJobManager()
 
         # Run squeue for current user
-        returncode, output = manager._ssh_exec("squeue -u $USER", timeout=15)
+        returncode, output = manager.transport.exec("squeue -u $USER", timeout=15)
         assert returncode == 0
 
         # Should have header at minimum
@@ -796,7 +798,7 @@ class TestSLURMCommands:
         manager = HPCJobManager()
 
         # Get list of partitions
-        returncode, output = manager._ssh_exec("sinfo -o '%P'", timeout=15)
+        returncode, output = manager.transport.exec("sinfo -o '%P'", timeout=15)
         assert returncode == 0
 
         # Should have at least one partition listed
@@ -815,7 +817,7 @@ class TestSLURMCommands:
         manager = HPCJobManager()
 
         # Get recent job history
-        returncode, output = manager._ssh_exec(
+        returncode, output = manager.transport.exec(
             "sacct --user=$USER --starttime=now-7days --format=JobID,JobName,State --noheader",
             timeout=15,
         )
@@ -826,7 +828,7 @@ class TestSLURMCommands:
         """Test running scontrol show config."""
         manager = HPCJobManager()
 
-        returncode, output = manager._ssh_exec("scontrol show config | head -20", timeout=15)
+        returncode, output = manager.transport.exec("scontrol show config | head -20", timeout=15)
         assert returncode == 0
 
         # Should contain config information
@@ -836,7 +838,7 @@ class TestSLURMCommands:
         """Test listing SLURM nodes."""
         manager = HPCJobManager()
 
-        returncode, output = manager._ssh_exec("sinfo -N", timeout=15)
+        returncode, output = manager.transport.exec("sinfo -N", timeout=15)
         assert returncode == 0
 
         # Should have node information
@@ -846,7 +848,7 @@ class TestSLURMCommands:
         """Test squeue with custom format."""
         manager = HPCJobManager()
 
-        returncode, output = manager._ssh_exec(
+        returncode, output = manager.transport.exec(
             "squeue -u $USER -o '%.18i %.9P %.20j %.8u %.2t %.10M %.6D %R'", timeout=15
         )
         assert returncode == 0
@@ -855,7 +857,7 @@ class TestSLURMCommands:
         """Test getting SLURM version."""
         manager = HPCJobManager()
 
-        returncode, output = manager._ssh_exec("scontrol --version", timeout=15)
+        returncode, output = manager.transport.exec("scontrol --version", timeout=15)
         assert returncode == 0
         assert "slurm" in output.lower()
 

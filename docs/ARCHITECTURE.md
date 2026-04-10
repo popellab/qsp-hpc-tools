@@ -102,11 +102,11 @@ from qsp_hpc import QSPSimulator
 
 # 1. Create simulator (reads config, sets up caching)
 sim = QSPSimulator(
-    test_stats_csv='test_stats.csv',
     priors_csv='priors.csv',
+    calibration_targets='calibration_targets/control/',
     model_script='my_model',
     model_version='v1',
-    scenario='control'
+    scenario='control',
 )
 
 # 2. Request simulations (automatic caching)

@@ -1,0 +1,25 @@
+# Scenario: combination therapy (vaccine + checkpoint inhibitor)
+# Demonstrates multi-drug dosing configuration.
+
+sim_config:
+  start_time: 0
+  stop_time: 60
+  time_units: day
+  solver: sundials
+  abs_tolerance: 1.0e-9
+  rel_tolerance: 1.0e-6
+
+dosing:
+  drugs: [GVAX, pembrolizumab]
+
+  # Vaccine: weekly for 4 weeks
+  GVAX_dose: 1.0e8
+  GVAX_start_time: 0
+  GVAX_interval: 7
+  GVAX_repeat_count: 4
+
+  # Checkpoint inhibitor: every 3 weeks starting at week 3
+  pembrolizumab_dose: 200
+  pembrolizumab_start_time: 21
+  pembrolizumab_interval: 21
+  pembrolizumab_repeat_count: 3

@@ -32,15 +32,15 @@ from qsp_hpc import QSPSimulator
 
 # Create simulator for a specific scenario
 simulator = QSPSimulator(
-    test_stats_csv='path/to/test_stats.csv',
-    priors_csv='path/to/priors.csv',
+    priors_csv='priors.csv',
+    calibration_targets='calibration_targets/control/',
     model_script='my_qsp_model',
     model_version='v1',
-    scenario='control'
+    scenario='control',
 )
 
 # Run simulations (automatically cached)
-params, observables = simulator(n_simulations=1000)
+params, observables = simulator(1000)
 ```
 
 ### CLI Commands
@@ -54,6 +54,8 @@ qsp-hpc logs      # View HPC job logs
 
 ## Documentation
 
+- **[Getting Started](docs/GETTING_STARTED.md)** - Full walkthrough from install to first run
+- **[MATLAB Model Requirements](docs/MATLAB_MODEL_REQUIREMENTS.md)** - Model interface contract
 - **[Configuration Guide](docs/CONFIGURATION.md)** - HPC setup and configuration
 - **[CLI Reference](docs/CLI.md)** - Command-line interface documentation
 - **[Architecture](docs/ARCHITECTURE.md)** - System design and caching strategy

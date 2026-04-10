@@ -111,7 +111,7 @@ class TestMaxBatchesInDerivationConfig:
     This caused the worker to process ALL batches instead of just the needed ones,
     leading to params/test_stats count mismatches.
 
-    See: https://github.com/jeliason/qsp-hpc-tools/issues/XXX
+    Regression test for selective derivation batch count bug.
     """
 
     def test_max_batches_always_none_for_full_derivation(self, tmp_path):

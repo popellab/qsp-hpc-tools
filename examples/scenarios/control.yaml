@@ -1,0 +1,12 @@
+# Scenario: untreated control arm
+# No dosing — baseline disease progression only.
+
+sim_config:
+  start_time: 0
+  stop_time: 60
+  time_units: day
+  solver: sundials
+  abs_tolerance: 1.0e-9
+  rel_tolerance: 1.0e-6
+
+# No dosing section → baseline (no treatment)

@@ -980,7 +980,7 @@ class HPCJobManager:
         pool_path: str,
         test_stats_csv: str,
         test_stats_hash: str,
-        species_units_file: Optional[str] = None,
+        model_structure_file: Optional[str] = None,
         num_simulations: Optional[int] = None,
     ) -> str:
         """
@@ -993,7 +993,7 @@ class HPCJobManager:
             pool_path: Path to simulation pool on HPC (e.g., {simulation_pool_path}/baseline_pdac_abc12345)
             test_stats_csv: Local path to test statistics CSV
             test_stats_hash: Hash of test statistics CSV
-            species_units_file: Local path to species_units.json mapping species to units
+            model_structure_file: Local path to model_structure.json with species metadata
             num_simulations: Number of simulations needed (None = derive all batches)
 
         Returns:
@@ -1018,11 +1018,11 @@ class HPCJobManager:
         self.transport.upload(test_stats_csv, remote_test_stats_csv)
 
         # Upload species units file if provided
-        remote_species_units_file = None
-        if species_units_file:
-            remote_species_units_file = f"{derivation_dir}/species_units.json"
-            self.logger.info("Uploading species units file to HPC...")
-            self.transport.upload(species_units_file, remote_species_units_file)
+        remote_model_structure_file = None
+        if model_structure_file:
+            remote_model_structure_file = f"{derivation_dir}/model_structure.json"
+            self.logger.info("Uploading model structure file to HPC...")
+            self.transport.upload(model_structure_file, remote_model_structure_file)
 
         # Expand $HOME in pool_path (Python won't expand shell variables)
         # Get the actual home directory from HPC
@@ -1042,7 +1042,7 @@ class HPCJobManager:
             "test_stats_csv": remote_test_stats_csv,
             "output_dir": expanded_pool_path,
             "test_stats_hash": test_stats_hash,
-            "species_units_file": remote_species_units_file,
+            "model_structure_file": remote_model_structure_file,
             "max_batches": None,  # Always derive all batches
         }
 

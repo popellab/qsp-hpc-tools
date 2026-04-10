@@ -12,7 +12,7 @@ Usage:
 The config JSON should contain:
     - simulation_pool_dir: Path to full simulation pool on HPC
     - test_stats_csv: Path to test statistics CSV
-    - species_units_file: Path to species_units.json (maps species names to unit strings)
+    - model_structure_file: Path to model_structure.json (species metadata with units)
     - output_dir: Path to output directory for derived test stats
     - test_stats_hash: Hash of test statistics configuration
 """
@@ -305,13 +305,13 @@ def main():
     test_stats_csv = Path(config["test_stats_csv"])
     output_dir = Path(config["output_dir"])
     test_stats_hash = config["test_stats_hash"]
-    species_units_file_str = config.get("species_units_file")
-    species_units_file = Path(species_units_file_str) if species_units_file_str else None
+    model_structure_file_str = config.get("model_structure_file")
+    model_structure_file = Path(model_structure_file_str) if model_structure_file_str else None
     max_batches = config.get("max_batches")  # None means process all batches
 
     logger.info(f"Simulation pool: {simulation_pool_dir}")
     logger.info(f"Test stats CSV: {test_stats_csv}")
-    logger.info(f"Species units: {species_units_file}")
+    logger.info(f"Model structure: {model_structure_file}")
     logger.info(f"Output dir: {output_dir}")
     if max_batches is not None:
         logger.info(f"Max batches to process: {max_batches}")
@@ -320,14 +320,15 @@ def main():
     test_stats_output_dir = output_dir / "test_stats" / test_stats_hash
     test_stats_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load species units (optional - use empty dict if not provided)
-    if species_units_file and species_units_file.exists():
-        logger.info("Loading species units...")
-        with open(species_units_file, "r") as f:
-            species_units = json.load(f)
+    # Load species units from model structure (optional - use empty dict if not provided)
+    if model_structure_file and model_structure_file.exists():
+        logger.info("Loading species units from model structure...")
+        with open(model_structure_file, "r") as f:
+            data = json.load(f)
+        species_units = {s["name"]: s["units"] for s in data["species"]}
         logger.info(f"Loaded units for {len(species_units)} species")
     else:
-        logger.info("No species units file provided - using dimensionless for all species")
+        logger.info("No model structure file provided - using dimensionless for all species")
         species_units = {}
 
     # Load test statistics configuration

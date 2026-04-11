@@ -117,6 +117,7 @@ class QSPSimulator:
         test_stats_csv: Optional[Union[str, Path]] = None,
         calibration_targets: Optional[Union[str, Path]] = None,
         model_structure_file: Optional[Union[str, Path]] = None,
+        submodel_priors_yaml: Optional[Union[str, Path]] = None,
         model_script: str = "",
         model_version: str = "v1",
         model_description: str = "",
@@ -146,6 +147,9 @@ class QSPSimulator:
                                 each simulation.
             model_structure_file: Path to model_structure.json with species metadata (array-of-objects
                                   format with name, compartment, base_name, units, description).
+            submodel_priors_yaml: Path to submodel_priors.yaml with fitted marginals and copula
+                                  correlations. When provided, overrides CSV priors for matched
+                                  parameters during sampling.
             model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
             model_version: Descriptive version name (e.g., 'baseline_gvax')
             model_description: Brief description of model configuration
@@ -187,6 +191,9 @@ class QSPSimulator:
             Path(model_structure_file) if model_structure_file is not None else None
         )
         self.priors_csv = Path(priors_csv)
+        self.submodel_priors_yaml = (
+            Path(submodel_priors_yaml) if submodel_priors_yaml is not None else None
+        )
         self.model_script = model_script
         self.model_version = model_version
         self.model_description = model_description
@@ -230,6 +237,7 @@ class QSPSimulator:
                 priors_csv=priors_csv,
                 model_script=model_script,
                 scenario=scenario,
+                submodel_priors_yaml=submodel_priors_yaml,
             )
             if self._calibration_targets_dir is not None:
                 pool_kwargs["calibration_targets"] = self._calibration_targets_dir
@@ -438,32 +446,43 @@ class QSPSimulator:
         """
         Generate parameter samples from priors.
 
+        Uses the composite prior (submodel YAML + CSV fallback) when a
+        submodel_priors_yaml is provided, otherwise falls back to CSV-only.
+
         Args:
             n_samples: Number of parameter sets to generate
 
         Returns:
             numpy array of shape (n_samples, num_params)
         """
-        import pandas as pd
+        if self.submodel_priors_yaml is not None and self.submodel_priors_yaml.exists():
+            from qsp_inference.priors.copula_prior import load_composite_prior_log
 
-        # Load priors CSV
-        priors_df = pd.read_csv(self.priors_csv)
-        param_names = priors_df["name"].tolist()
-        dist_types = priors_df["distribution"].tolist()
-        dist_param1 = priors_df["dist_param1"].values
-        dist_param2 = priors_df["dist_param2"].values
+            prior_log, _ = load_composite_prior_log(self.submodel_priors_yaml, self.priors_csv)
+            import torch
 
-        # Generate samples
-        samples = np.zeros((n_samples, len(param_names)))
-        for i in range(len(param_names)):
-            if dist_types[i] == "lognormal":
-                samples[:, i] = self.param_rng.lognormal(
-                    mean=dist_param1[i], sigma=dist_param2[i], size=n_samples
-                )
-            else:
-                raise ValueError(f"Unsupported distribution: {dist_types[i]}")
+            with torch.no_grad():
+                torch.manual_seed(int(self.param_rng.integers(2**31)))
+                log_samples = prior_log.sample((n_samples,)).numpy()
+            return np.exp(log_samples)
+        else:
+            import pandas as pd
 
-        return samples  # type: ignore[no-any-return]
+            priors_df = pd.read_csv(self.priors_csv)
+            dist_types = priors_df["distribution"].tolist()
+            dist_param1 = priors_df["dist_param1"].values
+            dist_param2 = priors_df["dist_param2"].values
+
+            samples = np.zeros((n_samples, len(priors_df)))
+            for i in range(len(priors_df)):
+                if dist_types[i] == "lognormal":
+                    samples[:, i] = self.param_rng.lognormal(
+                        mean=dist_param1[i], sigma=dist_param2[i], size=n_samples
+                    )
+                else:
+                    raise ValueError(f"Unsupported distribution: {dist_types[i]}")
+
+            return samples  # type: ignore[no-any-return]
 
     def _format_number(self, value: float) -> str:
         """

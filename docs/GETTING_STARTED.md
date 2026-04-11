@@ -159,7 +159,9 @@ from qsp_hpc import QSPSimulator
 # Initialize for the control scenario
 sim_control = QSPSimulator(
     priors_csv="priors.csv",
+    submodel_priors_yaml="submodel_priors.yaml",  # optional: narrows priors for calibrated params
     calibration_targets="calibration_targets/control/",
+    model_structure_file="model_structure.json",
     model_script="my_model",
     model_version="v1",
     scenario="control",
@@ -186,7 +188,9 @@ shared_seed = 42
 
 sim_control = QSPSimulator(
     priors_csv="priors.csv",
+    submodel_priors_yaml="submodel_priors.yaml",
     calibration_targets="calibration_targets/control/",
+    model_structure_file="model_structure.json",
     model_script="my_model",
     model_version="v1",
     scenario="control",
@@ -197,7 +201,9 @@ sim_control = QSPSimulator(
 
 sim_treatment = QSPSimulator(
     priors_csv="priors.csv",
+    submodel_priors_yaml="submodel_priors.yaml",
     calibration_targets="calibration_targets/treatment/",
+    model_structure_file="model_structure.json",
     model_script="my_model",
     model_version="v1",
     scenario="treatment",
@@ -220,6 +226,7 @@ For testing or small runs with a local MATLAB installation:
 sim = QSPSimulator(
     priors_csv="priors.csv",
     calibration_targets="calibration_targets/control/",
+    model_structure_file="model_structure.json",
     model_script="my_model",
     model_version="v1",
     scenario="control",

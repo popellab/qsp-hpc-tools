@@ -4,6 +4,7 @@ This module tests the QSPSimulator class which provides the interface between
 Python SBI workflows and MATLAB QSP models.
 """
 
+import importlib
 import shutil
 import tempfile
 from pathlib import Path
@@ -484,6 +485,85 @@ class TestParameterGenerationBasics:
 
         assert params.shape == (1, 3)
         assert isinstance(params, np.ndarray)
+
+
+_has_copula_prior = importlib.util.find_spec("torch") and importlib.util.find_spec("qsp_inference")
+
+
+@pytest.mark.skipif(not _has_copula_prior, reason="torch and qsp_inference required")
+class TestSubmodelPriorsSampling:
+    """Test _generate_parameters with submodel_priors_yaml."""
+
+    @pytest.fixture
+    def submodel_yaml(self, temp_dir):
+        """Create a submodel_priors.yaml that overrides one CSV param."""
+        yaml_path = temp_dir / "submodel_priors.yaml"
+        yaml_path.write_text(
+            "metadata:\n  n_parameters: 1\n"
+            "parameters:\n"
+            "- name: k_elim\n"
+            "  marginal:\n"
+            "    distribution: lognormal\n"
+            "    mu: -2.0\n"
+            "    sigma: 0.05\n"
+        )
+        return yaml_path
+
+    def test_generate_parameters_with_submodel_yaml(
+        self, sample_test_stats_csv, sample_priors_csv, temp_dir, submodel_yaml
+    ):
+        """Submodel YAML should produce samples with correct shape."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            submodel_priors_yaml=submodel_yaml,
+            model_version="v1",
+            cache_dir=temp_dir / "cache",
+        )
+        params = sim._generate_parameters(100)
+        assert params.shape == (100, 3)
+        assert np.all(params > 0)  # original space, all positive
+
+    def test_submodel_yaml_narrows_overridden_param(
+        self, sample_test_stats_csv, sample_priors_csv, temp_dir, submodel_yaml
+    ):
+        """Param overridden by submodel YAML should have tighter spread."""
+        sim_csv = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_version="v1",
+            cache_dir=temp_dir / "cache1",
+            seed=42,
+        )
+        sim_yaml = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            submodel_priors_yaml=submodel_yaml,
+            model_version="v1",
+            cache_dir=temp_dir / "cache2",
+            seed=42,
+        )
+        params_csv = sim_csv._generate_parameters(2000)
+        params_yaml = sim_yaml._generate_parameters(2000)
+
+        # k_elim is column 1; YAML sigma=0.05 vs CSV sigma=0.1
+        cv_csv = np.std(np.log(params_csv[:, 1]))
+        cv_yaml = np.std(np.log(params_yaml[:, 1]))
+        assert cv_yaml < cv_csv
+
+    def test_without_submodel_yaml_uses_csv(
+        self, sample_test_stats_csv, sample_priors_csv, temp_dir
+    ):
+        """Without submodel YAML, should fall back to CSV-only path."""
+        sim = QSPSimulator(
+            test_stats_csv=sample_test_stats_csv,
+            priors_csv=sample_priors_csv,
+            model_version="v1",
+            cache_dir=temp_dir / "cache",
+        )
+        assert sim.submodel_priors_yaml is None
+        params = sim._generate_parameters(50)
+        assert params.shape == (50, 3)
 
 
 # ============================================================================

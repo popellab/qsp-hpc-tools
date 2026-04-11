@@ -116,7 +116,7 @@ class QSPSimulator:
         priors_csv: Union[str, Path],
         test_stats_csv: Optional[Union[str, Path]] = None,
         calibration_targets: Optional[Union[str, Path]] = None,
-        species_units_file: Optional[Union[str, Path]] = None,
+        model_structure_file: Optional[Union[str, Path]] = None,
         model_script: str = "",
         model_version: str = "v1",
         model_description: str = "",
@@ -144,7 +144,8 @@ class QSPSimulator:
             calibration_targets: Path to directory of calibration target YAML files
                                 (from MAPLE). Defines the observables to extract from
                                 each simulation.
-            species_units_file: Path to species_units.json mapping species names to unit strings.
+            model_structure_file: Path to model_structure.json with species metadata (array-of-objects
+                                  format with name, compartment, base_name, units, description).
             model_script: MATLAB model script name (e.g., 'immune_oncology_model_PDAC')
             model_version: Descriptive version name (e.g., 'baseline_gvax')
             model_description: Brief description of model configuration
@@ -182,8 +183,8 @@ class QSPSimulator:
             test_stats_csv = self._temp_csv
 
         self.test_stats_csv = Path(test_stats_csv) if test_stats_csv is not None else None
-        self.species_units_file = (
-            Path(species_units_file) if species_units_file is not None else None
+        self.model_structure_file = (
+            Path(model_structure_file) if model_structure_file is not None else None
         )
         self.priors_csv = Path(priors_csv)
         self.model_script = model_script
@@ -1124,14 +1125,15 @@ class QSPSimulator:
             test_stat_registry = build_test_stat_registry(test_stats_df)
 
             # Load species units (required for Pint-aware test statistics)
-            if self.species_units_file is not None and self.species_units_file.exists():
-                with open(self.species_units_file, "r") as f:
-                    species_units = json.load(f)
+            if self.model_structure_file is not None and self.model_structure_file.exists():
+                with open(self.model_structure_file, "r") as f:
+                    data = json.load(f)
+                species_units = {s["name"]: s["units"] for s in data["species"]}
                 self.logger.info(f"Loaded units for {len(species_units)} species")
             else:
                 species_units = {}
                 self.logger.warning(
-                    "No species_units_file provided - using dimensionless for all species"
+                    "No model_structure_file provided - using dimensionless for all species"
                 )
 
             test_stats = compute_test_statistics_batch(
@@ -1251,7 +1253,9 @@ class QSPSimulator:
             hpc_pool_path,
             str(self.test_stats_csv),
             test_stats_hash,
-            species_units_file=str(self.species_units_file) if self.species_units_file else None,
+            model_structure_file=(
+                str(self.model_structure_file) if self.model_structure_file else None
+            ),
             num_simulations=num_simulations,
         )
         self.logger.info(f"Derivation job submitted: {job_id}")
@@ -1748,9 +1752,10 @@ class QSPSimulator:
         test_stat_registry = build_test_stat_registry(test_stats_df)
 
         species_units = {}
-        if self.species_units_file is not None and self.species_units_file.exists():
-            with open(self.species_units_file, "r") as f:
-                species_units = json.load(f)
+        if self.model_structure_file is not None and self.model_structure_file.exists():
+            with open(self.model_structure_file, "r") as f:
+                data = json.load(f)
+            species_units = {s["name"]: s["units"] for s in data["species"]}
 
         observables = compute_test_statistics_batch(
             species_df, test_stats_df, test_stat_registry, species_units

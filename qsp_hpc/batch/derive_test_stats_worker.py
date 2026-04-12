@@ -32,6 +32,7 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from qsp_hpc.utils.logging_config import setup_logger  # noqa: E402
+from qsp_hpc.utils.model_structure_units import load_units_from_model_structure  # noqa: E402
 
 
 # Test statistic functions are now stored directly in the CSV
@@ -320,15 +321,14 @@ def main():
     test_stats_output_dir = output_dir / "test_stats" / test_stats_hash
     test_stats_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load species units from model structure (optional - use empty dict if not provided)
+    # Load units from model structure (species + compartments + parameters).
+    # Covers all entities a calibration target may reference via species_dict.
     if model_structure_file and model_structure_file.exists():
-        logger.info("Loading species units from model structure...")
-        with open(model_structure_file, "r") as f:
-            data = json.load(f)
-        species_units = {s["name"]: s["units"] for s in data["species"]}
-        logger.info(f"Loaded units for {len(species_units)} species")
+        logger.info("Loading units from model structure...")
+        species_units = load_units_from_model_structure(model_structure_file)
+        logger.info(f"Loaded units for {len(species_units)} names")
     else:
-        logger.info("No model structure file provided - using dimensionless for all species")
+        logger.info("No model structure file provided - using dimensionless for all names")
         species_units = {}
 
     # Load test statistics configuration

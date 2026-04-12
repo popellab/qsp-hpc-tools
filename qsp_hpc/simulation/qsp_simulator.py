@@ -46,6 +46,7 @@ from qsp_hpc.utils.logging_config import (
     log_operation,
     setup_logger,
 )
+from qsp_hpc.utils.model_structure_units import load_units_from_model_structure
 
 
 class QSPSimulatorError(RuntimeError):
@@ -1131,7 +1132,6 @@ class QSPSimulator:
                 return params, parquet_file
 
             # Derive test stats from parquet (same as HPC derivation worker)
-            import json
 
             from qsp_hpc.batch.derive_test_stats_worker import (
                 build_test_stat_registry,
@@ -1143,16 +1143,14 @@ class QSPSimulator:
             test_stats_df = pd.read_csv(self.test_stats_csv)
             test_stat_registry = build_test_stat_registry(test_stats_df)
 
-            # Load species units (required for Pint-aware test statistics)
+            # Load units (species + compartments + parameters) for Pint-aware test stats
             if self.model_structure_file is not None and self.model_structure_file.exists():
-                with open(self.model_structure_file, "r") as f:
-                    data = json.load(f)
-                species_units = {s["name"]: s["units"] for s in data["species"]}
-                self.logger.info(f"Loaded units for {len(species_units)} species")
+                species_units = load_units_from_model_structure(self.model_structure_file)
+                self.logger.info(f"Loaded units for {len(species_units)} names")
             else:
                 species_units = {}
                 self.logger.warning(
-                    "No model_structure_file provided - using dimensionless for all species"
+                    "No model_structure_file provided - using dimensionless for all names"
                 )
 
             test_stats = compute_test_statistics_batch(
@@ -1690,7 +1688,6 @@ class QSPSimulator:
         Returns:
             Test statistics array (n_samples, n_test_stats)
         """
-        import json
 
         import pandas as pd
 
@@ -1772,9 +1769,7 @@ class QSPSimulator:
 
         species_units = {}
         if self.model_structure_file is not None and self.model_structure_file.exists():
-            with open(self.model_structure_file, "r") as f:
-                data = json.load(f)
-            species_units = {s["name"]: s["units"] for s in data["species"]}
+            species_units = load_units_from_model_structure(self.model_structure_file)
 
         observables = compute_test_statistics_batch(
             species_df, test_stats_df, test_stat_registry, species_units

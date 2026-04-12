@@ -390,6 +390,91 @@ class TestComputeTestStatisticsBatch:
         assert np.isnan(result[0, 0])
 
 
+class TestNonSpeciesResolution:
+    """Test that compartments and scalar parameters resolve correctly.
+
+    Regression tests for the bug where calibration targets referencing
+    compartment volumes (e.g., V_T) or scalar parameters (e.g., rho_collagen)
+    produced NaN because species_units only contained species, forcing
+    `.to('milliliter')` / `.to('gram/milliliter')` to fail on dimensionless defaults.
+    """
+
+    def test_compartment_volume_resolves_with_units(self):
+        """A compartment column (V_T) in sim_df should pick up its unit from species_units."""
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["cellularity"],
+                "required_species": ["V_T.C1,V_T"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    cancer_cells = np.mean(species_dict['V_T.C1'].magnitude)\n"
+                    "    V_T_mL = species_dict['V_T'].to('milliliter').magnitude\n"
+                    "    return cancer_cells * 1e-9 / V_T_mL"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0],
+                "status": [1],
+                "time": [[0.0, 1.0]],
+                "V_T.C1": [[1e8, 1e8]],
+                "V_T": [0.5],  # scalar compartment volume
+            }
+        )
+        species_units = {"V_T.C1": "cell", "V_T": "milliliter"}
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
+        assert not np.isnan(result[0, 0])
+        assert result[0, 0] == pytest.approx(1e8 * 1e-9 / 0.5)
+
+    def test_scalar_parameter_resolves_with_units(self):
+        """A `param:`-prefixed scalar parameter should pick up its unit from species_units."""
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["rho_identity"],
+                "required_species": ["rho_collagen"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return species_dict['rho_collagen'].to('gram/milliliter').magnitude"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0],
+                "status": [1],
+                "time": [[0.0]],
+                "param:rho_collagen": [0.025],
+            }
+        )
+        species_units = {"rho_collagen": "gram/milliliter"}
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
+        assert result[0, 0] == pytest.approx(0.025)
+
+    def test_wrong_unit_yields_nan(self):
+        """Sanity check: if species_units is missing the right unit (old buggy behavior),
+        `.to('milliliter')` on a dimensionless default should fail and produce NaN.
+        """
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["cellularity"],
+                "required_species": ["V_T"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return species_dict['V_T'].to('milliliter').magnitude"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame({"simulation_id": [0], "status": [1], "time": [[0.0]], "V_T": [0.5]})
+        # Deliberately omit V_T from species_units → defaults to dimensionless
+        species_units = {}
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
+        assert np.isnan(result[0, 0])
+
+
 class TestProcessSingleBatch:
     """Test process_single_batch function."""
 

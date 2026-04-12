@@ -95,6 +95,7 @@ class SimulationPoolManager:
         calibration_targets: Optional[Union[str, Path]] = None,
         model_script: str = "",
         scenario: str = "default",
+        submodel_priors_yaml: Optional[Union[str, Path]] = None,
     ):
         """
         Initialize simulation pool manager.
@@ -110,6 +111,8 @@ class SimulationPoolManager:
                                 (mutually exclusive with test_stats_csv)
             model_script: MATLAB model script name
             scenario: Scenario name (e.g., 'baseline_no_treatment', 'gvax_standard_regimen')
+            submodel_priors_yaml: Path to submodel_priors.yaml with fitted marginals
+                                  and copula correlations (overrides CSV for matched params)
         """
         if test_stats_csv is not None and calibration_targets is not None:
             raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
@@ -120,6 +123,9 @@ class SimulationPoolManager:
         self.model_version = model_version
         self.model_description = model_description
         self.priors_csv = Path(priors_csv)
+        self.submodel_priors_yaml = (
+            Path(submodel_priors_yaml) if submodel_priors_yaml is not None else None
+        )
         self.model_script = model_script
         self.scenario = scenario
         self._calibration_targets_dir = None
@@ -194,6 +200,10 @@ class SimulationPoolManager:
         # Hash priors CSV content
         priors_content = self.priors_csv.read_text()
         hasher.update(priors_content.encode("utf-8"))
+
+        # Hash submodel priors YAML content (overrides CSV for matched params)
+        if self.submodel_priors_yaml is not None and self.submodel_priors_yaml.exists():
+            hasher.update(self.submodel_priors_yaml.read_text().encode("utf-8"))
 
         # Hash observables source (either CSV or YAML directory)
         if self._calibration_targets_dir is not None:

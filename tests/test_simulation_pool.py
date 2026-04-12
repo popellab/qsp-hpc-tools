@@ -673,3 +673,65 @@ class TestSimulationPoolCalibrationTargets:
         loaded_params, loaded_obs = pool.load_simulations(n_requested=1, scenario="default")
         np.testing.assert_array_equal(loaded_params, params)
         np.testing.assert_array_equal(loaded_obs, obs)
+
+
+class TestSubmodelPriorsYaml:
+    """Test that submodel_priors_yaml affects config hash."""
+
+    @pytest.fixture
+    def sample_submodel_yaml(self, temp_dir):
+        """Create a minimal submodel_priors.yaml."""
+        yaml_path = temp_dir / "submodel_priors.yaml"
+        yaml_path.write_text(
+            "metadata:\n  n_parameters: 1\n"
+            "parameters:\n"
+            "- name: param2\n"
+            "  marginal:\n"
+            "    distribution: lognormal\n"
+            "    mu: 0.5\n"
+            "    sigma: 0.1\n"
+        )
+        return yaml_path
+
+    def test_config_hash_changes_with_submodel_yaml(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv, sample_submodel_yaml
+    ):
+        """Config hash should differ when submodel_priors_yaml is provided."""
+        pool_no_yaml = SimulationPoolManager(
+            cache_dir=temp_dir / "cache1",
+            model_version="v1",
+            model_description="Test",
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv,
+        )
+        pool_with_yaml = SimulationPoolManager(
+            cache_dir=temp_dir / "cache2",
+            model_version="v1",
+            model_description="Test",
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv,
+            submodel_priors_yaml=sample_submodel_yaml,
+        )
+        assert pool_no_yaml.config_hash != pool_with_yaml.config_hash
+
+    def test_config_hash_stable_with_submodel_yaml(
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv, sample_submodel_yaml
+    ):
+        """Config hash should be deterministic when submodel YAML is provided."""
+        pool1 = SimulationPoolManager(
+            cache_dir=temp_dir / "cache1",
+            model_version="v1",
+            model_description="Test",
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv,
+            submodel_priors_yaml=sample_submodel_yaml,
+        )
+        pool2 = SimulationPoolManager(
+            cache_dir=temp_dir / "cache2",
+            model_version="v1",
+            model_description="Test",
+            priors_csv=sample_priors_csv,
+            test_stats_csv=sample_test_stats_csv,
+            submodel_priors_yaml=sample_submodel_yaml,
+        )
+        assert pool1.config_hash == pool2.config_hash

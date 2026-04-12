@@ -103,7 +103,9 @@ from qsp_hpc import QSPSimulator
 # 1. Create simulator (reads config, sets up caching)
 sim = QSPSimulator(
     priors_csv='priors.csv',
+    submodel_priors_yaml='submodel_priors.yaml',  # optional: fitted marginals + copula
     calibration_targets='calibration_targets/control/',
+    model_structure_file='model_structure.json',
     model_script='my_model',
     model_version='v1',
     scenario='control',

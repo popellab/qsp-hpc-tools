@@ -33,7 +33,9 @@ from qsp_hpc import QSPSimulator
 # Create simulator for a specific scenario
 simulator = QSPSimulator(
     priors_csv='priors.csv',
+    submodel_priors_yaml='submodel_priors.yaml',  # optional: narrows priors for calibrated params
     calibration_targets='calibration_targets/control/',
+    model_structure_file='model_structure.json',
     model_script='my_qsp_model',
     model_version='v1',
     scenario='control',

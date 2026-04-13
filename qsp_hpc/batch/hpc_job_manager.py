@@ -74,6 +74,8 @@ class BatchConfig:
     memory_per_job: str = "2G"
     matlab_module: str = "matlab/R2024a"
     jobs_per_chunk: int = 20
+    cpus_per_task: int = 1
+    matlab_workers: int = 0  # 0 = serial; >0 = open parpool(N) in batch_worker
     strict_host_key_checking: bool = True  # Security: verify SSH host keys by default
     qsp_hpc_tools_source: str = "git+ssh://git@github.com/jeliason/qsp-hpc-tools.git"
 
@@ -385,6 +387,8 @@ class HPCJobManager:
             time_limit=time_limit,
             memory_per_job=memory_per_job,
             matlab_module=cluster.get("matlab_module", "matlab/R2024a").strip(),
+            cpus_per_task=int(slurm.get("cpus_per_task", 1)),
+            matlab_workers=int(slurm.get("matlab_workers", 0)),
             strict_host_key_checking=ssh.get(
                 "strict_host_key_checking", True
             ),  # Default to True for security

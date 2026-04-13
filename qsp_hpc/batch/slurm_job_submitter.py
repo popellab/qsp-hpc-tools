@@ -112,6 +112,7 @@ class SLURMJobSubmitter:
 #SBATCH --partition={self.config.partition}
 #SBATCH --time={self.config.time_limit}
 #SBATCH --mem={self.config.memory_per_job}
+#SBATCH --cpus-per-task={self.config.cpus_per_task}
 #SBATCH --array=0-{n_jobs-1}
 #SBATCH --output={log_dir}/qsp_batch_%A_%a.out
 #SBATCH --error={log_dir}/qsp_batch_%A_%a.err
@@ -123,6 +124,8 @@ echo "Job ID: $SLURM_JOB_ID"
 # Export HPC paths for MATLAB scripts to use
 export HPC_VENV_PATH="{self.config.hpc_venv_path}"
 export SIMULATION_POOL_PATH="{self.config.simulation_pool_path}"
+# MATLAB_WORKERS=0 (or unset) -> serial loop; >0 -> parpool(N) + parfor
+export MATLAB_WORKERS="{self.config.matlab_workers}"
 
 # Get MATLAB scripts path from installed qsp-hpc-tools package
 MATLAB_PATH=$("{self.config.hpc_venv_path}/bin/python" -c "import qsp_hpc.matlab; print(qsp_hpc.matlab.get_matlab_path())")

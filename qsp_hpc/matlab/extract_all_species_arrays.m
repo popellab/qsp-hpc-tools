@@ -82,44 +82,67 @@ time_arrays = cell(n_sims, 1);
 species_arrays = cell(n_sims, n_species);
 status = zeros(n_sims, 1);
 
-% Extract data from each simulation
-for i = 1:n_sims
+% Pre-compute per-species constant-compartment flags + values for parfor safety.
+% containers.Map doesn't serialize cleanly to parfor workers, and state names
+% like 'V_T.C1' can't be struct fields. Flat arrays handle both issues.
+is_const_comp = false(1, n_species);
+const_comp_vals = zeros(1, n_species);
+for j = 1:n_species
+    sname = species_names{j};
+    if isKey(constant_compartments, sname)
+        is_const_comp(j) = true;
+        const_comp_vals(j) = constant_compartments(sname);
+    end
+end
+
+% Extract data from each simulation. Uses parfor when MATLAB_WORKERS > 0 and a
+% parpool is already open (expected when invoked from batch_worker).
+num_workers = str2double(getenv('MATLAB_WORKERS'));
+if isnan(num_workers) || num_workers < 0
+    num_workers = 0;
+end
+p = gcp('nocreate');
+if isempty(p)
+    % No pool active — run serially regardless of env var.
+    num_workers = 0;
+end
+
+t_extract = tic;
+parfor (i = 1:n_sims, num_workers)
     simdata = chunk_results(i).simData;
 
     if isempty(simdata)
         % Failed simulation - store empty arrays
         status(i) = -1;
         time_arrays{i} = [];
+        row_cells = cell(1, n_species);
         for j = 1:n_species
-            species_arrays{i, j} = [];
+            row_cells{j} = [];
         end
     else
         % Successful simulation - extract time and species
         status(i) = 1;
         time_arrays{i} = simdata.Time;
 
-        % Extract each species/compartment
+        % Extract each species/compartment into a row cell, then assign once
+        % (parfor's slicing analyzer prefers a single assignment per iter).
+        row_cells = cell(1, n_species);
         for j = 1:n_species
-            state_name = species_names{j};
-
-            % Check if this is a constant compartment - use Capacity directly
-            % This avoids warnings from selectbyname for states not in simdata
-            if isKey(constant_compartments, state_name)
-                capacity = constant_compartments(state_name);
-                species_arrays{i, j} = repmat(capacity, size(simdata.Time));
+            if is_const_comp(j)
+                row_cells{j} = repmat(const_comp_vals(j), size(simdata.Time));
             else
-                % Species or non-constant compartment - extract from simdata
-                [~, data, ~] = selectbyname(simdata, state_name);
+                [~, data, ~] = selectbyname(simdata, species_names{j});
                 if ~isempty(data)
-                    species_arrays{i, j} = data;
+                    row_cells{j} = data;
                 else
-                    % State not found in simdata - store empty array
-                    species_arrays{i, j} = [];
+                    row_cells{j} = [];
                 end
             end
         end
     end
+    species_arrays(i, :) = row_cells;
 end
+fprintf('   Extraction loop: %.1fs (workers=%d)\n', toc(t_extract), num_workers);
 
 % Package output
 species_data = struct();

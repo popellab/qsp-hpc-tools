@@ -30,6 +30,24 @@ try
     % Set up MATLAB environment
     startup; % Load project paths and settings
 
+    % Open parpool if MATLAB_WORKERS > 0 (enables parfor over patients)
+    matlab_workers = str2double(getenv('MATLAB_WORKERS'));
+    if isnan(matlab_workers) || matlab_workers < 0
+        matlab_workers = 0;
+    end
+    if matlab_workers > 0
+        p_existing = gcp('nocreate');
+        if isempty(p_existing) || p_existing.NumWorkers ~= matlab_workers
+            if ~isempty(p_existing)
+                delete(p_existing);
+            end
+            fprintf('   Opening parpool with %d workers...\n', matlab_workers);
+            t_pool = tic;
+            parpool('local', matlab_workers);
+            fprintf('   ✓ parpool ready in %.1fs\n', toc(t_pool));
+        end
+    end
+
     % Determine file paths
     current_dir = pwd;
     base_dir = fullfile(current_dir, 'batch_jobs');
@@ -336,124 +354,114 @@ end
 function [chunk_results, chunk_metadata] = run_chunk_simulations(model_data, chunk_params, patient_range)
 %RUN_CHUNK_SIMULATIONS Execute simulations for parameter chunk
 %
-% This function mirrors the core simulation loop from PSA_simulate.m
-% but operates on a subset of patients.
+% Uses parfor when MATLAB_WORKERS env var > 0 (a parpool must already be open,
+% typically opened in batch_worker). When MATLAB_WORKERS is 0/unset, runs
+% serially. Either way, iterations are independent — each creates its own
+% `copyobj(model)` and variant.
 
-% Extract model data
-model = model_data.model;
-dose_schedule = model_data.dose_schedule;
-config = model_data.config;
+% Determine parfor worker count from env (0 = serial)
+num_workers = str2double(getenv('MATLAB_WORKERS'));
+if isnan(num_workers) || num_workers < 0
+    num_workers = 0;
+end
+
+% Extract and broadcast model data (parfor's static analyzer needs explicit names)
+model_bcast = model_data.model;
+dose_bcast = model_data.dose_schedule;
+params_bcast = chunk_params;
+patient_range_bcast = patient_range;
+if isfield(model_data, 'sim_config')
+    sim_cfg_bcast = model_data.sim_config;
+else
+    sim_cfg_bcast = struct();
+end
+if isfield(sim_cfg_bcast, 'initialization_function')
+    init_func_name = sim_cfg_bcast.initialization_function;
+else
+    init_func_name = '';
+end
 
 n_patients = length(patient_range);
-chunk_results = [];
-chunk_metadata = struct();
-chunk_metadata.status = zeros(n_patients, 1);  % 1=success, 0=failed_IC, -1=failed_sim
-chunk_metadata.patient_range = patient_range;
 
-fprintf('   Starting simulations...\n');
+% Pre-allocate sliced outputs (parfor-safe)
+sim_data_cell = cell(n_patients, 1);
+status_arr = zeros(n_patients, 1);  % 1=success, 0=failed_IC, -1=failed_sim
+
+fprintf('   Starting simulations (parfor workers=%d, %d patients)...\n', ...
+    num_workers, n_patients);
 t_sim_start = tic;
 
-for i = 1:n_patients
-    patient_global_id = patient_range(i);
+parfor (i = 1:n_patients, num_workers)
     t_patient_start = tic;
+    patient_global_id = patient_range_bcast(i);
 
-    % Progress indicator
-    fprintf('     [%s] Patient %d/%d (global ID: %d)\n', ...
-        datestr(now, 'HH:MM:SS'), i, n_patients, patient_global_id);
+    % Suppress SimBiology complex-number warning during ODE integration on
+    % each worker (fires millions of times from TCR quadratic / ^(2/3) terms).
+    warning('off', 'SimBiology:SimFunction:COMPLEX_DATA'); %#ok<PFOUS>
 
-    % Log first 3 parameter values for this patient
-    fprintf('       Parameters (first 3): ');
-    for j = 1:min(3, length(chunk_params.names))
-        pname = chunk_params.names{j};
-        if isfield(chunk_params, pname) && isfield(chunk_params.(pname), 'LHS')
-            pval = chunk_params.(pname).LHS(i);
-            fprintf('%s=%.3e ', pname, pval);
-        end
-    end
-    fprintf('\n       ');
+    fprintf('     Patient %d/%d (global ID: %d) starting\n', i, n_patients, patient_global_id);
 
-    % Clean up previous model copy
-    if i > 1, delete(model_copy); end
-
+    status_i = -1;
+    sim_data_i = [];
+    model_copy = [];
     try
-        % Suppress SimBiology complex-number warning during ODE integration.
-        % This fires millions of times per batch (e.g., 700k in a single task)
-        % due to the TCR quadratic discriminant and cancer_module ^(2/3) terms.
-        % The solver drops the imaginary part and continues; suppressing the
-        % warning prevents massive stdout bloat and speeds up straggler tasks.
-        warning('off', 'SimBiology:SimFunction:COMPLEX_DATA');
+        model_copy = copyobj(model_bcast);
+        variant = create_parameter_variant_worker(model_copy, params_bcast, i);
 
-        % Create model copy and parameter variant
-        model_copy = copyobj(model);
-        variant = create_parameter_variant_worker(model_copy, chunk_params, i);
-
-        % Initialize model (if initialization function specified)
-        if isfield(model_data, 'sim_config') && isfield(model_data.sim_config, 'initialization_function')
-            init_func = model_data.sim_config.initialization_function;
-            fprintf('DEBUG: Calling initialization function: %s (patient %d)\n', init_func, i);
-
+        % Initialize model if an init function was configured
+        ic_ok = true;
+        if ~isempty(init_func_name)
             try
-                [model_copy, ic_success, ~] = feval(init_func, model_copy, 'Variant', variant);
-
+                [model_copy, ic_success, ~] = feval(init_func_name, model_copy, 'Variant', variant);
                 if ~ic_success
-                    fprintf('Initialization failed (%s)\n', init_func);
-                    chunk_metadata.status(i) = 0;  % Failed IC
-                    chunk_results(i).simData = [];
-                    continue;
-                else
-                    fprintf('DEBUG: Initialization succeeded (%s)\n', init_func);
+                    fprintf('     Patient %d: IC rejected (%s, %.2fs)\n', ...
+                        i, init_func_name, toc(t_patient_start));
+                    status_i = 0;
+                    ic_ok = false;
                 end
-
             catch ic_err
-                fprintf('Initialization error (%s): %s\n', init_func, ic_err.message);
-                chunk_metadata.status(i) = 0;  % Failed IC
-                chunk_results(i).simData = [];
-                continue;
+                fprintf('     Patient %d: IC error (%s): %s\n', i, init_func_name, ic_err.message);
+                status_i = 0;
+                ic_ok = false;
             end
         end
 
-        % Run simulation
-        try
-            % Debug: check C1 initial condition before main simulation
-            c1_species = sbioselect(model_copy, 'Type', 'species', 'Name', 'C1');
-            if isempty(c1_species)
-                c1_species = sbioselect(model_copy, 'Type', 'species', 'Name', 'V_T.C1');
+        if ic_ok
+            try
+                sim_data_i = sbiosimulate(model_copy, [], variant, dose_bcast);
+                status_i = 1;
+                fprintf('     Patient %d: ok (%.2fs)\n', i, toc(t_patient_start));
+            catch sim_err
+                fprintf('     Patient %d: sim error: %s\n', i, sim_err.message);
+                status_i = -1;
             end
-            if ~isempty(c1_species)
-                fprintf('DEBUG: C1 before main sim: %.2e cells (%.3f cm)\n', c1_species.InitialAmount, ((6*c1_species.InitialAmount/1e9/pi)^(1/3)));
-            end
-
-            sim_data = sbiosimulate(model_copy, [], variant, dose_schedule);
-            t_patient = toc(t_patient_start);
-            chunk_metadata.status(i) = 1;   % Success
-            chunk_results(i).simData = sim_data;
-
-            fprintf('Success (%.2f sec)\n', t_patient);
-
-        catch sim_err
-            fprintf('Simulation error: %s\n', sim_err.message);
-            chunk_metadata.status(i) = -1;  % Failed simulation
-            chunk_results(i).simData = [];
         end
-
     catch ME
-        fprintf('Unexpected error: %s', ME.message);
-        if ~isempty(ME.stack)
-            fprintf(' at %s:%d', ME.stack(1).name, ME.stack(1).line);
-        end
-        fprintf('\n');
-        chunk_metadata.status(i) = -1;  % Failed simulation
-        chunk_results(i).simData = [];
+        fprintf('     Patient %d: unexpected error: %s\n', i, ME.message);
+        status_i = -1;
     end
+
+    % Clean up this iteration's model copy
+    if ~isempty(model_copy) && isvalid(model_copy)
+        delete(model_copy);
+    end
+
+    status_arr(i) = status_i;
+    sim_data_cell{i} = sim_data_i;
 end
+
+% Reassemble chunk_results as struct array (matches pre-parfor interface)
+chunk_results = struct([]);
+for i = 1:n_patients
+    chunk_results(i).simData = sim_data_cell{i};
+end
+
+chunk_metadata = struct();
+chunk_metadata.status = status_arr;
+chunk_metadata.patient_range = patient_range;
 
 t_sim_elapsed = toc(t_sim_start);
 fprintf('   Simulation loop complete in %.1f seconds\n', t_sim_elapsed);
-
-% Clean up final model copy
-if exist('model_copy', 'var')
-    delete(model_copy);
-end
 
 end
 

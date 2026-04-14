@@ -28,7 +28,10 @@ try
     end
 
     % Set up MATLAB environment
+    t_startup = tic;
     startup; % Load project paths and settings
+    dt_startup = toc(t_startup);
+    fprintf('   [timing] startup: %.2fs\n', dt_startup);
 
     % Open parpool if MATLAB_WORKERS > 0 (enables parfor over patients)
     matlab_workers = str2double(getenv('MATLAB_WORKERS'));
@@ -105,7 +108,10 @@ try
     fprintf('   Recreating model on remote worker...\n');
 
     % Run the model setup script
+    t_model_build = tic;
     eval(model_data.config.model_script);  % Creates 'model' variable
+    dt_model_build = toc(t_model_build);
+    fprintf('   [timing] model build (eval script): %.2fs\n', dt_model_build);
 
     % Create dose schedule from dosing config (if provided)
     if isfield(model_data, 'dosing') && ~isempty(model_data.dosing)
@@ -148,6 +154,7 @@ try
     end
 
     % Apply simulation configuration from model_data or use defaults
+    t_sim_config = tic;
     if isfield(model_data, 'sim_config') && ~isempty(model_data.sim_config)
         sim_config = model_data.sim_config;
         fprintf('   Using passed simulation config:\n');
@@ -174,19 +181,25 @@ try
             'abs_tolerance', 1e-12, ...
             'rel_tolerance', 1e-9);
     end
+    dt_sim_config = toc(t_sim_config);
+    fprintf('   [timing] simulation_config: %.2fs\n', dt_sim_config);
 
     % Apply model acceleration if requested (compile to C for faster simulation)
-    if isfield(model_data, 'sim_config') && isfield(model_data.sim_config, 'accelerate_model') && model_data.sim_config.accelerate_model
+    dt_accel = 0;
+    accel_requested = isfield(model_data, 'sim_config') && isfield(model_data.sim_config, 'accelerate_model') && model_data.sim_config.accelerate_model;
+    if accel_requested
         fprintf('   Accelerating model with sbioaccelerate...\n');
         t_accel_start = tic;
         try
             sbioaccelerate(model);
-            t_accel = toc(t_accel_start);
-            fprintf('   ✓ Model accelerated in %.1f seconds\n', t_accel);
+            dt_accel = toc(t_accel_start);
+            fprintf('   ✓ Model accelerated in %.1f seconds\n', dt_accel);
         catch accel_err
-            fprintf('   ⚠️  sbioaccelerate failed: %s (continuing without acceleration)\n', accel_err.message);
+            dt_accel = toc(t_accel_start);
+            fprintf('   ⚠️  sbioaccelerate failed after %.1fs: %s (continuing without acceleration)\n', dt_accel, accel_err.message);
         end
     end
+    fprintf('   [timing] sbioaccelerate: %.2fs (requested=%d)\n', dt_accel, accel_requested);
 
     % Update model_data with fresh objects
     model_data.model = model;
@@ -320,6 +333,8 @@ try
 
     fprintf('✅ Chunk processing complete in %.1f seconds (%.2f sec/patient)\n', ...
         t_elapsed, t_elapsed/length(patient_range));
+    fprintf('   [timing-summary] startup=%.2fs model_build=%.2fs sim_config=%.2fs sbioaccelerate=%.2fs parfor_total=%.2fs n_patients=%d\n', ...
+        dt_startup, dt_model_build, dt_sim_config, dt_accel, t_elapsed, length(patient_range));
     fprintf('   Success: %d/%d (%.1f%%)\n', n_success, length(patient_range), 100*n_success/length(patient_range));
     fprintf('   Failed IC: %d/%d (%.1f%%)\n', n_failed_ic, length(patient_range), 100*n_failed_ic/length(patient_range));
     fprintf('   Failed sim: %d/%d (%.1f%%)\n', n_failed_sim, length(patient_range), 100*n_failed_sim/length(patient_range));

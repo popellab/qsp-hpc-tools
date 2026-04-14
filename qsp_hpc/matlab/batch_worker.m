@@ -328,6 +328,11 @@ try
         fprintf('   Outputs: %s\n', strjoin(fieldnames(outputs), ', '));
     end
 
+    % Explicit parpool shutdown. Without this, MATLAB hangs on `exit` after the
+    % worker finishes, holding the compute node until SLURM timeout (observed on
+    % ~25% of tasks after parfor_patient_loop + parfor_extraction PRs).
+    close_parpool_if_open();
+
 catch ME
     fprintf('❌ Worker failed with error: %s\n', ME.message);
     fprintf('   Stack trace:\n');
@@ -346,8 +351,29 @@ catch ME
         end
     end
 
+    close_parpool_if_open();
     rethrow(ME);
 end
+end
+
+
+function close_parpool_if_open()
+%CLOSE_PARPOOL_IF_OPEN Best-effort shutdown of the current parpool.
+%
+% Called at the end of batch_worker so MATLAB can exit cleanly. Without this,
+% MATLAB frequently hangs on `exit` waiting for worker processes to drain,
+% holding the SLURM allocation until its wall-clock limit.
+    try
+        p = gcp('nocreate');
+        if ~isempty(p)
+            fprintf('   Closing parpool (NumWorkers=%d)...\n', p.NumWorkers);
+            t_close = tic;
+            delete(p);
+            fprintf('   ✓ parpool closed in %.1fs\n', toc(t_close));
+        end
+    catch close_err
+        fprintf('   parpool close warning: %s\n', close_err.message);
+    end
 
 end
 

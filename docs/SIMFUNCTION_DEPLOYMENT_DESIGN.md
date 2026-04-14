@@ -44,19 +44,34 @@ accelerated SimFunction + mcc'd exe:
 - Per-sim warm cost: **152 ms** (vs ~10s in the current loop — **~66× faster**).
 
 ### Sequential-launch test (4× back-to-back same node)
-- Wall per invocation: 26.4, 28.4, 26.2, 27.0s — **MCR init is not
-  cold-cache-bound.** Every process launch pays the ~25s Runtime init.
-- **Implication:** must batch many sims per exe invocation. One-patient-per-exe
-  would be catastrophic (1000 patients × 25s = 7hr of init).
+
+JVM enabled (baseline): 26.4, 28.4, 26.2, 27.0s. Warm cache doesn't help —
+the JVM bootstraps each launch from scratch.
+
+**JVM disabled** (`mcc -R '-nodisplay,-nosplash,-nojvm'`): 24.9, **10.4, 6.6, 10.5s**.
+The JVM was ~15-20s of CPU-bound startup that never amortizes; once removed,
+the remaining MCR init is cache-sensitive (~25s cold, ~7-10s warm).
+
+SimFunction's numerical call path is Java-free, so `-nojvm` is safe. The JVM
+is only needed for model construction/rule parsing, which happens at build
+time inside regular MATLAB.
+
+**Implications:**
+- Per-task floor is ~25s on a fresh SLURM node, **~8s on subsequent tasks on
+  the same node**. That makes task packing (via `--ntasks-per-node` / larger
+  `--cpus-per-task` allocations) a first-class tuning knob, not just sim batching.
+- Still must batch many sims per exe invocation. One-patient-per-exe remains
+  catastrophic even with `-nojvm`.
 
 ### Headline comparison (50 patients)
 
 | path | wall | license seats | scaling ceiling |
 |---|---|---|---|
 | current (parpool + sbioaccelerate + sim loop) | ~584s | 1 | license cap |
-| deployed exe + SimFunction | **~33s** | **0** | node cap |
+| deployed exe + SimFunction + `-nojvm`, fresh node | **~25s** | **0** | node cap |
+| deployed exe + SimFunction + `-nojvm`, warm node (packed) | **~8s** | **0** | node cap |
 
-~**18× faster, license-free, fan-out unlimited.**
+~**20-70× faster, license-free, fan-out unlimited.**
 
 ## Architecture
 

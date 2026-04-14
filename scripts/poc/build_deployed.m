@@ -40,8 +40,11 @@ save('build/sf_poc.mat', 'sf');
 deps = sf.DependentFiles(:);
 fprintf('[build] bundling %d SimFunction dependent files\n', numel(deps));
 
+% -R flags are baked into the CTF; '-nojvm' disables the JVM in the deployed
+% exe (typical MCR startup saving: 5-15s). Safe iff sf() doesn't reach into
+% Java-backed SimBiology internals at call time — verified empirically.
 mcc_args = {'-m', 'qsp_poc_main.m', '-d', 'build', '-v', ...
-            '-R', '-nodisplay,-nosplash', ...
+            '-R', '-nodisplay,-nosplash,-nojvm', ...
             '-a', 'build/sf_poc.mat'};
 for i = 1:numel(deps)
     mcc_args{end+1} = '-a';    %#ok<AGROW>

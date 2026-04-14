@@ -1805,35 +1805,30 @@ class QSPSimulator:
         return observables
 
     def _compute_priors_hash(self) -> str:
+        """Delegate to the shared pool-id hash so HPC paths and local
+        pool dirs / QSPResultLoader always agree.
+
+        Previously this had its own implementation that omitted
+        ``submodel_priors_yaml``, which meant the HPC save path used one
+        8-hex prefix while :class:`SimulationPool` / :class:`QSPResultLoader`
+        expected another — silently writing new simulations to a pool that
+        downstream loaders couldn't find.
         """
-        Compute hash of priors configuration (excludes test statistics).
+        from qsp_hpc.utils.hash_utils import compute_pool_id_hash
 
-        Returns:
-            SHA256 hash (full hex string)
-        """
-        hasher = hashlib.sha256()
-
-        # Hash priors CSV content
-        priors_content = self.priors_csv.read_text()
-        hasher.update(priors_content.encode("utf-8"))
-
-        # Hash model script name
-        hasher.update(self.model_script.encode("utf-8"))
-
-        # Hash model version
-        hasher.update(self.model_version.encode("utf-8"))
-
-        return hasher.hexdigest()
+        return compute_pool_id_hash(
+            priors_csv=self.priors_csv,
+            model_script=self.model_script,
+            model_version=self.model_version,
+            submodel_priors_yaml=self.submodel_priors_yaml,
+        )
 
     def _compute_test_stats_hash(self) -> str:
-        """
-        Compute hash of test statistics CSV.
+        """Delegate to the shared test-stats hash (matches
+        :class:`QSPResultLoader.test_stats_hash`)."""
+        from qsp_hpc.utils.hash_utils import compute_test_stats_hash
 
-        Returns:
-            SHA256 hash (full hex string)
-        """
-        test_stats_content = self.test_stats_csv.read_text()
-        return hashlib.sha256(test_stats_content.encode("utf-8")).hexdigest()
+        return compute_test_stats_hash(self.test_stats_csv)
 
     def _compute_hpc_pool_id(self, scenario_override: Optional[str] = None) -> str:
         """

@@ -38,8 +38,18 @@ opts = detectImportOptions(csv_file);
 % Read as table
 data_table = readtable(csv_file, opts);
 
-% Extract parameter names from column headers
-param_names = data_table.Properties.VariableNames;
+% Peel off sample_index column if present (added by Python staging so MATLAB
+% can thread it through to parquet for downstream cross-scenario alignment).
+all_names = data_table.Properties.VariableNames;
+if ~isempty(all_names) && strcmp(all_names{1}, 'sample_index')
+    params.sample_indices = int64(data_table.sample_index);
+    param_names = all_names(2:end);
+    data_matrix = table2array(data_table(:, 2:end));
+else
+    params.sample_indices = int64((1:height(data_table))' - 1);
+    param_names = all_names;
+    data_matrix = table2array(data_table);
+end
 n_params = length(param_names);
 n_samples = height(data_table);
 
@@ -50,7 +60,7 @@ fprintf('  Samples: %d\n', n_samples);
 params.names = param_names(:);  % Column vector
 
 % Convert table to matrix
-params.all = table2array(data_table);
+params.all = data_matrix;
 
 % Validate dimensions
 if size(params.all, 2) ~= n_params

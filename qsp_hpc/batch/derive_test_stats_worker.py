@@ -262,10 +262,15 @@ def process_single_batch(
             f"{clean_names[:5]}{'...' if len(clean_names) > 5 else ''}"
         )
 
-        # Save parameters to chunk_XXX_params.csv (strip prefix for clean names)
+        # Save parameters to chunk_XXX_params.csv (strip prefix for clean names).
+        # Prepend sample_index so the combined CSV carries cross-scenario
+        # alignment keys; missing column (legacy parquets) → fall back to
+        # batch-relative position downstream.
         params_output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_params.csv"
         params_df = sim_df[param_cols].copy()
         params_df.columns = clean_names
+        if "sample_index" in sim_df.columns:
+            params_df.insert(0, "sample_index", sim_df["sample_index"].astype("int64").values)
         params_df.to_csv(params_output_file, index=False, float_format="%.12e")
 
         logger.debug(f"  ✓ Parameters saved: {params_output_file.name}")

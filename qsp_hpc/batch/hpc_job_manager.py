@@ -731,6 +731,46 @@ class HPCJobManager:
         """Count number of simulations in pool from manifest or filenames."""
         return self.result_collector.count_pool_simulations(pool_path)
 
+    def get_max_sample_index(self, hpc_pool_path: str) -> Optional[int]:
+        """Return the largest ``sample_index`` already present in the HPC pool.
+
+        Scans ``batch_*.parquet`` files in ``hpc_pool_path`` and reads only
+        the ``sample_index`` column metadata (cheap). Returns ``None`` when
+        the dir doesn't exist, has no parquets, or the parquets predate the
+        sample_index schema. Used to assign contiguous index ranges to new
+        batches without re-using sample_indices already simulated.
+        """
+        py = self.config.hpc_venv_path + "/bin/python"
+        cmd = (
+            f'test -d "{hpc_pool_path}" || exit 0; '
+            f'{py} -c "'
+            f"import glob, sys; "
+            f"import pyarrow.parquet as pq; "
+            f"files = sorted(glob.glob('{hpc_pool_path}/batch_*.parquet')); "
+            f"max_i = -1; "
+            f"missing = False\n"
+            f"for f in files:\n"
+            f"    try:\n"
+            f"        col = pq.read_table(f, columns=['sample_index'])['sample_index']\n"
+            f"        m = max(col.to_pylist())\n"
+            f"        if m > max_i: max_i = m\n"
+            f"    except (KeyError, Exception):\n"
+            f"        missing = True\n"
+            f"        break\n"
+            f"sys.stdout.write('MISSING' if missing else str(max_i))"
+            f'"'
+        )
+        status, output = self.transport.exec(cmd, timeout=60)
+        if status != 0:
+            return None
+        out = output.strip()
+        if not out or out == "MISSING" or out == "-1":
+            return None
+        try:
+            return int(out)
+        except ValueError:
+            return None
+
     def check_hpc_full_simulations(
         self, model_version: str, priors_hash: str, n_requested: int
     ) -> Tuple[bool, str, int]:

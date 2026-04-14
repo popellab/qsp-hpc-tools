@@ -54,6 +54,9 @@ def write_species_parquet(json_file: str, output_file: str) -> None:
     # Extract parameter data (optional)
     param_names = data.get("param_names", [])
     param_values = data.get("param_values", [])
+    sample_indices = data.get("sample_indices", [])
+    if sample_indices and not isinstance(sample_indices, list):
+        sample_indices = [sample_indices]
 
     # Convert param_values to 2D array if needed (MATLAB jsonencode flattens 1xN matrices)
     if param_values and param_names:
@@ -76,6 +79,11 @@ def write_species_parquet(json_file: str, output_file: str) -> None:
     records = []
     for i in range(n_sims):
         record = {"simulation_id": i, "status": status[i]}
+
+        # sample_index identifies this row in the global theta pool, used
+        # downstream for cross-scenario alignment.
+        if sample_indices and i < len(sample_indices):
+            record["sample_index"] = int(sample_indices[i])
 
         # Add parameters (if provided) - prefix with "param:" to avoid species collisions
         if param_names and len(param_values) > 0:

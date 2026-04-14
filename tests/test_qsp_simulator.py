@@ -231,9 +231,12 @@ class TestQSPSimulatorInitialization:
 class TestParameterGeneration:
     """Tests for parameter sampling behavior."""
 
-    def test_generate_parameters_varies_across_calls(
+    def test_generate_parameters_deterministic_by_index(
         self, sample_test_stats_csv, sample_priors_csv, temp_dir
     ):
+        """Same indices → same theta. Replaces the old stateful-rng test:
+        cross-scenario alignment requires that index-keyed sampling not
+        depend on call history."""
         simulator = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
@@ -245,7 +248,10 @@ class TestParameterGeneration:
         first = simulator._generate_parameters(5)
         second = simulator._generate_parameters(5)
 
-        assert not np.allclose(first, second)
+        np.testing.assert_array_equal(first, second)
+        # And different index ranges produce different rows.
+        next_block = simulator._generate_parameters_for_indices(np.array([5, 6, 7, 8, 9]))
+        assert not np.allclose(first, next_block)
 
 
 # ============================================================================
@@ -1943,9 +1949,12 @@ class TestParameterGenerationIntegration:
         params1 = sim._generate_parameters(20)
         assert params1.shape == (20, 3)
 
-        # Generate again - should be different (RNG state advanced)
+        # Same call → same theta (deterministic by sample_index, not by RNG state).
         params2 = sim._generate_parameters(20)
-        assert not np.allclose(params1, params2)
+        np.testing.assert_array_equal(params1, params2)
+        # Asking for a later index range produces fresh rows.
+        params3 = sim._generate_parameters_for_indices(np.arange(20, 40))
+        assert not np.allclose(params1, params3)
 
     def test_parameter_sampling_from_pool(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
         """Test that parameters are sampled from pool when available."""
@@ -2370,15 +2379,17 @@ class TestHelperMethodsRealExecution:
         # Stage 50 parameters
         params, csv_path = sim._stage_parameters_to_csv(50)
 
-        # Verify parameters shape
+        # Verify parameters shape (sample_index column lives in CSV, not theta).
         assert params.shape == (50, 3)
 
-        # Verify CSV exists and is valid
+        # Verify CSV exists and is valid.
         import pandas as pd
 
         df = pd.read_csv(csv_path)
-        assert df.shape == (50, 3)
-        assert list(df.columns) == sim.param_names
+        assert df.shape == (50, 4)
+        assert list(df.columns) == ["sample_index", *sim.param_names]
+        # Empty pool → indices start at 0 and run contiguously.
+        assert list(df["sample_index"]) == list(range(50))
 
         # Cleanup
         Path(csv_path).unlink()
@@ -2520,8 +2531,14 @@ class TestRNGState:
         # But different from main seed
         assert sim1.cache_sampling_seed != sim1.seed
 
-    def test_param_rng_state_advances(self, sample_test_stats_csv, sample_priors_csv, temp_dir):
-        """Test that parameter RNG state advances with each call."""
+    def test_param_generation_indexed_not_stateful(
+        self, sample_test_stats_csv, sample_priors_csv, temp_dir
+    ):
+        """Same indices → same theta; different index ranges → different theta.
+
+        Replaces the old stateful-rng test. Cross-scenario alignment
+        requires the sampler to be a pure function of (seed, sample_index).
+        """
         sim = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
@@ -2530,15 +2547,12 @@ class TestRNGState:
             seed=42,
         )
 
-        # Generate parameters three times
-        params1 = sim._generate_parameters(10)
-        params2 = sim._generate_parameters(10)
-        params3 = sim._generate_parameters(10)
+        params_a = sim._generate_parameters_for_indices(np.arange(10))
+        params_b = sim._generate_parameters_for_indices(np.arange(10))
+        params_c = sim._generate_parameters_for_indices(np.arange(10, 20))
 
-        # All should be different (RNG state advancing)
-        assert not np.allclose(params1, params2)
-        assert not np.allclose(params2, params3)
-        assert not np.allclose(params1, params3)
+        np.testing.assert_array_equal(params_a, params_b)
+        assert not np.allclose(params_a, params_c)
 
 
 class TestProjectConfiguration:

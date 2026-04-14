@@ -241,6 +241,13 @@ try
         end
     end
 
+    % Subset sample_indices for this chunk so save_species_to_parquet can
+    % stamp each row with its global sample_index (used downstream for
+    % cross-scenario alignment).
+    if isfield(params_in, 'sample_indices') && ~isempty(params_in.sample_indices)
+        chunk_params.sample_indices = params_in.sample_indices(patient_range);
+    end
+
     % Run simulations for this chunk
     t_start = tic;
     [chunk_results, chunk_metadata] = run_chunk_simulations(model_data, chunk_params, patient_range);

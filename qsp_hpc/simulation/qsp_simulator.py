@@ -1372,14 +1372,20 @@ class QSPSimulator:
 
         Queries the HPC pool dir for parquet files and reads the max
         ``sample_index`` already present; the new batch takes the next
-        contiguous range. Empty pool → starts at 0. The remote scan reads
-        the parquet metadata only (cheap), not the species arrays.
+        contiguous range. Empty pool → starts at 0. Unavailable HPC config
+        (local-only runs, unit tests) also falls back to 0.
         """
-        hpc_pool_path = (
-            f"{self.job_manager.config.simulation_pool_path}/{self._compute_hpc_pool_id()}"
-        )
-        max_idx = self.job_manager.get_max_sample_index(hpc_pool_path)
-        start = (max_idx + 1) if max_idx is not None else 0
+        start = 0
+        try:
+            hpc_pool_path = (
+                f"{self.job_manager.config.simulation_pool_path}/" f"{self._compute_hpc_pool_id()}"
+            )
+            max_idx = self.job_manager.get_max_sample_index(hpc_pool_path)
+            if max_idx is not None:
+                start = max_idx + 1
+        except Exception:
+            # No HPC manager available or probe failed → treat pool as empty.
+            pass
         return np.arange(start, start + num_simulations, dtype=np.int64)
 
     def _stage_parameters_to_csv(self, num_simulations: int) -> Tuple[np.ndarray, str]:

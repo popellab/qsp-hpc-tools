@@ -8,6 +8,7 @@ including codebase syncing, file uploads, and directory setup.
 
 import json
 import shutil
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -17,6 +18,86 @@ from typing import Optional
 
 from qsp_hpc.utils.logging_config import setup_logger
 from qsp_hpc.utils.security import safe_shell_quote
+
+# Dotfiles / directories that belong to the *user*, not the project codebase.
+# rsync --delete with a broad remote_project_path (e.g. the user's home) would
+# otherwise wipe these. Excluded unconditionally so a misconfigured run can't
+# destroy shell setup or SSH credentials.
+_USER_DOTFILE_EXCLUDES = (
+    ".bashrc",
+    ".bash_profile",
+    ".bash_history",
+    ".bash_logout",
+    ".profile",
+    ".zshrc",
+    ".zsh_history",
+    ".zprofile",
+    ".inputrc",
+    ".gitconfig",
+    ".vimrc",
+    ".tmux.conf",
+    ".screenrc",
+    ".ssh/",
+    ".config/",
+    ".cache/",
+    ".local/",
+    ".aws/",
+    ".gnupg/",
+    ".kube/",
+    ".pki/",
+    ".mozilla/",
+    ".lesshst",
+    ".viminfo",
+    ".Xauthority",
+    ".wget-hsts",
+    ".python_history",
+    ".rediscli_history",
+    ".node_repl_history",
+    ".rstudio/",
+    ".matlab/",
+    ".mcrCache*",
+)
+
+
+def _resolve_host_aliases(hostname: str) -> set:
+    """Return all IPs the given hostname resolves to (DNS + aliases).
+
+    Used to detect when rsync source and destination live on the same machine;
+    running `rsync --delete` across paths on the same host is almost never
+    what you want and has catastrophic failure modes.
+    """
+    try:
+        _, _, addrs = socket.gethostbyname_ex(hostname)
+        return set(addrs)
+    except (socket.gaierror, socket.herror):
+        return set()
+
+
+def _is_same_host_as_local(hostname: str) -> bool:
+    """True if ``hostname`` resolves to the current machine.
+
+    Compares resolved IPs against local interfaces / localhost / current
+    hostname. Conservative: returns False on any resolution error.
+    """
+    if not hostname or hostname in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    remote_addrs = _resolve_host_aliases(hostname)
+    if not remote_addrs:
+        return False
+
+    local_names = {"localhost"}
+    try:
+        local_names.add(socket.gethostname())
+        local_names.add(socket.getfqdn())
+    except Exception:
+        pass
+
+    local_addrs: set = set()
+    for name in local_names:
+        local_addrs |= _resolve_host_aliases(name)
+    local_addrs |= {"127.0.0.1", "::1"}
+
+    return bool(remote_addrs & local_addrs)
 
 
 class HPCFileTransfer:
@@ -44,8 +125,12 @@ class HPCFileTransfer:
         self.verbose = verbose
         self.logger = setup_logger(__name__, verbose=verbose)
 
-        # Rsync exclusion patterns
+        # Rsync exclusion patterns.
+        # User dotfile excludes come FIRST and unconditionally — they protect
+        # the user's shell/ssh state against misconfigured rsyncs where the
+        # destination ends up being (or containing) the user's home.
         self.rsync_exclude_patterns = [
+            *_USER_DOTFILE_EXCLUDES,
             ".git",
             "*.mat",
             "*.asv",
@@ -68,6 +153,24 @@ class HPCFileTransfer:
             skip_sync: If True, skip syncing (for testing)
         """
         if skip_sync:
+            return
+
+        # Safety: bail out if we'd be rsyncing onto the same host we're running
+        # on. This almost always happens when a workflow meant for "laptop →
+        # HPC" gets invoked *on* the HPC (e.g. from an sbatch job), and the
+        # resulting rsync --delete with cwd=/home/user/project and remote
+        # path=/home/user/ wipes every dotfile in home that isn't in the
+        # project. Prefer a loud no-op over data loss.
+        if _is_same_host_as_local(self.config.ssh_host):
+            self.logger.warning(
+                "sync_codebase: ssh_host %r resolves to the local machine. "
+                "Skipping rsync to avoid destructive same-host --delete "
+                "(source=%s, dest=%s). Run this workflow from your laptop, "
+                "or pass skip_sync=True when invoking on the HPC itself.",
+                self.config.ssh_host,
+                Path.cwd(),
+                self.config.remote_project_path,
+            )
             return
 
         start_time = time.time()

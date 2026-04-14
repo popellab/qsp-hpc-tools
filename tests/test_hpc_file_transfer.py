@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from qsp_hpc.batch import hpc_file_transfer as hft_module
 from qsp_hpc.batch.hpc_file_transfer import HPCFileTransfer
 from qsp_hpc.batch.hpc_job_manager import BatchConfig
 
@@ -163,6 +164,73 @@ def test_sync_codebase_quotes_ssh_key_path(monkeypatch, tmp_path):
     # Should be: 'ssh -i "/path with spaces/id_rsa"'
     assert '"/path with spaces/id_rsa"' in ssh_command
     assert ssh_command.startswith('ssh -i "')
+
+
+def test_sync_codebase_excludes_user_dotfiles(monkeypatch, base_config, tmp_path):
+    """User dotfiles and .ssh/ must always appear in the rsync exclude list.
+
+    Regression guard: rsync --delete against a path that happens to contain
+    the user's home directory was observed to wipe .bashrc/.ssh/* because
+    those were not in the exclude patterns.
+    """
+    monkeypatch.chdir(tmp_path)
+    captured_cmd: list = []
+
+    def fake_run(cmd, capture_output, text):
+        captured_cmd.append(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # Force same-host check to be False so the rsync actually runs.
+    monkeypatch.setattr(hft_module, "_is_same_host_as_local", lambda _h: False)
+
+    HPCFileTransfer(base_config, DummyTransport()).sync_codebase()
+
+    assert len(captured_cmd) == 1
+    rsync_cmd = captured_cmd[0]
+    # All --exclude values
+    exclude_values = [rsync_cmd[i + 1] for i, a in enumerate(rsync_cmd[:-1]) if a == "--exclude"]
+    for required in (".bashrc", ".bash_profile", ".profile", ".ssh/", ".config/", ".bash_history"):
+        assert required in exclude_values, f"missing user-dotfile exclude: {required!r}"
+
+
+def test_sync_codebase_refuses_same_host(monkeypatch, base_config, tmp_path):
+    """When ssh_host resolves to the local machine, rsync must be skipped.
+
+    Running `sync_codebase` from an sbatch job on the HPC (cwd inside
+    project, remote path = user's home) would otherwise delete the user's
+    dotfiles via rsync --delete. Skip loudly instead of running.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hft_module, "_is_same_host_as_local", lambda _h: True)
+
+    called: list = []
+
+    def fake_run(cmd, capture_output, text):  # pragma: no cover - must not be called
+        called.append(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    warnings: list = []
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    transfer = HPCFileTransfer(base_config, DummyTransport())
+    monkeypatch.setattr(transfer.logger, "warning", lambda msg, *a, **kw: warnings.append(msg % a))
+    transfer.sync_codebase()
+
+    assert called == [], "rsync must not run when source/dest are on the same host"
+    assert any(
+        "same-host" in m.lower() or "local machine" in m.lower() for m in warnings
+    ), f"expected a warning explaining the skip; got: {warnings!r}"
+
+
+def test_is_same_host_as_local_handles_localhost():
+    assert hft_module._is_same_host_as_local("localhost")
+    assert hft_module._is_same_host_as_local("127.0.0.1")
+
+
+def test_is_same_host_as_local_false_for_unresolvable():
+    # Non-existent host → DNS fails → conservative False.
+    assert not hft_module._is_same_host_as_local("definitely-not-a-real-host.invalid")
 
 
 class TestUploadJobConfig:

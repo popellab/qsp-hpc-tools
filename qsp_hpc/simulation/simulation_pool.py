@@ -47,7 +47,6 @@ Usage:
     scenarios_data = pool.load_multi_scenario(['gvax', 'gvax_anti_pd1'], n_requested=1000)
 """
 
-import hashlib
 import re
 from datetime import datetime
 from pathlib import Path
@@ -183,48 +182,21 @@ class SimulationPoolManager:
 
     def _compute_config_hash(self) -> str:
         """
-        Compute configuration hash from file contents and model version.
+        Compute pool-id hash via shared :func:`compute_pool_id_hash`.
 
-        Hash is based on:
-        - Priors CSV content (parameter names, distributions, ranges)
-        - Test statistics CSV content OR calibration target YAML contents
-        - Model script name
-        - Model version
-        - Scenario name
-
-        Returns:
-            SHA256 hash (full 64-character hex string)
+        Hash includes only inputs that affect raw simulation outputs:
+        priors CSV, submodel priors YAML, model script, model version.
+        Test statistics live in a per-hash subdir (``test_stats/<hash>/``)
+        and scenario is the pool dir suffix — neither participates here.
         """
-        hasher = hashlib.sha256()
+        from qsp_hpc.utils.hash_utils import compute_pool_id_hash
 
-        # Hash priors CSV content
-        priors_content = self.priors_csv.read_text()
-        hasher.update(priors_content.encode("utf-8"))
-
-        # Hash submodel priors YAML content (overrides CSV for matched params)
-        if self.submodel_priors_yaml is not None and self.submodel_priors_yaml.exists():
-            hasher.update(self.submodel_priors_yaml.read_text().encode("utf-8"))
-
-        # Hash observables source (either CSV or YAML directory)
-        if self._calibration_targets_dir is not None:
-            from qsp_hpc.calibration import hash_calibration_targets
-
-            cal_hash = hash_calibration_targets(self._calibration_targets_dir)
-            hasher.update(cal_hash.encode("utf-8"))
-        else:
-            test_stats_content = self.test_stats_csv.read_text()
-            hasher.update(test_stats_content.encode("utf-8"))
-
-        # Hash model script name
-        hasher.update(self.model_script.encode("utf-8"))
-
-        # Hash model version
-        hasher.update(self.model_version.encode("utf-8"))
-
-        # Hash scenario name
-        hasher.update(self.scenario.encode("utf-8"))
-
-        return hasher.hexdigest()
+        return compute_pool_id_hash(
+            priors_csv=self.priors_csv,
+            model_script=self.model_script,
+            model_version=self.model_version,
+            submodel_priors_yaml=self.submodel_priors_yaml,
+        )
 
     def _scan_batches(self, scenario: Optional[str] = None) -> List[Dict]:
         """

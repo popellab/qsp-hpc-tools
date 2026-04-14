@@ -37,7 +37,6 @@ Usage::
 
 from __future__ import annotations
 
-import hashlib
 import tempfile
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -61,6 +60,7 @@ class QSPResultLoader:
         *,
         test_stats_csv: Optional[Union[str, Path]] = None,
         calibration_targets: Optional[Union[str, Path]] = None,
+        submodel_priors_yaml: Optional[Union[str, Path]] = None,
     ) -> None:
         if test_stats_csv is not None and calibration_targets is not None:
             raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
@@ -72,6 +72,9 @@ class QSPResultLoader:
         self.model_version = model_version
         self.model_script = model_script
         self.scenario = scenario
+        self.submodel_priors_yaml = (
+            Path(submodel_priors_yaml) if submodel_priors_yaml is not None else None
+        )
 
         self._temp_csv: Optional[Path] = None
         self._test_stats_df: Optional[pd.DataFrame] = None
@@ -94,17 +97,22 @@ class QSPResultLoader:
             raise FileNotFoundError(f"Test stats CSV not found: {self.test_stats_csv}")
 
     # ------------------------------------------------------------------
-    # Identity (matches QSPSimulator's hashing)
+    # Identity (delegates to shared helpers, matches SimulationPool)
     # ------------------------------------------------------------------
     def priors_hash(self) -> str:
-        h = hashlib.sha256()
-        h.update(self.priors_csv.read_text().encode("utf-8"))
-        h.update(self.model_script.encode("utf-8"))
-        h.update(self.model_version.encode("utf-8"))
-        return h.hexdigest()
+        from qsp_hpc.utils.hash_utils import compute_pool_id_hash
+
+        return compute_pool_id_hash(
+            priors_csv=self.priors_csv,
+            model_script=self.model_script,
+            model_version=self.model_version,
+            submodel_priors_yaml=self.submodel_priors_yaml,
+        )
 
     def test_stats_hash(self) -> str:
-        return hashlib.sha256(self.test_stats_csv.read_text().encode("utf-8")).hexdigest()
+        from qsp_hpc.utils.hash_utils import compute_test_stats_hash
+
+        return compute_test_stats_hash(self.test_stats_csv)
 
     def pool_id(self) -> str:
         return (

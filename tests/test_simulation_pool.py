@@ -145,10 +145,14 @@ class TestSimulationPoolManagerInit:
         )
         assert pool1.config_hash != pool2.config_hash
 
-    def test_config_hash_changes_with_scenario(
+    def test_config_hash_unchanged_across_scenarios(
         self, temp_dir, sample_priors_csv, sample_test_stats_csv
     ):
-        """Test that config hash changes when scenario changes."""
+        """Scenario name is the pool-dir suffix, NOT part of config_hash.
+
+        Pool dirs still differ because the suffix differs — see
+        test_different_scenarios_create_different_pool_directories.
+        """
         pool1 = SimulationPoolManager(
             cache_dir=temp_dir / "cache",
             model_version="test_v1",
@@ -167,7 +171,8 @@ class TestSimulationPoolManagerInit:
             model_script="test_model",
             scenario="gvax_standard_regimen",
         )
-        assert pool1.config_hash != pool2.config_hash
+        assert pool1.config_hash == pool2.config_hash
+        assert pool1.pool_dir != pool2.pool_dir
 
     def test_different_scenarios_create_different_pool_directories(
         self, temp_dir, sample_priors_csv, sample_test_stats_csv
@@ -607,10 +612,14 @@ class TestSimulationPoolCalibrationTargets:
                 model_script="test_model",
             )
 
-    def test_config_hash_differs_from_csv(
+    def test_config_hash_independent_of_test_stats_source(
         self, temp_dir, sample_priors_csv, sample_test_stats_csv, sample_calibration_targets_dir
     ):
-        """Config hash for calibration_targets differs from CSV-based hash."""
+        """Test stats / calibration targets do NOT affect config_hash.
+
+        Both feed the test_stats_hash subdir instead, so multiple test_stat
+        variants share the same raw-sim pool.
+        """
         pool_csv = SimulationPoolManager(
             cache_dir=temp_dir / "cache_csv",
             model_version="test_v1",
@@ -628,7 +637,7 @@ class TestSimulationPoolCalibrationTargets:
             model_script="test_model",
         )
 
-        assert pool_csv.config_hash != pool_yaml.config_hash
+        assert pool_csv.config_hash == pool_yaml.config_hash
 
     def test_config_hash_deterministic_with_yaml(
         self, temp_dir, sample_priors_csv, sample_calibration_targets_dir

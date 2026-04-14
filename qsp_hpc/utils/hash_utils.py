@@ -9,7 +9,41 @@ pure syntactic changes (like renaming).
 
 import hashlib
 import json
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+
+
+def compute_pool_id_hash(
+    priors_csv: Union[str, Path],
+    model_script: str,
+    model_version: str,
+    submodel_priors_yaml: Optional[Union[str, Path]] = None,
+) -> str:
+    """Hash inputs that determine raw simulation outputs (full sha256 hex).
+
+    Used by :class:`SimulationPool` and :class:`QSPResultLoader` to derive
+    the pool directory's 8-hex prefix. Includes only inputs that change the
+    parameter draws or sim trajectories — NOT test_stats (those live in a
+    subdir) and NOT scenario (it's the dir-name suffix).
+    """
+    h = hashlib.sha256()
+    h.update(Path(priors_csv).read_text().encode("utf-8"))
+    if submodel_priors_yaml is not None:
+        smp = Path(submodel_priors_yaml)
+        if smp.exists():
+            h.update(smp.read_text().encode("utf-8"))
+    h.update(model_script.encode("utf-8"))
+    h.update(model_version.encode("utf-8"))
+    return h.hexdigest()
+
+
+def compute_test_stats_hash(test_stats_csv: Union[str, Path]) -> str:
+    """Hash the test_stats CSV content (full sha256 hex).
+
+    Used as the subdirectory name under ``{pool_dir}/test_stats/`` so multiple
+    test_stats variants can share the same raw sim pool.
+    """
+    return hashlib.sha256(Path(test_stats_csv).read_text().encode("utf-8")).hexdigest()
 
 
 def _safe_sort_key(entry: Dict[str, Any]) -> tuple:

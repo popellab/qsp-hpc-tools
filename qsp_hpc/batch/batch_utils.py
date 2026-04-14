@@ -43,6 +43,35 @@ def calculate_batch_split(num_simulations: int, max_tasks: int) -> tuple[int, in
     return jobs_per_chunk, n_tasks
 
 
+def auto_size_max_tasks(
+    user_max_tasks: int,
+    cpus_per_task: int,
+    max_cpus_per_account: int,
+) -> int:
+    """Clip ``user_max_tasks`` to the one-wave ceiling set by the account's CPU cap.
+
+    With parfor jobs that each request ``cpus_per_task`` CPUs, only
+    ``max_cpus_per_account // cpus_per_task`` tasks can run simultaneously. Any
+    tasks past that limit queue as subsequent waves, each paying fixed per-task
+    startup overhead (parpool setup, model acceleration, save). Shrinking
+    ``max_tasks`` down to the one-wave limit gives bigger per-task chunks that
+    amortize the overhead once.
+
+    Args:
+        user_max_tasks: Task count requested by the caller.
+        cpus_per_task: CPUs each task will reserve (typically matlab_workers + 2).
+        max_cpus_per_account: SLURM MaxCpuPerAccount (or equivalent) for the
+            account. Pass 0 to disable auto-sizing.
+
+    Returns:
+        The smaller of ``user_max_tasks`` and the concurrent-task ceiling.
+    """
+    if max_cpus_per_account <= 0 or cpus_per_task <= 0:
+        return user_max_tasks
+    concurrent_cap = max(1, max_cpus_per_account // cpus_per_task)
+    return min(user_max_tasks, concurrent_cap)
+
+
 def calculate_num_tasks(num_simulations: int, jobs_per_chunk: int) -> int:
     """
     Calculate number of tasks needed for given simulations and chunk size.

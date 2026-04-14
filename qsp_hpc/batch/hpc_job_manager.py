@@ -76,6 +76,7 @@ class BatchConfig:
     jobs_per_chunk: int = 20
     cpus_per_task: int = 1
     matlab_workers: int = 0  # 0 = serial; >0 = open parpool(N) in batch_worker
+    max_cpus_per_account: int = 0  # 0 = no cap; >0 = enforce one-wave scheduling
     strict_host_key_checking: bool = True  # Security: verify SSH host keys by default
     qsp_hpc_tools_source: str = "git+ssh://git@github.com/jeliason/qsp-hpc-tools.git"
 
@@ -363,8 +364,26 @@ class HPCJobManager:
                 "Expected format: HH:MM:SS or DD-HH:MM:SS"
             )
 
-        # Validate memory format (e.g., '4G', '512M')
-        memory_per_job = slurm.get("mem_per_cpu", "4G")
+        # Worker/CPU/memory sizing:
+        #   matlab_workers is the single user-facing knob. When matlab_workers > 0,
+        #   cpus_per_task and memory_per_job (SLURM --mem) ALWAYS derive from it:
+        #       cpus_per_task = matlab_workers + 2  (parpool workers + MATLAB master + 1 slack)
+        #       memory_per_job = matlab_workers*5G + 30G  (5G/worker + solver/buffer)
+        #   This bypasses any mem_per_cpu/cpus_per_task inherited from the global
+        #   credentials file (which may be stale pre-parfor defaults).
+        #   Use mem_per_cpu_override in project creds to force a specific value
+        #   for memory-hungry models.
+        matlab_workers = int(slurm.get("matlab_workers", 0))
+        if matlab_workers > 0:
+            cpus_per_task = matlab_workers + 2
+            memory_per_job = slurm.get(
+                "mem_per_cpu_override",
+                f"{matlab_workers * 5 + 30}G",
+            )
+        else:
+            cpus_per_task = int(slurm.get("cpus_per_task", 1))
+            memory_per_job = slurm.get("mem_per_cpu", "4G")
+
         if not isinstance(memory_per_job, str) or memory_per_job[-1].upper() not in [
             "K",
             "M",
@@ -387,8 +406,9 @@ class HPCJobManager:
             time_limit=time_limit,
             memory_per_job=memory_per_job,
             matlab_module=cluster.get("matlab_module", "matlab/R2024a").strip(),
-            cpus_per_task=int(slurm.get("cpus_per_task", 1)),
-            matlab_workers=int(slurm.get("matlab_workers", 0)),
+            cpus_per_task=cpus_per_task,
+            matlab_workers=matlab_workers,
+            max_cpus_per_account=int(slurm.get("max_cpus_per_account", 0)),
             strict_host_key_checking=ssh.get(
                 "strict_host_key_checking", True
             ),  # Default to True for security

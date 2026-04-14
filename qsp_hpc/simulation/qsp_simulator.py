@@ -1920,6 +1920,11 @@ class QSPSimulator:
             f"   → Splitting {num_simulations} simulations into {n_tasks} tasks ({jobs_per_chunk} sims/task)"
         )
 
+        # The local paths inject accelerate_model into sim_config (see lines 1039,
+        # 1704); the HPC submit must do the same or the worker never sees the flag.
+        sim_config_with_accel = dict(self.sim_config) if self.sim_config else {}
+        sim_config_with_accel["accelerate_model"] = self.accelerate
+
         # Submit jobs via Python (no MATLAB startup!)
         job_info = self.job_manager.submit_jobs(
             samples_csv=samples_csv,
@@ -1931,7 +1936,7 @@ class QSPSimulator:
             skip_sync=False,  # Sync codebase first
             save_full_simulations=True,  # Enable full simulation saving
             simulation_pool_id=simulation_pool_id,  # Pool ID for HPC storage
-            sim_config=self.sim_config,  # Simulation settings (stop_time, solver, etc.)
+            sim_config=sim_config_with_accel,
             dosing=self.dosing,  # Treatment dosing schedule (if any)
         )
 

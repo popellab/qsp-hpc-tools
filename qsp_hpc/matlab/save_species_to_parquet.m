@@ -53,6 +53,14 @@ try
         json_data.param_values = [];
     end
 
+    % Stamp each row with its global sample_index from the theta pool so
+    % downstream loaders can intersect scenarios by index, not row position.
+    if nargin >= 3 && isfield(chunk_params, 'sample_indices') && ~isempty(chunk_params.sample_indices)
+        json_data.sample_indices = double(chunk_params.sample_indices(:));
+    else
+        json_data.sample_indices = [];
+    end
+
     % Convert time arrays (cell array -> array of arrays)
     json_data.time_arrays = cell(species_data.n_sims, 1);
     for i = 1:species_data.n_sims

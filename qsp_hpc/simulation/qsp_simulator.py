@@ -137,6 +137,7 @@ class QSPSimulator:
         matlab_path: str = "matlab",
         n_local_workers: int = 1,
         accelerate: bool = False,
+        theta_pool_size: int = 100_000,
     ):
         """
         Initialize QSP simulator.
@@ -211,6 +212,7 @@ class QSPSimulator:
         self.matlab_path = matlab_path
         self.n_local_workers = n_local_workers
         self.accelerate = accelerate
+        self.theta_pool_size = theta_pool_size
 
         if self.test_stats_csv is not None and not self.test_stats_csv.exists():
             raise FileNotFoundError(f"Test statistics CSV not found: {self.test_stats_csv}")
@@ -444,46 +446,35 @@ class QSPSimulator:
         self.logger.error(msg)
 
     def _generate_parameters(self, n_samples: int) -> np.ndarray:
+        """Back-compat shim: return theta for sample_indices ``[0, n_samples)``.
+
+        Prefer :meth:`_generate_parameters_for_indices` for new code so the
+        index range is explicit. Old call sites kept for now so external
+        callers continue to work; tests that previously relied on stateful
+        across-call variation no longer hold (deterministic by design).
         """
-        Generate parameter samples from priors.
+        if n_samples < 0:
+            raise ValueError(f"n_samples must be non-negative, got {n_samples}")
+        return self._generate_parameters_for_indices(np.arange(n_samples, dtype=np.int64))
 
-        Uses the composite prior (submodel YAML + CSV fallback) when a
-        submodel_priors_yaml is provided, otherwise falls back to CSV-only.
+    def _generate_parameters_for_indices(self, indices: np.ndarray) -> np.ndarray:
+        """Pull theta rows for the given sample indices from the deterministic pool.
 
-        Args:
-            n_samples: Number of parameter sets to generate
-
-        Returns:
-            numpy array of shape (n_samples, num_params)
+        Replaces the old stateful ``_generate_parameters(n)`` whose draws
+        depended on prior call history, which broke cross-scenario theta
+        alignment. See :mod:`qsp_hpc.simulation.theta_pool`.
         """
-        if self.submodel_priors_yaml is not None and self.submodel_priors_yaml.exists():
-            from qsp_inference.priors.copula_prior import load_composite_prior_log
+        from qsp_hpc.simulation.theta_pool import theta_for_indices
 
-            prior_log, _ = load_composite_prior_log(self.submodel_priors_yaml, self.priors_csv)
-            import torch
-
-            with torch.no_grad():
-                torch.manual_seed(int(self.param_rng.integers(2**31)))
-                log_samples = prior_log.sample((n_samples,)).numpy()
-            return np.exp(log_samples)
-        else:
-            import pandas as pd
-
-            priors_df = pd.read_csv(self.priors_csv)
-            dist_types = priors_df["distribution"].tolist()
-            dist_param1 = priors_df["dist_param1"].values
-            dist_param2 = priors_df["dist_param2"].values
-
-            samples = np.zeros((n_samples, len(priors_df)))
-            for i in range(len(priors_df)):
-                if dist_types[i] == "lognormal":
-                    samples[:, i] = self.param_rng.lognormal(
-                        mean=dist_param1[i], sigma=dist_param2[i], size=n_samples
-                    )
-                else:
-                    raise ValueError(f"Unsupported distribution: {dist_types[i]}")
-
-            return samples  # type: ignore[no-any-return]
+        n_total = self.theta_pool_size
+        return theta_for_indices(
+            indices=indices,
+            priors_csv=self.priors_csv,
+            submodel_priors_yaml=self.submodel_priors_yaml,
+            seed=self.seed,
+            n_total=n_total,
+            cache_dir=Path(self.cache_dir) / "theta_pools",
+        )
 
     def _format_number(self, value: float) -> str:
         """
@@ -1376,15 +1367,43 @@ class QSPSimulator:
         finally:
             Path(samples_csv).unlink(missing_ok=True)
 
+    def _next_sample_indices(self, num_simulations: int) -> np.ndarray:
+        """Pick which sample_indices the new batch should consume.
+
+        Queries the HPC pool dir for parquet files and reads the max
+        ``sample_index`` already present; the new batch takes the next
+        contiguous range. Empty pool → starts at 0. Unavailable HPC config
+        (local-only runs, unit tests) also falls back to 0.
+        """
+        start = 0
+        try:
+            hpc_pool_path = (
+                f"{self.job_manager.config.simulation_pool_path}/" f"{self._compute_hpc_pool_id()}"
+            )
+            max_idx = self.job_manager.get_max_sample_index(hpc_pool_path)
+            if max_idx is not None:
+                start = max_idx + 1
+        except Exception:
+            # No HPC manager available or probe failed → treat pool as empty.
+            pass
+        return np.arange(start, start + num_simulations, dtype=np.int64)
+
     def _stage_parameters_to_csv(self, num_simulations: int) -> Tuple[np.ndarray, str]:
-        """Generate parameters and stage to a temporary CSV."""
-        theta_np = self._generate_parameters(num_simulations)
+        """Generate parameters with deterministic sample_indices and stage to CSV.
+
+        Output CSV has ``sample_index`` as the first column, then one column
+        per parameter. MATLAB's ``load_parameter_samples_csv`` peels
+        ``sample_index`` off and threads it through the parquet output so
+        downstream loaders can align scenarios by index rather than position.
+        """
+        sample_indices = self._next_sample_indices(num_simulations)
+        theta_np = self._generate_parameters_for_indices(sample_indices)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as tmp:
             samples_csv = tmp.name
             writer = csv.writer(tmp)
-            writer.writerow(self.param_names)
-            for row in theta_np:
-                writer.writerow(row)
+            writer.writerow(["sample_index", *self.param_names])
+            for idx, row in zip(sample_indices, theta_np):
+                writer.writerow([int(idx), *row])
         return theta_np, samples_csv
 
     def _update_pool_with_results(self, params: np.ndarray, observables: np.ndarray) -> None:

@@ -32,7 +32,7 @@ Usage::
         model_script="immune_oncology_model_PDAC",
         scenario="baseline_no_treatment",
     )
-    params, observables = loader.load(n_simulations=20000)
+    params, observables, sample_index = loader.load(n_simulations=20000)
 """
 
 from __future__ import annotations
@@ -130,8 +130,13 @@ class QSPResultLoader:
     # ------------------------------------------------------------------
     # Load
     # ------------------------------------------------------------------
-    def load(self, n_simulations: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Return ``(params, observables)`` numpy arrays for ``n_simulations``.
+    def load(self, n_simulations: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return ``(params, observables, sample_index)`` for ``n_simulations``.
+
+        ``sample_index`` is the global theta-pool position for each row,
+        used downstream to align scenarios in multi-scenario inference.
+        Combined CSVs predating the sample_index schema fall back to
+        ``np.arange(n_simulations)``.
 
         Raises
         ------
@@ -155,12 +160,15 @@ class QSPResultLoader:
         if not stats_file.exists():
             raise FileNotFoundError(f"combined_test_stats.csv not found at {stats_file}.")
 
-        # combined_params.csv has a header row.
         params_df = pd.read_csv(params_file)
-        params = params_df.to_numpy()
+        if "sample_index" in params_df.columns:
+            sample_index = params_df["sample_index"].astype(np.int64).to_numpy()
+            params = params_df.drop(columns=["sample_index"]).to_numpy()
+        else:
+            sample_index = np.arange(len(params_df), dtype=np.int64)
+            params = params_df.to_numpy()
 
-        # combined_test_stats.csv has NO header (combine_test_stats_chunks
-        # concatenates raw chunk contents).
+        # combined_test_stats.csv has NO header.
         stats_df = pd.read_csv(stats_file, header=None)
         observables = stats_df.to_numpy()
 
@@ -171,7 +179,57 @@ class QSPResultLoader:
                 f"combined_test_stats.csv has {len(observables)} rows; " f"need {n_simulations}"
             )
 
-        return params[:n_simulations], observables[:n_simulations]
+        return params[:n_simulations], observables[:n_simulations], sample_index[:n_simulations]
+
+    @staticmethod
+    def load_aligned(
+        loaders: "list[QSPResultLoader]", n_simulations: int
+    ) -> Tuple[np.ndarray, "dict[str, np.ndarray]", np.ndarray]:
+        """Load multiple scenarios and align rows by ``sample_index``.
+
+        Returns ``(theta, observables_by_scenario, sample_index)`` where
+        ``theta`` is the parameter matrix for rows present in *all*
+        scenarios, ``observables_by_scenario[scen]`` is the corresponding
+        observable matrix for that scenario, and ``sample_index`` is the
+        shared index column (sorted ascending).
+
+        Replaces the old positional join in multi-scenario workflows that
+        silently drifted when scenarios' theta orderings diverged.
+        """
+        per_scen = {}
+        for ld in loaders:
+            theta, x, idx = ld.load(n_simulations)
+            per_scen[ld.scenario] = (theta, x, idx)
+
+        # Intersect indices across scenarios.
+        common = None
+        for theta, x, idx in per_scen.values():
+            s = set(idx.tolist())
+            common = s if common is None else (common & s)
+        common_arr = np.array(sorted(common), dtype=np.int64)
+
+        # Slice each scenario down to the common indices, in shared order.
+        theta_ref = None
+        obs_by_scen: "dict[str, np.ndarray]" = {}
+        for scen, (theta, x, idx) in per_scen.items():
+            order = pd.Series(np.arange(len(idx)), index=idx).reindex(common_arr).to_numpy()
+            if np.isnan(order).any():
+                raise RuntimeError(f"Index alignment failed for scenario {scen}")
+            order = order.astype(np.int64)
+            if theta_ref is None:
+                theta_ref = theta[order]
+            else:
+                # Sanity check: theta values must match across scenarios for shared indices.
+                if not np.allclose(theta_ref, theta[order], equal_nan=True):
+                    raise RuntimeError(
+                        f"Theta mismatch between scenarios at shared sample_indices "
+                        f"(scenario={scen}). Pools disagree on what theta a given "
+                        f"sample_index represents — likely a stale parquet from before "
+                        f"the deterministic theta pool was introduced."
+                    )
+            obs_by_scen[scen] = x[order]
+
+        return theta_ref, obs_by_scen, common_arr
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return (

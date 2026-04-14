@@ -90,11 +90,14 @@ def test_loader_reads_combined_files(tmp_path):
         scenario=scenario,
     )
 
-    params, obs = loader.load(n_simulations=20)
+    params, obs, sample_index = loader.load(n_simulations=20)
     assert params.shape == (20, 3)
     assert obs.shape == (20, 2)
+    assert sample_index.shape == (20,)
     # Sanity: first row of params should be [0, 1, 2]
     np.testing.assert_array_equal(params[0], [0.0, 1.0, 2.0])
+    # Legacy fixtures lack sample_index column → loader falls back to range.
+    np.testing.assert_array_equal(sample_index, np.arange(20))
 
 
 def test_loader_raises_when_combined_missing(tmp_path):

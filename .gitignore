@@ -46,5 +46,7 @@ Thumbs.db
 # Project specific
 *.mat
 *.csv
+# Allow MATLAB test fixtures (CSVs needed by tests/test_matlab.py).
+!qsp_hpc/matlab/tests/fixtures/*.csv
 cache/
 simulations/

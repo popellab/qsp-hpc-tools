@@ -1,0 +1,4 @@
+id,name,species,compartment,timepoint,statistic,units
+TS001,Peak concentration,Drug,V_C,24,max,ng/mL
+TS002,Trough concentration,Drug,V_C,168,value,ng/mL
+TS003,AUC 0-24h,Drug,V_C,24,auc,ng*h/mL

@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
-from qsp_hpc.batch.batch_utils import calculate_batch_split
+from qsp_hpc.batch.batch_utils import auto_size_max_tasks, calculate_batch_split
 from qsp_hpc.batch.hpc_job_manager import MissingOutputError, RemoteCommandError, SubmissionError
 from qsp_hpc.constants import HASH_PREFIX_LENGTH, JOB_QUEUE_TIMEOUT, SLURM_REGISTRATION_DELAY
 from qsp_hpc.simulation.simulation_pool import SimulationPoolManager
@@ -1899,8 +1899,23 @@ class QSPSimulator:
         hpc_save_path = f"{self.job_manager.config.simulation_pool_path}/{simulation_pool_id}"
         self.logger.info(f"   → HPC save path: {hpc_save_path} (scenario='{self.scenario}')")
 
+        # Clip requested max_tasks to the account's one-wave ceiling (if any)
+        # so big workloads run in a single wave rather than spending fixed
+        # per-task overhead multiple times.
+        cfg = self.job_manager.config
+        effective_max_tasks = auto_size_max_tasks(
+            user_max_tasks=self.max_tasks,
+            cpus_per_task=cfg.cpus_per_task,
+            max_cpus_per_account=cfg.max_cpus_per_account,
+        )
+        if effective_max_tasks != self.max_tasks:
+            self.logger.info(
+                f"   → Auto-sizing max_tasks: {self.max_tasks} → {effective_max_tasks} "
+                f"(cap: {cfg.max_cpus_per_account} cpus / {cfg.cpus_per_task} per task)"
+            )
+
         # Calculate optimal split across tasks
-        jobs_per_chunk, n_tasks = calculate_batch_split(num_simulations, self.max_tasks)
+        jobs_per_chunk, n_tasks = calculate_batch_split(num_simulations, effective_max_tasks)
         self.logger.info(
             f"   → Splitting {num_simulations} simulations into {n_tasks} tasks ({jobs_per_chunk} sims/task)"
         )

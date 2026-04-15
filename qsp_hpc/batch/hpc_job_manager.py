@@ -844,10 +844,17 @@ class HPCJobManager:
             if downloaded_params.exists():
                 downloaded_params.rename(local_params_file)
 
-                # Load params
+                # Load params.
+                # combined_params.csv now carries ``sample_index`` as the first
+                # column (used for cross-scenario alignment at load time). Strip
+                # it before returning the params matrix — leaving it in would
+                # treat sample_index=0 as a real parameter value and downstream
+                # ``np.log(theta)`` produces -inf in NPE training.
                 import pandas as pd
 
                 params_df = pd.read_csv(local_params_file)
+                if "sample_index" in params_df.columns:
+                    params_df = params_df.drop(columns=["sample_index"])
                 params = params_df.values
 
                 # Ensure 2D shape

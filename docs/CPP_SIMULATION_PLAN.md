@@ -178,19 +178,84 @@ path end-to-end.
 - Keep `test_ode_vs_matlab.py` in `SPQSP_PDAC` — that's the validation
   anchor for the C++ numerics and should stay.
 
-## Open questions (not blocking M1-M4)
+## Completed milestones and benchmarks (2026-04-15)
 
-- **Dosing / event machinery**: does the existing SPQSP_PDAC event handling
-  cover the scenario YAML dose shapes? User is investigating. Affects M6-M7
-  scope and possibly the driver CLI (may need `--dose-schedule` or similar).
-- **Scenario → param diffs**: today, scenarios mostly change a subset of
-  params + dose timing. For non-dosing scenarios the param-XML path Just
-  Works. For dosing scenarios, TBD.
-- **Parquet schema parity**: need to confirm exact column ordering and names
-  that `save_species_to_parquet.m` produces. One-time check against an
-  existing MATLAB Parquet in the pool.
+### M1-M4: DONE
+
+| | what | commit (SPQSP_PDAC) | commit (qsp-hpc-tools) |
+|---|---|---|---|
+| M1 | qsp_sim binary + raw-binary I/O | f250a0cd | — |
+| M2 | ParamXMLRenderer (dict → XML) | — | 57c1a79 |
+| M3 | CppRunner (single sim) | — | f2e4141 |
+| M4 | CppBatchRunner + MATLAB-schema Parquet | — | b22cb3e |
+
+### Performance milestones (SPQSP_PDAC branch `cpp-sweep-binary-io`)
+
+1. **simOdeSample** (commit 62571257): lets CVODE keep internal history
+   across output points instead of CVodeReInit on every step. 2-8× faster
+   depending on output cadence (dt=0.1 day: 832 → 104 ms/sim; dt=1 day:
+   190 → 84 ms/sim serial).
+
+2. **Jacobian sparsity profile** (commit feea0132): FD-computed Jacobian is
+   1.3-1.9% dense, stable across the full 180-day sim (max fan-in 16,
+   median 2). Strongly favours KLU sparse solver.
+
+3. **Analytical Jacobian codegen** (commit a37d24f5): qsp_codegen.py emits
+   a sympy-derived J with 1434 nnz (5.33% structural density). CSE with
+   `optimizations=None` compresses 1.7 MB → ~50 KB.
+
+4. **KLU infrastructure** (commit 06426261): CVODEBase virtual hooks +
+   CMake KLU detection + conditional sparse-solver path. USE_KLU defaults
+   to OFF because of boundary-singularity issues (see below).
+
+### KLU/analytical Jacobian — deferred
+
+The analytical Jacobian has genuine `1/x` singularities at boundary
+states where species = 0 (e.g. `d/d(collagen)` in rate laws that use
+collagen in Hill-function denominators). At `collagen = 0`, J entries
+evaluate to `Inf` → KLU numeric factorization fails.
+
+Attempted remedies:
+- NaN/Inf clamp to 0: gets past setup but CVODE exhausts mxstep budget
+  (clamped entries are wrong, Newton iteration diverges on subsequent steps)
+- IC floor to 1e-30: CVODE's non-negativity constraint drives species back
+  to 0, re-triggering the singularity
+- IC floor + constraint removal: segfault mid-integration inside KLU
+
+Future paths (2-5 hrs each, not blocking M5-M8):
+- Per-entry FD fallback: detect NaN columns in jac(), compute those via FD
+- Regularize rate laws in codegen: add ε to pow/div denominators
+- SPGMR iterative solver with matrix-free Jac-vector product: avoids
+  explicit J entirely, tolerates singularities
+
+### Benchmark numbers (8-core M-series laptop, Release -O3, dt=1 day)
+
+| metric | value |
+|---|---|
+| per-sim serial | 84 ms |
+| 100-sim parallel (8 workers) | 1.78s (18 ms/sim wall) |
+| 10k-sim extrapolated (8 cores) | ~3 min |
+| Rockfish 48-core projection | ~30s |
+| vs MATLAB SimFunction POC (10k) | ~4.8× faster |
+
+### Parquet schema parity: CONFIRMED
+
+C++ produces 164 species columns; all 164 overlap 100% with MATLAB v4
+Parquet from data-apopel1. MATLAB's extra 90 columns are assignment-rule
+outputs (H_*, *_total) not emitted by the C++ codegen. Metadata types
+(simulation_id, status, time) match.
+
+## Open questions
+
+- **Dosing / event machinery**: separate SPQSP_PDAC branch in flight.
+  Current qsp_sim stepping (simOdeSample) is event-free; a hybrid
+  stepper is needed for dosing scenarios. The events branch will own
+  the stepping-strategy design.
+- **Scenario → param diffs**: for non-dosing scenarios the param-XML
+  path Just Works. For dosing scenarios, TBD pending events branch.
+- **KLU activation**: see deferred section above. Not blocking.
 
 ## Total effort estimate
 
-**~1.5-2 weeks of focused work to M7.** MATLAB retirement is additive after
-that and can happen lazily.
+M1-M4 done. Remaining: M5 (~1 day), M6 (~2-3 days), M7 (~2 days),
+M8 (follow-up PR after M7 is validated in production).

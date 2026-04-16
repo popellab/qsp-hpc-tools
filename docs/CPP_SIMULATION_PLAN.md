@@ -178,12 +178,13 @@ path end-to-end.
 - Keep `test_ode_vs_matlab.py` in `SPQSP_PDAC` — that's the validation
   anchor for the C++ numerics and should stay.
 
-## Candidate next steps (post-M7)
+## Candidate next steps (post-M7, post-M10)
 
-The C++ path is numerically validated and runs end-to-end on Rockfish at
-100k scale. Everything below is optional — ordered roughly by the
-leverage each gives before we need to think about the MATLAB retirement
-in M8. Pick what's useful next; they're not a strict sequence.
+The C++ path is numerically validated, runs end-to-end on Rockfish at
+100k scale, and now covers scenarios with `evolve_to_diagnosis` + dosing
+(M10). Everything below is optional — ordered roughly by the leverage
+each gives before we need to think about the MATLAB retirement in M8.
+Pick what's useful next; they're not a strict sequence.
 
 ### M9 — On-cluster test-stat derivation for the C++ path
 
@@ -219,26 +220,65 @@ Steps:
    `CppSimulator._compute_config_hash` includes. For caching to work
    across backends the hash definition needs to agree.
 
-### M10 — Dosing / init-function support in qsp_sim
+### M10 — Dosing / init-function support in qsp_sim: DONE (2026-04-16)
 
-*Est: depends on events branch.*
+M7 had bypassed `baseline_no_treatment.yaml` because its
+`initialization_function: 'evolve_to_diagnosis'` wasn't implemented in
+C++ yet, and all treatment scenarios use dosing. M10 closes that gap
+end-to-end.
 
-M7 validation bypassed `baseline_no_treatment.yaml` because its
-`initialization_function: 'evolve_to_diagnosis'` isn't implemented in
-C++ yet, and all treatment scenarios use dosing. This is the main
-thing standing between the current C++ path and full SBI coverage.
+**Shipped (SPQSP_PDAC `cpp-sweep-binary-io`)**:
 
-The SPQSP_PDAC events/dosing branch is the owner here. When it lands:
+1. Cherry-picked the four PDAC_qsp_sync commits onto cpp-sweep-binary-io:
+   SBML `<listOfEvents>` codegen (`1e85ffc8`), YAML-driven dosing +
+   `drug_metadata.yaml` (`f3cb3e7a`), `get_compartment_volume()` codegen
+   (`8a06aa27`), `evolve_to_diagnosis` port (`06dc4f75`). The dumper +
+   dosing code was re-targeted from the old
+   `PDAC/sim/tests/ode_compile/dump_trajectories.cpp` to the
+   post-promotion `PDAC/qsp/sim/qsp_sim.cpp` layout.
+2. `setupSamplingRun(tEndOfSim, t0)` gained a `t0` parameter
+   (`df5d3cfd`). Without this, the fast sampling path re-inited CVODE
+   at `t=0` after evolve_to_diagnosis had already advanced ~857 days,
+   and the first `simOdeSample` blasted through in garbage steps.
+3. Segmented sampling (`8f2cacdf`): `qsp_sim::main` now partitions
+   `[t_offset, t_stop]` on dose times, running `simOdeSample` inside
+   each segment and `setupSamplingRun` only at boundaries. With no
+   doses it degenerates to the previous fast path; with doses it's
+   ~300× faster on fine output grids than the step-everywhere
+   predecessor. Bonus: doses fire at exact times (not next-tick).
 
-1. Port `evolve_to_diagnosis` (or its reduced ODE-only equivalent) to
-   qsp_sim. Needs the C++ `set_healthy_populations` hook to match
-   MATLAB's `set_baseline_populations`.
-2. Port the dosing-schedule mechanism so `qsp_sim --dosing
-   <config.json>` mirrors MATLAB's `schedule_dosing()`.
-3. Extend M7 validation to cover `baseline_no_treatment`,
-   `gvax_neoadjuvant_zheng2022`, and one nivo scenario. Agreement
-   should be as tight as the no-dosing case because the ODE core is
-   unchanged.
+**Shipped (qsp-hpc-tools `cpp-simulation-backend`)**:
+
+1. `CppSimulator` exposes `scenario_yaml` / `drug_metadata_yaml` /
+   `healthy_state_yaml` kwargs; config hash folds their file contents
+   so scenario edits invalidate the pool (`1b63c99`).
+2. `validate_cpp_vs_matlab.py --scenario <yaml>` drives both paths
+   through a pdac-build scenario, inferring stop_time + dosing from
+   the YAML (`c1428e6`).
+3. `HPCJobManager.submit_cpp_jobs` auto-pulls + rebuilds `qsp_sim` on
+   HPC via `ensure_cpp_binary()`; `skip_git_pull` / `skip_build`
+   escape hatches for iteration (`2f3990e`, `7d1082c`).
+4. Scenario YAMLs thread through `submit_cpp_jobs` → uploaded to
+   `batch_jobs/input/` → read by `cpp_batch_worker` → passed into
+   `CppBatchRunner` (`eddaf79`).
+
+**Validation**:
+
+- `test_ode_vs_matlab.py --run-matlab`: 17/17 pass in 62s, including
+  `test_scenario_trajectories_match` (dosing parity),
+  `test_evolved_initial_conditions_match` (evolve parity), and
+  `test_event_trajectories_match` (events parity).
+- M7-harness local sweep (4 sims × 5 varied params each), 25–27×
+  C++ speedup on the dosing scenarios:
+
+  | scenario | median rel_diff | Pearson r |
+  |---|---|---|
+  | `baseline_no_treatment` | 0.13% | 0.9999 |
+  | `gvax_neoadjuvant_zheng2022` | 0.13% | 0.9999 |
+  | `gvax_nivo_neoadjuvant_zheng2022` | 0.19% | 0.9999 |
+
+  Outliers are near-zero PD1/PDL1 complex species pre-dose
+  (MATLAB exactly 0, C++ ~1e-16). Absolute diffs ≤ 2e-14.
 
 ### M11 — Push past the 48-task concurrency ceiling
 
@@ -277,9 +317,9 @@ At 1M-scale (200 GB+ raw), a few efficiency moves matter:
   if we bump sims/chunk higher to amortize the 5–8s startup, streaming
   the Parquet rather than loading it all becomes worthwhile.
 
-## Completed milestones and benchmarks (2026-04-15)
+## Completed milestones and benchmarks (2026-04-15 through 2026-04-16)
 
-### M1-M7: DONE
+### M1-M7 + M10: DONE
 
 | | what | commit (SPQSP_PDAC) | commit (qsp-hpc-tools) |
 |---|---|---|---|
@@ -290,6 +330,7 @@ At 1M-scale (200 GB+ raw), a few efficiency moves matter:
 | M5 | CppSimulator (top-level Python API) | — | (pending) |
 | M6 | HPC integration (SLURM + C++ worker) | — | (pending) |
 | M7 | Numerical validation vs MATLAB | — | (pending) |
+| M10 | Dosing / evolve_to_diagnosis + HPC wiring | 1e85ffc8…8f2cacdf | 1b63c99…7d1082c |
 
 ### M7 results (20 sims × 30 days, no dosing, basic no-evolve-to-diagnosis)
 
@@ -373,6 +414,79 @@ chunk_size + seed in the filename. Fixed by including
 `SLURM_ARRAY_TASK_ID` in the Parquet name
 (`batch_{ts}_task{NNN}_{scenario}_{N}sims_seed{S}.parquet`).
 `CppSimulator._batch_pattern` accepts both old and new formats.
+
+### HPC scaling results — M10 scenarios (2026-04-16, Rockfish `shared`)
+
+End-to-end scenario sweeps via `scripts/bench_cpp_scenarios.py` on
+cpp-sweep-binary-io after the M10 port landed. N=1000, jpc=25 (40
+tasks), 4 cpus/task, same seed + 5 varied params across all four
+configs. All 4000 sims across the table succeeded (100%).
+
+| config        | tasks | wall | sum task compute | mean/task | parallelism | ms/sim wall |
+|---------------|-------|------|------------------|-----------|-------------|-------------|
+| no-scenario   | 40    | 7.0s | 27.4s            | 0.68s     | 3.9×        | 7.0         |
+| baseline      | 40    | 24.0s | 414.6s          | 10.37s    | 17.3×       | 24.0        |
+| gvax          | 40    | 18.0s | 414.3s          | 10.36s    | 23.0×       | 18.0        |
+| gvax-nivo     | 40    | 27.0s | 419.5s          | 10.49s    | 15.5×       | 27.0        |
+
+**Key observations**:
+
+1. **Evolve dominates.** All three scenarios sit at ~10.4s mean per
+   task (sum_sim ~414–420s) regardless of dosing or post-diagnosis
+   duration. The 857-day `evolve_to_diagnosis` is ~95% of per-sim
+   work; the 1d/21d/30d post-diagnosis integration and the 1-2
+   bolus events are noise on top.
+2. **~15× scenario overhead** vs the raw-ODE reference (0.68s →
+   10.37s mean/task). Matches the 857-vs-30-day ODE-work ratio.
+3. **Per-sim wall at 40 tasks**: 7 ms (no-scenario) vs 18–27 ms
+   (scenarios). Extrapolates to ~5–7 min for 1M sims at full
+   48-task `shared`-partition fan-out — the M11 ceiling, not a
+   scenario-cost artifact.
+4. **The no-scenario row is parallelism-noise-limited** (only 3.9×).
+   Each task finishes in 0.68s, which is comparable to SLURM's
+   per-task dispatch granularity — the array barely staggers.
+   Scenario rows hit 15–23×, closer to the 40-task theoretical
+   ceiling.
+
+**What this validates, end-to-end**:
+
+- SPQSP_PDAC cpp-sweep-binary-io cherry-picks + `setupSamplingRun(t0)`
+  fix + segmented sampling → qsp_sim with `--scenario` +
+  `--evolve-to-diagnosis` works on HPC.
+- `HPCJobManager.ensure_cpp_binary()` correctly auto-`git pull`s +
+  incremental-builds the remote binary from the pushed branch.
+- `cpp.build_modules` in credentials.yaml drives the HPC build
+  environment (`module purge && module load ...`) exactly like
+  `scripts/hpc/build_qsp_sim.sh`.
+- Scenario YAMLs upload to `batch_jobs/input/` and thread through to
+  the worker's `CppBatchRunner` via `cpp_job_config.json`.
+
+**Gotchas encountered**:
+
+1. **HPC venv reinstalls from git.** `ensure_hpc_venv` re-pip-installs
+   qsp-hpc-tools from the configured git source on every submit, so
+   unpushed commits make it look like `submit_cpp_jobs`' new kwargs
+   are silently ignored. Symptom: workers ran at ~0.3s/task with
+   `--evolve-to-diagnosis` config but no actual evolve work. Always
+   push qsp-hpc-tools before a scaling run.
+2. **`cmake ..` re-runs FetchContent.** The first draft of
+   `ensure_cpp_binary` ran `cmake ..` unconditionally, burning ~60–80s
+   per submit as SUNDIALS/yaml-cpp git refs re-verified. Fix: only
+   run `cmake ..` when `build/CMakeCache.txt` is absent;
+   `cmake --build` auto-re-runs configure on CMakeLists.txt changes
+   anyway (commit `7d1082c`). Brought per-submit cmake from ~80s to
+   ~13s.
+3. **Parents-index off-by-one.** The derivation of `cpp_repo_path`
+   from `cpp_binary_path` used `parents[3]` (→ `.../PDAC`) instead of
+   `parents[4]` (→ `.../SPQSP_PDAC`). Surfaced on the first real
+   submit. The unit test used an explicit `cpp_repo_path`, so it
+   didn't catch the derivation bug.
+4. **`parquets_ok=False` is flaky.** `bench_cpp_scenarios` counts
+   `ls {pool_dir}/batch_*.parquet | wc -l` 5s after the job drains;
+   file-system sync can lag, so a fully-successful run occasionally
+   reports a short count. Cosmetic — `sacct` confirmed all 40 tasks
+   `COMPLETED` and `sum_sim` values match across all three scenario
+   runs.
 
 ### Performance milestones (SPQSP_PDAC branch `cpp-sweep-binary-io`)
 

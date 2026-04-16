@@ -377,6 +377,70 @@ class TestSubmitCppJobs:
                 skip_sync=True,
             )
 
+    def test_submit_cpp_jobs_uploads_scenario_yamls(self, tmp_path):
+        """scenario_yaml / drug_metadata_yaml / healthy_state_yaml are
+        uploaded, and their remote paths land in cpp_job_config.json."""
+        import json as _json
+
+        manager, transport = self._make_manager()
+
+        csv = tmp_path / "params.csv"
+        csv.write_text("A\n1.0\n")
+
+        scen = tmp_path / "scen.yaml"
+        scen.write_text("dosing: {}\n")
+        drug = tmp_path / "drug.yaml"
+        drug.write_text("drugs: {}\n")
+        healthy = tmp_path / "healthy.yaml"
+        healthy.write_text("densities: {}\n")
+
+        captured: dict = {}
+
+        def capture(local, remote):
+            if "cpp_job_config.json" in remote:
+                with open(local) as f:
+                    captured["config"] = _json.load(f)
+
+        transport.upload.side_effect = capture
+
+        manager.submit_cpp_jobs(
+            samples_csv=str(csv),
+            num_simulations=1,
+            simulation_pool_id="pool",
+            skip_sync=True,
+            scenario_yaml=str(scen),
+            drug_metadata_yaml=str(drug),
+            healthy_state_yaml=str(healthy),
+        )
+
+        # All three YAMLs should have been uploaded to batch_jobs/input/.
+        upload_dests = [call.args[1] for call in transport.upload.call_args_list]
+        assert any(d.endswith("/batch_jobs/input/scenario.yaml") for d in upload_dests)
+        assert any(d.endswith("/batch_jobs/input/drug_metadata.yaml") for d in upload_dests)
+        assert any(d.endswith("/batch_jobs/input/healthy_state.yaml") for d in upload_dests)
+
+        cfg = captured["config"]
+        assert cfg["scenario_yaml"].endswith("/batch_jobs/input/scenario.yaml")
+        assert cfg["drug_metadata_yaml"].endswith("/batch_jobs/input/drug_metadata.yaml")
+        assert cfg["healthy_state_yaml"].endswith("/batch_jobs/input/healthy_state.yaml")
+
+    def test_submit_cpp_jobs_scenario_without_drug_meta_raises(self, tmp_path):
+        manager, _ = self._make_manager()
+
+        csv = tmp_path / "params.csv"
+        csv.write_text("A\n1.0\n")
+        scen = tmp_path / "scen.yaml"
+        scen.write_text("dosing: {}\n")
+
+        with pytest.raises(ValueError, match="scenario_yaml requires drug_metadata_yaml"):
+            manager.submit_cpp_jobs(
+                samples_csv=str(csv),
+                num_simulations=1,
+                simulation_pool_id="pool",
+                skip_sync=True,
+                scenario_yaml=str(scen),
+            )
+
     def test_submit_cpp_jobs_override_paths(self, tmp_path):
         manager, transport = self._make_manager(cpp_binary="", cpp_template="")
 

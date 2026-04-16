@@ -50,6 +50,9 @@ def run_chunk(config: dict, array_idx: int) -> None:
     scenario = config.get("scenario", "default")
     max_workers = config.get("max_workers")
     per_sim_timeout_s = config.get("per_sim_timeout_s", 300.0)
+    scenario_yaml = config.get("scenario_yaml")
+    drug_metadata_yaml = config.get("drug_metadata_yaml")
+    healthy_state_yaml = config.get("healthy_state_yaml")
 
     start = array_idx * jobs_per_chunk
     end = min(start + jobs_per_chunk, n_simulations)
@@ -96,6 +99,9 @@ def run_chunk(config: dict, array_idx: int) -> None:
         template_path=template_path,
         subtree=subtree,
         default_timeout_s=per_sim_timeout_s,
+        scenario_yaml=scenario_yaml,
+        drug_metadata_yaml=drug_metadata_yaml,
+        healthy_state_yaml=healthy_state_yaml,
     )
 
     result = runner.run(

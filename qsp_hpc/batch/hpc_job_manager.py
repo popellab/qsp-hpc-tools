@@ -739,6 +739,9 @@ class HPCJobManager:
         subtree: Optional[str] = None,
         cpp_cpus_per_task: int = 1,
         cpp_memory: str = "4G",
+        scenario_yaml: Optional[str] = None,
+        drug_metadata_yaml: Optional[str] = None,
+        healthy_state_yaml: Optional[str] = None,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
 
@@ -778,6 +781,14 @@ class HPCJobManager:
             subtree: Override ``cpp.subtree`` from credentials.
             cpp_cpus_per_task: CPUs per SLURM task for C++ jobs.
             cpp_memory: Memory per SLURM task for C++ jobs.
+            scenario_yaml: Local path to a pdac-build scenario YAML. Uploaded
+                to ``batch_jobs/input/`` and passed to each task's
+                ``CppBatchRunner`` as ``--scenario``. Requires
+                ``drug_metadata_yaml``.
+            drug_metadata_yaml: Local path to drug_metadata.yaml
+                (``--drug-metadata``). Uploaded alongside ``scenario_yaml``.
+            healthy_state_yaml: Local path to healthy_state.yaml
+                (``--evolve-to-diagnosis``). Uploaded and passed through.
 
         Returns:
             :class:`JobInfo` with job ID and state file.
@@ -828,6 +839,15 @@ class HPCJobManager:
         )
         self._setup_remote_directories()
 
+        if scenario_yaml and not drug_metadata_yaml:
+            raise ValueError("scenario_yaml requires drug_metadata_yaml")
+
+        # Upload scenario YAMLs to batch_jobs/input/ and record their remote
+        # paths so cpp_batch_worker can pass them into CppBatchRunner.
+        remote_scenario = self._upload_scenario_yaml(scenario_yaml, "scenario.yaml")
+        remote_drug_meta = self._upload_scenario_yaml(drug_metadata_yaml, "drug_metadata.yaml")
+        remote_healthy = self._upload_scenario_yaml(healthy_state_yaml, "healthy_state.yaml")
+
         self.logger.info("Uploading C++ job configuration and parameters...")
         self._upload_cpp_job_config(
             binary_path=binary_path,
@@ -842,6 +862,9 @@ class HPCJobManager:
             scenario=scenario,
             max_workers=max_workers,
             per_sim_timeout_s=per_sim_timeout_s,
+            scenario_yaml=remote_scenario,
+            drug_metadata_yaml=remote_drug_meta,
+            healthy_state_yaml=remote_healthy,
         )
         self._upload_parameter_csv(samples_csv)
 
@@ -865,6 +888,22 @@ class HPCJobManager:
 
         return job_info
 
+    def _upload_scenario_yaml(self, local_path: Optional[str], remote_name: str) -> Optional[str]:
+        """Upload a scenario-related YAML to ``batch_jobs/input/``.
+
+        Returns the absolute remote path on HPC, or ``None`` when
+        ``local_path`` is ``None`` (so the caller can leave the field
+        unset in the job config).
+        """
+        if not local_path:
+            return None
+        local = Path(local_path)
+        if not local.exists():
+            raise FileNotFoundError(f"YAML not found: {local}")
+        remote = f"{self.config.remote_project_path}/batch_jobs/input/{remote_name}"
+        self.transport.upload(str(local), remote)
+        return remote
+
     def _upload_cpp_job_config(
         self,
         binary_path: str,
@@ -879,6 +918,9 @@ class HPCJobManager:
         scenario: str,
         max_workers: Optional[int],
         per_sim_timeout_s: float,
+        scenario_yaml: Optional[str] = None,
+        drug_metadata_yaml: Optional[str] = None,
+        healthy_state_yaml: Optional[str] = None,
     ) -> None:
         """Create and upload C++ job configuration JSON."""
         import json
@@ -899,6 +941,10 @@ class HPCJobManager:
             "scenario": scenario,
             "max_workers": max_workers,
             "per_sim_timeout_s": per_sim_timeout_s,
+            # Absolute remote paths; None when the scenario feature isn't used.
+            "scenario_yaml": scenario_yaml,
+            "drug_metadata_yaml": drug_metadata_yaml,
+            "healthy_state_yaml": healthy_state_yaml,
         }
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:

@@ -584,6 +584,29 @@ more chances to hit a slow node). Realistic wall **3–6 min** for 1M
 gvax-nivo, with straggler mitigation (watchdog + requeue, or smaller
 chunks for finer granularity) needed to hit the low end.
 
+**Cost (Service Units ≈ CPU-hours).** SLURM array jobs allocate
+per-task; each task releases its node back to the pool when it
+completes. So billing is `sum(task_elapsed) × cpus_per_task`, not
+`wall × nodes_allocated`. Stragglers cost their own extra elapsed
+time, not the wait of their idle siblings.
+
+| run | sum elapsed × cpus | CPU-hours | per-sim |
+|---|---|---|---|
+| 1k `shared` | 415s × 4 | 0.46 | 0.46 µSU/sim |
+| 10k `parallel` | 526s × 48 | 7.0 | 0.70 µSU/sim |
+| 100k `parallel` | 4991s × 48 | 66.5 | 0.67 µSU/sim |
+
+Per-sim cost on `parallel` is ~constant ≈ 0.67–0.70 µSU/sim — same
+solver work per sim. The partition switch doesn't cost more per sim,
+it pays for parallelism in wall-clock. Straggler "tax" on the 100k run:
+task 33 ran 238s vs 120s median, costing ~1.57 extra CPU-hours (2.4%
+of total). Stragglers are a wall-clock problem, not a billing problem.
+
+**1M projection**: ~670 CPU-hours ≈ 670 SUs. On typical JHU ARCH
+institutional allocations (~1M SUs/yr per lab), that's ~0.07% of
+annual budget. Cloud equivalent ≈ $10–25 on AWS spot; purchased
+Rockfish SU ≈ $10.
+
 ### Performance milestones (SPQSP_PDAC branch `cpp-sweep-binary-io`)
 
 1. **simOdeSample** (commit 62571257): lets CVODE keep internal history

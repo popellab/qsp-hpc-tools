@@ -9,15 +9,31 @@ Produces:
     - Wall-clock timing for each path
     - Pickle with the comparison for deeper inspection
 
-Scenario design: `baseline_no_treatment.yaml` uses `evolve_to_diagnosis` as an
-initialization function (not implemented in C++ yet). So we bypass the scenario
-YAML and pass a custom `sim_config` directly — no init function, no dosing.
-The model's native ICs are used (same path as `export_trajectories.m` used for
-the original single-sim validation).
+Two modes:
 
-Usage (defaults = 20 sims, 5 params sampled, t_end=30 days)::
+1. No scenario (default). Minimal `sim_config` with no `initialization_function`
+   and no dosing — compares the raw ODE core under native ICs. Useful for
+   solver-level numerical validation.
+
+2. `--scenario <yaml>`. Loads `sim_config` + `dosing` from a pdac-build
+   scenario YAML and drives both paths through them:
+     - MATLAB: `sim_config` (incl. `initialization_function: evolve_to_diagnosis`)
+       + `dosing` forwarded into `batch_worker.m`, which calls
+       `evolve_to_diagnosis` and `schedule_dosing` just like
+       `run_median_simulation`.
+     - C++: `qsp_sim --scenario <yaml> --drug-metadata <yaml>
+       --evolve-to-diagnosis <yaml>`, wired via `CppBatchRunner`'s new
+       scenario kwargs. Output starts at user t=0 (post-diagnosis) on
+       both sides so time-grids align.
+
+Usage (no scenario, defaults = 20 sims, 5 params sampled, t_end=30 days)::
 
     python scripts/validate_cpp_vs_matlab.py
+
+With a scenario (stop_time and dosing inferred from the YAML)::
+
+    python scripts/validate_cpp_vs_matlab.py \\
+        --scenario ~/Projects/pdac-build/scenarios/baseline_no_treatment.yaml
 
 Outputs land under ``cache/validation/``.
 """
@@ -28,10 +44,12 @@ import argparse
 import pickle
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+import yaml
 
 DEFAULT_PRIORS_CSV = Path("/Users/joeleliason/Projects/pdac-build/parameters/pdac_priors.csv")
 DEFAULT_MATLAB_PROJECT_ROOT = Path("/Users/joeleliason/Projects/pdac-build")
@@ -41,6 +59,12 @@ DEFAULT_CPP_BINARY = Path(
 )
 DEFAULT_CPP_TEMPLATE = Path(
     "/Users/joeleliason/Projects/SPQSP_PDAC-cpp-sweep/PDAC/sim/resource/param_all.xml"
+)
+DEFAULT_DRUG_METADATA_YAML = Path(
+    "/Users/joeleliason/Projects/SPQSP_PDAC-cpp-sweep/PDAC/sim/resource/drug_metadata.yaml"
+)
+DEFAULT_HEALTHY_STATE_YAML = Path(
+    "/Users/joeleliason/Projects/SPQSP_PDAC-cpp-sweep/PDAC/sim/resource/healthy_state.yaml"
 )
 
 # Parameters to actually vary — all 5 are core rate constants that exist
@@ -91,26 +115,40 @@ def run_matlab(
     dt_days: float,
     seed: int,
     out_dir: Path,
+    sim_config_override: dict[str, Any] | None = None,
+    dosing: dict[str, Any] | None = None,
 ) -> tuple[Path, float]:
-    """Run the MATLAB path end-to-end, return (parquet, wall_seconds)."""
+    """Run the MATLAB path end-to-end, return (parquet, wall_seconds).
+
+    If `sim_config_override` is given, it is passed through to `batch_worker.m`
+    verbatim (including any `initialization_function`). Otherwise a minimal
+    sundials config is synthesized that skips init / dosing.
+    """
     from qsp_hpc.simulation.batch_runner import run_batch_worker
 
-    # sim_config WITHOUT initialization_function so we skip evolve_to_diagnosis.
-    # NB: batch_worker.m hardcodes dt=0.5 — it ignores any time_vector we pass.
+    # batch_worker.m hardcodes dt=0.5 — it ignores any time_vector we pass.
     # Match this on the C++ side by defaulting dt_days to 0.5 in the caller.
     if dt_days != 0.5:
         raise ValueError(
             f"MATLAB's batch_worker.m hardcodes dt=0.5; got dt_days={dt_days}. "
             "Pass --dt-days 0.5 or adjust batch_worker.m to honor a custom grid."
         )
-    sim_config = {
-        "start_time": 0,
-        "stop_time": t_end_days,
-        "time_units": "day",
-        "solver": "sundials",
-        "abs_tolerance": 1.0e-9,
-        "rel_tolerance": 1.0e-6,
-    }
+    if sim_config_override is not None:
+        sim_config = dict(sim_config_override)
+        # MATLAB side reads stop_time from sim_config, but the C++ side uses
+        # t_end_days as an independent flag. Keep them in sync by overwriting
+        # sim_config.stop_time with the caller's t_end_days (which is itself
+        # derived from the scenario when --scenario is used).
+        sim_config["stop_time"] = t_end_days
+    else:
+        sim_config = {
+            "start_time": 0,
+            "stop_time": t_end_days,
+            "time_units": "day",
+            "solver": "sundials",
+            "abs_tolerance": 1.0e-9,
+            "rel_tolerance": 1.0e-6,
+        }
 
     t0 = time.time()
     parquet = run_batch_worker(
@@ -120,6 +158,7 @@ def run_matlab(
         project_root=project_root,
         seed=seed,
         sim_config=sim_config,
+        dosing=dosing,
         simulation_pool_path=out_dir,
         simulation_pool_id="matlab_run",
         verbose=True,
@@ -138,6 +177,9 @@ def run_cpp(
     seed: int,
     out_dir: Path,
     max_workers: int | None = None,
+    scenario_yaml: Path | None = None,
+    drug_metadata_yaml: Path | None = None,
+    healthy_state_yaml: Path | None = None,
 ) -> tuple[Path, float]:
     """Run the C++ path end-to-end, return (parquet, wall_seconds)."""
     from qsp_hpc.cpp.batch_runner import CppBatchRunner
@@ -149,6 +191,9 @@ def run_cpp(
         binary_path=binary_path,
         template_path=template_path,
         subtree="QSP",
+        scenario_yaml=scenario_yaml,
+        drug_metadata_yaml=drug_metadata_yaml,
+        healthy_state_yaml=healthy_state_yaml,
     )
     t0 = time.time()
     runner.run(
@@ -301,7 +346,51 @@ def main() -> None:
         action="store_true",
         help="Reuse an existing MATLAB Parquet instead of re-running",
     )
+    ap.add_argument(
+        "--scenario",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a pdac-build scenario YAML. Enables init-function + dosing "
+            "on both paths. Derives stop_time and drug schedule from the YAML."
+        ),
+    )
+    ap.add_argument(
+        "--drug-metadata-yaml",
+        type=Path,
+        default=DEFAULT_DRUG_METADATA_YAML,
+        help="drug_metadata.yaml for C++ dose expansion (only used with --scenario).",
+    )
+    ap.add_argument(
+        "--healthy-state-yaml",
+        type=Path,
+        default=DEFAULT_HEALTHY_STATE_YAML,
+        help="healthy_state.yaml for C++ evolve_to_diagnosis.",
+    )
     args = ap.parse_args()
+
+    # Scenario-driven config: load sim_config / dosing from YAML, override
+    # t_end_days with scenario stop_time so both paths run the same length.
+    scenario_sim_config: dict[str, Any] | None = None
+    scenario_dosing: dict[str, Any] | None = None
+    scenario_healthy_yaml: Path | None = None
+    if args.scenario is not None:
+        scenario = yaml.safe_load(args.scenario.read_text())
+        scenario_sim_config = scenario["sim_config"]
+        scenario_dosing = scenario.get("dosing")
+        scen_stop = float(scenario_sim_config["stop_time"])
+        if scen_stop != args.t_end_days:
+            print(
+                f"[scenario] overriding --t-end-days {args.t_end_days} → {scen_stop} "
+                f"(from {args.scenario.name})"
+            )
+            args.t_end_days = scen_stop
+        # Only pass healthy-state to C++ when the scenario asks for it.
+        # Independently useful as an HPC cache guard: non-evolve scenarios
+        # shouldn't load healthy-state (their hash would spuriously depend
+        # on healthy_state.yaml contents).
+        if scenario_sim_config.get("initialization_function") == "evolve_to_diagnosis":
+            scenario_healthy_yaml = args.healthy_state_yaml
 
     out_dir = args.output_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -315,6 +404,12 @@ def main() -> None:
     print(f"  C++:      {args.cpp_binary.name}")
     print(f"  Template: {args.cpp_template.name}")
     print(f"  Params:   {args.params}")
+    if args.scenario is not None:
+        print(f"  Scenario: {args.scenario.name}")
+        if scenario_healthy_yaml is not None:
+            print(f"  Evolve:   {scenario_healthy_yaml.name}")
+        if scenario_dosing and scenario_dosing.get("drugs"):
+            print(f"  Drugs:    {scenario_dosing['drugs']}")
     print(f"  Output:   {out_dir}")
     print("=" * 70)
 
@@ -352,6 +447,8 @@ def main() -> None:
             dt_days=args.dt_days,
             seed=args.seed,
             out_dir=out_dir,
+            sim_config_override=scenario_sim_config,
+            dosing=scenario_dosing,
         )
         print(f"[MATLAB] Done in {matlab_time:.1f}s → {matlab_parquet.name}")
 
@@ -367,6 +464,9 @@ def main() -> None:
         seed=args.seed,
         out_dir=out_dir,
         max_workers=args.max_workers,
+        scenario_yaml=args.scenario,
+        drug_metadata_yaml=args.drug_metadata_yaml if args.scenario else None,
+        healthy_state_yaml=scenario_healthy_yaml,
     )
     print(f"[C++] Done in {cpp_time:.1f}s → {cpp_parquet.name}")
 

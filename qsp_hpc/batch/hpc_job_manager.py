@@ -82,6 +82,9 @@ class BatchConfig:
     cpp_binary_path: str = ""  # Path to qsp_sim binary on HPC
     cpp_template_path: str = ""  # Path to param_all.xml on HPC
     cpp_subtree: str = "QSP"  # XML subtree for parameter lookup
+    cpp_runtime_modules: str = (
+        ""  # Space-separated `module load` args run before qsp_sim (runtime deps)
+    )
 
 
 class RemoteCommandError(RuntimeError):
@@ -422,6 +425,7 @@ class HPCJobManager:
             cpp_binary_path=cpp.get("binary_path", "").strip(),
             cpp_template_path=cpp.get("template_path", "").strip(),
             cpp_subtree=cpp.get("subtree", "QSP").strip(),
+            cpp_runtime_modules=cpp.get("runtime_modules", "").strip(),
         )
 
     @staticmethod

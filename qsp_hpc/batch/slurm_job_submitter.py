@@ -196,6 +196,15 @@ echo "Job completed at $(date)"
         project_path = self.config.remote_project_path
         log_dir = f"{project_path}/batch_jobs/logs"
 
+        # Runtime modules: qsp_sim is dynamically linked against GCC 13's
+        # libstdc++ (GLIBCXX_3.4.32) and Boost 1.83.  These need to be on the
+        # shared-library search path when SLURM workers invoke the binary.
+        modules = self.config.cpp_runtime_modules or ""
+        module_load = (
+            f"module purge && module load {modules}"
+            if modules
+            else "# no runtime modules configured"
+        )
         return f"""#!/bin/bash
 #SBATCH --job-name=qsp_cpp_batch
 #SBATCH --partition={self.config.partition}
@@ -209,6 +218,8 @@ echo "Job completed at $(date)"
 echo "Starting C++ QSP batch job at $(date)"
 echo "Array task ID: $SLURM_ARRAY_TASK_ID"
 echo "Job ID: $SLURM_JOB_ID"
+
+{module_load}
 
 source "{self.config.hpc_venv_path}/bin/activate"
 

@@ -79,6 +79,9 @@ class BatchConfig:
     max_cpus_per_account: int = 0  # 0 = no cap; >0 = enforce one-wave scheduling
     strict_host_key_checking: bool = True  # Security: verify SSH host keys by default
     qsp_hpc_tools_source: str = "git+ssh://git@github.com/jeliason/qsp-hpc-tools.git"
+    cpp_binary_path: str = ""  # Path to qsp_sim binary on HPC
+    cpp_template_path: str = ""  # Path to param_all.xml on HPC
+    cpp_subtree: str = "QSP"  # XML subtree for parameter lookup
 
 
 class RemoteCommandError(RuntimeError):
@@ -317,6 +320,7 @@ class HPCJobManager:
         paths = cfg.get("paths", {})
         slurm = cfg.get("slurm", {})
         package = cfg.get("package", {})
+        cpp = cfg.get("cpp", {})
 
         # Validate required SSH fields
         ssh_host = ssh.get("host", "").strip()
@@ -415,6 +419,9 @@ class HPCJobManager:
             qsp_hpc_tools_source=package.get(
                 "qsp_hpc_tools_source", "git+ssh://git@github.com/jeliason/qsp-hpc-tools.git"
             ).strip(),
+            cpp_binary_path=cpp.get("binary_path", "").strip(),
+            cpp_template_path=cpp.get("template_path", "").strip(),
+            cpp_subtree=cpp.get("subtree", "QSP").strip(),
         )
 
     @staticmethod
@@ -577,6 +584,178 @@ class HPCJobManager:
         job_info.state_file = state_file
 
         return job_info
+
+    def submit_cpp_jobs(
+        self,
+        samples_csv: str,
+        num_simulations: int,
+        simulation_pool_id: str,
+        t_end_days: float = 180.0,
+        dt_days: float = 1.0,
+        scenario: str = "default",
+        seed: int = 2025,
+        jobs_per_chunk: Optional[int] = None,
+        max_workers: Optional[int] = None,
+        per_sim_timeout_s: float = 300.0,
+        skip_sync: bool = False,
+        binary_path: Optional[str] = None,
+        template_path: Optional[str] = None,
+        subtree: Optional[str] = None,
+        cpp_cpus_per_task: int = 1,
+        cpp_memory: str = "4G",
+    ) -> JobInfo:
+        """Submit C++ simulation batch to HPC cluster.
+
+        Like :meth:`submit_jobs` but uses :mod:`qsp_hpc.batch.cpp_batch_worker`
+        instead of the MATLAB ``batch_worker.m``.  No MATLAB module is loaded;
+        each array task activates the Python venv and runs
+        :class:`CppBatchRunner` on its chunk.
+
+        Args:
+            samples_csv: Path to CSV with parameter samples (columns = param names).
+            num_simulations: Total number of simulations.
+            simulation_pool_id: Pool directory name on HPC
+                (e.g. ``v1_a3f7b2c8_baseline``).
+            t_end_days: Simulation end time (days).
+            dt_days: Output timestep (days).
+            scenario: Scenario name for Parquet filenames.
+            seed: Random seed.
+            jobs_per_chunk: Simulations per array task (default from config).
+            max_workers: ``CppBatchRunner`` workers per task (``None`` = auto).
+            per_sim_timeout_s: Per-simulation timeout in seconds.
+            skip_sync: Skip rsync codebase sync.
+            binary_path: Override ``cpp.binary_path`` from credentials.
+            template_path: Override ``cpp.template_path`` from credentials.
+            subtree: Override ``cpp.subtree`` from credentials.
+            cpp_cpus_per_task: CPUs per SLURM task for C++ jobs.
+            cpp_memory: Memory per SLURM task for C++ jobs.
+
+        Returns:
+            :class:`JobInfo` with job ID and state file.
+        """
+        binary_path = binary_path or self.config.cpp_binary_path
+        template_path = template_path or self.config.cpp_template_path
+        subtree = subtree or self.config.cpp_subtree
+
+        if not binary_path:
+            raise ValueError(
+                "cpp.binary_path must be set in credentials.yaml or passed as argument"
+            )
+        if not template_path:
+            raise ValueError(
+                "cpp.template_path must be set in credentials.yaml or passed as argument"
+            )
+
+        if jobs_per_chunk is None:
+            jobs_per_chunk = self.config.jobs_per_chunk
+
+        from qsp_hpc.batch.batch_utils import calculate_num_tasks
+
+        n_jobs = calculate_num_tasks(num_simulations, jobs_per_chunk)
+
+        self.logger.info("Preparing C++ HPC job submission:")
+        job_config = {
+            "simulations": num_simulations,
+            "array_tasks": n_jobs,
+            "sims_per_task": jobs_per_chunk,
+            "binary": binary_path,
+            "template": template_path,
+            "scenario": scenario,
+            "seed": seed,
+            "t_end_days": t_end_days,
+            "dt_days": dt_days,
+        }
+        for line in format_config(job_config):
+            self.logger.info(line)
+
+        with log_operation(self.logger, "Syncing codebase to HPC", log_start=not skip_sync):
+            self.sync_codebase(skip_sync=skip_sync)
+
+        self.ensure_hpc_venv()
+        self._setup_remote_directories()
+
+        self.logger.info("Uploading C++ job configuration and parameters...")
+        self._upload_cpp_job_config(
+            binary_path=binary_path,
+            template_path=template_path,
+            subtree=subtree,
+            num_simulations=num_simulations,
+            seed=seed,
+            jobs_per_chunk=jobs_per_chunk,
+            t_end_days=t_end_days,
+            dt_days=dt_days,
+            simulation_pool_id=simulation_pool_id,
+            scenario=scenario,
+            max_workers=max_workers,
+            per_sim_timeout_s=per_sim_timeout_s,
+        )
+        self._upload_parameter_csv(samples_csv)
+
+        self.logger.info("Submitting C++ SLURM array job with %d tasks...", n_jobs)
+        job_id = self.slurm_submitter.submit_cpp_job(
+            n_jobs=n_jobs,
+            cpus_per_task=cpp_cpus_per_task,
+            memory=cpp_memory,
+        )
+        self.logger.info("Job submitted: %s", job_id)
+
+        job_info = JobInfo(
+            job_ids=[job_id],
+            state_file="",
+            n_jobs=n_jobs,
+            n_simulations=num_simulations,
+            submission_time=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        state_file = self._save_job_state(job_info)
+        job_info.state_file = state_file
+
+        return job_info
+
+    def _upload_cpp_job_config(
+        self,
+        binary_path: str,
+        template_path: str,
+        subtree: str,
+        num_simulations: int,
+        seed: int,
+        jobs_per_chunk: int,
+        t_end_days: float,
+        dt_days: float,
+        simulation_pool_id: str,
+        scenario: str,
+        max_workers: Optional[int],
+        per_sim_timeout_s: float,
+    ) -> None:
+        """Create and upload C++ job configuration JSON."""
+        import json
+        import tempfile
+
+        config = {
+            "binary_path": binary_path,
+            "template_path": template_path,
+            "subtree": subtree,
+            "param_csv": f"{self.config.remote_project_path}/batch_jobs/input/params.csv",
+            "n_simulations": num_simulations,
+            "seed": seed,
+            "jobs_per_chunk": jobs_per_chunk,
+            "t_end_days": t_end_days,
+            "dt_days": dt_days,
+            "simulation_pool_id": simulation_pool_id,
+            "simulation_pool_path": self.config.simulation_pool_path,
+            "scenario": scenario,
+            "max_workers": max_workers,
+            "per_sim_timeout_s": per_sim_timeout_s,
+        }
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config, f, indent=2)
+            temp_file = f.name
+
+        try:
+            remote_file = f"{self.config.remote_project_path}/batch_jobs/input/cpp_job_config.json"
+            self.transport.upload(temp_file, remote_file)
+        finally:
+            Path(temp_file).unlink()
 
     def _setup_remote_directories(self) -> None:
         """Create necessary directories on remote cluster and clean old files."""

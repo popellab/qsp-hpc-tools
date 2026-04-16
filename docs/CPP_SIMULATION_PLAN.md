@@ -180,7 +180,7 @@ path end-to-end.
 
 ## Completed milestones and benchmarks (2026-04-15)
 
-### M1-M4: DONE
+### M1-M7: DONE
 
 | | what | commit (SPQSP_PDAC) | commit (qsp-hpc-tools) |
 |---|---|---|---|
@@ -188,6 +188,35 @@ path end-to-end.
 | M2 | ParamXMLRenderer (dict → XML) | — | 57c1a79 |
 | M3 | CppRunner (single sim) | — | f2e4141 |
 | M4 | CppBatchRunner + MATLAB-schema Parquet | — | b22cb3e |
+| M5 | CppSimulator (top-level Python API) | — | (pending) |
+| M6 | HPC integration (SLURM + C++ worker) | — | (pending) |
+| M7 | Numerical validation vs MATLAB | — | (pending) |
+
+### M7 results (20 sims × 30 days, no dosing, basic no-evolve-to-diagnosis)
+
+- **125/164 meaningful-magnitude species compared** (39 at floating-point noise floor, both paths ≈ 0)
+- **Median Pearson r = 1.000000** across meaningful species
+- **Median max_rel_diff = 1.76e-6** (CVODE tolerance level)
+- **p95 max_rel_diff = 2.23e-4** (tight)
+- **Worst non-noise disagreement: V_T.P0/P1 at ~2.6e-3 relative, ~3.7e-9 absolute** (within `abs_tol=1e-9` integrator drift over 60 half-day steps)
+- **Speedup: 87× on the 20-sim workload** (MATLAB 3.72 s/sim → C++ 0.04 s/sim)
+
+**Validation gotcha resolved**: MATLAB's `batch_worker.m` hardcodes
+`time = 0:0.5:stop_time`, so the C++ side must also use `dt=0.5` for
+pointwise alignment. The script enforces this and fails loudly if the
+time grids disagree.
+
+**Known asymmetry (not a bug)**: MATLAB emits 253 columns (164 species
++ 78 assignment-rule outputs + 11 compartments); C++ emits just the 164
+species. The rule-param gap is an existing codegen gap (noted in M1-M4
+findings). All species that appear in both agree.
+
+**Scenario caveat**: `baseline_no_treatment.yaml` uses
+`evolve_to_diagnosis` as init — not implemented in C++ yet — so the
+validation bypasses the scenario YAML and passes `sim_config` directly
+with no `initialization_function`. Validation of scenarios that depend
+on `evolve_to_diagnosis` requires M8 or later work on the events/init
+branch.
 
 ### Performance milestones (SPQSP_PDAC branch `cpp-sweep-binary-io`)
 
@@ -257,5 +286,5 @@ outputs (H_*, *_total) not emitted by the C++ codegen. Metadata types
 
 ## Total effort estimate
 
-M1-M4 done. Remaining: M5 (~1 day), M6 (~2-3 days), M7 (~2 days),
-M8 (follow-up PR after M7 is validated in production).
+M1-M7 done. Remaining: M8 (follow-up PR after the C++ path has been
+used in at least one real SBI workflow end-to-end).

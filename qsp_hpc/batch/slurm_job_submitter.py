@@ -137,6 +137,86 @@ echo "Job completed at $(date)"
 """
         return script
 
+    def submit_cpp_job(
+        self,
+        n_jobs: int,
+        cpus_per_task: int = 1,
+        memory: str = "4G",
+    ) -> str:
+        """Submit a C++ simulation array job.
+
+        Generates a SLURM script that activates the Python venv and runs
+        :mod:`qsp_hpc.batch.cpp_batch_worker` — no MATLAB module is loaded.
+
+        Args:
+            n_jobs: Number of array tasks.
+            cpus_per_task: CPUs per task (controls CppBatchRunner parallelism).
+            memory: Memory per task (e.g. ``"4G"``).
+
+        Returns:
+            Job ID string.
+        """
+        self.logger.info("C++ SLURM Configuration:")
+        self.logger.info(f"  Partition: {self.config.partition}")
+        self.logger.info(f"  Time limit: {self.config.time_limit}")
+        self.logger.info(f"  Memory: {memory}")
+        self.logger.info(f"  CPUs/task: {cpus_per_task}")
+        self.logger.info(f"  Array size: {n_jobs} tasks")
+
+        script_content = self._generate_cpp_slurm_script(n_jobs, cpus_per_task, memory)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
+            f.write(script_content)
+            temp_script = f.name
+
+        try:
+            remote_script_dir = f"{self.config.remote_project_path}/batch_jobs/scripts"
+            remote_script = f"{remote_script_dir}/qsp_cpp_batch_job.sh"
+
+            self.transport.upload(temp_script, remote_script)
+
+            returncode, output = self.transport.exec(f'sbatch "{remote_script}"', timeout=30)
+
+            if returncode != 0:
+                raise SubmissionError(f"C++ SLURM submission failed: {output}")
+
+            match = re.search(r"Submitted batch job (\d+)", output)
+            if not match:
+                raise SubmissionError(f"Could not parse job ID from: {output}")
+
+            job_id = match.group(1)
+            self.logger.info(f"Job {job_id} ({n_jobs} C++ tasks)")
+            return job_id
+
+        finally:
+            Path(temp_script).unlink()
+
+    def _generate_cpp_slurm_script(self, n_jobs: int, cpus_per_task: int, memory: str) -> str:
+        """Generate SLURM script for C++ simulation array job."""
+        project_path = self.config.remote_project_path
+        log_dir = f"{project_path}/batch_jobs/logs"
+
+        return f"""#!/bin/bash
+#SBATCH --job-name=qsp_cpp_batch
+#SBATCH --partition={self.config.partition}
+#SBATCH --time={self.config.time_limit}
+#SBATCH --mem={memory}
+#SBATCH --cpus-per-task={cpus_per_task}
+#SBATCH --array=0-{n_jobs - 1}
+#SBATCH --output={log_dir}/qsp_cpp_%A_%a.out
+#SBATCH --error={log_dir}/qsp_cpp_%A_%a.err
+
+echo "Starting C++ QSP batch job at $(date)"
+echo "Array task ID: $SLURM_ARRAY_TASK_ID"
+echo "Job ID: $SLURM_JOB_ID"
+
+source "{self.config.hpc_venv_path}/bin/activate"
+
+cd "{project_path}"
+python3 -m qsp_hpc.batch.cpp_batch_worker batch_jobs/input/cpp_job_config.json
+echo "Job completed at $(date)"
+"""
+
     def submit_derivation_job(
         self,
         pool_path: str,

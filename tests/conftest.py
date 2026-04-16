@@ -15,6 +15,12 @@ def pytest_addoption(parser):
         default=False,
         help="Run tests marked with 'hpc' that require a real cluster",
     )
+    parser.addoption(
+        "--run-validation",
+        action="store_true",
+        default=False,
+        help="Run tests marked with 'validation' (needs MATLAB + built qsp_sim)",
+    )
 
 
 def pytest_configure(config):
@@ -24,9 +30,13 @@ def pytest_configure(config):
 
 def pytest_runtest_setup(item):
     """Skip HPC tests unless explicitly enabled."""
-    if "hpc" in {mark.name for mark in item.iter_markers()}:
+    markers = {mark.name for mark in item.iter_markers()}
+    if "hpc" in markers:
         if not item.config.getoption("--run-hpc"):
             pytest.skip("HPC tests skipped (use --run-hpc to enable)")
+    if "validation" in markers:
+        if not item.config.getoption("--run-validation"):
+            pytest.skip("Validation tests skipped (use --run-validation to enable)")
 
 
 @pytest.fixture

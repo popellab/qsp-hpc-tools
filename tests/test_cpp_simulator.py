@@ -1,0 +1,462 @@
+"""Tests for qsp_hpc.simulation.cpp_simulator.CppSimulator."""
+
+from __future__ import annotations
+
+import textwrap
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+from qsp_hpc.cpp.batch_runner import BatchResult
+
+# ---------------------------------------------------------------------------
+# Fixtures: fake binary, template, priors CSV
+# ---------------------------------------------------------------------------
+
+MINI_TEMPLATE = b"""<Param>
+  <QSP>
+    <A>1.0</A>
+    <B>2.0</B>
+  </QSP>
+</Param>
+"""
+
+PRIORS_CSV = """\
+name,distribution,dist_param1,dist_param2
+A,lognormal,0.0,0.5
+B,lognormal,0.5,0.3
+"""
+
+
+def _make_fake_binary(tmp_path: Path) -> Path:
+    """Shell script that mimics qsp_sim (2 time-points, 2 species)."""
+    script = tmp_path / "fake_qsp_sim.sh"
+    script.write_text(
+        textwrap.dedent(
+            """\
+        #!/usr/bin/env bash
+        set -e
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --binary-out) BIN_OUT="$2"; shift 2 ;;
+            --species-out) SP_OUT="$2"; shift 2 ;;
+            --param) PARAM="$2"; shift 2 ;;
+            --t-end-days) TEND="$2"; shift 2 ;;
+            --dt-days) DT="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        python3 - <<PY
+import struct
+header = struct.pack('<IIQQdd', 0x51535042, 1, 2, 2, float("$DT"), float("$TEND"))
+body = struct.pack('<4d', 10.0, 20.0, 30.0, 40.0)
+open("$BIN_OUT", 'wb').write(header + body)
+open("$SP_OUT", 'w').write("spA\\nspB\\n")
+PY
+    """
+        )
+    )
+    script.chmod(0o755)
+    return script
+
+
+@pytest.fixture
+def template_path(tmp_path: Path) -> Path:
+    p = tmp_path / "template.xml"
+    p.write_bytes(MINI_TEMPLATE)
+    return p
+
+
+@pytest.fixture
+def binary_path(tmp_path: Path) -> Path:
+    return _make_fake_binary(tmp_path)
+
+
+@pytest.fixture
+def priors_csv(tmp_path: Path) -> Path:
+    p = tmp_path / "priors.csv"
+    p.write_text(PRIORS_CSV)
+    return p
+
+
+@pytest.fixture
+def cache_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "cache"
+    d.mkdir()
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Helper to build a synthetic Parquet matching CppBatchRunner output
+# ---------------------------------------------------------------------------
+
+
+def _write_synthetic_parquet(
+    path: Path,
+    n_sims: int = 5,
+    param_names: list[str] | None = None,
+    species: list[str] | None = None,
+    n_times: int = 2,
+    dt: float = 0.1,
+    seed: int = 0,
+) -> None:
+    param_names = param_names or ["A", "B"]
+    species = species or ["spA", "spB"]
+    rng = np.random.default_rng(seed)
+    cols: dict[str, pa.Array] = {
+        "simulation_id": pa.array(np.arange(n_sims, dtype=np.int64)),
+        "status": pa.array(np.zeros(n_sims, dtype=np.int64)),
+        "time": pa.array(
+            [(np.arange(n_times) * dt).tolist()] * n_sims,
+            type=pa.list_(pa.float64()),
+        ),
+    }
+    for name in param_names:
+        cols[f"param:{name}"] = pa.array(rng.uniform(0, 1, n_sims))
+    for sp in species:
+        cols[sp] = pa.array(
+            [rng.uniform(0, 100, n_times).tolist() for _ in range(n_sims)],
+            type=pa.list_(pa.float64()),
+        )
+    pq.write_table(pa.table(cols), str(path))
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestCppSimulatorInit:
+    def test_basic_init(self, priors_csv, binary_path, template_path, cache_dir):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+        )
+        assert sim.param_names == ["A", "B"]
+        assert sim.pool_dir.exists()
+        assert sim.config_hash  # non-empty string
+
+    def test_missing_priors_raises(self, binary_path, template_path, cache_dir):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        with pytest.raises(FileNotFoundError, match="Priors CSV"):
+            CppSimulator(
+                priors_csv="/nonexistent.csv",
+                binary_path=binary_path,
+                template_xml=template_path,
+                cache_dir=cache_dir,
+            )
+
+    def test_config_hash_changes_with_binary(self, priors_csv, template_path, cache_dir, tmp_path):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        (tmp_path / "v1").mkdir(exist_ok=True)
+        bin1 = _make_fake_binary(tmp_path / "v1")
+
+        bin2_dir = tmp_path / "v2"
+        bin2_dir.mkdir()
+        bin2 = bin2_dir / "fake_qsp_sim.sh"
+        bin2.write_text(bin1.read_text() + "\n# changed")
+        bin2.chmod(0o755)
+
+        s1 = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=bin1,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+        )
+        s2 = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=bin2,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+        )
+        assert s1.config_hash != s2.config_hash
+
+    def test_config_hash_changes_with_template(self, priors_csv, binary_path, cache_dir, tmp_path):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        t1 = tmp_path / "t1.xml"
+        t1.write_bytes(MINI_TEMPLATE)
+        t2 = tmp_path / "t2.xml"
+        t2.write_bytes(MINI_TEMPLATE.replace(b"1.0", b"9.0"))
+
+        s1 = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=t1,
+            cache_dir=cache_dir,
+        )
+        s2 = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=t2,
+            cache_dir=cache_dir,
+        )
+        assert s1.config_hash != s2.config_hash
+
+    def test_pool_dir_includes_scenario(self, priors_csv, binary_path, template_path, cache_dir):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="my_scenario",
+        )
+        assert sim.pool_dir.name.endswith("_my_scenario")
+
+
+class TestPoolCaching:
+    def test_scan_empty_pool(self, priors_csv, binary_path, template_path, cache_dir):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+        )
+        assert sim.get_available_simulations() == 0
+
+    def test_scan_detects_parquet(self, priors_csv, binary_path, template_path, cache_dir):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="ctrl",
+        )
+        _write_synthetic_parquet(
+            sim.pool_dir / "batch_20260415_120000_ctrl_10sims_seed42.parquet",
+            n_sims=10,
+        )
+        assert sim.get_available_simulations() == 10
+
+    def test_scan_ignores_wrong_scenario(self, priors_csv, binary_path, template_path, cache_dir):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="ctrl",
+        )
+        _write_synthetic_parquet(
+            sim.pool_dir / "batch_20260415_120000_treatment_10sims_seed42.parquet",
+            n_sims=10,
+        )
+        assert sim.get_available_simulations() == 0
+
+    def test_load_from_pool_filters_failed(self, priors_csv, binary_path, template_path, cache_dir):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="ctrl",
+        )
+        # Write a parquet with one failed row
+        n = 5
+        cols: dict[str, pa.Array] = {
+            "simulation_id": pa.array(np.arange(n, dtype=np.int64)),
+            "status": pa.array([0, 0, 1, 0, 0], type=pa.int64()),
+            "time": pa.array([[0.0, 0.1]] * n, type=pa.list_(pa.float64())),
+            "param:A": pa.array([1.0, 2.0, 3.0, 4.0, 5.0]),
+            "param:B": pa.array([10.0, 20.0, 30.0, 40.0, 50.0]),
+            "spA": pa.array(
+                [[1.0, 2.0], [3.0, 4.0], [float("nan"), float("nan")], [7.0, 8.0], [9.0, 10.0]],
+                type=pa.list_(pa.float64()),
+            ),
+        }
+        pq.write_table(
+            pa.table(cols),
+            str(sim.pool_dir / "batch_20260415_120000_ctrl_5sims_seed42.parquet"),
+        )
+        theta, table = sim._load_from_pool(10)
+        assert table.num_rows == 4  # one failed row filtered
+        assert theta.shape[0] == 4
+
+    def test_load_samples_when_pool_exceeds_request(
+        self, priors_csv, binary_path, template_path, cache_dir
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="ctrl",
+        )
+        _write_synthetic_parquet(
+            sim.pool_dir / "batch_20260415_120000_ctrl_20sims_seed42.parquet",
+            n_sims=20,
+        )
+        theta, table = sim._load_from_pool(5)
+        assert theta.shape[0] == 5
+        assert table.num_rows == 5
+
+
+class TestCall:
+    def test_call_uses_cache_when_available(
+        self, priors_csv, binary_path, template_path, cache_dir
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="ctrl",
+        )
+        _write_synthetic_parquet(
+            sim.pool_dir / "batch_20260415_120000_ctrl_20sims_seed42.parquet",
+            n_sims=20,
+        )
+        with patch.object(sim, "_runner") as mock_runner:
+            theta, table = sim(10)
+            mock_runner.run.assert_not_called()
+        assert theta.shape[0] == 10
+
+    def test_call_runs_batch_when_no_cache(self, priors_csv, binary_path, template_path, cache_dir):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="ctrl",
+            t_end_days=0.2,
+            dt_days=0.1,
+        )
+
+        def fake_run(**kwargs):
+            _write_synthetic_parquet(
+                kwargs["output_path"],
+                n_sims=kwargs["theta_matrix"].shape[0],
+                param_names=list(kwargs["param_names"]),
+            )
+            return BatchResult(
+                parquet_path=kwargs["output_path"],
+                n_sims=kwargs["theta_matrix"].shape[0],
+                n_failed=0,
+                species_names=["spA", "spB"],
+                n_times=2,
+            )
+
+        with patch.object(sim._runner, "run", side_effect=fake_run):
+            theta, table = sim(5)
+
+        assert theta.shape == (5, 2)
+        assert table.num_rows == 5
+        assert sim.get_available_simulations() == 5
+
+    def test_call_tops_up_partial_cache(self, priors_csv, binary_path, template_path, cache_dir):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="ctrl",
+            t_end_days=0.2,
+            dt_days=0.1,
+        )
+        # Pre-seed pool with 3 sims
+        _write_synthetic_parquet(
+            sim.pool_dir / "batch_20260415_120000_ctrl_3sims_seed42.parquet",
+            n_sims=3,
+        )
+
+        run_calls = []
+
+        def fake_run(**kwargs):
+            run_calls.append(kwargs["theta_matrix"].shape[0])
+            _write_synthetic_parquet(
+                kwargs["output_path"],
+                n_sims=kwargs["theta_matrix"].shape[0],
+                param_names=list(kwargs["param_names"]),
+            )
+            return BatchResult(
+                parquet_path=kwargs["output_path"],
+                n_sims=kwargs["theta_matrix"].shape[0],
+                n_failed=0,
+                species_names=["spA", "spB"],
+                n_times=2,
+            )
+
+        with patch.object(sim._runner, "run", side_effect=fake_run):
+            theta, table = sim(10)
+
+        assert run_calls == [7]  # 10 - 3 = 7 new sims
+        assert theta.shape[0] == 10
+
+    def test_call_tuple_batch_size(self, priors_csv, binary_path, template_path, cache_dir):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="ctrl",
+        )
+        _write_synthetic_parquet(
+            sim.pool_dir / "batch_20260415_120000_ctrl_20sims_seed42.parquet",
+            n_sims=20,
+        )
+        with patch.object(sim, "_runner"):
+            theta, table = sim((5,))
+        assert theta.shape[0] == 5
+
+    def test_second_call_uses_cache(self, priors_csv, binary_path, template_path, cache_dir):
+        """After running once, second call with same size hits cache."""
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="ctrl",
+            t_end_days=0.2,
+            dt_days=0.1,
+        )
+
+        def fake_run(**kwargs):
+            _write_synthetic_parquet(
+                kwargs["output_path"],
+                n_sims=kwargs["theta_matrix"].shape[0],
+                param_names=list(kwargs["param_names"]),
+            )
+            return BatchResult(
+                parquet_path=kwargs["output_path"],
+                n_sims=kwargs["theta_matrix"].shape[0],
+                n_failed=0,
+                species_names=["spA", "spB"],
+                n_times=2,
+            )
+
+        with patch.object(sim._runner, "run", side_effect=fake_run) as mock_run:
+            sim(5)
+            assert mock_run.call_count == 1
+            sim(5)
+            assert mock_run.call_count == 1  # no additional run

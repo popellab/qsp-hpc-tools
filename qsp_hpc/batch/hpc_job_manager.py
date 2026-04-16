@@ -601,7 +601,7 @@ class HPCJobManager:
         jobs_per_chunk: Optional[int] = None,
         max_workers: Optional[int] = None,
         per_sim_timeout_s: float = 300.0,
-        skip_sync: bool = False,
+        skip_sync: bool = True,
         binary_path: Optional[str] = None,
         template_path: Optional[str] = None,
         subtree: Optional[str] = None,
@@ -627,7 +627,12 @@ class HPCJobManager:
             jobs_per_chunk: Simulations per array task (default from config).
             max_workers: ``CppBatchRunner`` workers per task (``None`` = auto).
             per_sim_timeout_s: Per-simulation timeout in seconds.
-            skip_sync: Skip rsync codebase sync.
+            skip_sync: Skip rsync codebase sync. Defaults to True — the C++
+                worker ships via the pip-installed Python package (see
+                :meth:`ensure_hpc_venv`), so the MATLAB-era rsync of
+                ``cwd`` to ``remote_project_path`` is not needed and may
+                be destructive if ``remote_project_path`` points at a
+                sibling project (e.g. pdac-build).
             binary_path: Override ``cpp.binary_path`` from credentials.
             template_path: Override ``cpp.template_path`` from credentials.
             subtree: Override ``cpp.subtree`` from credentials.

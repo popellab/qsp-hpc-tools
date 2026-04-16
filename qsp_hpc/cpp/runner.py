@@ -18,11 +18,14 @@ import numpy as np
 
 from qsp_hpc.cpp.param_xml import ParamXMLRenderer
 
-# Must match qsp_sim.cpp's binary format.
+# Must match qsp_sim.cpp's binary format. Header layout:
+#   magic | version=2 | n_times | n_species | n_compartments | n_rules | dt | t_end
+# Body: n_times × (n_species + n_compartments + n_rules) doubles, in
+# row-major order with columns laid out as species → compartments → rules.
 _MAGIC = 0x51535042  # "QSPB" little-endian
-_SUPPORTED_VERSIONS = {1}
-_HEADER_STRUCT = struct.Struct("<IIQQdd")  # magic, version, n_t, n_sp, dt, t_end
-_HEADER_SIZE = _HEADER_STRUCT.size  # 40 bytes
+_HEADER_STRUCT = struct.Struct("<IIQQQQdd")
+_HEADER_SIZE = _HEADER_STRUCT.size  # 56 bytes
+_SUPPORTED_VERSION = 2
 
 
 class QspSimError(RuntimeError):
@@ -34,11 +37,35 @@ class BinaryFormatError(RuntimeError):
 
 
 @dataclass
-class SimResult:
-    """One simulation's output."""
+class TrajectoryHeader:
+    """Parsed binary header — knows the column layout for the body."""
 
-    trajectory: np.ndarray  # shape (n_times, n_species), float64
-    species_names: list[str]  # length n_species
+    version: int
+    n_times: int
+    n_species: int
+    n_compartments: int
+    n_rules: int
+    dt_days: float
+    t_end_days: float
+
+    @property
+    def n_columns(self) -> int:
+        return self.n_species + self.n_compartments + self.n_rules
+
+
+@dataclass
+class SimResult:
+    """One simulation's output.
+
+    ``trajectory`` columns are laid out as
+    ``[species..., compartments..., rules...]`` (matching the binary
+    body order).
+    """
+
+    trajectory: np.ndarray  # shape (n_times, n_columns), float64
+    species_names: list[str]
+    compartment_names: list[str]
+    rule_names: list[str]
     dt_days: float
     t_end_days: float
 
@@ -47,36 +74,53 @@ class SimResult:
         """Time axis reconstructed from dt and n_times (t=0 is first row)."""
         return np.arange(self.trajectory.shape[0]) * self.dt_days
 
+    @property
+    def column_names(self) -> list[str]:
+        """All column names in trajectory order."""
+        return list(self.species_names) + list(self.compartment_names) + list(self.rule_names)
 
-def read_binary_trajectory(path: Path) -> tuple[np.ndarray, float, float]:
-    """Parse a qsp_sim --binary-out file.
 
-    Returns (trajectory[n_t, n_sp], dt_days, t_end_days).
+def read_binary_trajectory(path: Path) -> tuple[np.ndarray, TrajectoryHeader]:
+    """Parse a qsp_sim --binary-out file (format version 2).
+
+    Returns ``(trajectory, header)``. Trajectory shape is
+    ``(n_times, n_columns)`` with columns laid out as
+    ``[species..., compartments..., rules...]``.
     """
     data = path.read_bytes()
     if len(data) < _HEADER_SIZE:
         raise BinaryFormatError(
             f"Binary file truncated: {len(data)} bytes < {_HEADER_SIZE}-byte header"
         )
-    magic, version, n_t, n_sp, dt, t_end = _HEADER_STRUCT.unpack_from(data, 0)
+    magic, version, n_t, n_sp, n_comp, n_rules, dt, t_end = _HEADER_STRUCT.unpack_from(data, 0)
     if magic != _MAGIC:
         raise BinaryFormatError(
             f"Bad magic: got 0x{magic:08x}, expected 0x{_MAGIC:08x} "
             f"(is this a qsp_sim --binary-out file?)"
         )
-    if version not in _SUPPORTED_VERSIONS:
+    if version != _SUPPORTED_VERSION:
         raise BinaryFormatError(
             f"Unsupported binary version {version}; this code handles "
-            f"{sorted(_SUPPORTED_VERSIONS)}"
+            f"{_SUPPORTED_VERSION} (rebuild qsp_sim if you have an older binary)"
         )
-    expected = _HEADER_SIZE + n_t * n_sp * 8
+    n_cols = n_sp + n_comp + n_rules
+    expected = _HEADER_SIZE + n_t * n_cols * 8
     if len(data) != expected:
         raise BinaryFormatError(
             f"Binary file size mismatch: got {len(data)} bytes, "
-            f"expected {expected} ({n_t} times × {n_sp} species × 8 + {_HEADER_SIZE})"
+            f"expected {expected} ({n_t} times × {n_cols} cols × 8 + {_HEADER_SIZE})"
         )
-    arr = np.frombuffer(data, dtype="<f8", offset=_HEADER_SIZE).reshape(n_t, n_sp)
-    return arr, float(dt), float(t_end)
+    arr = np.frombuffer(data, dtype="<f8", offset=_HEADER_SIZE).reshape(n_t, n_cols)
+    header = TrajectoryHeader(
+        version=version,
+        n_times=n_t,
+        n_species=n_sp,
+        n_compartments=n_comp,
+        n_rules=n_rules,
+        dt_days=float(dt),
+        t_end_days=float(t_end),
+    )
+    return arr, header
 
 
 class CppRunner:
@@ -122,6 +166,8 @@ class CppRunner:
         self._renderer = ParamXMLRenderer(template_path, subtree=subtree)
         self.default_timeout_s = default_timeout_s
         self._species_names: list[str] | None = None
+        self._compartment_names: list[str] | None = None
+        self._rule_names: list[str] | None = None
 
     @property
     def parameter_names(self) -> frozenset[str]:
@@ -133,6 +179,19 @@ class CppRunner:
         """Species column names from the last qsp_sim invocation (None
         until the first run_one call)."""
         return self._species_names
+
+    @property
+    def compartment_names(self) -> list[str] | None:
+        """Compartment column names from the last v2 qsp_sim invocation
+        (None until the first run_one call; empty list for v1 binaries)."""
+        return self._compartment_names
+
+    @property
+    def rule_names(self) -> list[str] | None:
+        """Assignment-rule column names from the last v2 qsp_sim
+        invocation (None until the first run_one call; empty list for
+        v1 binaries)."""
+        return self._rule_names
 
     def run_one(
         self,
@@ -167,6 +226,8 @@ class CppRunner:
         xml_path = work / f"{sim_id}.xml"
         bin_path = work / f"{sim_id}.bin"
         species_path = work / f"{sim_id}.species.txt"
+        compartments_path = work / f"{sim_id}.comps.txt"
+        rules_path = work / f"{sim_id}.rules.txt"
 
         self._renderer.render_to_file(params, xml_path)
 
@@ -178,6 +239,10 @@ class CppRunner:
             str(bin_path),
             "--species-out",
             str(species_path),
+            "--compartments-out",
+            str(compartments_path),
+            "--rules-out",
+            str(rules_path),
             "--t-end-days",
             repr(float(t_end_days)),
             "--dt-days",
@@ -216,7 +281,7 @@ class CppRunner:
             )
 
         try:
-            traj, dt, t_end = read_binary_trajectory(bin_path)
+            traj, header = read_binary_trajectory(bin_path)
         except BinaryFormatError as e:
             stash = self._stash_failure(work, sim_id, xml_path, reason="bad-binary")
             raise QspSimError(
@@ -226,23 +291,54 @@ class CppRunner:
             ) from e
 
         species = species_path.read_text().splitlines()
-        if len(species) != traj.shape[1]:
+        if len(species) != header.n_species:
             raise QspSimError(
-                f"species-out line count ({len(species)}) != trajectory "
-                f"column count ({traj.shape[1]}) for sim {sim_id}"
+                f"species-out line count ({len(species)}) != binary header "
+                f"n_species ({header.n_species}) for sim {sim_id}"
+            )
+
+        if not compartments_path.exists() or not rules_path.exists():
+            raise QspSimError(
+                f"--compartments-out / --rules-out files missing for sim "
+                f"{sim_id} (rebuild qsp_sim if it was built before binary v2)"
+            )
+        compartments = compartments_path.read_text().splitlines()
+        rules = rules_path.read_text().splitlines()
+        if len(compartments) != header.n_compartments:
+            raise QspSimError(
+                f"compartments-out line count ({len(compartments)}) != "
+                f"header n_compartments ({header.n_compartments}) for "
+                f"sim {sim_id}"
+            )
+        if len(rules) != header.n_rules:
+            raise QspSimError(
+                f"rules-out line count ({len(rules)}) != header n_rules "
+                f"({header.n_rules}) for sim {sim_id}"
+            )
+
+        if traj.shape[1] != header.n_columns:
+            raise QspSimError(
+                f"trajectory width ({traj.shape[1]}) != header n_columns "
+                f"({header.n_columns}) for sim {sim_id}"
             )
         self._species_names = species
+        self._compartment_names = compartments
+        self._rule_names = rules
 
         if not keep_files:
             xml_path.unlink(missing_ok=True)
             bin_path.unlink(missing_ok=True)
             species_path.unlink(missing_ok=True)
+            compartments_path.unlink(missing_ok=True)
+            rules_path.unlink(missing_ok=True)
 
         return SimResult(
             trajectory=traj,
             species_names=species,
-            dt_days=dt,
-            t_end_days=t_end,
+            compartment_names=compartments,
+            rule_names=rules,
+            dt_days=header.dt_days,
+            t_end_days=header.t_end_days,
         )
 
     @staticmethod

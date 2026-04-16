@@ -8,11 +8,17 @@ pipeline has been emitting — so downstream caching / test-stat
 derivation code keeps working without edits.
 
 Schema (one row per simulation):
-    simulation_id: int64     # zero-indexed within this batch
-    status:        int64     # 0 = success, 1 = qsp_sim failure
-    time:          list<float64>    # length n_times (same for all rows)
-    param:<name>:  float64   # one column per priors-CSV param
-    <species>:     list<float64>   # one column per qsp_sim species
+    simulation_id:  int64     # zero-indexed within this batch
+    status:         int64     # 0 = success, 1 = qsp_sim failure
+    time:           list<float64>   # length n_times (same for all rows)
+    param:<name>:   float64   # one column per priors-CSV param
+    <species>:      list<float64>   # one column per qsp_sim species
+    <compartment>:  list<float64>   # v2 binaries: one per compartment
+    <rule>:         list<float64>   # v2 binaries: one per assignment rule
+
+The compartment and rule columns are emitted as bare names (no prefix)
+so calibration-target functions can read them via ``species_dict[name]``
+just like the MATLAB SimBiology output.
 """
 
 from __future__ import annotations
@@ -48,6 +54,8 @@ class BatchResult:
     n_failed: int
     species_names: list[str]
     n_times: int
+    compartment_names: list[str] | None = None
+    rule_names: list[str] | None = None
 
 
 # --- Worker (module-level so ProcessPoolExecutor can pickle it) -------------
@@ -92,8 +100,16 @@ def _run_one_in_worker(
     t_end_days: float,
     dt_days: float,
     timeout_s: float | None,
-) -> tuple[int, int, np.ndarray | None, list[str] | None, str | None]:
-    """Return (sim_id, status, trajectory_or_None, species_or_None, err_msg_or_None)."""
+) -> tuple[
+    int,
+    int,
+    np.ndarray | None,
+    list[str] | None,
+    list[str] | None,
+    list[str] | None,
+    str | None,
+]:
+    """Return (sim_id, status, trajectory, species, comps, rules, err)."""
     assert _WORKER_RUNNER is not None, "_worker_init must be called first"
     assert _WORKER_WORKDIR is not None
     try:
@@ -104,9 +120,17 @@ def _run_one_in_worker(
             workdir=_WORKER_WORKDIR,
             timeout_s=timeout_s,
         )
-        return sim_id, STATUS_OK, result.trajectory, result.species_names, None
+        return (
+            sim_id,
+            STATUS_OK,
+            result.trajectory,
+            result.species_names,
+            result.compartment_names,
+            result.rule_names,
+            None,
+        )
     except (QspSimError, ParamNotFoundError) as e:
-        return sim_id, STATUS_FAILED, None, None, str(e)
+        return sim_id, STATUS_FAILED, None, None, None, None, str(e)
 
 
 # --- Public batch runner ----------------------------------------------------
@@ -210,6 +234,8 @@ class CppBatchRunner:
         statuses: list[int] = [STATUS_FAILED] * n_sims
         errors: list[str | None] = [None] * n_sims
         species_names: list[str] | None = None
+        compartment_names: list[str] | None = None
+        rule_names: list[str] | None = None
 
         with ProcessPoolExecutor(
             max_workers=max_workers,
@@ -239,12 +265,14 @@ class CppBatchRunner:
                     )
                 )
             for fut in as_completed(futures):
-                sim_id, status, traj, sp, err = fut.result()
+                sim_id, status, traj, sp, comps, rules, err = fut.result()
                 statuses[sim_id] = status
                 if status == STATUS_OK:
                     trajectories[sim_id] = traj
                     if species_names is None:
                         species_names = sp
+                        compartment_names = comps or []
+                        rule_names = rules or []
                 else:
                     errors[sim_id] = err
                     logger.warning("sim %d failed: %s", sim_id, err)
@@ -260,6 +288,11 @@ class CppBatchRunner:
                 f"First error: {next((e for e in errors if e), '(none)')}"
             )
 
+        # mypy/pyright: _run_one_in_worker initializes all three when
+        # status is OK, so these are non-None by this point.
+        assert compartment_names is not None
+        assert rule_names is not None
+
         n_times = trajectories[next(i for i, t in enumerate(trajectories) if t is not None)].shape[
             0
         ]
@@ -271,16 +304,21 @@ class CppBatchRunner:
             statuses=statuses,
             trajectories=trajectories,
             species_names=species_names,
+            compartment_names=compartment_names,
+            rule_names=rule_names,
             t_end_days=t_end_days,
             dt_days=dt_days,
             n_times=n_times,
         )
 
         logger.info(
-            "Batch complete: %d/%d succeeded, wrote %s",
+            "Batch complete: %d/%d succeeded, wrote %s (cols: %d species + %d comps + %d rules)",
             n_sims - n_failed,
             n_sims,
             parquet_path,
+            len(species_names),
+            len(compartment_names),
+            len(rule_names),
         )
         return BatchResult(
             parquet_path=parquet_path,
@@ -288,6 +326,8 @@ class CppBatchRunner:
             n_failed=n_failed,
             species_names=species_names,
             n_times=n_times,
+            compartment_names=compartment_names,
+            rule_names=rule_names,
         )
 
 
@@ -301,11 +341,19 @@ def _write_batch_parquet(
     statuses: list[int],
     trajectories: list[np.ndarray | None],
     species_names: list[str],
+    compartment_names: list[str],
+    rule_names: list[str],
     t_end_days: float,
     dt_days: float,
     n_times: int,
 ) -> Path:
-    """Build one pyarrow Table matching MATLAB's Parquet schema, write it."""
+    """Build one pyarrow Table matching MATLAB's Parquet schema, write it.
+
+    Trajectory columns are laid out in the order
+    ``[species..., compartments..., rules...]`` (matching the v2 binary
+    layout). Each is emitted as a bare column name so downstream code
+    reads them via ``species_dict[name]`` uniformly.
+    """
     n_sims = len(statuses)
 
     # Time column is the same for every row; reconstruct from dt × i.
@@ -322,19 +370,19 @@ def _write_batch_parquet(
     }
     for j, name in enumerate(param_names):
         columns[f"param:{name}"] = pa.array(theta_matrix[:, j].astype(np.float64))
-    # Stack trajectories into (n_sims, n_times, n_species). Can't hold all
-    # of this as one ndarray if n_sims × n_times × n_species is huge, but
-    # for typical sweep shapes (≤10k sims × ≤1800 times × 164 species ≈
-    # 2.4 GB) it's fine on a single node. The Parquet writer holds the
-    # same memory anyway.
-    for k, sp in enumerate(species_names):
+
+    # Trajectory columns in the same order they appear in the v2 binary:
+    # species first, then compartments, then assignment rules. Indexing
+    # is positional — column k corresponds to trajectory[:, k].
+    all_trajectory_names = list(species_names) + list(compartment_names) + list(rule_names)
+    for k, name in enumerate(all_trajectory_names):
         per_sim_series: list[list[float]] = []
-        for i, traj in enumerate(trajectories):
+        for traj in trajectories:
             if traj is None:
                 per_sim_series.append(nan_row.tolist())
             else:
                 per_sim_series.append(traj[:, k].tolist())
-        columns[sp] = pa.array(per_sim_series, type=pa.list_(pa.float64()))
+        columns[name] = pa.array(per_sim_series, type=pa.list_(pa.float64()))
 
     table = pa.Table.from_pydict(columns)
     pq.write_table(table, str(output_path), compression="snappy")

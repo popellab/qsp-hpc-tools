@@ -43,6 +43,8 @@ def _make_fake_binary(tmp_path: Path) -> Path:
           case "$1" in
             --binary-out) BIN_OUT="$2"; shift 2 ;;
             --species-out) SP_OUT="$2"; shift 2 ;;
+            --compartments-out) COMP_OUT="$2"; shift 2 ;;
+            --rules-out) RULES_OUT="$2"; shift 2 ;;
             --param) shift 2 ;;
             --t-end-days) TEND="$2"; shift 2 ;;
             --dt-days) DT="$2"; shift 2 ;;
@@ -51,10 +53,12 @@ def _make_fake_binary(tmp_path: Path) -> Path:
         done
         python3 - <<PY
         import struct
-        header = struct.pack('<IIQQdd', 0x51535042, 1, 2, 2, float("$DT"), float("$TEND"))
+        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 2, 0, 0, float("$DT"), float("$TEND"))
         body = struct.pack('<4d', 10.0, 20.0, 30.0, 40.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("spA\\nspB\\n")
+        open("$COMP_OUT", 'w').write('')
+        open("$RULES_OUT", 'w').write('')
         PY
     """
         )
@@ -572,3 +576,171 @@ class TestEnsureCppBinary:
         pull_cmd = next(c for c in commands if "git pull" in c)
         assert "my-feature-branch" in pull_cmd
         assert "main" not in pull_cmd
+
+
+# ---------------------------------------------------------------------------
+# M9: chained on-cluster derivation for the C++ path
+# ---------------------------------------------------------------------------
+
+
+class TestDerivationDependency:
+    """SLURMJobSubmitter emits --dependency only when caller asks for it."""
+
+    def _make_submitter(self):
+        from qsp_hpc.batch.hpc_job_manager import BatchConfig
+        from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter
+
+        config = BatchConfig(
+            ssh_host="test.edu",
+            ssh_user="testuser",
+            simulation_pool_path="/scratch/sims",
+            hpc_venv_path="/home/testuser/.venv/qsp",
+            remote_project_path="/home/testuser/project",
+            partition="shared",
+            time_limit="01:00:00",
+        )
+        return SLURMJobSubmitter(config, MagicMock())
+
+    def test_script_omits_dependency_when_unset(self):
+        sub = self._make_submitter()
+        script = sub._generate_derivation_slurm_script(
+            pool_path="/scratch/sims/pool",
+            test_stats_config="/home/testuser/project/batch_jobs/derivation/cfg.json",
+            derivation_dir="/home/testuser/project/batch_jobs/derivation",
+        )
+        assert "--dependency" not in script
+
+    def test_script_includes_dependency_when_set(self):
+        sub = self._make_submitter()
+        script = sub._generate_derivation_slurm_script(
+            pool_path="/scratch/sims/pool",
+            test_stats_config="/home/testuser/project/batch_jobs/derivation/cfg.json",
+            derivation_dir="/home/testuser/project/batch_jobs/derivation",
+            dependency="afterok:54321",
+        )
+        assert "#SBATCH --dependency=afterok:54321" in script
+
+
+class TestSubmitCppJobsWithDerivation:
+    """submit_cpp_jobs(derive_test_stats=True) chains a derivation job
+    with --dependency=afterok:<array_id>."""
+
+    def _make_manager(self):
+        from qsp_hpc.batch.hpc_job_manager import BatchConfig, HPCJobManager
+
+        config = BatchConfig(
+            ssh_host="test.edu",
+            ssh_user="testuser",
+            simulation_pool_path="/scratch/sims",
+            hpc_venv_path="/home/testuser/.venv/qsp",
+            remote_project_path="/home/testuser/project",
+            partition="shared",
+            time_limit="01:00:00",
+            cpp_binary_path="/usr/bin/qsp_sim",
+            cpp_template_path="/tmp/p.xml",
+            cpp_repo_path="/home/testuser/SPQSP_PDAC",
+        )
+        transport = MagicMock()
+
+        # Hand each sbatch a unique id so we can tell array vs derivation
+        # jobs apart in the test, and keep `echo OK` working.
+        submit_ids = iter(["11111", "22222", "33333"])
+
+        def exec_side_effect(cmd, *args, **kwargs):
+            if "echo OK" in cmd:
+                return (0, "OK")
+            if "sbatch" in cmd:
+                return (0, f"Submitted batch job {next(submit_ids)}")
+            return (0, "")
+
+        transport.exec.side_effect = exec_side_effect
+        transport.upload.return_value = None
+        return HPCJobManager(config=config, transport=transport), transport
+
+    def test_chains_derivation_when_derive_test_stats_true(self, tmp_path):
+        manager, transport = self._make_manager()
+
+        params_csv = tmp_path / "params.csv"
+        params_csv.write_text("A\n1.0\n")
+        ts_csv = tmp_path / "test_stats.csv"
+        ts_csv.write_text("name,model_output_code\n")
+
+        # The derivation script is a temp file deleted right after upload —
+        # snapshot its content during the upload call before it's gone.
+        captured_scripts: list[str] = []
+
+        def capture_upload(local, remote):
+            if remote.endswith("derive_script.sh"):
+                with open(local) as f:
+                    captured_scripts.append(f.read())
+
+        transport.upload.side_effect = capture_upload
+
+        info = manager.submit_cpp_jobs(
+            samples_csv=str(params_csv),
+            num_simulations=1,
+            simulation_pool_id="v1_abc_ctrl",
+            skip_sync=True,
+            derive_test_stats=True,
+            test_stats_csv=str(ts_csv),
+            test_stats_hash="deadbeef" * 8,
+        )
+
+        # First sbatch was the C++ array, second was the derivation.
+        assert info.job_ids == ["11111", "22222"]
+
+        # Derivation script must have been written and uploaded with the
+        # afterok dependency directive.
+        assert len(captured_scripts) == 1
+        assert "#SBATCH --dependency=afterok:11111" in captured_scripts[0]
+
+    def test_derive_test_stats_requires_csv(self, tmp_path):
+        manager, _ = self._make_manager()
+
+        params_csv = tmp_path / "params.csv"
+        params_csv.write_text("A\n1.0\n")
+
+        with pytest.raises(ValueError, match="test_stats_csv"):
+            manager.submit_cpp_jobs(
+                samples_csv=str(params_csv),
+                num_simulations=1,
+                simulation_pool_id="pool",
+                skip_sync=True,
+                derive_test_stats=True,
+                test_stats_hash="abc",
+            )
+
+    def test_derive_test_stats_requires_hash(self, tmp_path):
+        manager, _ = self._make_manager()
+
+        params_csv = tmp_path / "params.csv"
+        params_csv.write_text("A\n1.0\n")
+        ts_csv = tmp_path / "test_stats.csv"
+        ts_csv.write_text("name\n")
+
+        with pytest.raises(ValueError, match="test_stats_hash"):
+            manager.submit_cpp_jobs(
+                samples_csv=str(params_csv),
+                num_simulations=1,
+                simulation_pool_id="pool",
+                skip_sync=True,
+                derive_test_stats=True,
+                test_stats_csv=str(ts_csv),
+            )
+
+    def test_no_derivation_when_derive_test_stats_false(self, tmp_path):
+        manager, transport = self._make_manager()
+
+        params_csv = tmp_path / "params.csv"
+        params_csv.write_text("A\n1.0\n")
+
+        info = manager.submit_cpp_jobs(
+            samples_csv=str(params_csv),
+            num_simulations=1,
+            simulation_pool_id="pool",
+            skip_sync=True,
+        )
+
+        assert info.job_ids == ["11111"]
+        upload_dests = [call.args[1] for call in transport.upload.call_args_list]
+        assert not any(d.endswith("derive_script.sh") for d in upload_dests)

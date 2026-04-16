@@ -747,6 +747,10 @@ class HPCJobManager:
         scenario_yaml: Optional[str] = None,
         drug_metadata_yaml: Optional[str] = None,
         healthy_state_yaml: Optional[str] = None,
+        derive_test_stats: bool = False,
+        test_stats_csv: Optional[str] = None,
+        test_stats_hash: Optional[str] = None,
+        model_structure_file: Optional[str] = None,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
 
@@ -794,10 +798,35 @@ class HPCJobManager:
                 (``--drug-metadata``). Uploaded alongside ``scenario_yaml``.
             healthy_state_yaml: Local path to healthy_state.yaml
                 (``--evolve-to-diagnosis``). Uploaded and passed through.
+            derive_test_stats: If True, chain a test-statistics derivation
+                job after the C++ array using ``--dependency=afterok:<array_id>``.
+                Requires ``test_stats_csv`` and ``test_stats_hash``. The
+                derivation job id is appended to ``JobInfo.job_ids``.
+            test_stats_csv: Local path to the test-stats CSV (with
+                ``model_output_code`` column). Uploaded to HPC and passed
+                to :meth:`submit_derivation_job`. Required when
+                ``derive_test_stats=True``.
+            test_stats_hash: Hash of the test-stats CSV — used to name the
+                derivation output subdirectory
+                (``{pool_path}/test_stats/{test_stats_hash}/``) so the SBI
+                workflow can locate it later. Required when
+                ``derive_test_stats=True``.
+            model_structure_file: Local path to ``model_structure.json``
+                with species unit metadata. Optional — defaults to
+                dimensionless if omitted.
 
         Returns:
-            :class:`JobInfo` with job ID and state file.
+            :class:`JobInfo` with job ID(s) and state file. When
+            ``derive_test_stats=True``, ``job_ids`` has two entries:
+            ``[cpp_array_id, derivation_id]``.
         """
+        if derive_test_stats:
+            if not test_stats_csv:
+                raise ValueError("derive_test_stats=True requires test_stats_csv (path to the CSV)")
+            if not test_stats_hash:
+                raise ValueError(
+                    "derive_test_stats=True requires test_stats_hash (CSV content hash)"
+                )
         binary_path = binary_path or self.config.cpp_binary_path
         template_path = template_path or self.config.cpp_template_path
         subtree = subtree or self.config.cpp_subtree
@@ -881,8 +910,21 @@ class HPCJobManager:
         )
         self.logger.info("Job submitted: %s", job_id)
 
+        job_ids = [job_id]
+        if derive_test_stats:
+            hpc_pool_path = f"{self.config.simulation_pool_path}/{simulation_pool_id}"
+            self.logger.info("Chaining test-stats derivation after C++ array (afterok:%s)", job_id)
+            derive_job_id = self.submit_derivation_job(
+                pool_path=hpc_pool_path,
+                test_stats_csv=test_stats_csv,
+                test_stats_hash=test_stats_hash,
+                model_structure_file=model_structure_file,
+                dependency=f"afterok:{job_id}",
+            )
+            job_ids.append(derive_job_id)
+
         job_info = JobInfo(
-            job_ids=[job_id],
+            job_ids=job_ids,
             state_file="",
             n_jobs=n_jobs,
             n_simulations=num_simulations,
@@ -1437,6 +1479,7 @@ class HPCJobManager:
         test_stats_hash: str,
         model_structure_file: Optional[str] = None,
         num_simulations: Optional[int] = None,
+        dependency: Optional[str] = None,
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -1450,6 +1493,11 @@ class HPCJobManager:
             test_stats_hash: Hash of test statistics CSV
             model_structure_file: Local path to model_structure.json with species metadata
             num_simulations: Number of simulations needed (None = derive all batches)
+            dependency: Optional SLURM dependency expression (e.g.
+                ``"afterok:12345"``). When set, the derivation job is queued
+                with ``--dependency`` and only runs after the upstream job
+                succeeds — used by :meth:`submit_cpp_jobs` to chain
+                derivation after the C++ array.
 
         Returns:
             SLURM job ID
@@ -1485,8 +1533,13 @@ class HPCJobManager:
         home_dir = home_dir.strip()
         expanded_pool_path = pool_path.replace("$HOME", home_dir)
 
-        # Log pool info (for visibility, but always derive all batches)
-        n_batches = self._calculate_batches_needed(pool_path, num_simulations=None)
+        # Log pool info (for visibility, but always derive all batches).
+        # Skip the count when chaining via --dependency: the upstream array
+        # populates the pool, so the directory may not exist yet at submit time.
+        if dependency:
+            n_batches = -1  # sentinel: count unknown, will be populated by upstream job
+        else:
+            n_batches = self._calculate_batches_needed(pool_path, num_simulations=None)
 
         # Create derivation config JSON
         # Always derive ALL batches to handle incremental pool growth correctly.
@@ -1522,9 +1575,15 @@ class HPCJobManager:
             pool_path=pool_path,
             test_stats_config=remote_config,
             derivation_dir=derivation_dir,
+            dependency=dependency,
         )
 
-        self.logger.info(f"   🚀 Derivation job {job_id} (single task, {n_batches} batches)")
+        if dependency:
+            self.logger.info(
+                f"   🚀 Derivation job {job_id} (single task, dependency={dependency})"
+            )
+        else:
+            self.logger.info(f"   🚀 Derivation job {job_id} (single task, {n_batches} batches)")
         return job_id
 
     def submit_trajectory_grid_job(

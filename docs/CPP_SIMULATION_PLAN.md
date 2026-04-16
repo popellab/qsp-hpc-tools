@@ -186,39 +186,64 @@ The C++ path is numerically validated, runs end-to-end on Rockfish at
 each gives before we need to think about the MATLAB retirement in M8.
 Pick what's useful next; they're not a strict sequence.
 
-### M9 — On-cluster test-stat derivation for the C++ path
-
-*Est: 1–2 days.*
+### M9 — On-cluster test-stat derivation for the C++ path: DONE (2026-04-16)
 
 Once sweep sizes exceed ~10k, downloading raw trajectories is the slow
 part (100k ≈ 21 GB Parquet, 1M ≈ 210 GB). The MATLAB path already has
 `qsp_hpc/batch/derive_test_stats_worker.py` running as a single SLURM
 task that chews through a pool directory of Parquets and emits
 `chunk_XXX_test_stats.csv` files. That worker is backend-agnostic
-(reads Parquet + species unit metadata), so it should run against
-C++-produced pools unchanged.
+(reads Parquet + species unit metadata), so it runs against C++-produced
+pools unchanged.
 
-What this unlocks:
+**Shipped**:
 
-- `QSPSimulator` / SBI workflows can point at `simulation_pool_path` on
-  HPC and download per-sim test statistics (small) instead of raw
-  trajectories (huge).
-- Existing 3-tier caching (local pool → HPC test stats → HPC full sims
-  → new simulations) works end-to-end for the C++ backend.
+1. **Schema parity verified** — `derive_test_stats_worker` reads the C++
+   Parquet (`status`, `time`, `param:*`, species columns) with no code
+   changes. Confirmed against `batch_runner.py:297-341`.
+2. **SLURM dependency plumbing** — `SLURMJobSubmitter.submit_derivation_job`
+   and `_generate_derivation_slurm_script` accept a `dependency` arg and
+   emit `#SBATCH --dependency={dependency}` when set.
+   `HPCJobManager.submit_derivation_job` passes it through and skips the
+   pre-flight batch-count check when chaining (the upstream array
+   populates the pool).
+3. **Chained derivation in `submit_cpp_jobs()`** — opt-in via
+   `derive_test_stats=True` plus `test_stats_csv` + `test_stats_hash`.
+   When set, after submitting the array, the manager calls
+   `submit_derivation_job(..., dependency=f"afterok:{array_id}")` and
+   appends the derivation id to `JobInfo.job_ids`.
+4. **HPC tier on `CppSimulator`** — new `run_hpc(n)` method mirrors
+   `QSPSimulator`'s 3-tier flow (local test-stats cache → HPC test
+   stats → HPC full-sim derivation → fresh sweep + chained derivation),
+   returning `(theta, test_stats)` arrays. New constructor args
+   `job_manager`, `calibration_targets` (the public-facing YAML-dir
+   API used by pdac-build) **or** `test_stats_csv` (legacy/internal),
+   and `model_structure_file`. The two observable inputs are mutually
+   exclusive — when `calibration_targets` is set, the YAMLs are loaded
+   into a temp CSV that downstream code (hashing, HPC upload) treats
+   uniformly, exactly mirroring `QSPSimulator.__init__`. Local pool
+   dir and HPC pool id share an identity (binary-aware hash:
+   `{model_version}_{config_hash[:8]}_{scenario}`), so the existing
+   `HPCJobManager.check_hpc_test_stats` / `download_test_stats`
+   work unchanged. C++ and MATLAB pools are intentionally separate
+   identities — binary content affects sim outputs.
+5. **Smoke-sweep CLI** — `scripts/submit_cpp_smoke_sweep.py` gained
+   `--derive-test-stats / --calibration-targets / --test-stats-csv /
+   --model-structure-file` flags. `--calibration-targets` is the
+   public-facing input (YAML dir from pdac-build); the script
+   serializes it to a CSV before submission. The script now prints
+   the derivation log path alongside the array log path.
+6. **Tests** — `tests/test_cpp_hpc.py` covers dependency directive
+   emission, validation errors, and end-to-end chained derivation;
+   `tests/test_cpp_simulator.py` covers all four `run_hpc` tiers with
+   a mocked `HPCJobManager`. 514 unit tests pass.
 
-Steps:
+**Out of scope (deferred)**:
 
-1. Verify `derive_test_stats_worker` reads the C++ Parquet schema
-   without modification. It mostly depends on `status`, `time`,
-   species-name columns, and (optionally) the `param:*` columns.
-2. Update `HPCJobManager.submit_cpp_jobs()` to optionally chain a
-   derivation job after the sim array (via `SLURMJobSubmitter.submit_derivation_job`
-   with a `--dependency=afterok:<array_id>` flag).
-3. Wire C++ pool paths into `QSPSimulator`'s `check_hpc_test_stats` /
-   `check_hpc_full_sims` lookups. Config hash compatibility: local
-   `SimulationPoolManager` uses a subset of what
-   `CppSimulator._compute_config_hash` includes. For caching to work
-   across backends the hash definition needs to agree.
+- A `backend='cpp'` flag on `QSPSimulator` — kept MATLAB-only.
+  C++ HPC SBI is reachable through `CppSimulator.run_hpc()`.
+- `SimulationPoolManager` ↔ `CppSimulator` hash reconciliation — not
+  needed because the C++ flow doesn't go through `SimulationPoolManager`.
 
 ### M10 — Dosing / init-function support in qsp_sim: DONE (2026-04-16)
 
@@ -685,8 +710,9 @@ production-viable for no-dosing sweeps.
 
 **Candidate next steps** (not required, ordered by leverage):
 
-- **M9** (on-cluster test-stat derivation) — needed before 1M-scale
-  sweeps are practical. ~1–2 days.
+- ~~**M9** (on-cluster test-stat derivation)~~ — DONE (2026-04-16). C++
+  pools can now derive test stats on-cluster via chained SLURM
+  dependency, and `CppSimulator.run_hpc()` walks the 3-tier cache.
 - **M10** (dosing + evolve_to_diagnosis in qsp_sim) — blocks treatment
   scenarios. Depends on SPQSP_PDAC events branch.
 - **M11** (push past 48-task concurrency cap) — ~0.5–1 day, mostly a

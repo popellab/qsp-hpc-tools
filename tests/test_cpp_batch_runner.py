@@ -46,6 +46,8 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
           case "$1" in
             --binary-out) BIN_OUT="$2"; shift 2 ;;
             --species-out) SP_OUT="$2"; shift 2 ;;
+            --compartments-out) COMP_OUT="$2"; shift 2 ;;
+            --rules-out) RULES_OUT="$2"; shift 2 ;;
             --param) PARAM="$2"; shift 2 ;;
             --t-end-days) TEND="$2"; shift 2 ;;
             --dt-days) DT="$2"; shift 2 ;;
@@ -57,10 +59,12 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
           ok)
             python3 - <<PY
         import struct
-        header = struct.pack('<IIQQdd', 0x51535042, 1, 2, 3, float("$DT"), float("$TEND"))
+        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 3, 0, 0, float("$DT"), float("$TEND"))
         body = struct.pack('<6d', 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("spA\\nspB\\nspC\\n")
+        open("$COMP_OUT", 'w').write('')
+        open("$RULES_OUT", 'w').write('')
         PY
             ;;
           fail_on_bad_A)
@@ -71,10 +75,12 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
             fi
             python3 - <<PY
         import struct
-        header = struct.pack('<IIQQdd', 0x51535042, 1, 2, 3, float("$DT"), float("$TEND"))
+        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 3, 0, 0, float("$DT"), float("$TEND"))
         body = struct.pack('<6d', 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("spA\\nspB\\nspC\\n")
+        open("$COMP_OUT", 'w').write('')
+        open("$RULES_OUT", 'w').write('')
         PY
             ;;
         esac

@@ -1,7 +1,11 @@
 """C++ QSP simulator with local pool-based caching.
 
 Mirrors QSPSimulator's callable interface but uses CppBatchRunner
-for execution instead of MATLAB. No HPC integration (see M6).
+for execution instead of MATLAB.  Optional HPC integration (M9):
+when ``job_manager`` is supplied, :meth:`CppSimulator.run_hpc` runs
+the same 3-tier cache walk QSPSimulator uses (local test-stats →
+HPC test-stats → HPC full sims + on-cluster derivation → fresh sweep
++ chained derivation), returning ``(theta, test_stats)`` arrays.
 """
 
 from __future__ import annotations
@@ -10,17 +14,23 @@ import csv
 import hashlib
 import logging
 import re
+import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from qsp_hpc.constants import HASH_PREFIX_LENGTH
+from qsp_hpc.constants import HASH_PREFIX_LENGTH, JOB_QUEUE_TIMEOUT, SLURM_REGISTRATION_DELAY
 from qsp_hpc.cpp.batch_runner import CppBatchRunner
 from qsp_hpc.utils.logging_config import create_child_logger, format_config, setup_logger
+
+if TYPE_CHECKING:
+    from qsp_hpc.batch.hpc_job_manager import HPCJobManager
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +72,12 @@ class CppSimulator:
         scenario_yaml: Optional[str | Path] = None,
         drug_metadata_yaml: Optional[str | Path] = None,
         healthy_state_yaml: Optional[str | Path] = None,
+        job_manager: Optional["HPCJobManager"] = None,
+        test_stats_csv: Optional[str | Path] = None,
+        calibration_targets: Optional[str | Path] = None,
+        model_structure_file: Optional[str | Path] = None,
+        poll_interval: float = 30.0,
+        max_wait_time: Optional[float] = None,
         verbose: bool = False,
     ):
         self.priors_csv = Path(priors_csv)
@@ -84,6 +100,33 @@ class CppSimulator:
         self.scenario_yaml = Path(scenario_yaml).resolve() if scenario_yaml else None
         self.drug_metadata_yaml = Path(drug_metadata_yaml).resolve() if drug_metadata_yaml else None
         self.healthy_state_yaml = Path(healthy_state_yaml).resolve() if healthy_state_yaml else None
+        self.job_manager = job_manager
+        # calibration_targets and test_stats_csv are mutually exclusive — the
+        # YAML directory is the public-facing API used by pdac-build; the CSV
+        # form is the internal/legacy path. Mirrors QSPSimulator.__init__.
+        if calibration_targets is not None and test_stats_csv is not None:
+            raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
+        self._calibration_targets_dir: Optional[Path] = None
+        self._temp_test_stats_csv: Optional[Path] = None
+        if calibration_targets is not None:
+            from qsp_hpc.calibration import load_calibration_targets
+
+            cal_dir = Path(calibration_targets).resolve()
+            self._calibration_targets_dir = cal_dir
+            df = load_calibration_targets(cal_dir)
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".csv", delete=False, prefix="cpp_cal_targets_"
+            )
+            tmp.close()
+            self._temp_test_stats_csv = Path(tmp.name)
+            df.to_csv(self._temp_test_stats_csv, index=False)
+            test_stats_csv = self._temp_test_stats_csv
+        self.test_stats_csv = Path(test_stats_csv).resolve() if test_stats_csv else None
+        self.model_structure_file = (
+            Path(model_structure_file).resolve() if model_structure_file else None
+        )
+        self.poll_interval = poll_interval
+        self.max_wait_time = max_wait_time
 
         with open(self.priors_csv) as f:
             reader = csv.DictReader(f)
@@ -165,6 +208,15 @@ class CppSimulator:
             if yml is not None:
                 h.update(yml.read_bytes())
         return h.hexdigest()
+
+    def __del__(self):
+        """Clean up the temp CSV serialized from calibration_targets."""
+        tmp = getattr(self, "_temp_test_stats_csv", None)
+        if tmp is not None and tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     # Pool scanning / loading
@@ -294,3 +346,245 @@ class CppSimulator:
 
         self.logger.info(f"Batch complete, loading {n} from pool")
         return self._load_from_pool(n)
+
+    # ------------------------------------------------------------------
+    # HPC tier (M9) — 3-tier cache walk against an HPC pool
+    # ------------------------------------------------------------------
+
+    @property
+    def simulation_pool_id(self) -> str:
+        """The pool directory name shared between local and HPC.
+
+        Both ``self.pool_dir`` and the HPC pool live at this name so the
+        existing :meth:`HPCJobManager.check_hpc_test_stats` /
+        :meth:`download_test_stats` (which take a pool path) work
+        unchanged.
+        """
+        return self.pool_dir.name
+
+    def _compute_test_stats_hash(self) -> str:
+        """SHA-256 of the test-stats CSV (matches QSPSimulator)."""
+        if self.test_stats_csv is None:
+            raise RuntimeError("test_stats_csv must be set to compute test_stats_hash")
+        from qsp_hpc.utils.hash_utils import compute_test_stats_hash
+
+        return compute_test_stats_hash(self.test_stats_csv)
+
+    def _local_test_stats_path(self, test_stats_hash: str) -> Path:
+        """Where downloaded HPC test stats land locally.
+
+        Mirrors the HPC layout (``{pool}/test_stats/{hash}/``) so the
+        local cache key is obvious.
+        """
+        return self.pool_dir / "test_stats" / test_stats_hash / "test_stats.parquet"
+
+    def _load_local_test_stats(self, path: Path) -> Tuple[np.ndarray, np.ndarray]:
+        """Load the cached (params, test_stats) Parquet."""
+        table = pq.read_table(str(path))
+        param_cols = sorted(c for c in table.column_names if c.startswith("param:"))
+        ts_cols = sorted(
+            (c for c in table.column_names if c.startswith("ts:")),
+            key=lambda c: int(c.split(":", 1)[1]),
+        )
+        params = np.column_stack([table.column(c).to_numpy() for c in param_cols])
+        test_stats = np.column_stack([table.column(c).to_numpy() for c in ts_cols])
+        return params, test_stats
+
+    def _persist_local_test_stats(
+        self, path: Path, params: np.ndarray, test_stats: np.ndarray
+    ) -> None:
+        """Persist downloaded HPC test stats next to the local pool."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cols: dict[str, np.ndarray] = {}
+        for i, name in enumerate(self.param_names[: params.shape[1]]):
+            cols[f"param:{name}"] = params[:, i]
+        for j in range(test_stats.shape[1]):
+            cols[f"ts:{j}"] = test_stats[:, j]
+        table = pa.table(cols)
+        pq.write_table(table, str(path))
+
+    def _wait_for_jobs(self, job_ids: List[str]) -> None:
+        """Poll ``check_job_status`` until all jobs leave the queue."""
+        if self.job_manager is None:
+            raise RuntimeError("job_manager required for _wait_for_jobs")
+
+        time.sleep(SLURM_REGISTRATION_DELAY)
+        start = time.time()
+        max_seen = 0
+        while True:
+            totals = {"completed": 0, "running": 0, "pending": 0, "failed": 0}
+            for jid in job_ids:
+                try:
+                    status = self.job_manager.check_job_status(jid)
+                    for k in totals:
+                        totals[k] += status[k]
+                except Exception as e:
+                    self.logger.warning(f"Status check failed for job {jid}: {e}")
+            total = sum(totals.values())
+            max_seen = max(max_seen, total)
+            elapsed = time.time() - start
+            self.logger.info(
+                f"  [{int(elapsed // 60)}m {int(elapsed % 60)}s] "
+                f"{totals['completed']}/{total} done | "
+                f"running={totals['running']} pending={totals['pending']} "
+                f"failed={totals['failed']}"
+            )
+            active = totals["running"] + totals["pending"]
+            if total > 0 and active == 0:
+                if totals["failed"] > 0:
+                    self.logger.warning(f"{totals['failed']} task(s) failed")
+                return
+            if total == 0 and max_seen > 0 and elapsed > 30:
+                return
+            if total == 0 and elapsed > JOB_QUEUE_TIMEOUT:
+                self.logger.warning(f"No jobs visible after {JOB_QUEUE_TIMEOUT}s — proceeding")
+                return
+            if self.max_wait_time and elapsed > self.max_wait_time:
+                raise TimeoutError(f"Job wait exceeded {self.max_wait_time}s for {job_ids}")
+            time.sleep(self.poll_interval)
+
+    def _download_and_persist(
+        self, hpc_pool_path: str, test_stats_hash: str
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Download HPC test stats and persist a local Parquet cache."""
+        if self.job_manager is None:
+            raise RuntimeError("job_manager required for download")
+        with tempfile.TemporaryDirectory() as tmp:
+            params, test_stats = self.job_manager.download_test_stats(
+                hpc_pool_path, test_stats_hash, Path(tmp)
+            )
+        if params is None:
+            raise RuntimeError("HPC has test stats but no params CSV — re-run derivation.")
+        self._persist_local_test_stats(
+            self._local_test_stats_path(test_stats_hash), params, test_stats
+        )
+        return params, test_stats
+
+    def _sample_first_n(
+        self, params: np.ndarray, test_stats: np.ndarray, n: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return the first ``n`` rows (params + test_stats), or all if fewer."""
+        if params.shape[0] <= n:
+            return params, test_stats
+        return params[:n], test_stats[:n]
+
+    def _write_params_csv(self, n_sims: int) -> Path:
+        """Generate ``n_sims`` thetas via the deterministic theta pool and
+        write them to a temp CSV that ``submit_cpp_jobs`` can upload."""
+        indices = np.arange(0, n_sims, dtype=np.int64)
+        theta = self._generate_parameters(indices)
+        df = pd.DataFrame(theta, columns=self.param_names)
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, prefix="cpp_hpc_params_"
+        )
+        df.to_csv(tmp.name, index=False)
+        tmp.close()
+        return Path(tmp.name)
+
+    def run_hpc(self, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Run ``n`` simulations through the 3-tier HPC cache.
+
+        Returns ``(theta, test_stats)`` arrays — *not* full trajectories.
+        Mirrors :meth:`QSPSimulator.__call__`'s flow:
+
+        1. Local test-stats cache hit → return immediately.
+        2. HPC test-stats hit → download + cache locally.
+        3. HPC has full sims (no derived stats) → submit derivation,
+           wait, download.
+        4. Otherwise → submit a fresh C++ array with chained derivation,
+           wait for both, download.
+
+        Requires ``job_manager`` and ``test_stats_csv`` set in the
+        constructor.
+        """
+        if self.job_manager is None:
+            raise RuntimeError("run_hpc() requires job_manager")
+        if self.test_stats_csv is None:
+            raise RuntimeError("run_hpc() requires test_stats_csv")
+
+        test_stats_hash = self._compute_test_stats_hash()
+        local_cache = self._local_test_stats_path(test_stats_hash)
+
+        self.logger.info(f"HPC request: {n} simulations (scenario={self.scenario})")
+        self.logger.info(f"  pool id: {self.simulation_pool_id}")
+        self.logger.info(f"  test_stats_hash: {test_stats_hash[:8]}...")
+
+        # Tier 1: local test-stats cache
+        if local_cache.exists():
+            params, test_stats = self._load_local_test_stats(local_cache)
+            if params.shape[0] >= n:
+                self.logger.info(f"✓ Local test-stats cache hit ({params.shape[0]} available)")
+                return self._sample_first_n(params, test_stats, n)
+            self.logger.info(f"Local cache has {params.shape[0]}/{n} — checking HPC")
+
+        hpc_pool_path = f"{self.job_manager.config.simulation_pool_path}/{self.simulation_pool_id}"
+        self.logger.info(f"  HPC pool path: {hpc_pool_path}")
+
+        # Tier 2: HPC pre-derived test stats
+        self.logger.info("Checking HPC for pre-derived test statistics...")
+        if self.job_manager.check_hpc_test_stats(hpc_pool_path, test_stats_hash, expected_n_sims=n):
+            self.logger.info("✓ HPC test stats found — downloading")
+            params, test_stats = self._download_and_persist(hpc_pool_path, test_stats_hash)
+            return self._sample_first_n(params, test_stats, n)
+        self.logger.info("No pre-derived test stats on HPC")
+
+        # Tier 3: HPC full sims exist — derive on cluster, then download
+        has_pool = self.job_manager.result_collector.check_pool_directory_exists(hpc_pool_path)
+        n_hpc = (
+            self.job_manager.result_collector.count_pool_simulations(hpc_pool_path)
+            if has_pool
+            else 0
+        )
+        if n_hpc >= n:
+            self.logger.info(f"✓ HPC pool has {n_hpc} full sims — submitting derivation")
+            derive_id = self.job_manager.submit_derivation_job(
+                pool_path=hpc_pool_path,
+                test_stats_csv=str(self.test_stats_csv),
+                test_stats_hash=test_stats_hash,
+                model_structure_file=(
+                    str(self.model_structure_file) if self.model_structure_file else None
+                ),
+            )
+            self.logger.info(f"Derivation job: {derive_id}")
+            self._wait_for_jobs([derive_id])
+            params, test_stats = self._download_and_persist(hpc_pool_path, test_stats_hash)
+            return self._sample_first_n(params, test_stats, n)
+
+        # Tier 4: submit fresh C++ array + chained derivation
+        self.logger.info(
+            f"HPC pool has {n_hpc}/{n} sims — submitting fresh sweep + chained derivation"
+        )
+        params_csv = self._write_params_csv(n)
+        try:
+            info = self.job_manager.submit_cpp_jobs(
+                samples_csv=str(params_csv),
+                num_simulations=n,
+                simulation_pool_id=self.simulation_pool_id,
+                t_end_days=self.t_end_days,
+                dt_days=self.dt_days,
+                scenario=self.scenario,
+                seed=self.seed,
+                binary_path=str(self.binary_path),
+                template_path=str(self.template_xml),
+                subtree=self.subtree,
+                scenario_yaml=(str(self.scenario_yaml) if self.scenario_yaml else None),
+                drug_metadata_yaml=(
+                    str(self.drug_metadata_yaml) if self.drug_metadata_yaml else None
+                ),
+                healthy_state_yaml=(
+                    str(self.healthy_state_yaml) if self.healthy_state_yaml else None
+                ),
+                derive_test_stats=True,
+                test_stats_csv=str(self.test_stats_csv),
+                test_stats_hash=test_stats_hash,
+                model_structure_file=(
+                    str(self.model_structure_file) if self.model_structure_file else None
+                ),
+            )
+        finally:
+            params_csv.unlink(missing_ok=True)
+
+        self.logger.info(f"Submitted jobs: {info.job_ids}")
+        self._wait_for_jobs(info.job_ids)
+        params, test_stats = self._download_and_persist(hpc_pool_path, test_stats_hash)
+        return self._sample_first_n(params, test_stats, n)

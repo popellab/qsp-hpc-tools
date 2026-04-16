@@ -233,6 +233,7 @@ echo "Job completed at $(date)"
         pool_path: str,
         test_stats_config: str,
         derivation_dir: str,
+        dependency: str | None = None,
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -247,6 +248,11 @@ echo "Job completed at $(date)"
             pool_path: Path to simulation pool on HPC
             test_stats_config: Path to test statistics config on HPC
             derivation_dir: Directory for derivation outputs
+            dependency: Optional SLURM dependency expression (e.g.
+                ``"afterok:12345"``) — when set, derivation waits for the
+                upstream job to complete before starting. Used by
+                :meth:`HPCJobManager.submit_cpp_jobs` to chain derivation
+                after a C++ array.
 
         Returns:
             Job ID string
@@ -257,10 +263,12 @@ echo "Job completed at $(date)"
         self.logger.info("  Time limit: 00:15:00 (fixed for derivation)")
         self.logger.info("  Memory: 4G (fixed for derivation)")
         self.logger.info("  Single task (processes all batches)")
+        if dependency:
+            self.logger.info(f"  Dependency: {dependency}")
 
         # Generate SLURM script
         script_content = self._generate_derivation_slurm_script(
-            pool_path, test_stats_config, derivation_dir
+            pool_path, test_stats_config, derivation_dir, dependency=dependency
         )
 
         # Write to temp file
@@ -294,9 +302,11 @@ echo "Job completed at $(date)"
         pool_path: str,
         test_stats_config: str,
         derivation_dir: str,
+        dependency: str | None = None,
     ) -> str:
         """Generate SLURM script for test statistics derivation."""
         log_dir = f"{self.config.remote_project_path}/batch_jobs/logs"
+        dependency_directive = f"#SBATCH --dependency={dependency}\n" if dependency else ""
         return f"""#!/bin/bash
 #SBATCH --job-name=qsp_derive
 #SBATCH --partition={self.config.partition}
@@ -304,7 +314,7 @@ echo "Job completed at $(date)"
 #SBATCH --mem=4G
 #SBATCH --output={log_dir}/qsp_derive_%j.out
 #SBATCH --error={log_dir}/qsp_derive_%j.err
-
+{dependency_directive}
 # Activate Python virtual environment
 source {self.config.hpc_venv_path}/bin/activate
 

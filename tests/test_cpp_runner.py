@@ -21,6 +21,7 @@ from qsp_hpc.cpp.runner import (
     CppRunner,
     QspSimError,
     SimResult,
+    TrajectoryHeader,
     read_binary_trajectory,
 )
 
@@ -44,33 +45,50 @@ def template_path(tmp_path: Path) -> Path:
 
 
 def _pack_binary(
-    traj: np.ndarray, dt: float, t_end: float, magic: int = 0x51535042, version: int = 1
+    traj: np.ndarray,
+    dt: float,
+    t_end: float,
+    n_sp: int,
+    n_comp: int = 0,
+    n_rules: int = 0,
+    magic: int = 0x51535042,
+    version: int = 2,
 ) -> bytes:
-    n_t, n_sp = traj.shape
-    header = struct.pack("<IIQQdd", magic, version, n_t, n_sp, dt, t_end)
+    n_t, n_cols = traj.shape
+    assert n_cols == n_sp + n_comp + n_rules
+    header = struct.pack("<IIQQQQdd", magic, version, n_t, n_sp, n_comp, n_rules, dt, t_end)
     return header + traj.astype("<f8").tobytes()
 
 
-def test_read_binary_trajectory_roundtrip(tmp_path: Path):
-    traj = np.arange(24, dtype="f8").reshape(3, 8)  # 3 times × 8 species
+def test_read_binary_roundtrip(tmp_path: Path):
+    # 3 times × (5 species + 2 comps + 4 rules) = 3 × 11
+    traj = np.arange(33, dtype="f8").reshape(3, 11)
     p = tmp_path / "ok.bin"
-    p.write_bytes(_pack_binary(traj, dt=0.1, t_end=0.2))
-    out, dt, t_end = read_binary_trajectory(p)
+    p.write_bytes(_pack_binary(traj, dt=0.5, t_end=1.0, n_sp=5, n_comp=2, n_rules=4))
+    out, header = read_binary_trajectory(p)
     np.testing.assert_array_equal(out, traj)
-    assert dt == 0.1
-    assert t_end == 0.2
+    assert isinstance(header, TrajectoryHeader)
+    assert header.version == 2
+    assert header.n_species == 5
+    assert header.n_compartments == 2
+    assert header.n_rules == 4
+    assert header.n_columns == 11
+    assert header.dt_days == 0.5
+    assert header.t_end_days == 1.0
 
 
 def test_read_binary_bad_magic(tmp_path: Path):
     p = tmp_path / "bad.bin"
-    p.write_bytes(_pack_binary(np.zeros((1, 1)), 1.0, 1.0, magic=0xDEADBEEF))
+    p.write_bytes(_pack_binary(np.zeros((1, 1)), 1.0, 1.0, n_sp=1, magic=0xDEADBEEF))
     with pytest.raises(BinaryFormatError, match="magic"):
         read_binary_trajectory(p)
 
 
 def test_read_binary_unsupported_version(tmp_path: Path):
-    p = tmp_path / "v2.bin"
-    p.write_bytes(_pack_binary(np.zeros((1, 1)), 1.0, 1.0, version=2))
+    # Anything other than v2 must be rejected loudly so a stale qsp_sim
+    # binary doesn't silently produce mismatched columns.
+    p = tmp_path / "vX.bin"
+    p.write_bytes(_pack_binary(np.zeros((1, 1)), 1.0, 1.0, n_sp=1, version=1))
     with pytest.raises(BinaryFormatError, match="version"):
         read_binary_trajectory(p)
 
@@ -83,8 +101,8 @@ def test_read_binary_truncated_header(tmp_path: Path):
 
 
 def test_read_binary_size_mismatch(tmp_path: Path):
-    # Header claims 3×2 doubles, but the payload is only 1 double.
-    header = struct.pack("<IIQQdd", 0x51535042, 1, 3, 2, 0.1, 0.3)
+    # Header claims 3×2 doubles, payload only has 1 double.
+    header = struct.pack("<IIQQQQdd", 0x51535042, 2, 3, 2, 0, 0, 0.1, 0.3)
     p = tmp_path / "short_body.bin"
     p.write_bytes(header + b"\x00" * 8)
     with pytest.raises(BinaryFormatError, match="size mismatch"):
@@ -109,6 +127,8 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
           case "$1" in
             --binary-out) BIN_OUT="$2"; shift 2 ;;
             --species-out) SP_OUT="$2"; shift 2 ;;
+            --compartments-out) COMP_OUT="$2"; shift 2 ;;
+            --rules-out) RULES_OUT="$2"; shift 2 ;;
             --param) PARAM="$2"; shift 2 ;;
             --t-end-days) TEND="$2"; shift 2 ;;
             --dt-days) DT="$2"; shift 2 ;;
@@ -118,14 +138,15 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
 
         case "$BEHAVIOR" in
           ok)
-            # Write a tiny 2-time-point × 3-species binary using python.
+            # Write a tiny v2 binary: 2 time points × (3 species + 0 comps + 0 rules).
             python3 - <<PY
         import struct
-        header = struct.pack('<IIQQdd', 0x51535042, 1, 2, 3, float("$DT"), float("$TEND"))
+        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 3, 0, 0, float("$DT"), float("$TEND"))
         body = struct.pack('<6d', 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
-            # Stored as row-major (2 rows × 3 cols).
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("\\n".join(['spA', 'spB', 'spC']) + '\\n')
+        open("$COMP_OUT", 'w').write('')
+        open("$RULES_OUT", 'w').write('')
         PY
             ;;
           crash)
@@ -139,15 +160,19 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
           bad_binary)
             echo 0xdeadbeef > "$BIN_OUT"  # not a valid binary
             echo -e "spA\\nspB\\nspC" > "$SP_OUT"
+            : > "$COMP_OUT"
+            : > "$RULES_OUT"
             ;;
           species_mismatch)
             python3 - <<PY
         import struct
         # 2×3 trajectory but species list has 2 entries.
-        header = struct.pack('<IIQQdd', 0x51535042, 1, 2, 3, float("$DT"), float("$TEND"))
+        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 3, 0, 0, float("$DT"), float("$TEND"))
         body = struct.pack('<6d', 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("spA\\nspB\\n")
+        open("$COMP_OUT", 'w').write('')
+        open("$RULES_OUT", 'w').write('')
         PY
             ;;
         esac
@@ -316,20 +341,25 @@ def _make_fake_argv_recorder(tmp_path: Path) -> tuple[Path, Path]:
         #!/usr/bin/env bash
         set -e
         printf '%s\\n' "$@" > "{log}"
-        # Parse --binary-out / --species-out for the minimal emit below.
+        # Parse --binary-out / --species-out / --compartments-out / --rules-out
+        # for the minimal emit below.
         while [ $# -gt 0 ]; do
           case "$1" in
             --binary-out) BIN_OUT="$2"; shift 2 ;;
             --species-out) SP_OUT="$2"; shift 2 ;;
+            --compartments-out) COMP_OUT="$2"; shift 2 ;;
+            --rules-out) RULES_OUT="$2"; shift 2 ;;
             *) shift ;;
           esac
         done
         python3 - <<PY
         import struct
-        header = struct.pack('<IIQQdd', 0x51535042, 1, 1, 1, 0.1, 0.1)
+        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 1, 1, 0, 0, 0.1, 0.1)
         body = struct.pack('<d', 1.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("spA\\n")
+        open("$COMP_OUT", 'w').write('')
+        open("$RULES_OUT", 'w').write('')
         PY
     """
         )

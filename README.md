@@ -8,8 +8,11 @@ A Python package for running quantitative systems pharmacology (QSP) simulations
 
 ## Features
 
+- **Two backends**: original MATLAB / SimBiology path and a faster C++ `qsp_sim`
+  path (~25-87× speedup; closes the column-set gap with SimBiology so calibration
+  targets work unchanged). See [docs/CPP_SIMULATION_PLAN.md](docs/CPP_SIMULATION_PLAN.md).
 - **Simulation Pool Management**: Efficient local caching of simulation results with scenario support
-- **HPC Integration**: Submit and monitor MATLAB QSP simulations on SLURM clusters via SSH
+- **HPC Integration**: Submit and monitor QSP simulations on SLURM clusters via SSH
 - **Multi-Scenario Support**: Run the same parameters under different therapy protocols independently
 - **Intelligent Caching**: Three-tier caching strategy (local pool → HPC test statistics → HPC full simulations)
 - **Flexible Configuration**: Content-based hashing for automatic cache invalidation
@@ -27,10 +30,11 @@ qsp-hpc setup
 
 ### Basic Usage
 
+**MATLAB backend** (`QSPSimulator`):
+
 ```python
 from qsp_hpc import QSPSimulator
 
-# Create simulator for a specific scenario
 simulator = QSPSimulator(
     priors_csv='priors.csv',
     submodel_priors_yaml='submodel_priors.yaml',  # optional: narrows priors for calibrated params
@@ -40,9 +44,30 @@ simulator = QSPSimulator(
     model_version='v1',
     scenario='control',
 )
-
-# Run simulations (automatically cached)
 params, observables = simulator(1000)
+```
+
+**C++ backend** (`CppSimulator`) — drop-in for the simulation step, runs
+the same 3-tier cache walk via `run_hpc()` when given an `HPCJobManager`:
+
+```python
+from qsp_hpc.batch.hpc_job_manager import HPCJobManager
+from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+simulator = CppSimulator(
+    priors_csv='priors.csv',
+    binary_path='/path/to/SPQSP_PDAC/PDAC/qsp/sim/build/qsp_sim',
+    template_xml='/path/to/SPQSP_PDAC/PDAC/sim/resource/param_all.xml',
+    scenario_yaml='scenarios/baseline_no_treatment.yaml',
+    drug_metadata_yaml='/path/to/SPQSP_PDAC/PDAC/sim/resource/drug_metadata.yaml',
+    healthy_state_yaml='/path/to/SPQSP_PDAC/PDAC/sim/resource/healthy_state.yaml',
+    calibration_targets='calibration_targets/baseline_no_treatment/',
+    model_structure_file='model_structure.json',
+    model_version='v1',
+    scenario='baseline_no_treatment',
+    job_manager=HPCJobManager(),
+)
+params, test_stats = simulator.run_hpc(1000)
 ```
 
 ### CLI Commands

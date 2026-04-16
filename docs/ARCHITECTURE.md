@@ -33,8 +33,47 @@ SSH/SLURM integration for job management. Handles codebase syncing, job submissi
 - `batch_worker.m`: Main SLURM array job worker
 - `extract_all_species_arrays.m`: Extracts simulation timecourse data
 - `save_species_to_parquet.m`: MATLAB→Python bridge for Parquet writing
+- Per-sim `status` column convention: `0` = success, `1` = failure
+  (matches the C++ backend; see `derive_test_stats_worker.py`).
 
 **Location:** `qsp_hpc/matlab/`
+
+### 5. C++ Backend (qsp_sim)
+
+Faster alternative to the MATLAB workers. Runs the SBML-derived
+`qsp_sim` binary from the sibling SPQSP_PDAC repo against a per-sim
+parameter XML; reads the v2 raw-binary trajectory (species +
+compartments + assignment-rule values) into a MATLAB-compatible
+Parquet so downstream caching / test-stat derivation works unchanged.
+
+- `CppRunner` (`qsp_hpc/cpp/runner.py`): one-sim invocation +
+  binary-format parser. Always emits `--species-out`,
+  `--compartments-out`, `--rules-out` companion files alongside the
+  binary; `read_binary_trajectory` returns the trajectory plus a
+  `TrajectoryHeader` describing the column layout.
+- `CppBatchRunner` (`qsp_hpc/cpp/batch_runner.py`): parallel sweep,
+  Parquet writer. Every model parameter from the template is broadcast
+  as a `param:*` Parquet column (sampled values from `theta_matrix`,
+  template defaults for everything else) so cal-target functions can
+  read any model parameter via `species_dict[name]`.
+- `CppSimulator` (`qsp_hpc/simulation/cpp_simulator.py`): top-level
+  API. Local pool cache via `__call__` (drop-in for QSPSimulator's
+  simulation step); HPC 3-tier walk via `run_hpc(n)` (local cache →
+  HPC test stats → HPC sims + on-cluster derivation → fresh sweep +
+  chained derivation).
+- `HPCJobManager.submit_cpp_jobs(derive_test_stats=True, ...)`: chains
+  a derivation job after the C++ array via `--dependency=afterok:<id>`
+  so test stats land on HPC without raw-trajectory download.
+- Local pool dir name + HPC pool id share an identity:
+  `{model_version}_{config_hash[:8]}_{scenario}` where `config_hash`
+  is binary-aware (covers binary content, template XML, scenario
+  YAMLs).
+
+**Location:** `qsp_hpc/cpp/` (Python) and the sibling `SPQSP_PDAC`
+repo on branch `cpp-sweep-binary-io` (C++ + codegen).
+
+**See:** `docs/CPP_SIMULATION_PLAN.md` for the full milestone history
+and design notes.
 
 ## Caching Strategy
 

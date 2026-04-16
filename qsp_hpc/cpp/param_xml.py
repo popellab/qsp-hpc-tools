@@ -132,6 +132,20 @@ class ParamXMLRenderer:
         """All substitutable parameter names in the template."""
         return self._parameter_names
 
+    @property
+    def template_defaults(self) -> dict[str, float]:
+        """Snapshot of every parameter's template value as ``{name: float}``.
+
+        Pulled from the freshly-reset working tree so this is always the
+        unmodified template default, not any per-render override. Useful
+        for enriching downstream artefacts (e.g. the per-sim Parquet) with
+        every model parameter so calibration-target functions can read any
+        of them via ``species_dict[name]`` even when the workflow only
+        varies a handful via the priors.
+        """
+        self._reset_tree()
+        return {name: float(elem.text) for name, elem in self._leaf_map.items()}
+
     def _reset_tree(self) -> None:
         self._tree = ElementTree.ElementTree(ElementTree.fromstring(self._template_bytes))
         self._rebuild_leaf_map()

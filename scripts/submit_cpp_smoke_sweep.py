@@ -146,6 +146,13 @@ def main() -> None:
         ap.error("--calibration-targets and --test-stats-csv are mutually exclusive")
     if args.derive_test_stats and not (args.calibration_targets or args.test_stats_csv):
         ap.error("--derive-test-stats requires --calibration-targets or --test-stats-csv")
+    if args.derive_test_stats and not args.model_structure_file:
+        ap.error(
+            "--derive-test-stats requires --model-structure-file (path to "
+            "model_structure.json) — without it the derivation worker tags "
+            "every species as dimensionless and most cal-target unit "
+            "conversions silently NaN out."
+        )
 
     out_dir = args.output_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)

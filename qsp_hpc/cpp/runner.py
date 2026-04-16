@@ -175,6 +175,15 @@ class CppRunner:
         return self._renderer.parameter_names
 
     @property
+    def template_defaults(self) -> dict[str, float]:
+        """Every model parameter's template value as ``{name: float}``.
+
+        Forwarded from the underlying ParamXMLRenderer; see
+        :meth:`ParamXMLRenderer.template_defaults` for use cases.
+        """
+        return self._renderer.template_defaults
+
+    @property
     def species_names(self) -> list[str] | None:
         """Species column names from the last qsp_sim invocation (None
         until the first run_one call)."""

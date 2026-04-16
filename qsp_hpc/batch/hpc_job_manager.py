@@ -812,8 +812,10 @@ class HPCJobManager:
                 workflow can locate it later. Required when
                 ``derive_test_stats=True``.
             model_structure_file: Local path to ``model_structure.json``
-                with species unit metadata. Optional — defaults to
-                dimensionless if omitted.
+                with species unit metadata. Required when
+                ``derive_test_stats=True`` — without it the worker tags
+                every species as dimensionless and most calibration-target
+                ``.to('cell/mm**2')``-style conversions silently NaN out.
 
         Returns:
             :class:`JobInfo` with job ID(s) and state file. When
@@ -826,6 +828,14 @@ class HPCJobManager:
             if not test_stats_hash:
                 raise ValueError(
                     "derive_test_stats=True requires test_stats_hash (CSV content hash)"
+                )
+            if not model_structure_file:
+                raise ValueError(
+                    "derive_test_stats=True requires model_structure_file "
+                    "(path to model_structure.json) — without it the "
+                    "derivation worker treats every species as "
+                    "dimensionless and most cal-target unit conversions "
+                    "silently NaN out."
                 )
         binary_path = binary_path or self.config.cpp_binary_path
         template_path = template_path or self.config.cpp_template_path

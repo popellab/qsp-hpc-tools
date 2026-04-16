@@ -501,6 +501,12 @@ class CppSimulator:
             raise RuntimeError("run_hpc() requires job_manager")
         if self.test_stats_csv is None:
             raise RuntimeError("run_hpc() requires test_stats_csv")
+        if self.model_structure_file is None:
+            raise RuntimeError(
+                "run_hpc() requires model_structure_file — without it the "
+                "derivation worker treats every species as dimensionless "
+                "and most cal-target unit conversions silently NaN out."
+            )
 
         test_stats_hash = self._compute_test_stats_hash()
         local_cache = self._local_test_stats_path(test_stats_hash)

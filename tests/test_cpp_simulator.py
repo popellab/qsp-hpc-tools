@@ -530,6 +530,8 @@ class TestCppSimulatorRunHpc:
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
         ts_csv = TestCppSimulatorRunHpc._stub_test_stats_csv(tmp_path)
+        ms_file = tmp_path / "model_structure.json"
+        ms_file.write_text("{}\n")
         job_manager = MagicMock()
         job_manager.config.simulation_pool_path = "/scratch/sims"
         sim = CppSimulator(
@@ -539,6 +541,7 @@ class TestCppSimulatorRunHpc:
             cache_dir=cache_dir,
             job_manager=job_manager,
             test_stats_csv=ts_csv,
+            model_structure_file=ms_file,
             poll_interval=0.001,
         )
         # Don't actually sleep / poll on tests
@@ -555,6 +558,25 @@ class TestCppSimulatorRunHpc:
             cache_dir=cache_dir,
         )
         with pytest.raises(RuntimeError, match="job_manager"):
+            sim.run_hpc(5)
+
+    def test_run_hpc_requires_model_structure_file(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        from unittest.mock import MagicMock
+
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        ts_csv = self._stub_test_stats_csv(tmp_path)
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            job_manager=MagicMock(),
+            test_stats_csv=ts_csv,
+        )
+        with pytest.raises(RuntimeError, match="model_structure_file"):
             sim.run_hpc(5)
 
     def test_run_hpc_local_cache_hit_skips_hpc(

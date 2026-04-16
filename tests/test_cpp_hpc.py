@@ -676,6 +676,9 @@ class TestSubmitCppJobsWithDerivation:
 
         transport.upload.side_effect = capture_upload
 
+        ms_file = tmp_path / "model_structure.json"
+        ms_file.write_text("{}\n")
+
         info = manager.submit_cpp_jobs(
             samples_csv=str(params_csv),
             num_simulations=1,
@@ -684,6 +687,7 @@ class TestSubmitCppJobsWithDerivation:
             derive_test_stats=True,
             test_stats_csv=str(ts_csv),
             test_stats_hash="deadbeef" * 8,
+            model_structure_file=str(ms_file),
         )
 
         # First sbatch was the C++ array, second was the derivation.
@@ -726,6 +730,25 @@ class TestSubmitCppJobsWithDerivation:
                 skip_sync=True,
                 derive_test_stats=True,
                 test_stats_csv=str(ts_csv),
+            )
+
+    def test_derive_test_stats_requires_model_structure(self, tmp_path):
+        manager, _ = self._make_manager()
+
+        params_csv = tmp_path / "params.csv"
+        params_csv.write_text("A\n1.0\n")
+        ts_csv = tmp_path / "test_stats.csv"
+        ts_csv.write_text("name\n")
+
+        with pytest.raises(ValueError, match="model_structure_file"):
+            manager.submit_cpp_jobs(
+                samples_csv=str(params_csv),
+                num_simulations=1,
+                simulation_pool_id="pool",
+                skip_sync=True,
+                derive_test_stats=True,
+                test_stats_csv=str(ts_csv),
+                test_stats_hash="abc",
             )
 
     def test_no_derivation_when_derive_test_stats_false(self, tmp_path):

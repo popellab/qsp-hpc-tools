@@ -217,6 +217,34 @@ def test_batch_filename_format():
     )
 
 
+def test_batch_runner_emits_template_defaults_for_unsampled_params(
+    tmp_path: Path, template_path: Path, ok_binary: Path
+):
+    """Every model parameter in the template should land as a `param:*`
+    column. Sampled params get their per-sim values; unsampled params get
+    the template default broadcast across all rows. Lets cal-target
+    functions read any model parameter via species_dict[name] regardless
+    of what the current sweep is varying.
+    """
+    runner = CppBatchRunner(ok_binary, template_path)
+    # Vary only A; B is in the template but not sampled.
+    theta = np.array([[1.1], [1.2], [1.3]])
+    out = tmp_path / "batch.parquet"
+    runner.run(
+        theta_matrix=theta,
+        param_names=["A"],
+        t_end_days=0.2,
+        dt_days=0.1,
+        output_path=out,
+        max_workers=2,
+    )
+    table = pq.read_table(out)
+    # Sampled column varies per-sim.
+    np.testing.assert_allclose(table.column("param:A").to_numpy(), [1.1, 1.2, 1.3])
+    # Unsampled B is broadcast as the template default (2.0 from MINI_TEMPLATE).
+    np.testing.assert_allclose(table.column("param:B").to_numpy(), [2.0, 2.0, 2.0])
+
+
 def test_batch_runner_all_fail_raises(tmp_path: Path, template_path: Path):
     flaky = _make_fake_binary(tmp_path, "fail_on_bad_A")
     runner = CppBatchRunner(flaky, template_path)

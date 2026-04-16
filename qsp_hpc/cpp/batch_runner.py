@@ -167,6 +167,13 @@ class CppBatchRunner:
         self.drug_metadata_yaml = probe.drug_metadata_yaml
         self.healthy_state_yaml = probe.healthy_state_yaml
         self.parameter_names = probe.parameter_names
+        # Cache template defaults so the Parquet writer can broadcast every
+        # model parameter as a column — sampled params get their per-sim
+        # values, non-sampled params get the constant template value. This
+        # keeps cal-target functions like phi_collagen working when they
+        # reach for a model parameter (e.g. rho_collagen) that isn't part
+        # of the current sweep's sampled set.
+        self.template_defaults = probe.template_defaults
 
     def run(
         self,
@@ -306,6 +313,7 @@ class CppBatchRunner:
             species_names=species_names,
             compartment_names=compartment_names,
             rule_names=rule_names,
+            template_defaults=self.template_defaults,
             t_end_days=t_end_days,
             dt_days=dt_days,
             n_times=n_times,
@@ -343,6 +351,7 @@ def _write_batch_parquet(
     species_names: list[str],
     compartment_names: list[str],
     rule_names: list[str],
+    template_defaults: dict[str, float],
     t_end_days: float,
     dt_days: float,
     n_times: int,
@@ -353,6 +362,13 @@ def _write_batch_parquet(
     ``[species..., compartments..., rules...]`` (matching the v2 binary
     layout). Each is emitted as a bare column name so downstream code
     reads them via ``species_dict[name]`` uniformly.
+
+    Every model parameter in ``template_defaults`` is also emitted as a
+    ``param:<name>`` column. Sampled params take their values from
+    ``theta_matrix``; non-sampled params are broadcast as the constant
+    template default. This lets calibration-target functions reach for
+    any model parameter (e.g. ``rho_collagen``) regardless of whether
+    the current sweep is varying it.
     """
     n_sims = len(statuses)
 
@@ -368,8 +384,17 @@ def _write_batch_parquet(
         "status": pa.array(np.asarray(statuses, dtype=np.int64)),
         "time": pa.array(time_lists, type=pa.list_(pa.float64())),
     }
+    sampled_set = set(param_names)
     for j, name in enumerate(param_names):
         columns[f"param:{name}"] = pa.array(theta_matrix[:, j].astype(np.float64))
+    # Broadcast non-sampled template defaults as constant columns. Snappy
+    # compresses identical-value columns to roughly nothing, so the
+    # storage cost is negligible compared to the cal-target fix.
+    for name in sorted(template_defaults):
+        if name in sampled_set:
+            continue
+        default = float(template_defaults[name])
+        columns[f"param:{name}"] = pa.array(np.full(n_sims, default, dtype=np.float64))
 
     # Trajectory columns in the same order they appear in the v2 binary:
     # species first, then compartments, then assignment rules. Indexing

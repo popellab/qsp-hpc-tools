@@ -30,6 +30,7 @@ Usage:
 """
 
 import pickle
+import shlex
 import subprocess
 import tempfile
 import time
@@ -84,6 +85,11 @@ class BatchConfig:
     cpp_subtree: str = "QSP"  # XML subtree for parameter lookup
     cpp_runtime_modules: str = (
         ""  # Space-separated `module load` args run before qsp_sim (runtime deps)
+    )
+    cpp_repo_path: str = ""  # SPQSP_PDAC checkout on HPC; if empty, derived from cpp_binary_path
+    cpp_branch: str = "cpp-sweep-binary-io"  # Branch to track when auto-rebuilding
+    cpp_build_modules: str = (
+        ""  # Modules for build-time (cmake, git). Falls back to runtime_modules.
     )
 
 
@@ -426,6 +432,9 @@ class HPCJobManager:
             cpp_template_path=cpp.get("template_path", "").strip(),
             cpp_subtree=cpp.get("subtree", "QSP").strip(),
             cpp_runtime_modules=cpp.get("runtime_modules", "").strip(),
+            cpp_repo_path=cpp.get("repo_path", "").strip(),
+            cpp_branch=cpp.get("branch", "cpp-sweep-binary-io").strip(),
+            cpp_build_modules=cpp.get("build_modules", "").strip(),
         )
 
     @staticmethod
@@ -477,6 +486,127 @@ class HPCJobManager:
         required packages for Parquet I/O and test statistics derivation.
         """
         return self.file_transfer.ensure_hpc_venv()
+
+    def ensure_cpp_binary(
+        self,
+        skip_git_pull: bool = False,
+        skip_build: bool = False,
+        repo_path: Optional[str] = None,
+        branch: Optional[str] = None,
+        binary_path: Optional[str] = None,
+    ) -> None:
+        """Ensure the C++ qsp_sim binary on HPC is up-to-date with source.
+
+        Fetches + fast-forwards the SPQSP_PDAC checkout on HPC to the
+        configured branch, then runs an incremental ``cmake --build --target
+        qsp_sim`` in the existing build directory. Incremental makes are
+        near-zero cost when source is unchanged; a first build (or one after
+        qsp_sim.cpp edits) pays the compile cost once.
+
+        Args:
+            skip_git_pull: Skip ``git fetch + checkout + pull``. Use when
+                iterating with unpushed local edits in the HPC checkout, or
+                when running submits with known-fresh source.
+            skip_build: Skip the cmake/make step. Only checks that the binary
+                exists. Use when you know the binary is already current.
+            repo_path: Override ``cpp.repo_path`` (or the derived value from
+                ``cpp.binary_path``).
+            branch: Override ``cpp.branch``.
+            binary_path: Override ``cpp.binary_path``. Used by callers that
+                pass a per-submit override (e.g. :meth:`submit_cpp_jobs`'s
+                ``binary_path`` kwarg).
+
+        Raises:
+            RuntimeError: If the HPC checkout is dirty, the pull fails
+                non-fast-forward, the build fails, or the binary is missing
+                after the build.
+        """
+        binary_path = binary_path or self.config.cpp_binary_path
+        if not binary_path:
+            raise ValueError("cpp.binary_path must be set in credentials.yaml")
+
+        # Derive repo_path from the binary path if not explicitly configured.
+        # Convention: {repo}/PDAC/qsp/sim/build/qsp_sim → parents[3] is {repo}.
+        if repo_path is None:
+            repo_path = self.config.cpp_repo_path
+            if not repo_path:
+                parents = Path(binary_path).parents
+                if len(parents) < 4:
+                    raise ValueError(
+                        f"Cannot derive cpp.repo_path from binary_path={binary_path!r}. "
+                        "Expected layout: {repo}/PDAC/qsp/sim/build/qsp_sim. "
+                        "Set cpp.repo_path explicitly in credentials.yaml."
+                    )
+                repo_path = str(parents[3])
+        branch = branch or self.config.cpp_branch
+
+        build_modules = self.config.cpp_build_modules or self.config.cpp_runtime_modules
+        module_prelude = (
+            f"module purge && module load {build_modules}"
+            if build_modules
+            else "# no build modules configured"
+        )
+
+        sim_dir = f"{repo_path}/PDAC/qsp/sim"
+
+        self.logger.info("Ensuring C++ qsp_sim binary is current on HPC:")
+        for line in format_config(
+            {
+                "repo_path": repo_path,
+                "branch": branch,
+                "skip_git_pull": skip_git_pull,
+                "skip_build": skip_build,
+            }
+        ):
+            self.logger.info(line)
+
+        # 1. git pull (optional). Uses --ff-only so a dirty/diverged checkout
+        #    fails loudly instead of merging or resetting the user's work.
+        if not skip_git_pull:
+            with log_operation(self.logger, f"git fetch + fast-forward to {branch}"):
+                pull_cmd = (
+                    f"set -e && cd {shlex.quote(repo_path)} && "
+                    'if [ -n "$(git status --porcelain)" ]; then '
+                    "  echo 'HPC checkout has uncommitted changes:' >&2; "
+                    "  git status --short >&2; "
+                    "  echo 'Either commit+push, or pass skip_git_pull=True.' >&2; "
+                    "  exit 1; "
+                    "fi && "
+                    "git fetch origin && "
+                    f"git checkout {shlex.quote(branch)} && "
+                    f"git pull --ff-only origin {shlex.quote(branch)}"
+                )
+                status, output = self.file_transfer.transport.exec(pull_cmd, timeout=120)
+                if status != 0:
+                    raise RuntimeError(f"git pull failed on HPC (rc={status}):\n{output}")
+
+        # 2. Incremental build. mkdir -p + cmake .. is near-zero when the
+        #    build dir exists and CMakeCache is valid; make is near-zero when
+        #    objects are up-to-date. First build or post-edit pays the real
+        #    compile cost here.
+        if not skip_build:
+            with log_operation(self.logger, "cmake --build --target qsp_sim"):
+                build_cmd = (
+                    f"set -e && {module_prelude} && "
+                    f"cd {shlex.quote(sim_dir)} && "
+                    "mkdir -p build && cd build && "
+                    "cmake .. -DCMAKE_BUILD_TYPE=Release >/dev/null && "
+                    'cmake --build . --target qsp_sim -j "$(nproc)"'
+                )
+                # 10 min ceiling covers a cold SUNDIALS+KLU+yaml-cpp fetch+build.
+                status, output = self.file_transfer.transport.exec(build_cmd, timeout=600)
+                if status != 0:
+                    raise RuntimeError(f"qsp_sim build failed on HPC (rc={status}):\n{output}")
+
+        # 3. Verify the binary exists where the config says it does.
+        check_cmd = f"test -x {shlex.quote(binary_path)} && echo OK"
+        status, output = self.file_transfer.transport.exec(check_cmd)
+        if status != 0 or "OK" not in output:
+            raise RuntimeError(
+                f"qsp_sim binary not found or not executable at {binary_path}. "
+                f"Check cpp.binary_path / cpp.repo_path in credentials.yaml."
+            )
+        self.logger.info(f"  ✓ qsp_sim binary ready at {binary_path}")
 
     def sync_codebase(self, skip_sync: bool = False) -> None:
         """
@@ -602,6 +732,8 @@ class HPCJobManager:
         max_workers: Optional[int] = None,
         per_sim_timeout_s: float = 300.0,
         skip_sync: bool = True,
+        skip_git_pull: bool = False,
+        skip_build: bool = False,
         binary_path: Optional[str] = None,
         template_path: Optional[str] = None,
         subtree: Optional[str] = None,
@@ -633,6 +765,14 @@ class HPCJobManager:
                 ``cwd`` to ``remote_project_path`` is not needed and may
                 be destructive if ``remote_project_path`` points at a
                 sibling project (e.g. pdac-build).
+            skip_git_pull: Skip the ``git fetch + pull`` step of
+                :meth:`ensure_cpp_binary`. Defaults to False so freshly-pushed
+                source lands on HPC automatically; set True when iterating
+                with unpushed local edits in the HPC checkout.
+            skip_build: Skip the cmake/make step of :meth:`ensure_cpp_binary`.
+                Defaults to False; incremental makes are near-zero when
+                source is unchanged, so leaving this False is almost always
+                the right call.
             binary_path: Override ``cpp.binary_path`` from credentials.
             template_path: Override ``cpp.template_path`` from credentials.
             subtree: Override ``cpp.subtree`` from credentials.
@@ -681,6 +821,11 @@ class HPCJobManager:
             self.sync_codebase(skip_sync=skip_sync)
 
         self.ensure_hpc_venv()
+        self.ensure_cpp_binary(
+            skip_git_pull=skip_git_pull,
+            skip_build=skip_build,
+            binary_path=binary_path,
+        )
         self._setup_remote_directories()
 
         self.logger.info("Uploading C++ job configuration and parameters...")

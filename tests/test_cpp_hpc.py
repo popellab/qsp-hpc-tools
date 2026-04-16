@@ -276,9 +276,23 @@ class TestSubmitCppJobs:
             time_limit="01:00:00",
             cpp_binary_path=cpp_binary,
             cpp_template_path=cpp_template,
+            # Explicit repo_path so submit_cpp_jobs' ensure_cpp_binary call
+            # doesn't try to derive from the stub `/usr/bin/qsp_sim`.
+            cpp_repo_path="/home/testuser/SPQSP_PDAC",
         )
         transport = MagicMock()
-        transport.exec.return_value = (0, "Submitted batch job 12345")
+
+        # Command-aware mock: `test -x ... && echo OK` must actually produce
+        # "OK" so ensure_cpp_binary's existence check passes; all other
+        # commands (git pull, cmake/make, submit) return the SLURM-style
+        # stub. Tests that care about a specific exec call install their
+        # own side_effect.
+        def exec_side_effect(cmd, *args, **kwargs):
+            if "echo OK" in cmd:
+                return (0, "OK")
+            return (0, "Submitted batch job 12345")
+
+        transport.exec.side_effect = exec_side_effect
         transport.upload.return_value = None
 
         manager = HPCJobManager(config=config, transport=transport)
@@ -378,3 +392,119 @@ class TestSubmitCppJobs:
             template_path="/override/param.xml",
         )
         assert info.job_ids == ["12345"]
+
+
+# ---------------------------------------------------------------------------
+# HPCJobManager.ensure_cpp_binary
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureCppBinary:
+    def _make_manager(self, **overrides):
+        from qsp_hpc.batch.hpc_job_manager import BatchConfig, HPCJobManager
+
+        config_kwargs = dict(
+            ssh_host="test.edu",
+            ssh_user="testuser",
+            simulation_pool_path="/scratch/sims",
+            hpc_venv_path="/home/testuser/.venv/qsp",
+            remote_project_path="/home/testuser/project",
+            cpp_binary_path="/home/testuser/SPQSP_PDAC/PDAC/qsp/sim/build/qsp_sim",
+            cpp_repo_path="/home/testuser/SPQSP_PDAC",
+            cpp_branch="cpp-sweep-binary-io",
+            cpp_build_modules="GCC/13.2.0",
+        )
+        config_kwargs.update(overrides)
+        config = BatchConfig(**config_kwargs)
+
+        transport = MagicMock()
+        transport.upload.return_value = None
+        return HPCJobManager(config=config, transport=transport), transport
+
+    @staticmethod
+    def _exec_side_effect(binary_ok=True, dirty=False, build_rc=0):
+        """Classify commands by content; return appropriate stub results."""
+
+        def side_effect(cmd, *args, **kwargs):
+            if "git status --porcelain" in cmd:
+                if dirty:
+                    return (1, "HPC checkout has uncommitted changes:\n M qsp_sim.cpp")
+                return (0, "")
+            if "cmake --build" in cmd:
+                return (build_rc, "" if build_rc == 0 else "make failed")
+            if "echo OK" in cmd:
+                return (0, "OK") if binary_ok else (1, "missing")
+            return (0, "")
+
+        return side_effect
+
+    def test_happy_path_runs_all_three_steps(self):
+        manager, transport = self._make_manager()
+        transport.exec.side_effect = self._exec_side_effect()
+
+        manager.ensure_cpp_binary()
+
+        commands = [call.args[0] for call in transport.exec.call_args_list]
+        assert any("git fetch origin" in c for c in commands), "should fetch"
+        assert any("cmake --build" in c for c in commands), "should build"
+        assert any("test -x" in c and "echo OK" in c for c in commands), "should verify binary"
+
+    def test_skip_git_pull_skips_fetch(self):
+        manager, transport = self._make_manager()
+        transport.exec.side_effect = self._exec_side_effect()
+
+        manager.ensure_cpp_binary(skip_git_pull=True)
+
+        commands = [call.args[0] for call in transport.exec.call_args_list]
+        assert not any("git fetch" in c for c in commands), "should not pull"
+        assert any("cmake --build" in c for c in commands), "should still build"
+
+    def test_skip_build_only_verifies(self):
+        manager, transport = self._make_manager()
+        transport.exec.side_effect = self._exec_side_effect()
+
+        manager.ensure_cpp_binary(skip_git_pull=True, skip_build=True)
+
+        commands = [call.args[0] for call in transport.exec.call_args_list]
+        assert not any("cmake --build" in c for c in commands), "should not build"
+        assert any("echo OK" in c for c in commands), "should still verify"
+
+    def test_dirty_worktree_raises(self):
+        manager, transport = self._make_manager()
+        transport.exec.side_effect = self._exec_side_effect(dirty=True)
+
+        with pytest.raises(RuntimeError, match="git pull failed"):
+            manager.ensure_cpp_binary()
+
+    def test_build_failure_raises(self):
+        manager, transport = self._make_manager()
+        transport.exec.side_effect = self._exec_side_effect(build_rc=2)
+
+        with pytest.raises(RuntimeError, match="qsp_sim build failed"):
+            manager.ensure_cpp_binary()
+
+    def test_missing_binary_raises(self):
+        manager, transport = self._make_manager()
+        transport.exec.side_effect = self._exec_side_effect(binary_ok=False)
+
+        with pytest.raises(RuntimeError, match="not found or not executable"):
+            manager.ensure_cpp_binary(skip_git_pull=True, skip_build=True)
+
+    def test_short_binary_path_needs_explicit_repo_path(self):
+        manager, transport = self._make_manager(
+            cpp_binary_path="/usr/bin/qsp_sim", cpp_repo_path=""
+        )
+
+        with pytest.raises(ValueError, match="Cannot derive cpp.repo_path"):
+            manager.ensure_cpp_binary()
+
+    def test_branch_override_reaches_git_commands(self):
+        manager, transport = self._make_manager(cpp_branch="main")
+        transport.exec.side_effect = self._exec_side_effect()
+
+        manager.ensure_cpp_binary(branch="my-feature-branch")
+
+        commands = [call.args[0] for call in transport.exec.call_args_list]
+        pull_cmd = next(c for c in commands if "git pull" in c)
+        assert "my-feature-branch" in pull_cmd
+        assert "main" not in pull_cmd

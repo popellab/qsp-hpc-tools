@@ -178,6 +178,105 @@ path end-to-end.
 - Keep `test_ode_vs_matlab.py` in `SPQSP_PDAC` — that's the validation
   anchor for the C++ numerics and should stay.
 
+## Candidate next steps (post-M7)
+
+The C++ path is numerically validated and runs end-to-end on Rockfish at
+100k scale. Everything below is optional — ordered roughly by the
+leverage each gives before we need to think about the MATLAB retirement
+in M8. Pick what's useful next; they're not a strict sequence.
+
+### M9 — On-cluster test-stat derivation for the C++ path
+
+*Est: 1–2 days.*
+
+Once sweep sizes exceed ~10k, downloading raw trajectories is the slow
+part (100k ≈ 21 GB Parquet, 1M ≈ 210 GB). The MATLAB path already has
+`qsp_hpc/batch/derive_test_stats_worker.py` running as a single SLURM
+task that chews through a pool directory of Parquets and emits
+`chunk_XXX_test_stats.csv` files. That worker is backend-agnostic
+(reads Parquet + species unit metadata), so it should run against
+C++-produced pools unchanged.
+
+What this unlocks:
+
+- `QSPSimulator` / SBI workflows can point at `simulation_pool_path` on
+  HPC and download per-sim test statistics (small) instead of raw
+  trajectories (huge).
+- Existing 3-tier caching (local pool → HPC test stats → HPC full sims
+  → new simulations) works end-to-end for the C++ backend.
+
+Steps:
+
+1. Verify `derive_test_stats_worker` reads the C++ Parquet schema
+   without modification. It mostly depends on `status`, `time`,
+   species-name columns, and (optionally) the `param:*` columns.
+2. Update `HPCJobManager.submit_cpp_jobs()` to optionally chain a
+   derivation job after the sim array (via `SLURMJobSubmitter.submit_derivation_job`
+   with a `--dependency=afterok:<array_id>` flag).
+3. Wire C++ pool paths into `QSPSimulator`'s `check_hpc_test_stats` /
+   `check_hpc_full_sims` lookups. Config hash compatibility: local
+   `SimulationPoolManager` uses a subset of what
+   `CppSimulator._compute_config_hash` includes. For caching to work
+   across backends the hash definition needs to agree.
+
+### M10 — Dosing / init-function support in qsp_sim
+
+*Est: depends on events branch.*
+
+M7 validation bypassed `baseline_no_treatment.yaml` because its
+`initialization_function: 'evolve_to_diagnosis'` isn't implemented in
+C++ yet, and all treatment scenarios use dosing. This is the main
+thing standing between the current C++ path and full SBI coverage.
+
+The SPQSP_PDAC events/dosing branch is the owner here. When it lands:
+
+1. Port `evolve_to_diagnosis` (or its reduced ODE-only equivalent) to
+   qsp_sim. Needs the C++ `set_healthy_populations` hook to match
+   MATLAB's `set_baseline_populations`.
+2. Port the dosing-schedule mechanism so `qsp_sim --dosing
+   <config.json>` mirrors MATLAB's `schedule_dosing()`.
+3. Extend M7 validation to cover `baseline_no_treatment`,
+   `gvax_neoadjuvant_zheng2022`, and one nivo scenario. Agreement
+   should be as tight as the no-dosing case because the ODE core is
+   unchanged.
+
+### M11 — Push past the 48-task concurrency ceiling
+
+*Est: 0.5–1 day.*
+
+The 100k Rockfish run achieved 48× parallelism wall-side, close to the
+`shared` partition's apparent concurrency cap. For 1M-scale sweeps we
+hit a ~20 min wall floor from this alone. Options:
+
+1. **Dedicated allocation** (`apopel1` account on `defq`/`parallel`):
+   higher concurrent-task ceiling. Needs a credentials change
+   (`slurm.partition`) and a re-benchmark.
+2. **Multi-node jobs per task**: not applicable — qsp_sim is
+   single-process and CppBatchRunner already saturates `cpus_per_task`
+   cores within a task.
+3. **`max_cpus_per_account` auto-sizing**: `batch_utils.auto_size_max_tasks`
+   already handles the one-wave optimization for the MATLAB path;
+   submit_cpp_jobs should use the same logic so users don't have to
+   hand-tune `jobs_per_chunk` for every partition.
+
+### M12 — Compression + streaming for very large sweeps
+
+*Est: 1 day.*
+
+At 1M-scale (200 GB+ raw), a few efficiency moves matter:
+
+- **Compression**: replace Parquet `snappy` with `zstd` — typical 2–3×
+  smaller at negligible read cost. One-line change in
+  `CppBatchRunner._write_batch_parquet`.
+- **Column pruning**: emit only the species listed in `required_species`
+  across the test-stats CSV. The other ~100 species columns go unused
+  once test stats are derived. A 3–5× size reduction.
+- **Streaming derivation**: today the derivation worker loads one
+  Parquet into memory at a time. For 500+ sims/Parquet × 164 species ×
+  361 timepoints × 8 bytes ≈ 240 MB per Parquet, which is fine — but
+  if we bump sims/chunk higher to amortize the 5–8s startup, streaming
+  the Parquet rather than loading it all becomes worthwhile.
+
 ## Completed milestones and benchmarks (2026-04-15)
 
 ### M1-M7: DONE
@@ -217,6 +316,63 @@ validation bypasses the scenario YAML and passes `sim_config` directly
 with no `initialization_function`. Validation of scenarios that depend
 on `evolve_to_diagnosis` requires M8 or later work on the events/init
 branch.
+
+### HPC scaling results (2026-04-16, Rockfish `shared` partition)
+
+First end-to-end C++ sweeps on Rockfish via `HPCJobManager.submit_cpp_jobs()`.
+All 110,100 sims across the table succeeded (100%).
+
+| N sims | tasks | jpc | wall | sum task compute | parallelism | ms/sim wall |
+|---|---|---|---|---|---|---|
+| 100 | 4 | 25 | ~15s | ~3s | 4× | 150 |
+| 1k | 40 | 25 | 6s | 45s | 7.5× | 6 |
+| 10k | 100 | 100 | 30s | 532s | 17× | 3 |
+| **100k** | **200** | **500** | **130s (2m10s)** | **6237s (1h44m)** | **48×** | **1.3** |
+
+**Rockfish vs MATLAB** (extrapolated from the M7 3.72 s/sim local baseline):
+
+- MATLAB laptop serial: 100k ≈ **4.3 days**
+- MATLAB HPC (40-task parfor array, typical): 100k ≈ **30–60 min**
+- **C++ HPC (this work)**: 100k in **2m 10s** → ~20–40× faster than MATLAB HPC
+
+**Chunk-shape benchmark at N=1000** (varying `jobs_per_chunk`):
+
+| jpc | tasks | wall | parallelism |
+|---|---|---|---|
+| 10 | 100 | 13s | 4.8× |
+| **25** | **40** | **6s** | **7.5×** |
+| 50 | 20 | 9s | 5.9× |
+| 100 | 10 | 7s | 5.7× |
+| 250 | 4 | 12s | 2.6× |
+
+Sweet spot for small N is ~25-100 sims/task. Extreme chunk shapes are
+slower: too-small tasks pay setup overhead (module load + venv activate +
+Python import ≈ 5–8s); too-large tasks don't parallelize across SLURM.
+For 100k we chose jpc=500 (200 tasks) — large enough to avoid SLURM array
+limits, small enough to fan out across ~50 concurrent workers.
+
+**Bottlenecks identified**:
+
+1. **Per-task startup ~5–8s** (module load + venv activate + Python import).
+   For tasks with fewer than ~25 sims, overhead dominates.
+2. **Submit-side overhead ~30s** per `submit_cpp_jobs()` call, mostly from
+   `ensure_hpc_venv()` re-upgrading qsp-hpc-tools from GitHub. Amortizes
+   across multiple same-session submissions.
+3. **Rockfish `shared` partition concurrency cap ~48 tasks**. Above that,
+   tasks queue into additional waves. Breaking past this wall (for
+   1M-scale sweeps) needs a bigger allocation or a different partition.
+4. **Storage scales linearly**: 100k × 180 days × 164 species (snappy
+   Parquet) ≈ 21 GB. A 1M-sim sweep would be ~210 GB — at that scale,
+   deriving test statistics on the cluster and dropping the raw
+   trajectories makes sense (see M9 below).
+
+**Filename-collision fix** (caught in the first smoke sweep): all 4
+tasks in the initial 100-sim run started in the same second and 2
+tasks' Parquets were overwritten — identical timestamps + scenario +
+chunk_size + seed in the filename. Fixed by including
+`SLURM_ARRAY_TASK_ID` in the Parquet name
+(`batch_{ts}_task{NNN}_{scenario}_{N}sims_seed{S}.parquet`).
+`CppSimulator._batch_pattern` accepts both old and new formats.
 
 ### Performance milestones (SPQSP_PDAC branch `cpp-sweep-binary-io`)
 
@@ -286,5 +442,21 @@ outputs (H_*, *_total) not emitted by the C++ codegen. Metadata types
 
 ## Total effort estimate
 
-M1-M7 done. Remaining: M8 (follow-up PR after the C++ path has been
-used in at least one real SBI workflow end-to-end).
+M1–M7 done. Core path (build → validate → scale to 100k on HPC) is
+production-viable for no-dosing sweeps.
+
+**Remaining required work:**
+
+- **M8** (MATLAB retirement) — follow-up PR after the C++ path has been
+  used in at least one real SBI workflow end-to-end.
+
+**Candidate next steps** (not required, ordered by leverage):
+
+- **M9** (on-cluster test-stat derivation) — needed before 1M-scale
+  sweeps are practical. ~1–2 days.
+- **M10** (dosing + evolve_to_diagnosis in qsp_sim) — blocks treatment
+  scenarios. Depends on SPQSP_PDAC events branch.
+- **M11** (push past 48-task concurrency cap) — ~0.5–1 day, mostly a
+  credentials / partition change.
+- **M12** (compression + column pruning for 1M-scale) — ~1 day, small
+  Parquet changes.

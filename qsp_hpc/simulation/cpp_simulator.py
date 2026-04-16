@@ -96,7 +96,13 @@ class CppSimulator:
         self.pool_dir = self.cache_dir / pool_name
         self.pool_dir.mkdir(parents=True, exist_ok=True)
 
-        self._batch_pattern = re.compile(r"batch_(\d{8}_\d{6})_(.+?)_(\d+)sims_seed(\d+)\.parquet")
+        # Optional `_task{N}` segment is emitted by the HPC worker
+        # (cpp_batch_worker.py) to make concurrent array tasks' filenames
+        # unique when timestamp resolution is only 1 second.  Local-only
+        # CppSimulator runs don't use it.
+        self._batch_pattern = re.compile(
+            r"batch_(\d{8}_\d{6})(?:_task\d+)?_(.+?)_(\d+)sims_seed(\d+)\.parquet"
+        )
 
         base_logger = setup_logger(__name__, verbose=verbose)
         self.logger = create_child_logger(base_logger, scenario)

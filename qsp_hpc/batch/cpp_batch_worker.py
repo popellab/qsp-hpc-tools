@@ -80,8 +80,13 @@ def run_chunk(config: dict, array_idx: int) -> None:
     pool_dir = Path(pool_base) / pool_id
     pool_dir.mkdir(parents=True, exist_ok=True)
 
+    # Include array_idx in the filename so concurrent tasks starting within
+    # the same second don't collide on a shared pool directory. Timestamp
+    # alone has 1-second resolution, which is easily overwhelmed when SLURM
+    # launches an array of short C++ sims at once (observed on Rockfish:
+    # 4 tasks started in the same second, 2 parquets were lost to overwrite).
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"batch_{ts}_{scenario}_{chunk_size}sims_seed{seed}.parquet"
+    filename = f"batch_{ts}_task{array_idx:03d}_{scenario}_{chunk_size}sims_seed{seed}.parquet"
     output_path = pool_dir / filename
 
     t0 = time.time()

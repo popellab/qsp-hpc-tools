@@ -59,6 +59,9 @@ class CppSimulator:
         max_workers: int | None = None,
         per_sim_timeout_s: float | None = None,
         submodel_priors_yaml: Optional[str | Path] = None,
+        scenario_yaml: Optional[str | Path] = None,
+        drug_metadata_yaml: Optional[str | Path] = None,
+        healthy_state_yaml: Optional[str | Path] = None,
         verbose: bool = False,
     ):
         self.priors_csv = Path(priors_csv)
@@ -78,6 +81,9 @@ class CppSimulator:
         self.max_workers = max_workers
         self.per_sim_timeout_s = per_sim_timeout_s
         self.submodel_priors_yaml = Path(submodel_priors_yaml) if submodel_priors_yaml else None
+        self.scenario_yaml = Path(scenario_yaml).resolve() if scenario_yaml else None
+        self.drug_metadata_yaml = Path(drug_metadata_yaml).resolve() if drug_metadata_yaml else None
+        self.healthy_state_yaml = Path(healthy_state_yaml).resolve() if healthy_state_yaml else None
 
         with open(self.priors_csv) as f:
             reader = csv.DictReader(f)
@@ -88,6 +94,9 @@ class CppSimulator:
             template_path=template_xml,
             subtree=subtree,
             default_timeout_s=per_sim_timeout_s or 120.0,
+            scenario_yaml=self.scenario_yaml,
+            drug_metadata_yaml=self.drug_metadata_yaml,
+            healthy_state_yaml=self.healthy_state_yaml,
         )
 
         self.config_hash = self._compute_config_hash()
@@ -119,6 +128,13 @@ class CppSimulator:
             "t_end_days": t_end_days,
             "dt_days": dt_days,
             "seed": seed,
+            "scenario_yaml": str(self.scenario_yaml) if self.scenario_yaml else "-",
+            "drug_metadata_yaml": (
+                str(self.drug_metadata_yaml) if self.drug_metadata_yaml else "-"
+            ),
+            "healthy_state_yaml": (
+                str(self.healthy_state_yaml) if self.healthy_state_yaml else "-"
+            ),
         }
         for line in format_config(config_info):
             self.logger.info(line)
@@ -142,6 +158,12 @@ class CppSimulator:
         h = hashlib.sha256(base_hash.encode())
         h.update(hashlib.sha256(self.binary_path.read_bytes()).hexdigest().encode())
         h.update(self.template_xml.read_text().encode())
+        # Scenario/drug-meta/healthy-state YAMLs change sim outputs but live
+        # outside the priors-CSV + XML template hashed above, so fold them
+        # in explicitly — edits to any of these must invalidate the pool.
+        for yml in (self.scenario_yaml, self.drug_metadata_yaml, self.healthy_state_yaml):
+            if yml is not None:
+                h.update(yml.read_bytes())
         return h.hexdigest()
 
     # ------------------------------------------------------------------

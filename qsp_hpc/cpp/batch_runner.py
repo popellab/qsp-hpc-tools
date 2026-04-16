@@ -66,6 +66,9 @@ def _worker_init(
     subtree: str | None,
     workdir: str,
     default_timeout_s: float,
+    scenario_yaml: str | None,
+    drug_metadata_yaml: str | None,
+    healthy_state_yaml: str | None,
 ) -> None:
     global _WORKER_RUNNER, _WORKER_WORKDIR
     _WORKER_RUNNER = CppRunner(
@@ -73,6 +76,9 @@ def _worker_init(
         template_path=template_path,
         subtree=subtree,
         default_timeout_s=default_timeout_s,
+        scenario_yaml=scenario_yaml,
+        drug_metadata_yaml=drug_metadata_yaml,
+        healthy_state_yaml=healthy_state_yaml,
     )
     # Per-process subdir so concurrent workers don't fight over the same
     # `failed/` folder or race on UUID collisions (unlikely but cheap).
@@ -115,6 +121,9 @@ class CppBatchRunner:
         template_path: str | Path,
         subtree: str | None = "QSP",
         default_timeout_s: float = 120.0,
+        scenario_yaml: str | Path | None = None,
+        drug_metadata_yaml: str | Path | None = None,
+        healthy_state_yaml: str | Path | None = None,
     ):
         # Validate eagerly so callers fail fast, before we fork workers.
         probe = CppRunner(
@@ -122,11 +131,17 @@ class CppBatchRunner:
             template_path=template_path,
             subtree=subtree,
             default_timeout_s=default_timeout_s,
+            scenario_yaml=scenario_yaml,
+            drug_metadata_yaml=drug_metadata_yaml,
+            healthy_state_yaml=healthy_state_yaml,
         )
         self.binary_path = probe.binary_path
         self.template_path = Path(template_path).resolve()
         self.subtree = subtree
         self.default_timeout_s = default_timeout_s
+        self.scenario_yaml = probe.scenario_yaml
+        self.drug_metadata_yaml = probe.drug_metadata_yaml
+        self.healthy_state_yaml = probe.healthy_state_yaml
         self.parameter_names = probe.parameter_names
 
     def run(
@@ -205,6 +220,9 @@ class CppBatchRunner:
                 self.subtree,
                 str(workdir),
                 self.default_timeout_s,
+                str(self.scenario_yaml) if self.scenario_yaml else None,
+                str(self.drug_metadata_yaml) if self.drug_metadata_yaml else None,
+                str(self.healthy_state_yaml) if self.healthy_state_yaml else None,
             ),
         ) as pool:
             futures = []

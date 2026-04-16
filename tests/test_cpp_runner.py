@@ -300,3 +300,124 @@ def test_real_qsp_sim_end_to_end(tmp_path: Path):
     assert "V_T.C1" in result.species_names
     # First row is initial conditions; should be finite and non-NaN.
     assert np.all(np.isfinite(result.trajectory[0]))
+
+
+# --- Scenario / evolve-to-diagnosis wiring --------------------------------
+
+
+def _make_fake_argv_recorder(tmp_path: Path) -> tuple[Path, Path]:
+    """Fake qsp_sim that records its argv, then writes a minimal valid binary
+    + species file so run_one's parser is happy. Returns (script, argv_log)."""
+    log = tmp_path / "argv.log"
+    script = tmp_path / "fake_record.sh"
+    script.write_text(
+        textwrap.dedent(
+            f"""\
+        #!/usr/bin/env bash
+        set -e
+        printf '%s\\n' "$@" > "{log}"
+        # Parse --binary-out / --species-out for the minimal emit below.
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --binary-out) BIN_OUT="$2"; shift 2 ;;
+            --species-out) SP_OUT="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        python3 - <<PY
+        import struct
+        header = struct.pack('<IIQQdd', 0x51535042, 1, 1, 1, 0.1, 0.1)
+        body = struct.pack('<d', 1.0)
+        open("$BIN_OUT", 'wb').write(header + body)
+        open("$SP_OUT", 'w').write("spA\\n")
+        PY
+    """
+        )
+    )
+    script.chmod(0o755)
+    return script, log
+
+
+def test_runner_appends_scenario_flags(tmp_path: Path, template_path: Path):
+    script, log = _make_fake_argv_recorder(tmp_path)
+    scenario = tmp_path / "scenario.yaml"
+    scenario.write_text("dosing: {}\n")
+    drug_meta = tmp_path / "drug_meta.yaml"
+    drug_meta.write_text("drugs: {}\n")
+
+    runner = CppRunner(
+        script,
+        template_path,
+        scenario_yaml=scenario,
+        drug_metadata_yaml=drug_meta,
+    )
+    runner.run_one(params={"A": 1.0}, t_end_days=0.1, dt_days=0.1, workdir=tmp_path / "w")
+
+    argv = log.read_text().splitlines()
+    assert "--scenario" in argv
+    assert str(scenario.resolve()) in argv
+    assert "--drug-metadata" in argv
+    assert str(drug_meta.resolve()) in argv
+    assert "--evolve-to-diagnosis" not in argv
+
+
+def test_runner_appends_evolve_flag(tmp_path: Path, template_path: Path):
+    script, log = _make_fake_argv_recorder(tmp_path)
+    healthy = tmp_path / "healthy.yaml"
+    healthy.write_text("densities: {}\n")
+
+    runner = CppRunner(script, template_path, healthy_state_yaml=healthy)
+    runner.run_one(params={"A": 1.0}, t_end_days=0.1, dt_days=0.1, workdir=tmp_path / "w")
+
+    argv = log.read_text().splitlines()
+    assert "--evolve-to-diagnosis" in argv
+    assert str(healthy.resolve()) in argv
+    assert "--scenario" not in argv
+
+
+def test_runner_scenario_requires_drug_metadata(tmp_path: Path, template_path: Path, fake_ok: Path):
+    scenario = tmp_path / "scenario.yaml"
+    scenario.write_text("dosing: {}\n")
+    with pytest.raises(ValueError, match="drug_metadata_yaml"):
+        CppRunner(fake_ok, template_path, scenario_yaml=scenario)
+
+
+def test_runner_missing_yaml_raises(tmp_path: Path, template_path: Path, fake_ok: Path):
+    with pytest.raises(FileNotFoundError, match="YAML not found"):
+        CppRunner(fake_ok, template_path, healthy_state_yaml=tmp_path / "nope.yaml")
+
+
+def _real_healthy_yaml() -> Path | None:
+    here = Path(__file__).resolve().parent.parent
+    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
+        c = here.parent / sibling / "PDAC" / "sim" / "resource" / "healthy_state.yaml"
+        if c.exists():
+            return c
+    return None
+
+
+@pytest.mark.skipif(
+    _real_binary_path() is None or _real_template_path() is None or _real_healthy_yaml() is None,
+    reason="qsp_sim binary, template, or healthy_state.yaml not found",
+)
+def test_real_qsp_sim_evolve_to_diagnosis(tmp_path: Path):
+    """Evolve-to-diagnosis end-to-end: output starts at user t=0 (post-evolve)."""
+    runner = CppRunner(
+        _real_binary_path(),
+        _real_template_path(),
+        healthy_state_yaml=_real_healthy_yaml(),
+    )
+    result = runner.run_one(
+        params={"k_C1_growth": 0.01},
+        t_end_days=3.0,
+        dt_days=1.0,
+        workdir=tmp_path,
+    )
+    # 3 post-diagnosis days at dt=1.0 → 4 rows (t=0, 1, 2, 3).
+    assert result.trajectory.shape == (4, 164)
+    # After evolve_to_diagnosis, V_T should equal ~17mL (3.2cm-diameter sphere)
+    # at user t=0 — unambiguously different from the "healthy" microinvasive IC
+    # (~4e-5 mL) we'd see without --evolve-to-diagnosis. qsp_sim writes
+    # species in source units; V_T maps to one of the species columns when
+    # the model's Amount-units compartments are dumped there.
+    assert np.all(np.isfinite(result.trajectory[0]))

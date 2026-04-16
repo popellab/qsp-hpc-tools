@@ -92,12 +92,32 @@ class CppRunner:
         template_path: str | Path,
         subtree: str | None = "QSP",
         default_timeout_s: float = 120.0,
+        scenario_yaml: str | Path | None = None,
+        drug_metadata_yaml: str | Path | None = None,
+        healthy_state_yaml: str | Path | None = None,
     ):
         self.binary_path = Path(binary_path).resolve()
         if not self.binary_path.exists():
             raise FileNotFoundError(f"qsp_sim binary not found: {self.binary_path}")
         if not self.binary_path.is_file():
             raise FileNotFoundError(f"Not a file: {self.binary_path}")
+
+        # Batch-constant simulation config. These flags don't vary per-sim,
+        # so we resolve + validate them once here and append to every
+        # `qsp_sim` invocation in run_one.
+        def _resolve(p: str | Path | None) -> Path | None:
+            if p is None:
+                return None
+            rp = Path(p).resolve()
+            if not rp.exists():
+                raise FileNotFoundError(f"YAML not found: {rp}")
+            return rp
+
+        self.scenario_yaml = _resolve(scenario_yaml)
+        self.drug_metadata_yaml = _resolve(drug_metadata_yaml)
+        self.healthy_state_yaml = _resolve(healthy_state_yaml)
+        if self.scenario_yaml is not None and self.drug_metadata_yaml is None:
+            raise ValueError("scenario_yaml requires drug_metadata_yaml")
 
         self._renderer = ParamXMLRenderer(template_path, subtree=subtree)
         self.default_timeout_s = default_timeout_s
@@ -163,6 +183,15 @@ class CppRunner:
             "--dt-days",
             repr(float(dt_days)),
         ]
+        if self.scenario_yaml is not None:
+            cmd += [
+                "--scenario",
+                str(self.scenario_yaml),
+                "--drug-metadata",
+                str(self.drug_metadata_yaml),
+            ]
+        if self.healthy_state_yaml is not None:
+            cmd += ["--evolve-to-diagnosis", str(self.healthy_state_yaml)]
 
         try:
             proc = subprocess.run(

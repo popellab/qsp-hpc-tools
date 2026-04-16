@@ -215,6 +215,49 @@ class TestCppSimulatorInit:
         )
         assert sim.pool_dir.name.endswith("_my_scenario")
 
+    def test_config_hash_changes_with_scenario_yaml(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        drug = tmp_path / "drug.yaml"
+        drug.write_text("drugs: {}\n")
+        s1_yaml = tmp_path / "s1.yaml"
+        s1_yaml.write_text("dosing: {nivolumab_dose: 3.0}\n")
+        s2_yaml = tmp_path / "s2.yaml"
+        s2_yaml.write_text("dosing: {nivolumab_dose: 5.0}\n")
+
+        common = dict(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            drug_metadata_yaml=drug,
+        )
+        s1 = CppSimulator(**common, scenario_yaml=s1_yaml)
+        s2 = CppSimulator(**common, scenario_yaml=s2_yaml)
+        assert s1.config_hash != s2.config_hash
+
+    def test_config_hash_changes_with_healthy_yaml(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        h1 = tmp_path / "h1.yaml"
+        h1.write_text("densities: {C1: 1e6}\n")
+        h2 = tmp_path / "h2.yaml"
+        h2.write_text("densities: {C1: 2e6}\n")
+
+        common = dict(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+        )
+        s1 = CppSimulator(**common, healthy_state_yaml=h1)
+        s2 = CppSimulator(**common, healthy_state_yaml=h2)
+        assert s1.config_hash != s2.config_hash
+
 
 class TestPoolCaching:
     def test_scan_empty_pool(self, priors_csv, binary_path, template_path, cache_dir):

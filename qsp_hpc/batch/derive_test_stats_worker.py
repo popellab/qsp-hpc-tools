@@ -164,8 +164,9 @@ def compute_test_statistics_batch(
 
         # Apply function to each simulation
         for i, sim_row in sim_df.iterrows():
-            if sim_row["status"] != 1:
-                # Failed simulation - skip
+            if sim_row["status"] != 0:
+                # status==0 means the simulation succeeded; skip anything
+                # else (status==1 = qsp_sim/MATLAB failure → all-NaN row).
                 continue
 
             try:

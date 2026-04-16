@@ -334,17 +334,18 @@ try
     save(results_file, 'chunk_results', 'chunk_metadata');
 
     % Summary
-    n_success = sum(chunk_metadata.status == 1);
-    n_failed_ic = sum(chunk_metadata.status == 0);
-    n_failed_sim = sum(chunk_metadata.status == -1);
+    % status convention: 0=success, 1=failure (any kind). The IC-vs-sim
+    % split lives only in the per-patient log lines now.
+    n_success = sum(chunk_metadata.status == 0);
+    n_failed = sum(chunk_metadata.status == 1);
 
     fprintf('✅ Chunk processing complete in %.1f seconds (%.2f sec/patient)\n', ...
         t_elapsed, t_elapsed/length(patient_range));
     fprintf('   [timing-summary] startup=%.2fs model_build=%.2fs sim_config=%.2fs sbioaccelerate=%.2fs parfor_total=%.2fs n_patients=%d\n', ...
         dt_startup, dt_model_build, dt_sim_config, dt_accel, t_elapsed, length(patient_range));
     fprintf('   Success: %d/%d (%.1f%%)\n', n_success, length(patient_range), 100*n_success/length(patient_range));
-    fprintf('   Failed IC: %d/%d (%.1f%%)\n', n_failed_ic, length(patient_range), 100*n_failed_ic/length(patient_range));
-    fprintf('   Failed sim: %d/%d (%.1f%%)\n', n_failed_sim, length(patient_range), 100*n_failed_sim/length(patient_range));
+    fprintf('   Failed:  %d/%d (%.1f%%)  (see per-patient log lines for IC vs sim split)\n', ...
+        n_failed, length(patient_range), 100*n_failed/length(patient_range));
     fprintf('   Full results: %s\n', results_filename);
     if ~isempty(fieldnames(outputs))
         fprintf('   Outputs: %s\n', strjoin(fieldnames(outputs), ', '));
@@ -433,7 +434,11 @@ n_patients = length(patient_range);
 
 % Pre-allocate sliced outputs (parfor-safe)
 sim_data_cell = cell(n_patients, 1);
-status_arr = zeros(n_patients, 1);  % 1=success, 0=failed_IC, -1=failed_sim
+% status convention: 0=success, 1=failure (any kind). Collapsed from the
+% old tri-state {1,0,-1} encoding so MATLAB and C++ Parquets agree on the
+% filter the Python derive_test_stats_worker uses (status==0 => process).
+% Specific failure mode is still visible in the per-patient log lines.
+status_arr = ones(n_patients, 1);  % default = failure; flipped to 0 on success
 
 fprintf('   Starting simulations (parfor workers=%d, %d patients)...\n', ...
     num_workers, n_patients);
@@ -449,7 +454,7 @@ parfor (i = 1:n_patients, num_workers)
 
     fprintf('     Patient %d/%d (global ID: %d) starting\n', i, n_patients, patient_global_id);
 
-    status_i = -1;
+    status_i = 1;  % default = failure; only set to 0 on a clean simulate()
     sim_data_i = [];
     model_copy = [];
     try
@@ -464,12 +469,10 @@ parfor (i = 1:n_patients, num_workers)
                 if ~ic_success
                     fprintf('     Patient %d: IC rejected (%s, %.2fs)\n', ...
                         i, init_func_name, toc(t_patient_start));
-                    status_i = 0;
                     ic_ok = false;
                 end
             catch ic_err
                 fprintf('     Patient %d: IC error (%s): %s\n', i, init_func_name, ic_err.message);
-                status_i = 0;
                 ic_ok = false;
             end
         end
@@ -477,16 +480,14 @@ parfor (i = 1:n_patients, num_workers)
         if ic_ok
             try
                 sim_data_i = sbiosimulate(model_copy, [], variant, dose_bcast);
-                status_i = 1;
+                status_i = 0;
                 fprintf('     Patient %d: ok (%.2fs)\n', i, toc(t_patient_start));
             catch sim_err
                 fprintf('     Patient %d: sim error: %s\n', i, sim_err.message);
-                status_i = -1;
             end
         end
     catch ME
         fprintf('     Patient %d: unexpected error: %s\n', i, ME.message);
-        status_i = -1;
     end
 
     % Clean up this iteration's model copy

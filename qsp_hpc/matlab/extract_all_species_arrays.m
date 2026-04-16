@@ -17,7 +17,7 @@ function species_data = extract_all_species_arrays(chunk_results, model)
 %                    .species_names  - Cell array of names (1 x n_species)
 %                    .time_arrays    - Cell array of time vectors (n_sims x 1)
 %                    .species_arrays - Cell array of data matrices (n_sims x n_species)
-%                    .status         - Status vector (n_sims x 1): 1=success, 0=failed IC, -1=failed sim
+%                    .status         - Status vector (n_sims x 1): 0=success, 1=failure (any kind, see per-sim log lines for IC-vs-sim split)
 %
 % Example:
 %   species_data = extract_all_species_arrays(chunk_results, model);
@@ -80,6 +80,8 @@ end
 % Initialize output arrays
 time_arrays = cell(n_sims, 1);
 species_arrays = cell(n_sims, n_species);
+% status convention: 0=success, 1=failure. Default = success; flipped to
+% 1 below for sims where simdata is empty.
 status = zeros(n_sims, 1);
 
 % Pre-compute per-species constant-compartment flags + values for parfor safety.
@@ -113,7 +115,7 @@ parfor (i = 1:n_sims, num_workers)
 
     if isempty(simdata)
         % Failed simulation - store empty arrays
-        status(i) = -1;
+        status(i) = 1;
         time_arrays{i} = [];
         row_cells = cell(1, n_species);
         for j = 1:n_species
@@ -121,7 +123,7 @@ parfor (i = 1:n_sims, num_workers)
         end
     else
         % Successful simulation - extract time and species
-        status(i) = 1;
+        status(i) = 0;
         time_arrays{i} = simdata.Time;
 
         % Extract each species/compartment into a row cell, then assign once
@@ -154,7 +156,7 @@ species_data.time_arrays = time_arrays;
 species_data.species_arrays = species_arrays;
 species_data.status = status;
 
-n_success = sum(status == 1);
+n_success = sum(status == 0);
 fprintf('   Extracted species data: %d/%d successful simulations\n', n_success, n_sims);
 
 end

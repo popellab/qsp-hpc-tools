@@ -1900,8 +1900,8 @@ class HPCJobManager:
         simulation_ids = df["simulation_id"].values
         statuses = df["status"].values
 
-        # Filter to successful simulations only
-        success_mask = statuses == 1
+        # Filter to successful simulations only (status==0 = success)
+        success_mask = statuses == 0
         n_successful: int = int(np.sum(success_mask))
 
         if n_successful == 0:

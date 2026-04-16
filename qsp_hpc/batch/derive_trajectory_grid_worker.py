@@ -70,7 +70,8 @@ def extract_trajectory_grid_batch(
             column_names.append(f"{species}__t{t:.1f}")
 
     for i, (_, sim_row) in enumerate(sim_df.iterrows()):
-        if sim_row["status"] != 1:
+        # status==0 = success; skip status==1 (qsp_sim/MATLAB failure → NaN row).
+        if sim_row["status"] != 0:
             continue
 
         try:

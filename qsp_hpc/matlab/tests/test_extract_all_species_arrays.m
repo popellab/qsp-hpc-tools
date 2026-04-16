@@ -172,10 +172,10 @@ classdef test_extract_all_species_arrays < matlab.unittest.TestCase
 
             testCase.verifyEqual(species_data.n_sims, 3);
 
-            % Check status vector
-            testCase.verifyEqual(species_data.status(1), 1, 'First sim should be success');
-            testCase.verifyEqual(species_data.status(2), -1, 'Second sim should be failed');
-            testCase.verifyEqual(species_data.status(3), 1, 'Third sim should be success');
+            % Check status vector (0=success, 1=failure)
+            testCase.verifyEqual(species_data.status(1), 0, 'First sim should be success');
+            testCase.verifyEqual(species_data.status(2), 1, 'Second sim should be failed');
+            testCase.verifyEqual(species_data.status(3), 0, 'Third sim should be success');
 
             % Failed simulation should have empty arrays
             testCase.verifyEmpty(species_data.time_arrays{2});
@@ -235,8 +235,8 @@ classdef test_extract_all_species_arrays < matlab.unittest.TestCase
             species_data = extract_all_species_arrays(chunk_results, testCase.Model);
 
             testCase.verifyEqual(species_data.n_sims, 2);
-            testCase.verifyEqual(sum(species_data.status), -2, ...
-                'All simulations should be marked as failed');
+            testCase.verifyEqual(sum(species_data.status), 2, ...
+                'All simulations should be marked as failed (status==1 each)');
         end
     end
 

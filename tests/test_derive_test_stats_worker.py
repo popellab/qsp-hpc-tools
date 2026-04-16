@@ -220,7 +220,7 @@ class TestComputeTestStatisticsBatch:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0, 1],
-                "status": [1, 1],  # Both successful
+                "status": [0, 0],  # Both successful (status==0 = success)
                 "time": [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]],
                 "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],  # Mean = 200  # Mean = 100
             }
@@ -249,11 +249,11 @@ class TestComputeTestStatisticsBatch:
 
         registry = build_test_stat_registry(test_stats_df)
 
-        # Simulation 1 failed (status != 1)
+        # Simulation 1 failed (status==1 = failure)
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0, 1],
-                "status": [1, 0],  # Second simulation failed
+                "status": [0, 1],  # First successful, second failed
                 "time": [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]],
                 "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],
             }
@@ -286,7 +286,7 @@ class TestComputeTestStatisticsBatch:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0],
-                "status": [1],
+                "status": [0],
                 "time": [[0.0, 1.0, 2.0]],
                 "V_T.C1": [[100.0, 200.0, 300.0]],
             }
@@ -321,7 +321,7 @@ class TestComputeTestStatisticsBatch:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0],
-                "status": [1],
+                "status": [0],
                 "time": [[0.0, 1.0, 2.0]],
                 "V_T.CD8": [[100.0, 110.0, 120.0]],
                 "V_T.Treg": [[50.0, 55.0, 60.0]],
@@ -351,7 +351,7 @@ class TestComputeTestStatisticsBatch:
         registry = {}
 
         sim_df = pd.DataFrame(
-            {"simulation_id": [0], "status": [1], "time": [[0.0, 1.0]], "V_T.C1": [[100.0, 200.0]]}
+            {"simulation_id": [0], "status": [0], "time": [[0.0, 1.0]], "V_T.C1": [[100.0, 200.0]]}
         )
 
         species_units = {"V_T.C1": "cell"}
@@ -378,7 +378,7 @@ class TestComputeTestStatisticsBatch:
         registry = build_test_stat_registry(test_stats_df)
 
         sim_df = pd.DataFrame(
-            {"simulation_id": [0], "status": [1], "time": [[0.0, 1.0]], "V_T.C1": [[100.0, 200.0]]}
+            {"simulation_id": [0], "status": [0], "time": [[0.0, 1.0]], "V_T.C1": [[100.0, 200.0]]}
         )
 
         species_units = {"V_T.C1": "cell"}
@@ -417,7 +417,7 @@ class TestNonSpeciesResolution:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0],
-                "status": [1],
+                "status": [0],
                 "time": [[0.0, 1.0]],
                 "V_T.C1": [[1e8, 1e8]],
                 "V_T": [0.5],  # scalar compartment volume
@@ -444,7 +444,7 @@ class TestNonSpeciesResolution:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0],
-                "status": [1],
+                "status": [0],
                 "time": [[0.0]],
                 "param:rho_collagen": [0.025],
             }
@@ -468,7 +468,7 @@ class TestNonSpeciesResolution:
             }
         )
         registry = build_test_stat_registry(test_stats_df)
-        sim_df = pd.DataFrame({"simulation_id": [0], "status": [1], "time": [[0.0]], "V_T": [0.5]})
+        sim_df = pd.DataFrame({"simulation_id": [0], "status": [0], "time": [[0.0]], "V_T": [0.5]})
         # Deliberately omit V_T from species_units → defaults to dimensionless
         species_units = {}
         result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
@@ -510,7 +510,7 @@ class TestProcessSingleBatch:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0, 1, 2],
-                "status": [1, 1, 1],
+                "status": [0, 0, 0],
                 "time": [[0.0, 1.0, 2.0]] * 3,
                 "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0], [10.0, 20.0, 30.0]],
             }
@@ -540,7 +540,7 @@ class TestProcessSingleBatch:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0, 1],
-                "status": [1, 1],
+                "status": [0, 0],
                 "time": [[0.0, 1.0, 2.0]] * 2,
                 "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],
             }
@@ -615,7 +615,7 @@ class TestMaxBatchesLimit:
             sim_df = pd.DataFrame(
                 {
                     "simulation_id": [i * 10 + j for j in range(10)],
-                    "status": [1] * 10,
+                    "status": [0] * 10,
                     "time": [[0.0, 1.0]] * 10,
                     "value": [[float(i * 100 + j)] * 2 for j in range(10)],
                 }
@@ -677,7 +677,7 @@ class TestMaxBatchesLimit:
             sim_df = pd.DataFrame(
                 {
                     "simulation_id": [i * 5 + j for j in range(5)],
-                    "status": [1] * 5,
+                    "status": [0] * 5,
                     "time": [[0.0, 1.0]] * 5,
                     "value": [[float(i * 100 + j)] * 2 for j in range(5)],
                 }
@@ -748,7 +748,7 @@ class TestSingleTaskDerivation:
             sim_df = pd.DataFrame(
                 {
                     "simulation_id": [i * 10 + j for j in range(5)],
-                    "status": [1] * 5,
+                    "status": [0] * 5,
                     "time": [[0.0, 1.0]] * 5,
                     "value": [[float(i * 100 + j)] * 2 for j in range(5)],
                 }

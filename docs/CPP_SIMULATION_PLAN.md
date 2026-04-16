@@ -546,12 +546,43 @@ uv run python scripts/bench_cpp_scenarios.py \
 2. **Evolve-to-diagnosis rejections are not bugs.** `qsp_sim` exits 2 when the evolve rejects (max_days exceeded, or diagnosis too fast). CppBatchRunner sees this as `QspSimError`, records `STATUS_FAILED`, writes a NaN row. ~16% of 10k lognormal param draws hit one of the rejection criteria — this is the model correctly flagging implausible draws.
 3. **Pool cleanup timeout.** `ssh hpc "rm -rf {pool_dir}"` can stall past 60s on 10k+ sim pools (~15 GB). Bench scripts now use `timeout=600`.
 
-**Extrapolation to 1M**: sim-work-per-sim term (the asymptotic floor
-set by `per_sim_cpu_time / total_cpus_in_flight`) is ~1.7 ms/sim wall
-at 960 CPUs. At 4000+ CPUs (say 100 whole nodes), the floor drops to
-~0.4 ms/sim wall and 1M lands in ~6–7 min. Practical cap is queue
-contention + SLURM dispatch lag at very high concurrency; 3–10 min
-for 1M gvax-nivo on `parallel` is the realistic window.
+**100k × gvax-nivo, `parallel`, 40 whole-node tasks (2026-04-16):**
+
+| metric | value |
+|---|---|
+| tasks | 40 (× 2500 sims each) |
+| cpus/task | 48 (full node) |
+| nodes used | 40 (~6% of `parallel`'s 712 total) |
+| total cpus in flight | **1920** |
+| sweep wall | **238s (3m 58s)** |
+| median per-task wall | ~120s |
+| **straggler**: task 33 | 238s (**1.98× median**) — set the sweep wall |
+| sweep wall *without* the straggler | ~132s → ~1.3 ms/sim |
+| reported ms/sim wall | **2.4** |
+| parallelism | 20.2× |
+
+**Straggler tax is real at scale.** Task 33 finished at 238s vs a
+~130s median; 39 of 40 nodes met the predicted ~1.3 ms/sim wall, but
+the 40th stretched the whole sweep to ~2.4 ms/sim. This is a classic
+long-tail problem on large clusters — hardware variance, noisy
+neighbors on shared network/storage, or an unlucky parameter draw
+pushing CVODE into more integration steps. Budget ~1.5–2× the
+mean-task wall for sweep planning.
+
+**Scaling curve across runs:**
+
+| N sims | partition | tasks | cpus in flight | wall | ms/sim wall |
+|---|---|---|---|---|---|
+| 1k | `shared` | 40 | 160 | 27s | 27 |
+| 10k | `parallel` | 20 | 960 | 34s | 3.4 |
+| 100k | `parallel` | 40 | 1920 | 238s | 2.4 |
+
+**Extrapolation to 1M**: at ~400 nodes × 48 = 19,200 CPUs in flight,
+per-task compute for jpc=2500 is ~8.6s, but straggler variance at
+400-node concurrency is at least as bad as at 40-node (maybe worse —
+more chances to hit a slow node). Realistic wall **3–6 min** for 1M
+gvax-nivo, with straggler mitigation (watchdog + requeue, or smaller
+chunks for finer granularity) needed to hit the low end.
 
 ### Performance milestones (SPQSP_PDAC branch `cpp-sweep-binary-io`)
 

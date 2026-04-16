@@ -176,8 +176,10 @@ def run_one_bench(
     timing["submit_s"] = submit_s
     timing["jobs_per_chunk"] = jobs_per_chunk
 
-    # Delete pool to save disk.
-    ssh(f"rm -rf {pool_dir}")
+    # Delete pool to save disk. Generous timeout: at 10k+ sims the pool is
+    # multi-GB and ssh can hang well past 60s closing the connection even
+    # though the remote rm itself is fast.
+    ssh(f"rm -rf {pool_dir}", timeout=600)
     tmp_csv.unlink(missing_ok=True)
 
     return timing

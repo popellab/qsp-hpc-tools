@@ -105,6 +105,8 @@ def run_one_scenario(
     seed: int,
     priors_csv: Path,
     params: list[str],
+    partition: Optional[str] = None,
+    time_limit: str = "00:20:00",
 ) -> dict:
     """Submit one scenario's sweep, wait, collect timing, delete the pool."""
     # Fresh theta with a deterministic seed so all scenarios see the same
@@ -117,9 +119,12 @@ def run_one_scenario(
     from qsp_hpc.batch.hpc_job_manager import HPCJobManager
 
     manager = HPCJobManager(verbose=False)
-    # 15 min cap; baseline/gvax finish in well under that but evolve adds
-    # ~1-2s/sim on top so keep headroom.
-    manager.config.time_limit = "00:20:00"
+    manager.config.time_limit = time_limit
+    # Override the default partition from credentials.yaml when the caller
+    # wants to retarget (e.g. `parallel` for whole-node fan-out). Leave
+    # unchanged when partition=None so the credentials value is respected.
+    if partition is not None:
+        manager.config.partition = partition
 
     # Only pass --evolve-to-diagnosis when the scenario actually asks for it;
     # a pure-ODE run shouldn't silently pay the 857-day evolve cost.
@@ -158,8 +163,10 @@ def run_one_scenario(
     timing["jobs_per_chunk"] = jobs_per_chunk
 
     # Pool cleanup; iterating over scenarios back-to-back would otherwise
-    # accumulate GB of trajectories.
-    ssh(f"rm -rf {pool_dir}")
+    # accumulate GB of trajectories. Use a generous timeout: at 10k+ sims
+    # the pool directory is ~15 GB and can take well over a minute for
+    # the remote ssh call to return even though the rm itself is fast.
+    ssh(f"rm -rf {pool_dir}", timeout=600)
     tmp_csv.unlink(missing_ok=True)
 
     return timing
@@ -172,6 +179,17 @@ def main() -> None:
     ap.add_argument("--cpus-per-task", type=int, default=4)
     ap.add_argument("--memory", default="4G")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--partition",
+        default=None,
+        help="SLURM partition override (default: credentials.yaml). "
+        "Use 'parallel' for whole-node fan-out on Rockfish.",
+    )
+    ap.add_argument(
+        "--time-limit",
+        default="00:20:00",
+        help="SLURM time limit per array task.",
+    )
     ap.add_argument(
         "--configs",
         nargs="+",
@@ -207,6 +225,8 @@ def main() -> None:
             seed=args.seed,
             priors_csv=DEFAULT_PRIORS_CSV,
             params=DEFAULT_SAMPLED_PARAMS,
+            partition=args.partition,
+            time_limit=args.time_limit,
         )
         print(
             f"    wall={timing['wall_s']:.1f}s  "

@@ -488,6 +488,71 @@ configs. All 4000 sims across the table succeeded (100%).
    `COMPLETED` and `sum_sim` values match across all three scenario
    runs.
 
+### Partition switch: `shared` → `parallel` (2026-04-16)
+
+After the 1k-sim scenario bench, the next question was how to scale toward
+1M sims in a 5–10 min wall window. The `shared` partition caps per-job
+allocation to 1 node (`MaxNodes=1`), and the 32-CPU `shared` QOS practically
+limits fan-out to ~160 CPUs in-flight (40 tasks × 4 cpus). The `parallel`
+partition is the big one: 712 nodes × 48 CPUs = 34,176 CPUs total, ~15,000
+idle at any moment, no GrpTRES cap on the `apopel1` account, with
+`ExclusiveUser=YES` (whole nodes). For evolve-dominated scenarios that's
+a ~6× increase in in-flight CPUs.
+
+`bench_cpp_scenarios.py` gained `--partition` and `--time-limit` args
+(and the existing `--cpus-per-task` / `--memory` already handled the
+whole-node ask).
+
+**10k × gvax-nivo, `parallel`, whole-node tasks:**
+
+| metric | value |
+|---|---|
+| tasks | 20 (× 500 sims each) |
+| cpus/task | 48 (full node via `ExclusiveUser=YES`) |
+| memory/task | 180G |
+| wall (first-start → last-end) | **34s** |
+| per-task wall | 25–29s (tight spread) |
+| sum task compute | ~526s |
+| parallelism | 15.5× (single wave, all 20 tasks ran concurrently) |
+| **ms/sim wall** | **3.4** |
+| evolve-rejected sims | ~16% (biologically implausible param draws; returned as `STATUS_FAILED` NaN rows in Parquet) |
+
+**Comparison**: 1k gvax-nivo on `shared` was 27 ms/sim wall; 10k on
+`parallel` is 3.4 ms/sim — **~8× better cluster throughput**.
+
+The ~8× factor decomposes cleanly:
+- **~6× from more CPUs in flight** (160 → 960)
+- **~1.3× from amortizing fixed per-task overhead** (5–8s of module
+  load + venv activate + Python import) over 500 sims/task instead of
+  25 sims/task
+
+A small countervailing loss (~30% per-CPU throughput at 48-worker
+ProcessPool vs 4-worker — NUMA + shared-bus contention on a full
+node) is easily swamped by the 12× cpus/task.
+
+**Invocation** for future runs:
+
+```bash
+uv run python scripts/bench_cpp_scenarios.py \
+  --n-sims 10000 --jobs-per-chunk 500 \
+  --cpus-per-task 48 --memory 180G \
+  --partition parallel --time-limit 00:30:00 \
+  --configs gvax-nivo
+```
+
+**Gotchas**:
+
+1. **`192G` memory request fails on `parallel`** even though `MaxMemPerCPU=4000` × 48 = 192000 MB. SLURM interprets `G` as `1024*1024*1024` bytes (196608 MB > 192000 cap). Use `180G` — works cleanly. The SLURM error is misleading: "CPU count per node can not be satisfied" when the actual failure is memory.
+2. **Evolve-to-diagnosis rejections are not bugs.** `qsp_sim` exits 2 when the evolve rejects (max_days exceeded, or diagnosis too fast). CppBatchRunner sees this as `QspSimError`, records `STATUS_FAILED`, writes a NaN row. ~16% of 10k lognormal param draws hit one of the rejection criteria — this is the model correctly flagging implausible draws.
+3. **Pool cleanup timeout.** `ssh hpc "rm -rf {pool_dir}"` can stall past 60s on 10k+ sim pools (~15 GB). Bench scripts now use `timeout=600`.
+
+**Extrapolation to 1M**: sim-work-per-sim term (the asymptotic floor
+set by `per_sim_cpu_time / total_cpus_in_flight`) is ~1.7 ms/sim wall
+at 960 CPUs. At 4000+ CPUs (say 100 whole nodes), the floor drops to
+~0.4 ms/sim wall and 1M lands in ~6–7 min. Practical cap is queue
+contention + SLURM dispatch lag at very high concurrency; 3–10 min
+for 1M gvax-nivo on `parallel` is the realistic window.
+
 ### Performance milestones (SPQSP_PDAC branch `cpp-sweep-binary-io`)
 
 1. **simOdeSample** (commit 62571257): lets CVODE keep internal history

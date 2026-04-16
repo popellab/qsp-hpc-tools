@@ -526,18 +526,19 @@ class HPCJobManager:
             raise ValueError("cpp.binary_path must be set in credentials.yaml")
 
         # Derive repo_path from the binary path if not explicitly configured.
-        # Convention: {repo}/PDAC/qsp/sim/build/qsp_sim → parents[3] is {repo}.
+        # Convention: {repo}/PDAC/qsp/sim/build/qsp_sim — 5 intermediate parts
+        # (build, sim, qsp, PDAC, {repo}) so parents[4] is {repo}.
         if repo_path is None:
             repo_path = self.config.cpp_repo_path
             if not repo_path:
                 parents = Path(binary_path).parents
-                if len(parents) < 4:
+                if len(parents) < 5:
                     raise ValueError(
                         f"Cannot derive cpp.repo_path from binary_path={binary_path!r}. "
                         "Expected layout: {repo}/PDAC/qsp/sim/build/qsp_sim. "
                         "Set cpp.repo_path explicitly in credentials.yaml."
                     )
-                repo_path = str(parents[3])
+                repo_path = str(parents[4])
         branch = branch or self.config.cpp_branch
 
         build_modules = self.config.cpp_build_modules or self.config.cpp_runtime_modules
@@ -580,17 +581,21 @@ class HPCJobManager:
                 if status != 0:
                     raise RuntimeError(f"git pull failed on HPC (rc={status}):\n{output}")
 
-        # 2. Incremental build. mkdir -p + cmake .. is near-zero when the
-        #    build dir exists and CMakeCache is valid; make is near-zero when
-        #    objects are up-to-date. First build or post-edit pays the real
-        #    compile cost here.
+        # 2. Incremental build. Skip explicit `cmake ..` when CMakeCache.txt
+        #    already exists — otherwise FetchContent re-verifies SUNDIALS +
+        #    yaml-cpp git refs and burns ~60s per submit for no real work.
+        #    `cmake --build` still auto-re-runs configure via the generator's
+        #    dependency tracking if CMakeLists.txt has been modified, so real
+        #    CMake-level changes aren't missed. First build (no cache yet)
+        #    pays the full SUNDIALS+yaml-cpp fetch once.
         if not skip_build:
             with log_operation(self.logger, "cmake --build --target qsp_sim"):
                 build_cmd = (
                     f"set -e && {module_prelude} && "
-                    f"cd {shlex.quote(sim_dir)} && "
-                    "mkdir -p build && cd build && "
-                    "cmake .. -DCMAKE_BUILD_TYPE=Release >/dev/null && "
+                    f"cd {shlex.quote(sim_dir)} && mkdir -p build && cd build && "
+                    "if [ ! -f CMakeCache.txt ]; then "
+                    "  cmake .. -DCMAKE_BUILD_TYPE=Release; "
+                    "fi && "
                     'cmake --build . --target qsp_sim -j "$(nproc)"'
                 )
                 # 10 min ceiling covers a cold SUNDIALS+KLU+yaml-cpp fetch+build.

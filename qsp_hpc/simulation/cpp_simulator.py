@@ -81,6 +81,8 @@ class CppSimulator:
         remote_binary_path: Optional[str] = None,
         remote_template_xml: Optional[str] = None,
         verbose: bool = False,
+        evolve_cache: bool = True,
+        evolve_cache_root: Optional[str | Path] = None,
     ):
         self.priors_csv = Path(priors_csv)
         if not self.priors_csv.exists():
@@ -145,6 +147,24 @@ class CppSimulator:
             reader = csv.DictReader(f)
             self.param_names = [row["name"] for row in reader]
 
+        # Evolve-to-diagnosis cache (M13). Keyed on the rendered param-XML
+        # hash and shared across scenarios for the same theta, so
+        # multi-arm sweeps pay one evolve (~95% of per-sim cost) per theta
+        # instead of one per scenario. Location lives OUTSIDE the per-
+        # scenario pool directory so baseline + treatment arms of the
+        # same theta hit the same cache.
+        #
+        # Silently inert when healthy_state_yaml is None (nothing to
+        # cache without an evolve phase) or evolve_cache=False.
+        if evolve_cache and self.healthy_state_yaml is not None:
+            self.evolve_cache_root = Path(
+                evolve_cache_root
+                if evolve_cache_root is not None
+                else self.cache_dir / "evolve_cache"
+            ).resolve()
+        else:
+            self.evolve_cache_root = None
+
         self._runner = CppBatchRunner(
             binary_path=binary_path,
             template_path=template_xml,
@@ -153,6 +173,7 @@ class CppSimulator:
             scenario_yaml=self.scenario_yaml,
             drug_metadata_yaml=self.drug_metadata_yaml,
             healthy_state_yaml=self.healthy_state_yaml,
+            evolve_cache_root=self.evolve_cache_root,
         )
 
         self.config_hash = self._compute_config_hash()
@@ -195,6 +216,9 @@ class CppSimulator:
             ),
             "healthy_state_yaml": (
                 str(self.healthy_state_yaml) if self.healthy_state_yaml else "-"
+            ),
+            "evolve_cache_root": (
+                str(self.evolve_cache_root) if self.evolve_cache_root else "disabled"
             ),
         }
         for line in format_config(config_info):
@@ -757,6 +781,7 @@ class CppSimulator:
                 model_structure_file=(
                     str(self.model_structure_file) if self.model_structure_file else None
                 ),
+                evolve_cache=self.evolve_cache_root is not None,
             )
         finally:
             params_csv.unlink(missing_ok=True)

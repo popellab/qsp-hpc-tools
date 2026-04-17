@@ -751,6 +751,7 @@ class HPCJobManager:
         test_stats_csv: Optional[str] = None,
         test_stats_hash: Optional[str] = None,
         model_structure_file: Optional[str] = None,
+        evolve_cache: bool = True,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
 
@@ -816,6 +817,15 @@ class HPCJobManager:
                 ``derive_test_stats=True`` — without it the worker tags
                 every species as dimensionless and most calibration-target
                 ``.to('cell/mm**2')``-style conversions silently NaN out.
+            evolve_cache: When True (default) and ``healthy_state_yaml`` is
+                set, each array task reuses a post-``evolve_to_diagnosis``
+                ODE state cache at
+                ``{simulation_pool_path}/evolve_cache/`` on scratch (M13).
+                Multi-scenario sweeps over the same theta amortize the
+                ~857-day evolve across scenarios: the first task builds
+                the QSTH blob under an ``fcntl`` lock, later tasks skip
+                evolve via ``--initial-state``. No effect when
+                ``healthy_state_yaml`` is None (no evolve phase to cache).
 
         Returns:
             :class:`JobInfo` with job ID(s) and state file. When
@@ -892,6 +902,14 @@ class HPCJobManager:
         remote_drug_meta = self._upload_scenario_yaml(drug_metadata_yaml, "drug_metadata.yaml")
         remote_healthy = self._upload_scenario_yaml(healthy_state_yaml, "healthy_state.yaml")
 
+        # Evolve-cache root lives on scratch alongside the per-scenario
+        # sim pools so every scenario job hitting the same theta shares
+        # one cached QSTH blob. Silently inert without healthy_state_yaml
+        # (no evolve phase to cache).
+        evolve_cache_root: Optional[str] = None
+        if evolve_cache and remote_healthy:
+            evolve_cache_root = f"{self.config.simulation_pool_path}/evolve_cache"
+
         self.logger.info("Uploading C++ job configuration and parameters...")
         self._upload_cpp_job_config(
             binary_path=binary_path,
@@ -909,6 +927,7 @@ class HPCJobManager:
             scenario_yaml=remote_scenario,
             drug_metadata_yaml=remote_drug_meta,
             healthy_state_yaml=remote_healthy,
+            evolve_cache_root=evolve_cache_root,
         )
         self._upload_parameter_csv(samples_csv)
 
@@ -1004,6 +1023,7 @@ class HPCJobManager:
         scenario_yaml: Optional[str] = None,
         drug_metadata_yaml: Optional[str] = None,
         healthy_state_yaml: Optional[str] = None,
+        evolve_cache_root: Optional[str] = None,
     ) -> None:
         """Create and upload C++ job configuration JSON."""
         import json
@@ -1028,6 +1048,8 @@ class HPCJobManager:
             "scenario_yaml": scenario_yaml,
             "drug_metadata_yaml": drug_metadata_yaml,
             "healthy_state_yaml": healthy_state_yaml,
+            # Absolute remote path; None disables the M13 evolve-cache.
+            "evolve_cache_root": evolve_cache_root,
         }
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:

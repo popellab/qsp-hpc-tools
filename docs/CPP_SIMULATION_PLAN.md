@@ -342,6 +342,181 @@ At 1M-scale (200 GB+ raw), a few efficiency moves matter:
   if we bump sims/chunk higher to amortize the 5–8s startup, streaming
   the Parquet rather than loading it all becomes worthwhile.
 
+### M13 — Cache evolve-to-diagnosis state across scenarios
+
+*Est: 1–2 days C++ + 0.5 day Python.*
+
+**Motivation.** The M10 benchmark showed `evolve_to_diagnosis` is ~95%
+of per-sim work (857-day healthy-state integration; the 1d/21d/30d
+post-diagnosis leg is noise). For multi-scenario sweeps that share
+theta (baseline + treatment arms on the same parameter set), every
+scenario currently re-runs the full evolve. Caching the post-evolve
+ODE state per theta collapses N scenarios from ~N×T_evolve to
+~T_evolve + N×T_post — roughly an N× speedup on the dominant term.
+
+Deterministic in theta: same param-XML → identical ODE state at
+diagnosis, independent of scenario (scenarios only affect
+post-diagnosis dosing/events). So the cache key is a function of
+theta + evolve-affecting knobs, and the scenario YAML is **not** part
+of it.
+
+#### C++ CLI contract (qsp_sim)
+
+Two new flags, mutually exclusive with each other but both compatible
+with `--scenario`:
+
+- `--dump-state <path>`: run only the evolve-to-diagnosis phase (uses
+  `--evolve-to-diagnosis <healthy_state.yaml>` as today), serialize
+  the post-evolve ODE state to `<path>`, and exit 0. Do **not** run
+  the scenario / post-diagnosis sim. Any `--binary-out` etc. are
+  ignored (warn).
+- `--initial-state <path>`: skip evolve entirely. Load `<path>` as the
+  ODE ICs, set internal `t0 = t_diagnosis_days` from the file header,
+  then proceed with the normal post-diagnosis sim (scenario + dosing
+  + `simOdeSample` loop). Error if combined with
+  `--evolve-to-diagnosis` on the same invocation.
+
+Binary format for the dumped state (little-endian, extends the M1
+binary-v2 style):
+
+```
+magic:          uint32    0x53545148   "QSTH" (Qsp STate Header)
+version:        uint32    1
+n_species:      uint64    must match binary produced by the same qsp_sim build
+t_diagnosis:   float64   days (from EvolveResult.t_diagnosis_days)
+vt_diameter:   float64   cm   (from EvolveResult.diameter_cm, for audit)
+params_hash:   char[32]  hex-truncated SHA-256 of the rendered param-XML
+                          contents — qsp_sim refuses --initial-state if the
+                          current XML hashes differently (guard against
+                          mismatched-theta reuse).
+state:         float64[n_species]   (row-major ODE_system state vector,
+                                     same order as ODE_system::getHeader())
+```
+
+`params_hash` is verified but not computed by qsp_sim — Python passes
+it in via a new `--params-hash <hex>` flag on the dump/initial-state
+calls (keeps qsp_sim file-I/O only; avoids pulling a SHA lib into the
+C++ build).
+
+#### Python-side cache layout
+
+Cache directory, co-located with the existing sim pool so scratch
+quotas and cleanup policies match:
+
+```
+<pool_dir>/                        # e.g. .../cpp_mvp1_a3f7b2c8_scenario/
+  evolve_cache/
+    <theta_hash>.state.bin         # QSTH blob
+    <theta_hash>.meta.json         # t_diagnosis, vt_diameter, params_hash,
+                                   # qsp_sim_version, healthy_state_hash,
+                                   # created_at
+```
+
+`<theta_hash>` = SHA-256(rendered param-XML bytes) — the same bytes
+qsp_sim sees, so there's zero ambiguity. Truncated to 16 hex chars in
+the filename (full hash stored in meta.json).
+
+Cache is **shared across scenarios for the same theta**, so it lives
+*above* the per-scenario pool, not inside it. Concretely:
+
+```
+<cpp_cache_root>/
+  evolve_cache/
+    <model_version>_<healthy_state_hash[:8]>/
+      <theta_hash>.state.bin
+      <theta_hash>.meta.json
+  cpp_mvp1_a3f7b2c8_baseline_no_treatment/
+    batch_*.parquet
+  cpp_mvp1_a3f7b2c8_folfirinox/
+    batch_*.parquet
+```
+
+`<cpp_cache_root>` defaults to `cache/cpp_simulations/` locally and
+the HPC `simulation_pool_path` remotely (same as today).
+`<healthy_state_hash[:8]>` segments the cache by healthy-state YAML
+contents so edits to that file invalidate every entry automatically.
+
+#### CppRunner / CppSimulator changes
+
+1. `CppRunner.run_one(..., evolve_state_path: Path | None = None,
+   dump_evolve_state_to: Path | None = None)`:
+   - If `evolve_state_path` is set → pass `--initial-state` +
+     `--params-hash` instead of `--evolve-to-diagnosis`.
+   - If `dump_evolve_state_to` is set → pass `--dump-state` +
+     `--params-hash`, return an `EvolveDumpResult` (no trajectory).
+   - Both default None; current behavior unchanged.
+
+2. New helper `CppEvolveCache` (in `qsp_hpc/cpp/evolve_cache.py`):
+   - `get_or_build(theta_hash, params_xml_bytes, workdir) -> Path`
+     — returns a path to a cached `.state.bin`, building it via
+     `CppRunner` (dump-only) if absent. Lock file (`.lock` alongside
+     the blob) to avoid concurrent builds racing on the same theta.
+   - `load_meta(theta_hash) -> dict` for diagnostics.
+
+3. `CppBatchRunner`: when `healthy_state_yaml` is set and
+   `evolve_cache` is provided, for each sim in the batch:
+   - Compute `theta_hash` from rendered param-XML.
+   - `get_or_build` → path.
+   - Run sim with `evolve_state_path=...` instead of
+     `healthy_state_yaml=...`.
+   This keeps batch scheduling unchanged; the first sim per theta
+   pays the evolve cost, subsequent scenarios reuse it.
+
+4. `CppSimulator`: new kwarg `evolve_cache: bool = True`. When True
+   and `healthy_state_yaml` is set, wire the cache through. Config
+   hash **does not** include evolve-cache state (it's a pure
+   derived-compute cache, not a semantic input).
+
+#### HPC path
+
+The chained SLURM approach scales naturally:
+
+- Option A (simple): evolve cache lives on scratch, shared across
+  scenario jobs. First scenario to run a theta writes the blob;
+  later scenarios read it. File lock handles the race. No new job
+  type needed.
+- Option B (explicit, if Option A is contended at 1M-scale): add a
+  standalone "evolve prep" array job that materializes the entire
+  cache for a theta list up-front, then scenario array jobs depend
+  on it via `--dependency=afterok`. Same chaining pattern as M9
+  derivation. Defer this until A is measured and proves to be a
+  bottleneck.
+
+#### Invalidation
+
+Cache entry is valid iff **all** of:
+- `meta.json.params_hash` matches SHA-256 of the current rendered
+  param-XML (guards param-name or value changes).
+- `meta.json.healthy_state_hash` matches the current
+  `healthy_state.yaml` bytes.
+- `meta.json.qsp_sim_version` matches the current binary (embed a
+  git-describe string at build time; qsp_sim already has the plumbing
+  for this via the existing version stamping).
+
+Any mismatch → rebuild, overwrite blob and meta. No manual eviction
+needed for normal workflows; a `CppEvolveCache.clear()` helper
+handles the rare case of wanting a full purge.
+
+#### Tradeoffs / risks
+
+- **Storage**: ~164 species × 8 bytes = ~1.3 KB per theta. 1M thetas
+  ≈ 1.3 GB. Trivial compared to trajectory Parquet.
+- **Scenario-affects-evolve escape hatch**: if a future scenario
+  needs to modify pre-diagnosis params (none do today), the cache
+  key must grow to include scenario. Gate behind a
+  `scenario_affects_evolve: bool` field in the scenario YAML; when
+  true, skip cache for that scenario.
+- **Binary compatibility**: `n_species` and species-order must match
+  between dump and load. The `qsp_sim_version` guard handles the
+  common case; the `n_species` header check catches any remaining
+  mismatch at load time.
+- **Race on first scenario**: without a lock, two parallel workers
+  hitting the same theta both run evolve, one wins, the other's
+  write is wasted. Advisory file lock (`fcntl.flock` on `.lock`) is
+  the smallest fix; losers wait on the lock, then read the winner's
+  blob. Add from day one — it's cheap and the alternative is silent
+  duplicate work.
+
 ## Completed milestones and benchmarks (2026-04-15 through 2026-04-16)
 
 ### M1-M7 + M10: DONE
@@ -719,3 +894,8 @@ production-viable for no-dosing sweeps.
   credentials / partition change.
 - **M12** (compression + column pruning for 1M-scale) — ~1 day, small
   Parquet changes.
+- **M13** (cache evolve-to-diagnosis across scenarios) — ~1.5–2.5 days
+  total (C++ + Python). Highest-leverage remaining optimization for
+  multi-scenario sweeps: ~N× speedup on the dominant term when a
+  theta is run under N treatment arms, since evolve is ~95% of
+  per-sim work.

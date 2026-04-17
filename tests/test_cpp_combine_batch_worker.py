@@ -197,10 +197,10 @@ class TestCombineChunks:
     def test_fewer_chunks_than_expected_still_succeeds(self, staging_pool):
         """If a pathological task fails to write its chunk (e.g. wall-time
         kill after log-flush but before parquet flush), combine should still
-        produce a consolidated batch from what's available — the combined
-        rowcount just reflects the chunks that made it to disk, and n_sims
-        in the filename reflects the expected total so downstream tooling
-        can spot the drop-out."""
+        produce a consolidated batch from what's available. The filename
+        encodes the ACTUAL row count — not the requested n_simulations —
+        so downstream filename-based sim-counters (count_pool_simulations)
+        don't overreport and trigger spurious re-derivations."""
         from qsp_hpc.batch.cpp_combine_batch_worker import combine_chunks
 
         pool_base, staging = staging_pool
@@ -212,14 +212,16 @@ class TestCombineChunks:
                 "pool_id": pool_id,
                 "staging_dir": str(staging),
                 "scenario": "scen",
-                "n_simulations": 20,  # expected total; filename reflects this
+                "n_simulations": 20,  # requested — may not be achievable
                 "seed": 2025,
                 "expected_chunks": 5,
             }
         )
         assert out.exists()
-        assert out.name.endswith("_scen_20sims_seed2025.parquet")
-        # Combined file has the rows that actually made it (3 chunks × 4 sims).
+        # Filename reflects actual delivered count (12 = 3 chunks × 4 sims),
+        # not the 20 originally requested.
+        assert out.name.endswith("_scen_12sims_seed2025.parquet")
+        assert "_scen_20sims_" not in out.name
         table = pq.read_table(str(out))
         assert table.num_rows == 12
 

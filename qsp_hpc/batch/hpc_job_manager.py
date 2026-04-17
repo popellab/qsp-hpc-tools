@@ -1436,22 +1436,29 @@ class HPCJobManager:
             if status == 0:
                 try:
                     n_derived = int(output.strip())
-                    if n_derived < expected_n_sims:
-                        # Not enough derived - need to derive more
-                        self.logger.info(
-                            f"  Warning:  Not enough derived test stats: {n_derived} < {expected_n_sims} needed"
-                        )
-                        self.logger.info("   Will derive additional batches")
-                        # Delete old derived test stats so they get re-derived
-                        self.transport.exec(f'rm -rf "{test_stats_dir}"')
+                    if n_derived == 0:
+                        # Truly empty — need to derive
+                        self.logger.info("  Derived test stats empty — will derive")
                         return False
-                    elif n_derived > expected_n_sims:
-                        # Have more than needed - that's fine!
+                    if n_derived < expected_n_sims:
+                        # n_derived cannot exceed the pool's actual row
+                        # count — if it's less than expected, the pool
+                        # itself is short (e.g. some array tasks dropped
+                        # chunks). Deleting and re-deriving produces the
+                        # same count and wastes compute. Keep the existing
+                        # derivations; the caller's Tier 1 load + Tier 3.5
+                        # top-up handle the shortfall by submitting the
+                        # missing delta to the pool.
                         self.logger.info(
-                            f"   Found {n_derived} derived sims (need {expected_n_sims}) - using existing"
+                            f"   Found {n_derived} derived sims (expected "
+                            f"{expected_n_sims}); reusing — caller can top up."
+                        )
+                    elif n_derived > expected_n_sims:
+                        self.logger.info(
+                            f"   Found {n_derived} derived sims (need "
+                            f"{expected_n_sims}) - using existing"
                         )
                     else:
-                        # Exact match
                         self.logger.info(
                             f"   Derived test stats count matches: {n_derived} simulations"
                         )

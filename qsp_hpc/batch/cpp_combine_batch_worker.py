@@ -97,16 +97,30 @@ def combine_chunks(config: dict) -> Path:
         idx = combined.column_names.index("simulation_id")
         combined = combined.set_column(idx, "simulation_id", new_ids)
 
+    # Filename encodes the ACTUAL number of rows written (combined.num_rows),
+    # not n_sims from the config. When some array tasks fail to flush their
+    # parquet (e.g. wall-time kills on oversubscribed nodes), the combined
+    # batch has fewer rows than requested. Trusting the config count here
+    # would cause count_pool_simulations (which parses `{N}sims` from the
+    # filename) to overreport, and the Tier 2 check_hpc_test_stats would
+    # then keep nuking the derived test_stats and re-deriving them
+    # indefinitely because derived_count < filename_count.
+    #
     # Microsecond-resolution timestamp prevents filename collisions when
     # two combines for the same pool complete within the same wall-second
-    # (e.g. quick top-up after the initial batch finishes). The suffix
-    # stays parseable: _batch_pattern's (\d{8}_\d{6}) still matches the
-    # first 15 chars; the _\d{6} microsecond slice is optional and
-    # consumed by the (?:_task\d+)? branch's permissiveness, since we
-    # keep that regex for backward compat.
+    # (e.g. quick top-up after the initial batch finishes).
+    n_rows_written = combined.num_rows
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"batch_{ts}_{scenario}_{n_sims}sims_seed{seed}.parquet"
+    filename = f"batch_{ts}_{scenario}_{n_rows_written}sims_seed{seed}.parquet"
     output_path = pool_dir / filename
+    if n_rows_written != n_sims:
+        logger.warning(
+            "Actual row count %d differs from requested %d "
+            "(%d chunks lost) — naming batch by actual count",
+            n_rows_written,
+            n_sims,
+            n_sims - n_rows_written,
+        )
 
     # Atomic write: temp file in same dir, then rename. Prevents a reader
     # from seeing a partial parquet if the process is killed mid-write.

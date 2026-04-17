@@ -210,6 +210,8 @@ class CppRunner:
         workdir: str | Path,
         timeout_s: float | None = None,
         keep_files: bool = False,
+        evolve_state_path: str | Path | None = None,
+        params_hash: str | None = None,
     ) -> SimResult:
         """Run one simulation end-to-end.
 
@@ -225,10 +227,27 @@ class CppRunner:
             keep_files: If True, leave XML + binary on disk after parsing
                 (useful for debugging). If False, delete on success;
                 always keep on failure.
+            evolve_state_path: If provided, pass ``--initial-state`` to
+                qsp_sim instead of ``--evolve-to-diagnosis`` — skips the
+                ~857-day healthy-state integration by loading a previously
+                dumped ODE state. Mutually exclusive with any runner-level
+                ``healthy_state_yaml`` for this call: the cached state
+                supersedes it. Typically supplied by
+                :class:`CppEvolveCache`.
+            params_hash: Optional SHA-256 hex of the rendered param-XML
+                bytes, passed to qsp_sim as ``--params-hash`` for
+                cache-consistency checks. Required when
+                ``evolve_state_path`` is set (without it, qsp_sim cannot
+                verify the cached state matches the current theta).
 
         Returns:
             SimResult with trajectory, species_names, dt, t_end.
         """
+        if evolve_state_path is not None and params_hash is None:
+            raise ValueError(
+                "run_one: params_hash is required when evolve_state_path "
+                "is set — it guards against theta/cache drift"
+            )
         work = Path(workdir)
         work.mkdir(parents=True, exist_ok=True)
         sim_id = uuid.uuid4().hex[:12]
@@ -264,7 +283,20 @@ class CppRunner:
                 "--drug-metadata",
                 str(self.drug_metadata_yaml),
             ]
-        if self.healthy_state_yaml is not None:
+        if evolve_state_path is not None:
+            # qsp_sim's QSTH header stores a 32-char params_hash. Truncate
+            # here so callers can pass the full 64-char SHA-256 digest
+            # (which is what the cache keeps for filenames / diagnostics)
+            # without having to know the on-wire length.
+            from qsp_hpc.cpp.evolve_cache import wire_hash
+
+            cmd += [
+                "--initial-state",
+                str(evolve_state_path),
+                "--params-hash",
+                wire_hash(params_hash),
+            ]
+        elif self.healthy_state_yaml is not None:
             cmd += ["--evolve-to-diagnosis", str(self.healthy_state_yaml)]
 
         try:
@@ -349,6 +381,82 @@ class CppRunner:
             dt_days=header.dt_days,
             t_end_days=header.t_end_days,
         )
+
+    def dump_evolve_state(
+        self,
+        params: Mapping[str, float],
+        params_hash: str,
+        state_out: str | Path,
+        workdir: str | Path,
+        *,
+        timeout_s: float | None = None,
+    ) -> Path:
+        """Run qsp_sim's evolve-to-diagnosis phase only, serializing the
+        post-evolve ODE state to ``state_out`` (QSTH binary blob).
+
+        This is the cache-population path used by
+        :class:`CppEvolveCache`. No trajectory output is produced — qsp_sim
+        exits 0 as soon as it has written the blob. ``params_hash`` is
+        stamped into the blob header so the corresponding load
+        (``--initial-state``) can verify it against the current theta.
+
+        Returns the resolved ``state_out`` path on success.
+        """
+        if self.healthy_state_yaml is None:
+            raise ValueError(
+                "dump_evolve_state requires runner.healthy_state_yaml — "
+                "the dump is the result of evolving from that YAML's "
+                "healthy IC"
+            )
+        work = Path(workdir)
+        work.mkdir(parents=True, exist_ok=True)
+        out = Path(state_out).resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        sim_id = uuid.uuid4().hex[:12]
+        xml_path = work / f"{sim_id}.dump.xml"
+        self._renderer.render_to_file(params, xml_path)
+
+        cmd = [
+            str(self.binary_path),
+            "--param",
+            str(xml_path),
+            "--evolve-to-diagnosis",
+            str(self.healthy_state_yaml),
+            "--dump-state",
+            str(out),
+            "--params-hash",
+            params_hash,
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s if timeout_s is not None else self.default_timeout_s,
+            )
+        except subprocess.TimeoutExpired as e:
+            self._stash_failure(work, sim_id, xml_path, reason="dump-timeout")
+            raise QspSimError(
+                f"qsp_sim --dump-state timed out after {e.timeout}s for "
+                f"sim {sim_id}; XML preserved at "
+                f"{work / 'failed' / f'{sim_id}.dump-timeout.xml'}"
+            ) from e
+
+        if proc.returncode != 0:
+            stash = self._stash_failure(work, sim_id, xml_path, reason="dump-nonzero-exit")
+            raise QspSimError(
+                f"qsp_sim --dump-state exited {proc.returncode} for sim "
+                f"{sim_id}.\n  XML: {stash}\n"
+                f"  stderr:\n{_indent(proc.stderr)}"
+            )
+        if not out.exists():
+            stash = self._stash_failure(work, sim_id, xml_path, reason="dump-missing-output")
+            raise QspSimError(
+                f"qsp_sim --dump-state exited 0 but {out} was not written."
+                f"\n  XML: {stash}\n  stderr:\n{_indent(proc.stderr)}"
+            )
+        xml_path.unlink(missing_ok=True)
+        return out
 
     @staticmethod
     def _stash_failure(work: Path, sim_id: str, xml_path: Path, reason: str) -> Path:

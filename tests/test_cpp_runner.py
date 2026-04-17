@@ -320,7 +320,14 @@ def test_real_qsp_sim_end_to_end(tmp_path: Path):
         dt_days=1.0,
         workdir=tmp_path,
     )
-    assert result.trajectory.shape == (6, 164)  # 5 days + t=0, 164 species
+    # Binary v2 emits species + compartments + rules as concatenated
+    # columns; check species count via species_names and validate the
+    # full width equals species+comps+rules rather than hardcoding 164.
+    n_t, n_cols = result.trajectory.shape
+    assert n_t == 6  # 5 days + t=0
+    assert n_cols == len(result.species_names) + len(result.compartment_names) + len(
+        result.rule_names
+    )
     assert len(result.species_names) == 164
     assert "V_T.C1" in result.species_names
     # First row is initial conditions; should be finite and non-NaN.
@@ -444,7 +451,12 @@ def test_real_qsp_sim_evolve_to_diagnosis(tmp_path: Path):
         workdir=tmp_path,
     )
     # 3 post-diagnosis days at dt=1.0 → 4 rows (t=0, 1, 2, 3).
-    assert result.trajectory.shape == (4, 164)
+    n_t, n_cols = result.trajectory.shape
+    assert n_t == 4
+    assert n_cols == len(result.species_names) + len(result.compartment_names) + len(
+        result.rule_names
+    )
+    assert len(result.species_names) == 164
     # After evolve_to_diagnosis, V_T should equal ~17mL (3.2cm-diameter sphere)
     # at user t=0 — unambiguously different from the "healthy" microinvasive IC
     # (~4e-5 mL) we'd see without --evolve-to-diagnosis. qsp_sim writes

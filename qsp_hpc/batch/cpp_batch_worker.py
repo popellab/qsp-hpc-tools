@@ -52,6 +52,11 @@ def run_chunk(config: dict, array_idx: int) -> None:
     scenario_yaml = config.get("scenario_yaml")
     drug_metadata_yaml = config.get("drug_metadata_yaml")
     healthy_state_yaml = config.get("healthy_state_yaml")
+    # M13: shared evolve-to-diagnosis cache on scratch. First task to hit
+    # a given theta runs evolve + writes the QSTH blob under an advisory
+    # fcntl lock; every other task (including future scenario arrays) for
+    # the same theta skips evolve via --initial-state. None disables.
+    evolve_cache_root = config.get("evolve_cache_root")
 
     start = array_idx * jobs_per_chunk
     end = min(start + jobs_per_chunk, n_simulations)
@@ -122,6 +127,7 @@ def run_chunk(config: dict, array_idx: int) -> None:
         scenario_yaml=scenario_yaml,
         drug_metadata_yaml=drug_metadata_yaml,
         healthy_state_yaml=healthy_state_yaml,
+        evolve_cache_root=evolve_cache_root,
     )
 
     result = runner.run(

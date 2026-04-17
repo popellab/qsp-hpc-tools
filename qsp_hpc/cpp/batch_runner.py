@@ -35,6 +35,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from qsp_hpc.cpp.evolve_cache import CppEvolveCache
 from qsp_hpc.cpp.param_xml import ParamNotFoundError
 from qsp_hpc.cpp.runner import CppRunner, QspSimError, SimResult
 
@@ -66,6 +67,11 @@ class BatchResult:
 # every sim.
 _WORKER_RUNNER: CppRunner | None = None
 _WORKER_WORKDIR: Path | None = None
+# Optional: when the batch was constructed with evolve_cache_root, workers
+# hold a CppEvolveCache keyed on the same healthy_state_yaml / qsp_sim
+# binary. Workers lookup via the cache per-sim; the fcntl lock inside
+# get_or_build serializes builds across workers hitting the same theta.
+_WORKER_EVOLVE_CACHE: CppEvolveCache | None = None
 
 
 def _worker_init(
@@ -77,8 +83,9 @@ def _worker_init(
     scenario_yaml: str | None,
     drug_metadata_yaml: str | None,
     healthy_state_yaml: str | None,
+    evolve_cache_root: str | None,
 ) -> None:
-    global _WORKER_RUNNER, _WORKER_WORKDIR
+    global _WORKER_RUNNER, _WORKER_WORKDIR, _WORKER_EVOLVE_CACHE
     _WORKER_RUNNER = CppRunner(
         binary_path=binary_path,
         template_path=template_path,
@@ -92,6 +99,15 @@ def _worker_init(
     # `failed/` folder or race on UUID collisions (unlikely but cheap).
     _WORKER_WORKDIR = Path(workdir) / f"worker_{os.getpid()}"
     _WORKER_WORKDIR.mkdir(parents=True, exist_ok=True)
+
+    if evolve_cache_root is not None and healthy_state_yaml is not None:
+        _WORKER_EVOLVE_CACHE = CppEvolveCache(
+            cache_root=evolve_cache_root,
+            renderer=_WORKER_RUNNER._renderer,
+            runner=_WORKER_RUNNER,
+        )
+    else:
+        _WORKER_EVOLVE_CACHE = None
 
 
 def _run_one_in_worker(
@@ -113,12 +129,26 @@ def _run_one_in_worker(
     assert _WORKER_RUNNER is not None, "_worker_init must be called first"
     assert _WORKER_WORKDIR is not None
     try:
+        # If the evolve cache is active, materialize the post-evolve state
+        # for this theta (build-if-missing) and pass it to qsp_sim via
+        # --initial-state. Scenarios sharing a theta amortize the evolve
+        # across all runs; the first one pays ~0.5s, the rest ~0ms.
+        evolve_state_path: Path | None = None
+        params_hash: str | None = None
+        if _WORKER_EVOLVE_CACHE is not None:
+            evolve_state_path, params_hash = _WORKER_EVOLVE_CACHE.get_or_build(
+                params,
+                workdir=_WORKER_WORKDIR,
+                timeout_s=timeout_s,
+            )
         result: SimResult = _WORKER_RUNNER.run_one(
             params=params,
             t_end_days=t_end_days,
             dt_days=dt_days,
             workdir=_WORKER_WORKDIR,
             timeout_s=timeout_s,
+            evolve_state_path=evolve_state_path,
+            params_hash=params_hash,
         )
         return (
             sim_id,
@@ -148,6 +178,7 @@ class CppBatchRunner:
         scenario_yaml: str | Path | None = None,
         drug_metadata_yaml: str | Path | None = None,
         healthy_state_yaml: str | Path | None = None,
+        evolve_cache_root: str | Path | None = None,
     ):
         # Validate eagerly so callers fail fast, before we fork workers.
         probe = CppRunner(
@@ -167,6 +198,17 @@ class CppBatchRunner:
         self.drug_metadata_yaml = probe.drug_metadata_yaml
         self.healthy_state_yaml = probe.healthy_state_yaml
         self.parameter_names = probe.parameter_names
+        # evolve_cache_root is propagated to workers. Only meaningful when
+        # healthy_state_yaml is set — without an evolve phase there is
+        # nothing to cache. Silently ignored otherwise so callers that
+        # pass it unconditionally (e.g. CppSimulator) don't have to check.
+        if evolve_cache_root is not None and probe.healthy_state_yaml is None:
+            logger.debug(
+                "evolve_cache_root=%s ignored: no healthy_state_yaml " "(no evolve phase to cache)",
+                evolve_cache_root,
+            )
+            evolve_cache_root = None
+        self.evolve_cache_root = Path(evolve_cache_root).resolve() if evolve_cache_root else None
         # Cache template defaults so the Parquet writer can broadcast every
         # model parameter as a column — sampled params get their per-sim
         # values, non-sampled params get the constant template value. This
@@ -267,6 +309,7 @@ class CppBatchRunner:
                 str(self.scenario_yaml) if self.scenario_yaml else None,
                 str(self.drug_metadata_yaml) if self.drug_metadata_yaml else None,
                 str(self.healthy_state_yaml) if self.healthy_state_yaml else None,
+                str(self.evolve_cache_root) if self.evolve_cache_root else None,
             ),
         ) as pool:
             futures = []

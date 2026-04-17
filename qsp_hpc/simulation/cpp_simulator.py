@@ -400,25 +400,35 @@ class CppSimulator:
     def _load_local_test_stats(self, path: Path) -> Tuple[np.ndarray, np.ndarray]:
         """Load the cached (params, test_stats) Parquet.
 
-        Preserves the parquet's stored column order for ``param:*``
-        columns — this matches the order that :meth:`_persist_local_test_stats`
-        used (derived from ``HPCJobManager._last_param_names``, which in
-        turn matches ``combined_params.csv`` on HPC). Sorting here would
-        re-order columns relative to what Tier 2/3/4 returns directly
-        from HPC download, causing cross-scenario alignment to compare
-        different parameter axes.
+        Returns only the SAMPLED parameter columns (``self.param_names``),
+        filtered by exact column match against the stored
+        ``param:<name>`` headers. Pre-2026-04 parquets followed the
+        "only sampled params are columns" convention; post-2026-04
+        parquets include every template default as a broadcast column
+        so cal-target functions can reach any model parameter. NPE
+        training needs just the sampled set — mixing in constant
+        template-defaults creates zero-variance / zero-valued columns
+        that blow up np.log(theta) in sbi_runner.
 
         Also populates ``self.last_sample_index`` when the cache has the
-        ``sample_index`` column — callers that need cross-scenario
-        alignment (sbi_runner) read it off the instance after run_hpc.
+        ``sample_index`` column.
         """
         table = pq.read_table(str(path))
-        param_cols = [c for c in table.column_names if c.startswith("param:")]
+        col_set = set(table.column_names)
+        # Project to the sampled-priors subset, preserving priors-CSV order
+        # so theta column j always means self.param_names[j] across scenarios.
+        selected = [f"param:{n}" for n in self.param_names if f"param:{n}" in col_set]
+        if len(selected) != len(self.param_names):
+            missing = [n for n in self.param_names if f"param:{n}" not in col_set]
+            raise RuntimeError(
+                f"Local cache at {path} missing {len(missing)} sampled "
+                f"param columns (e.g. {missing[:5]})."
+            )
         ts_cols = sorted(
             (c for c in table.column_names if c.startswith("ts:")),
             key=lambda c: int(c.split(":", 1)[1]),
         )
-        params = np.column_stack([table.column(c).to_numpy() for c in param_cols])
+        params = np.column_stack([table.column(c).to_numpy() for c in selected])
         test_stats = np.column_stack([table.column(c).to_numpy() for c in ts_cols])
         if "sample_index" in table.column_names:
             self.last_sample_index = table.column("sample_index").to_numpy().astype(np.int64)
@@ -538,6 +548,8 @@ class CppSimulator:
             and len(param_names) == params.shape[1]
         ):
             param_names = None
+        # Persist the full set (all param:* columns) so cal-target code
+        # and future re-derivations can reach any template parameter.
         self._persist_local_test_stats(
             self._local_test_stats_path(test_stats_hash),
             params,
@@ -545,6 +557,19 @@ class CppSimulator:
             sample_index=sample_index,
             param_names=param_names,
         )
+        # But return ONLY the sampled-priors subset for NPE training —
+        # constant-valued broadcast columns (zero flags, dimensionless
+        # one-valued toggles) break np.log(theta) downstream.
+        if param_names is not None:
+            idxs = [param_names.index(n) for n in self.param_names if n in param_names]
+            if len(idxs) != len(self.param_names):
+                missing = [n for n in self.param_names if n not in param_names]
+                raise RuntimeError(
+                    f"HPC download missing {len(missing)} sampled param "
+                    f"columns (e.g. {missing[:5]}). Check priors CSV vs "
+                    f"param_all.xml consistency."
+                )
+            params = params[:, idxs]
         return params, test_stats
 
     def _sample_first_n(

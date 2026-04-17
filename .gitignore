@@ -50,3 +50,5 @@ Thumbs.db
 !qsp_hpc/matlab/tests/fixtures/*.csv
 cache/
 simulations/
+# HPC job state pickles written by HPCJobManager._save_job_state
+batch_jobs/

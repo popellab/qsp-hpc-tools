@@ -26,6 +26,12 @@ import pandas as pd
 from qsp_hpc.cpp.batch_runner import CppBatchRunner
 from qsp_hpc.utils.logging_config import setup_logger
 
+# Configure the `qsp_hpc` parent logger so descendant loggers —
+# qsp_hpc.cpp.evolve_cache, qsp_hpc.cpp.batch_runner, etc. — propagate up
+# and their output lands in the SLURM .out/.err files. Without this, only
+# __main__ emits anything and post-mortem debugging of array-task runs
+# has nothing to work with (see #36, surfaced by #34).
+setup_logger("qsp_hpc", verbose=True)
 logger = setup_logger(__name__, verbose=True)
 
 

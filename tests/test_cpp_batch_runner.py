@@ -123,7 +123,9 @@ def test_batch_runner_happy_path(tmp_path: Path, template_path: Path, ok_binary:
 
     table = pq.read_table(out)
     cols = table.column_names
-    assert cols[:3] == ["simulation_id", "status", "time"]
+    # sample_index leads (global theta-pool index — stamped on every row
+    # for cross-scenario alignment), then local simulation_id, status, time.
+    assert cols[:4] == ["sample_index", "simulation_id", "status", "time"]
     assert "param:A" in cols and "param:B" in cols
     # Species columns are list<double>.
     for sp in ("spA", "spB", "spC"):

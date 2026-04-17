@@ -69,6 +69,20 @@ def run_chunk(config: dict, array_idx: int) -> None:
     logger.info("Processing sims [%d, %d) — %d simulations", start, end, chunk_size)
 
     params_df = pd.read_csv(param_csv)
+    # Peel off sample_index (first column, written by CppSimulator
+    # ._write_params_csv — mirrors MATLAB's load_parameter_samples_csv.m).
+    # Without this, rows entering CppBatchRunner would look like an extra
+    # integer-valued "param" and fail the XML template lookup. The index
+    # is forwarded to runner.run so the written parquet carries it, which
+    # downstream multi-scenario alignment relies on.
+    if "sample_index" in params_df.columns:
+        sample_index_all = params_df["sample_index"].astype(np.int64).values
+        sample_indices_chunk = sample_index_all[start:end]
+        params_df = params_df.drop(columns=["sample_index"])
+    else:
+        # Legacy / test CSVs that predate the sample_index convention —
+        # fall back to positional global index (task_offset + local idx).
+        sample_indices_chunk = np.arange(start, end, dtype=np.int64)
     param_names = list(params_df.columns)
     theta_chunk = params_df.iloc[start:end].values.astype(np.float64)
 
@@ -113,6 +127,7 @@ def run_chunk(config: dict, array_idx: int) -> None:
     result = runner.run(
         theta_matrix=theta_chunk,
         param_names=param_names,
+        sample_indices=sample_indices_chunk,
         t_end_days=t_end_days,
         dt_days=dt_days,
         output_path=output_path,

@@ -136,6 +136,10 @@ class CppSimulator:
         # falls back to credentials.yaml's cpp.binary_path / cpp.template_path.
         self.remote_binary_path = remote_binary_path
         self.remote_template_xml = remote_template_xml
+        # Populated by run_hpc() / __call__() with the global theta-pool
+        # indices of the rows returned — sbi_runner reads this to align
+        # scenarios. None until the first simulate call completes.
+        self.last_sample_index: np.ndarray | None = None
 
         with open(self.priors_csv) as f:
             reader = csv.DictReader(f)
@@ -349,6 +353,7 @@ class CppSimulator:
         self._runner.run(
             theta_matrix=theta_new,
             param_names=self.param_names,
+            sample_indices=indices,
             t_end_days=self.t_end_days,
             dt_days=self.dt_days,
             output_path=output_path,
@@ -393,7 +398,15 @@ class CppSimulator:
         return self.pool_dir / "test_stats" / test_stats_hash / "test_stats.parquet"
 
     def _load_local_test_stats(self, path: Path) -> Tuple[np.ndarray, np.ndarray]:
-        """Load the cached (params, test_stats) Parquet."""
+        """Load the cached (params, test_stats) Parquet.
+
+        Also populates ``self.last_sample_index`` when the cache has the
+        ``sample_index`` column — callers that need cross-scenario
+        alignment (sbi_runner) read it off the instance after run_hpc.
+        Legacy caches written before the sample-index plumbing landed
+        leave the attribute at ``None``; sbi_runner falls back to row
+        order in that case and risks the positional-join bug.
+        """
         table = pq.read_table(str(path))
         param_cols = sorted(c for c in table.column_names if c.startswith("param:"))
         ts_cols = sorted(
@@ -402,14 +415,24 @@ class CppSimulator:
         )
         params = np.column_stack([table.column(c).to_numpy() for c in param_cols])
         test_stats = np.column_stack([table.column(c).to_numpy() for c in ts_cols])
+        if "sample_index" in table.column_names:
+            self.last_sample_index = table.column("sample_index").to_numpy().astype(np.int64)
+        else:
+            self.last_sample_index = None
         return params, test_stats
 
     def _persist_local_test_stats(
-        self, path: Path, params: np.ndarray, test_stats: np.ndarray
+        self,
+        path: Path,
+        params: np.ndarray,
+        test_stats: np.ndarray,
+        sample_index: np.ndarray | None = None,
     ) -> None:
         """Persist downloaded HPC test stats next to the local pool."""
         path.parent.mkdir(parents=True, exist_ok=True)
         cols: dict[str, np.ndarray] = {}
+        if sample_index is not None:
+            cols["sample_index"] = np.asarray(sample_index, dtype=np.int64)
         for i, name in enumerate(self.param_names[: params.shape[1]]):
             cols[f"param:{name}"] = params[:, i]
         for j in range(test_stats.shape[1]):
@@ -460,7 +483,14 @@ class CppSimulator:
     def _download_and_persist(
         self, hpc_pool_path: str, test_stats_hash: str
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Download HPC test stats and persist a local Parquet cache."""
+        """Download HPC test stats and persist a local Parquet cache.
+
+        Captures ``sample_index`` from the HPC-side params CSV (via
+        :attr:`HPCJobManager._last_sample_index`) and both (a) stamps it
+        onto the local parquet so subsequent Tier-1 cache hits carry the
+        index, and (b) stashes it on ``self.last_sample_index`` for the
+        caller to inspect.
+        """
         if self.job_manager is None:
             raise RuntimeError("job_manager required for download")
         with tempfile.TemporaryDirectory() as tmp:
@@ -469,17 +499,36 @@ class CppSimulator:
             )
         if params is None:
             raise RuntimeError("HPC has test stats but no params CSV — re-run derivation.")
+        sample_index = getattr(self.job_manager, "_last_sample_index", None)
+        # Defensive: in unit-test contexts where download_test_stats is
+        # mocked, the attribute may be a MagicMock rather than a real
+        # ndarray / None. Only treat it as valid when it's actually an
+        # ndarray whose length matches the params returned.
+        if isinstance(sample_index, np.ndarray) and len(sample_index) == len(params):
+            self.last_sample_index = sample_index
+        else:
+            sample_index = None
+            self.last_sample_index = None
         self._persist_local_test_stats(
-            self._local_test_stats_path(test_stats_hash), params, test_stats
+            self._local_test_stats_path(test_stats_hash),
+            params,
+            test_stats,
+            sample_index=sample_index,
         )
         return params, test_stats
 
     def _sample_first_n(
         self, params: np.ndarray, test_stats: np.ndarray, n: int
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Return the first ``n`` rows (params + test_stats), or all if fewer."""
+        """Return the first ``n`` rows (params + test_stats), or all if fewer.
+
+        Also trims ``self.last_sample_index`` so cross-scenario alignment
+        downstream sees the exact indices that match the returned rows.
+        """
         if params.shape[0] <= n:
             return params, test_stats
+        if self.last_sample_index is not None:
+            self.last_sample_index = self.last_sample_index[:n]
         return params[:n], test_stats[:n]
 
     def _write_params_csv(self, n_sims: int, start_index: int = 0) -> Path:
@@ -491,10 +540,18 @@ class CppSimulator:
         pool already has ``n_hpc`` sims and only ``n - n_hpc`` new draws
         are needed. Theta identity is preserved across submissions because
         the theta pool is seed-deterministic.
+
+        The CSV layout mirrors the MATLAB convention:
+        ``sample_index`` is the first column (int64), followed by one
+        column per parameter. ``cpp_batch_worker`` peels it off, and the
+        written parquet carries the column through — so downstream
+        multi-scenario alignment (sbi_runner.py) can intersect pools on
+        ``sample_index`` rather than row position.
         """
         indices = np.arange(start_index, start_index + n_sims, dtype=np.int64)
         theta = self._generate_parameters(indices)
         df = pd.DataFrame(theta, columns=self.param_names)
+        df.insert(0, "sample_index", indices)
         tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".csv", delete=False, prefix="cpp_hpc_params_"
         )

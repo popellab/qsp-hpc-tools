@@ -1316,7 +1316,17 @@ class HPCJobManager:
 
                 params_df = pd.read_csv(local_params_file)
                 if "sample_index" in params_df.columns:
+                    # Keep a copy on the result_collector so callers that
+                    # care about cross-scenario alignment can retrieve it
+                    # via download_sample_index (C++ path uses this). The
+                    # ndarray return stays sample_index-free so existing
+                    # MATLAB callers don't see an extra column shifting
+                    # theta[:, 0] into what was previously an integer
+                    # index, breaking np.log(theta) and similar.
+                    self._last_sample_index = params_df["sample_index"].astype("int64").values
                     params_df = params_df.drop(columns=["sample_index"])
+                else:
+                    self._last_sample_index = None
                 params = params_df.values
 
                 # Ensure 2D shape

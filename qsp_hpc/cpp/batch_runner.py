@@ -187,6 +187,7 @@ class CppBatchRunner:
         workdir: str | Path | None = None,
         max_workers: int | None = None,
         per_sim_timeout_s: float | None = None,
+        sample_indices: np.ndarray | None = None,
     ) -> BatchResult:
         """Execute a batch and write the Parquet.
 
@@ -204,6 +205,11 @@ class CppBatchRunner:
                 Defaults to a sibling of `output_path`.
             max_workers: process-pool size. Default = CPU count.
             per_sim_timeout_s: overrides default_timeout_s for this batch.
+            sample_indices: optional length-n_sims int64 array. Row i's
+                global theta-pool index, written as the ``sample_index``
+                Parquet column. When ``None`` (local/test use), falls
+                back to ``arange(n_sims)`` — which is only valid for
+                single-batch runs, not for multi-scenario alignment.
 
         Returns:
             BatchResult with the written path, counts, and schema info.
@@ -213,6 +219,11 @@ class CppBatchRunner:
             raise ValueError(
                 f"theta_matrix has {n_params} columns but {len(param_names)} "
                 f"param_names were given"
+            )
+        if sample_indices is not None and len(sample_indices) != n_sims:
+            raise ValueError(
+                f"sample_indices has {len(sample_indices)} entries "
+                f"but theta_matrix has {n_sims} rows"
             )
 
         unknown = set(param_names) - self.parameter_names
@@ -317,6 +328,7 @@ class CppBatchRunner:
             t_end_days=t_end_days,
             dt_days=dt_days,
             n_times=n_times,
+            sample_indices=sample_indices,
         )
 
         logger.info(
@@ -355,6 +367,7 @@ def _write_batch_parquet(
     t_end_days: float,
     dt_days: float,
     n_times: int,
+    sample_indices: np.ndarray | None = None,
 ) -> Path:
     """Build one pyarrow Table matching MATLAB's Parquet schema, write it.
 
@@ -379,7 +392,18 @@ def _write_batch_parquet(
     # Failed rows get NaN arrays so downstream can filter on status==0.
     nan_row = np.full(n_times, np.nan, dtype=np.float64)
 
+    # sample_index is the GLOBAL theta-pool position (same across all
+    # scenarios for a given patient/draw); simulation_id is the LOCAL
+    # position within this batch. Downstream multi-scenario alignment
+    # (sbi_runner.py) intersects on sample_index. When the caller doesn't
+    # provide one — e.g. local runs or tests — fall back to arange, which
+    # is only correct for a single-batch, single-scenario pool.
+    if sample_indices is None:
+        sample_indices_arr = np.arange(n_sims, dtype=np.int64)
+    else:
+        sample_indices_arr = np.asarray(sample_indices, dtype=np.int64)
     columns: dict[str, pa.Array] = {
+        "sample_index": pa.array(sample_indices_arr),
         "simulation_id": pa.array(np.arange(n_sims, dtype=np.int64)),
         "status": pa.array(np.asarray(statuses, dtype=np.int64)),
         "time": pa.array(time_lists, type=pa.list_(pa.float64())),

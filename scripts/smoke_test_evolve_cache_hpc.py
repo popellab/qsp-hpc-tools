@@ -216,6 +216,14 @@ def main() -> int:
         help="Local workdir for params.csv / state files.",
     )
     ap.add_argument(
+        "--m13-branch",
+        default="m13-evolve-cache",
+        help="Branch to track for both SPQSP_PDAC (cpp_branch) and "
+             "qsp-hpc-tools (pip install source). Must include M13's "
+             "--dump-state / --initial-state flags. Pass empty string "
+             "to use credentials-file defaults.",
+    )
+    ap.add_argument(
         "--clear-cache-first",
         action="store_true",
         help="Remove the remote evolve_cache directory before "
@@ -256,6 +264,29 @@ def main() -> int:
     from qsp_hpc.batch.hpc_job_manager import HPCJobManager
 
     manager = HPCJobManager(verbose=True)
+
+    # Both Python package and C++ binary must come from the M13 feature
+    # branch for this test to exercise --dump-state / --initial-state.
+    # Default config tracks cpp-sweep-binary-io + main, which predate M13.
+    if args.m13_branch:
+        manager.config.cpp_branch = args.m13_branch
+        # pip git URLs look like ``git+ssh://host/repo.git@<ref>``. If the
+        # credentials source already has a ``@<ref>`` suffix, replace
+        # it; otherwise append. Splitting on ``.git`` is unambiguous
+        # because the repo URL must end in ``.git`` before any ref.
+        src = manager.config.qsp_hpc_tools_source
+        if ".git" in src:
+            head, _sep, _tail = src.partition(".git")
+            manager.config.qsp_hpc_tools_source = f"{head}.git@{args.m13_branch}"
+        else:
+            # Fallback: no ``.git`` sentinel — append unconditionally.
+            manager.config.qsp_hpc_tools_source = f"{src}@{args.m13_branch}"
+        print(
+            f"\nOverriding for M13 branch: "
+            f"cpp_branch={manager.config.cpp_branch}, "
+            f"qsp_hpc_tools_source={manager.config.qsp_hpc_tools_source}"
+        )
+
     cache_root = f"{manager.config.simulation_pool_path}/evolve_cache"
 
     if args.clear_cache_first:

@@ -77,22 +77,34 @@ class TestCheckHPCTestStatsValidation:
 
         assert result is True  # Should accept >= match
 
-    def test_rejects_less_derived_than_needed(self):
-        """Test that having 100 derived when needing 200 triggers re-derivation."""
+    def test_preserves_partial_derivations_for_topup(self):
+        """When HPC has fewer derived rows than needed, keep them and let
+        the caller's top-up path submit the delta.
+
+        n_derived cannot exceed the pool's actual row count, so if it's
+        short the pool itself is short — deleting and re-deriving produces
+        the same count and wastes compute. Regression lock for the commit
+        that stopped the old delete-and-re-derive behaviour; see
+        qsp_hpc/batch/hpc_job_manager.py:check_hpc_test_stats.
+        """
         manager = self._create_manager()
 
-        # Have 100 derived, need 200
+        # Have 100 derived, need 200 — only two execs (chunk check + count);
+        # no rm -rf cleanup should be issued.
         manager.transport.exec = Mock(
             side_effect=[
                 (0, "TEST_STATS_CHUNKS:2\nPARAMS_CHUNKS:2"),
-                (0, "100"),  # Not enough
-                (0, ""),  # rm -rf cleanup
+                (0, "100"),
             ]
         )
 
         result = manager.check_hpc_test_stats("/pool", "abc123", expected_n_sims=200)
 
-        assert result is False  # Should reject and trigger re-derivation
+        assert result is True  # Accept; caller tops up the missing 100.
+
+        for call in manager.transport.exec.call_args_list:
+            cmd = call.args[0] if call.args else call.kwargs.get("cmd", "")
+            assert "rm -rf" not in cmd, f"unexpected destructive cmd: {cmd}"
 
     @staticmethod
     def _create_manager():

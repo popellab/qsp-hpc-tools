@@ -78,6 +78,8 @@ class CppSimulator:
         model_structure_file: Optional[str | Path] = None,
         poll_interval: float = 30.0,
         max_wait_time: Optional[float] = None,
+        remote_binary_path: Optional[str] = None,
+        remote_template_xml: Optional[str] = None,
         verbose: bool = False,
     ):
         self.priors_csv = Path(priors_csv)
@@ -127,6 +129,13 @@ class CppSimulator:
         )
         self.poll_interval = poll_interval
         self.max_wait_time = max_wait_time
+        # HPC-side paths for the binary + template. The laptop-resident
+        # self.binary_path / self.template_xml are used for config hashing
+        # (read_bytes) and local CppBatchRunner execution; HPC sbatch scripts
+        # need the path as it exists on the cluster. When omitted, run_hpc()
+        # falls back to credentials.yaml's cpp.binary_path / cpp.template_path.
+        self.remote_binary_path = remote_binary_path
+        self.remote_template_xml = remote_template_xml
 
         with open(self.priors_csv) as f:
             reader = csv.DictReader(f)
@@ -501,6 +510,23 @@ class CppSimulator:
             raise RuntimeError("run_hpc() requires job_manager")
         if self.test_stats_csv is None:
             raise RuntimeError("run_hpc() requires test_stats_csv")
+
+        # Resolve HPC-side paths: explicit ctor arg → credentials → error.
+        # Laptop-resident self.binary_path / self.template_xml are unsuitable
+        # for the cluster (the sbatch worker and ensure_cpp_binary check both
+        # need paths that exist on HPC).
+        remote_binary_path = self.remote_binary_path or self.job_manager.config.cpp_binary_path
+        remote_template_xml = self.remote_template_xml or self.job_manager.config.cpp_template_path
+        if not remote_binary_path:
+            raise RuntimeError(
+                "HPC binary path unset — pass remote_binary_path to CppSimulator "
+                "or set cpp.binary_path in credentials.yaml"
+            )
+        if not remote_template_xml:
+            raise RuntimeError(
+                "HPC template path unset — pass remote_template_xml to CppSimulator "
+                "or set cpp.template_path in credentials.yaml"
+            )
         if self.model_structure_file is None:
             raise RuntimeError(
                 "run_hpc() requires model_structure_file — without it the "
@@ -570,8 +596,8 @@ class CppSimulator:
                 dt_days=self.dt_days,
                 scenario=self.scenario,
                 seed=self.seed,
-                binary_path=str(self.binary_path),
-                template_path=str(self.template_xml),
+                binary_path=remote_binary_path,
+                template_path=remote_template_xml,
                 subtree=self.subtree,
                 scenario_yaml=(str(self.scenario_yaml) if self.scenario_yaml else None),
                 drug_metadata_yaml=(

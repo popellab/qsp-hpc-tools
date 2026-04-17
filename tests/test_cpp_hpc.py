@@ -113,13 +113,17 @@ class TestCppBatchWorker:
             "scenario": "ctrl",
         }
 
-        # Task 0 processes sims [0, 2)
+        # Task 0 processes sims [0, 2). Writes to per-submission staging dir,
+        # cpp_combine_batch_worker consolidates to a pool-level batch parquet
+        # during the post-array combine step.
         run_chunk(config, array_idx=0)
-        parquets = list((pool_dir / "test_pool").glob("*.parquet"))
+        parquets = list((pool_dir / "test_pool").rglob("*.parquet"))
         assert len(parquets) == 1
+        assert parquets[0].parent.name == "local"  # SLURM_ARRAY_JOB_ID fallback
+        assert parquets[0].parent.parent.name == ".staging"
+        assert parquets[0].name == "chunk_000.parquet"
         table = pq.read_table(str(parquets[0]))
         assert table.num_rows == 2
-        assert "ctrl" in parquets[0].name
         np.testing.assert_allclose(table.column("param:A").to_numpy(), [1.0, 1.1])
 
     def test_run_chunk_last_task_partial(self, tmp_path, fake_binary, template_path, params_csv):
@@ -141,10 +145,12 @@ class TestCppBatchWorker:
             "scenario": "ctrl",
         }
 
-        # Task 2 processes sims [4, 5) — only 1 sim
+        # Task 2 processes sims [4, 5) — only 1 sim. Written to staging;
+        # combine step will later consolidate into the pool-level batch.
         run_chunk(config, array_idx=2)
-        parquets = list((pool_dir / "test_pool").glob("*.parquet"))
+        parquets = list((pool_dir / "test_pool").rglob("*.parquet"))
         assert len(parquets) == 1
+        assert parquets[0].name == "chunk_002.parquet"
         table = pq.read_table(str(parquets[0]))
         assert table.num_rows == 1
         np.testing.assert_allclose(table.column("param:A").to_numpy(), [1.4])
@@ -315,7 +321,11 @@ class TestSubmitCppJobs:
             skip_sync=True,
         )
 
-        assert info.job_ids == ["12345"]
+        # Two jobs: the C++ array and the chained combine step that
+        # consolidates per-task chunks into one pool-level batch parquet.
+        # The mock sbatch always returns the same id ("12345") so both
+        # appear identical, which is expected in this stub.
+        assert info.job_ids == ["12345", "12345"]
         assert info.n_simulations == 2
         assert info.n_jobs >= 1
 
@@ -459,7 +469,8 @@ class TestSubmitCppJobs:
             binary_path="/override/qsp_sim",
             template_path="/override/param.xml",
         )
-        assert info.job_ids == ["12345"]
+        # Array + combine (no derivation — derive_test_stats defaults False).
+        assert info.job_ids == ["12345", "12345"]
 
 
 # ---------------------------------------------------------------------------
@@ -690,13 +701,16 @@ class TestSubmitCppJobsWithDerivation:
             model_structure_file=str(ms_file),
         )
 
-        # First sbatch was the C++ array, second was the derivation.
-        assert info.job_ids == ["11111", "22222"]
+        # Three sbatch submissions chain together: array → combine →
+        # derivation. The combine step consolidates per-task chunks into
+        # one pool-level batch parquet before derivation walks the pool.
+        assert info.job_ids == ["11111", "22222", "33333"]
 
-        # Derivation script must have been written and uploaded with the
-        # afterok dependency directive.
+        # Derivation depends on the combine job (22222) — NOT directly on
+        # the array (11111) — so it only runs after the pool has a
+        # consolidated batch parquet instead of scattered chunks.
         assert len(captured_scripts) == 1
-        assert "#SBATCH --dependency=afterok:11111" in captured_scripts[0]
+        assert "#SBATCH --dependency=afterok:22222" in captured_scripts[0]
 
     def test_derive_test_stats_requires_csv(self, tmp_path):
         manager, _ = self._make_manager()
@@ -764,6 +778,10 @@ class TestSubmitCppJobsWithDerivation:
             skip_sync=True,
         )
 
-        assert info.job_ids == ["11111"]
+        # Array + combine, no derivation. The combine step is always
+        # chained regardless of derive_test_stats so the pool is left in
+        # a consolidated (MATLAB-compatible) shape even when the caller
+        # only wants raw sims.
+        assert info.job_ids == ["11111", "22222"]
         upload_dests = [call.args[1] for call in transport.upload.call_args_list]
         assert not any(d.endswith("derive_script.sh") for d in upload_dests)

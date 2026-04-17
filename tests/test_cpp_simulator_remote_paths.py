@@ -80,6 +80,168 @@ def _make_job_manager(
     return jm
 
 
+class TestTopUpTier35:
+    """run_hpc() must submit only the delta when pool has 0 < n_hpc < n."""
+
+    def _build_simulator(
+        self,
+        *,
+        priors_csv: Path,
+        binary_path: Path,
+        template_path: Path,
+        cache_dir: Path,
+        test_stats_csv: Path,
+        model_structure_file: Path,
+        job_manager: MagicMock,
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        return CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            job_manager=job_manager,
+            test_stats_csv=test_stats_csv,
+            model_structure_file=model_structure_file,
+        )
+
+    def _shortcircuit(self, sim, monkeypatch, n_request: int = 1000):
+        """Stop run_hpc after submit_cpp_jobs returns so the call captures
+        the kwargs without doing SCP/SLURM work."""
+        import numpy as np
+
+        monkeypatch.setattr(sim, "_wait_for_jobs", lambda _ids: None)
+        monkeypatch.setattr(
+            sim,
+            "_download_and_persist",
+            lambda *a, **k: (np.zeros((1, 2)), np.zeros((1, 1))),
+        )
+        monkeypatch.setattr(sim, "_sample_first_n", lambda p, t, n: (p, t))
+        return sim.run_hpc(n_request)
+
+    def _jm_with_partial_pool(self, n_hpc: int) -> MagicMock:
+        jm = MagicMock()
+        jm.config = SimpleNamespace(
+            cpp_binary_path="/hpc/qsp_sim",
+            cpp_template_path="/hpc/param_all.xml",
+            simulation_pool_path="/hpc/pools",
+        )
+        # Tier-2 miss (no pre-derived test stats):
+        jm.check_hpc_test_stats.return_value = False
+        # Tier-3 miss (pool exists but n_hpc < n_requested):
+        jm.result_collector.check_pool_directory_exists.return_value = True
+        jm.result_collector.count_pool_simulations.return_value = n_hpc
+        jm.submit_cpp_jobs.return_value = SimpleNamespace(
+            job_ids=["array", "combine", "derive"]
+        )
+        return jm
+
+    def test_partial_pool_submits_only_the_delta(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        test_stats_csv,
+        model_structure_file,
+        monkeypatch,
+    ):
+        """Pool has 720/1000 → submit 280, not a fresh 1000.
+
+        Regression lock for the bug where Tier 4 resubmitted full N even
+        when the pool already had most of the sims — wasting up to ~70%
+        of the compute on any re-run.
+        """
+        jm = self._jm_with_partial_pool(n_hpc=720)
+        sim = self._build_simulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_path=template_path,
+            cache_dir=cache_dir,
+            test_stats_csv=test_stats_csv,
+            model_structure_file=model_structure_file,
+            job_manager=jm,
+        )
+        self._shortcircuit(sim, monkeypatch)
+
+        kwargs = jm.submit_cpp_jobs.call_args.kwargs
+        assert kwargs["num_simulations"] == 280, (
+            f"Expected delta submission of 280, got {kwargs['num_simulations']}"
+        )
+
+    def test_partial_pool_uses_offset_theta_indices(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        test_stats_csv,
+        model_structure_file,
+        monkeypatch,
+    ):
+        """The params CSV uploaded for the top-up must contain thetas at
+        indices [720, 1000) — not [0, 280). The deterministic theta pool
+        is seed-keyed, so index offset is what preserves identity across
+        the existing pool batches + this new batch."""
+        import pandas as pd
+
+        jm = self._jm_with_partial_pool(n_hpc=720)
+        sim = self._build_simulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_path=template_path,
+            cache_dir=cache_dir,
+            test_stats_csv=test_stats_csv,
+            model_structure_file=model_structure_file,
+            job_manager=jm,
+        )
+        self._shortcircuit(sim, monkeypatch)
+
+        # Reconstruct what _write_params_csv would have produced for
+        # (start_index=720, n_sims=280) vs (start=0, n=280) — they must
+        # differ, otherwise the top-up is re-running the first slice.
+        offset = sim._write_params_csv(280, start_index=720)
+        zero_start = sim._write_params_csv(280, start_index=0)
+        try:
+            df_offset = pd.read_csv(offset)
+            df_zero = pd.read_csv(zero_start)
+            assert not df_offset.equals(df_zero), (
+                "Offset and zero-start slices should differ — theta pool "
+                "sampling is not being offset correctly."
+            )
+        finally:
+            offset.unlink(missing_ok=True)
+            zero_start.unlink(missing_ok=True)
+
+    def test_empty_pool_submits_full_n(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        test_stats_csv,
+        model_structure_file,
+        monkeypatch,
+    ):
+        """Pool empty (no dir) → submit all 1000 starting at index 0."""
+        jm = self._jm_with_partial_pool(n_hpc=0)
+        jm.result_collector.check_pool_directory_exists.return_value = False
+        sim = self._build_simulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_path=template_path,
+            cache_dir=cache_dir,
+            test_stats_csv=test_stats_csv,
+            model_structure_file=model_structure_file,
+            job_manager=jm,
+        )
+        self._shortcircuit(sim, monkeypatch)
+
+        kwargs = jm.submit_cpp_jobs.call_args.kwargs
+        assert kwargs["num_simulations"] == 1000
+
+
 class TestRemotePathResolution:
     """run_hpc() must use HPC paths, not laptop paths, in submit_cpp_jobs."""
 

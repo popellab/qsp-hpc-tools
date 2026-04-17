@@ -18,7 +18,6 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -83,14 +82,21 @@ def run_chunk(config: dict, array_idx: int) -> None:
     pool_dir = Path(pool_base) / pool_id
     pool_dir.mkdir(parents=True, exist_ok=True)
 
-    # Include array_idx in the filename so concurrent tasks starting within
-    # the same second don't collide on a shared pool directory. Timestamp
-    # alone has 1-second resolution, which is easily overwhelmed when SLURM
-    # launches an array of short C++ sims at once (observed on Rockfish:
-    # 4 tasks started in the same second, 2 parquets were lost to overwrite).
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"batch_{ts}_task{array_idx:03d}_{scenario}_{chunk_size}sims_seed{seed}.parquet"
-    output_path = pool_dir / filename
+    # Write to a per-submission staging subdir. A downstream combine task
+    # (cpp_combine_batch_worker) consolidates all chunks into a single
+    # pool-level batch parquet, matching MATLAB's "one file per
+    # submission" layout. This avoids task-id sharding in the pool dir
+    # and lets partial top-up (n_hpc < n) work cleanly: each top-up is
+    # simply one additional batch file scanned by the pool loader.
+    #
+    # SLURM_ARRAY_JOB_ID is shared by every task in the array, so all
+    # chunks from one submission land in the same staging dir. Using
+    # "local" as the fallback keeps unit tests runnable without SLURM.
+    array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID", "local")
+    staging_dir = pool_dir / ".staging" / str(array_job_id)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"chunk_{array_idx:03d}.parquet"
+    output_path = staging_dir / filename
 
     t0 = time.time()
 

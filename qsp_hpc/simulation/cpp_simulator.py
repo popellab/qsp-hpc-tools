@@ -157,12 +157,17 @@ class CppSimulator:
         self.pool_dir = self.cache_dir / pool_name
         self.pool_dir.mkdir(parents=True, exist_ok=True)
 
-        # Optional `_task{N}` segment is emitted by the HPC worker
-        # (cpp_batch_worker.py) to make concurrent array tasks' filenames
-        # unique when timestamp resolution is only 1 second.  Local-only
-        # CppSimulator runs don't use it.
+        # HPC pool parquets now follow the MATLAB "one file per
+        # submission" shape — cpp_combine_batch_worker consolidates all
+        # array-task chunks into a single batch file before derivation.
+        # The combine worker writes a microsecond-resolution timestamp to
+        # avoid filename collisions when two combines land in the same
+        # wall-second (e.g. quick top-up chained onto the initial run).
+        # The `_task{N}` segment is kept in the regex only for backward
+        # compatibility with pre-existing pools seeded before the unify
+        # refactor; new runs never produce it.
         self._batch_pattern = re.compile(
-            r"batch_(\d{8}_\d{6})(?:_task\d+)?_(.+?)_(\d+)sims_seed(\d+)\.parquet"
+            r"batch_(\d{8}_\d{6}(?:_\d{6})?)(?:_task\d+)?_(.+?)_(\d+)sims_seed(\d+)\.parquet"
         )
 
         base_logger = setup_logger(__name__, verbose=verbose)
@@ -477,10 +482,17 @@ class CppSimulator:
             return params, test_stats
         return params[:n], test_stats[:n]
 
-    def _write_params_csv(self, n_sims: int) -> Path:
+    def _write_params_csv(self, n_sims: int, start_index: int = 0) -> Path:
         """Generate ``n_sims`` thetas via the deterministic theta pool and
-        write them to a temp CSV that ``submit_cpp_jobs`` can upload."""
-        indices = np.arange(0, n_sims, dtype=np.int64)
+        write them to a temp CSV that ``submit_cpp_jobs`` can upload.
+
+        ``start_index`` lets callers request a later slice of the theta
+        pool — used by the top-up path in :meth:`run_hpc` when the HPC
+        pool already has ``n_hpc`` sims and only ``n - n_hpc`` new draws
+        are needed. Theta identity is preserved across submissions because
+        the theta pool is seed-deterministic.
+        """
+        indices = np.arange(start_index, start_index + n_sims, dtype=np.int64)
         theta = self._generate_parameters(indices)
         df = pd.DataFrame(theta, columns=self.param_names)
         tmp = tempfile.NamedTemporaryFile(
@@ -582,15 +594,36 @@ class CppSimulator:
             params, test_stats = self._download_and_persist(hpc_pool_path, test_stats_hash)
             return self._sample_first_n(params, test_stats, n)
 
-        # Tier 4: submit fresh C++ array + chained derivation
-        self.logger.info(
-            f"HPC pool has {n_hpc}/{n} sims — submitting fresh sweep + chained derivation"
-        )
-        params_csv = self._write_params_csv(n)
+        # Tier 3.5: partial pool — run only the delta.
+        # Mirrors QSPSimulator._run_new_simulations(n_needed) — if the pool
+        # has some sims but not enough, submit only (n - n_hpc) new draws
+        # with theta indices [n_hpc, n) from the deterministic theta pool.
+        # The combine step appends one batch_*.parquet per submission, so
+        # the next derivation walks old + new transparently.
+        if n_hpc > 0:
+            n_needed = n - n_hpc
+            start_index = n_hpc
+            self.logger.info(
+                "HPC pool has %d/%d sims — submitting delta of %d (indices [%d, %d))",
+                n_hpc,
+                n,
+                n_needed,
+                start_index,
+                start_index + n_needed,
+            )
+        else:
+            # Tier 4: empty pool — submit a fresh full sweep.
+            n_needed = n
+            start_index = 0
+            self.logger.info(
+                "HPC pool empty — submitting fresh sweep of %d sims", n_needed
+            )
+
+        params_csv = self._write_params_csv(n_needed, start_index=start_index)
         try:
             info = self.job_manager.submit_cpp_jobs(
                 samples_csv=str(params_csv),
-                num_simulations=n,
+                num_simulations=n_needed,
                 simulation_pool_id=self.simulation_pool_id,
                 t_end_days=self.t_end_days,
                 dt_days=self.dt_days,

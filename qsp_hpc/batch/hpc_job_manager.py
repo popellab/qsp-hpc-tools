@@ -921,15 +921,41 @@ class HPCJobManager:
         self.logger.info("Job submitted: %s", job_id)
 
         job_ids = [job_id]
+
+        # Chain a combine step afterok:array_job_id. The array tasks write
+        # chunks to .staging/{SLURM_ARRAY_JOB_ID}/, and the combine worker
+        # consolidates them into one pool-level batch_*.parquet matching
+        # the MATLAB "one file per submission" shape. Derivation then
+        # chains afterok:combine, so it sees a single new batch file per
+        # submission instead of n_jobs task-sharded parquets.
+        hpc_pool_path = f"{self.config.simulation_pool_path}/{simulation_pool_id}"
+        self.logger.info(
+            "Chaining batch combine after C++ array (afterok:%s)", job_id
+        )
+        combine_job_id = self.submit_combine_batch_job(
+            pool_path=hpc_pool_path,
+            pool_base=self.config.simulation_pool_path,
+            pool_id=simulation_pool_id,
+            array_job_id=job_id,
+            scenario=scenario,
+            n_simulations=num_simulations,
+            seed=seed,
+            expected_chunks=n_jobs,
+            dependency=f"afterok:{job_id}",
+        )
+        job_ids.append(combine_job_id)
+
         if derive_test_stats:
-            hpc_pool_path = f"{self.config.simulation_pool_path}/{simulation_pool_id}"
-            self.logger.info("Chaining test-stats derivation after C++ array (afterok:%s)", job_id)
+            self.logger.info(
+                "Chaining test-stats derivation after combine (afterok:%s)",
+                combine_job_id,
+            )
             derive_job_id = self.submit_derivation_job(
                 pool_path=hpc_pool_path,
                 test_stats_csv=test_stats_csv,
                 test_stats_hash=test_stats_hash,
                 model_structure_file=model_structure_file,
-                dependency=f"afterok:{job_id}",
+                dependency=f"afterok:{combine_job_id}",
             )
             job_ids.append(derive_job_id)
 
@@ -1594,6 +1620,94 @@ class HPCJobManager:
             )
         else:
             self.logger.info(f"   🚀 Derivation job {job_id} (single task, {n_batches} batches)")
+        return job_id
+
+    def submit_combine_batch_job(
+        self,
+        pool_path: str,
+        pool_base: str,
+        pool_id: str,
+        array_job_id: str,
+        scenario: str,
+        n_simulations: int,
+        seed: int,
+        expected_chunks: int,
+        dependency: str,
+    ) -> str:
+        """Submit SLURM job to combine array-task chunks into one batch parquet.
+
+        Generates a config JSON + sbatch script that runs
+        :mod:`qsp_hpc.batch.cpp_combine_batch_worker` as a single task
+        chained ``afterok:<array_job>``. The worker walks
+        ``{pool_path}/.staging/{array_job_id}/chunk_*.parquet``,
+        concatenates them into one pool-level ``batch_*.parquet``,
+        and removes the staging dir.
+
+        This unifies the C++ HPC pool layout with MATLAB's (one file per
+        submission, no task-id sharding) so partial top-ups append cleanly
+        and pool loaders scan a simple flat directory.
+
+        Args:
+            pool_path: Full HPC path to the simulation pool.
+            pool_base: Parent dir (``simulation_pool_path`` in credentials).
+            pool_id: Pool directory name (``{version}_{hash8}_{scenario}``).
+            array_job_id: SLURM job id of the upstream C++ array — used to
+                locate the staging dir.
+            scenario: Scenario name (embedded in final batch filename).
+            n_simulations: Total sims in this submission (embedded in
+                filename; combine worker warns on mismatch but does not
+                fail so pathological-sim drop-outs are tolerated).
+            seed: Seed (embedded in filename).
+            expected_chunks: Number of array tasks; combine warns if
+                fewer chunks are found.
+            dependency: ``afterok:<array_job_id>`` expression.
+
+        Returns:
+            SLURM job id of the combine task.
+        """
+        self.logger.info("Preparing combine-batch job:")
+        self.logger.info(f"  Pool: {pool_path}")
+        self.logger.info(f"  Upstream array: {array_job_id}")
+
+        # Scratch dir for combine script + config, shared with derivation.
+        combine_dir = f"{self.config.remote_project_path}/batch_jobs/derivation"
+        self.transport.exec(f'mkdir -p "{combine_dir}"')
+
+        # Resolve $HOME so the combine worker can stat the staging dir.
+        _, home_dir = self.transport.exec("echo $HOME")
+        home_dir = home_dir.strip()
+        expanded_pool_base = pool_base.replace("$HOME", home_dir)
+        staging_dir = f"{expanded_pool_base}/{pool_id}/.staging/{array_job_id}"
+
+        config = {
+            "pool_base": expanded_pool_base,
+            "pool_id": pool_id,
+            "staging_dir": staging_dir,
+            "scenario": scenario,
+            "n_simulations": n_simulations,
+            "seed": seed,
+            "expected_chunks": expected_chunks,
+        }
+
+        import json as _json
+        import tempfile as _tempfile
+
+        with _tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            _json.dump(config, f, indent=2)
+            temp_config = f.name
+
+        remote_config = f"{combine_dir}/combine_config_{array_job_id}.json"
+        self.transport.upload(temp_config, remote_config)
+        Path(temp_config).unlink()
+
+        job_id = self.slurm_submitter.submit_combine_batch_job(
+            combine_config=remote_config,
+            combine_dir=combine_dir,
+            dependency=dependency,
+        )
+        self.logger.info(
+            f"   🧩 Combine job {job_id} (single task, dependency={dependency})"
+        )
         return job_id
 
     def submit_trajectory_grid_job(

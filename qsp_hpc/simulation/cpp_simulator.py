@@ -400,15 +400,20 @@ class CppSimulator:
     def _load_local_test_stats(self, path: Path) -> Tuple[np.ndarray, np.ndarray]:
         """Load the cached (params, test_stats) Parquet.
 
+        Preserves the parquet's stored column order for ``param:*``
+        columns — this matches the order that :meth:`_persist_local_test_stats`
+        used (derived from ``HPCJobManager._last_param_names``, which in
+        turn matches ``combined_params.csv`` on HPC). Sorting here would
+        re-order columns relative to what Tier 2/3/4 returns directly
+        from HPC download, causing cross-scenario alignment to compare
+        different parameter axes.
+
         Also populates ``self.last_sample_index`` when the cache has the
         ``sample_index`` column — callers that need cross-scenario
         alignment (sbi_runner) read it off the instance after run_hpc.
-        Legacy caches written before the sample-index plumbing landed
-        leave the attribute at ``None``; sbi_runner falls back to row
-        order in that case and risks the positional-join bug.
         """
         table = pq.read_table(str(path))
-        param_cols = sorted(c for c in table.column_names if c.startswith("param:"))
+        param_cols = [c for c in table.column_names if c.startswith("param:")]
         ts_cols = sorted(
             (c for c in table.column_names if c.startswith("ts:")),
             key=lambda c: int(c.split(":", 1)[1]),
@@ -427,13 +432,31 @@ class CppSimulator:
         params: np.ndarray,
         test_stats: np.ndarray,
         sample_index: np.ndarray | None = None,
+        param_names: list[str] | None = None,
     ) -> None:
-        """Persist downloaded HPC test stats next to the local pool."""
+        """Persist downloaded HPC test stats next to the local pool.
+
+        When ``param_names`` is supplied (the authoritative list from the
+        downloaded params CSV — usually wider than ``self.param_names``
+        because HPC parquets include every template parameter as a
+        ``param:*`` column, not just the sampled subset), it is used to
+        key the parquet columns. Absent that, we fall back to
+        ``self.param_names`` sliced to ``params.shape[1]``, which silently
+        mislabels columns when the HPC pool has more params than the
+        sampled priors — downstream cross-scenario alignment then sees
+        mixed column counts and blows up.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
         cols: dict[str, np.ndarray] = {}
         if sample_index is not None:
             cols["sample_index"] = np.asarray(sample_index, dtype=np.int64)
-        for i, name in enumerate(self.param_names[: params.shape[1]]):
+        names = param_names if param_names is not None else self.param_names[: params.shape[1]]
+        if len(names) != params.shape[1]:
+            raise ValueError(
+                f"param_names length {len(names)} does not match "
+                f"params.shape[1]={params.shape[1]}"
+            )
+        for i, name in enumerate(names):
             cols[f"param:{name}"] = params[:, i]
         for j in range(test_stats.shape[1]):
             cols[f"ts:{j}"] = test_stats[:, j]
@@ -509,11 +532,18 @@ class CppSimulator:
         else:
             sample_index = None
             self.last_sample_index = None
+        param_names = getattr(self.job_manager, "_last_param_names", None)
+        if not (
+            isinstance(param_names, list)
+            and len(param_names) == params.shape[1]
+        ):
+            param_names = None
         self._persist_local_test_stats(
             self._local_test_stats_path(test_stats_hash),
             params,
             test_stats,
             sample_index=sample_index,
+            param_names=param_names,
         )
         return params, test_stats
 

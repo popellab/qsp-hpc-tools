@@ -1327,6 +1327,11 @@ class HPCJobManager:
                     params_df = params_df.drop(columns=["sample_index"])
                 else:
                     self._last_sample_index = None
+                # Stash the column names so local-cache persistence can
+                # write them back with their true names (otherwise the
+                # cache mislabels columns by zipping data against an
+                # unrelated priors-CSV name list).
+                self._last_param_names = list(params_df.columns)
                 params = params_df.values
 
                 # Ensure 2D shape

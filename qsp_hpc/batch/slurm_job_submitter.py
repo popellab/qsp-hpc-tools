@@ -116,6 +116,8 @@ class SLURMJobSubmitter:
 #SBATCH --array=0-{n_jobs-1}
 #SBATCH --output={log_dir}/qsp_batch_%A_%a.out
 #SBATCH --error={log_dir}/qsp_batch_%A_%a.err
+set -e
+set -o pipefail
 
 echo "Starting QSP batch job at $(date)"
 echo "Array task ID: $SLURM_ARRAY_TASK_ID"
@@ -214,6 +216,8 @@ echo "Job completed at $(date)"
 #SBATCH --array=0-{n_jobs - 1}
 #SBATCH --output={log_dir}/qsp_cpp_%A_%a.out
 #SBATCH --error={log_dir}/qsp_cpp_%A_%a.err
+set -e
+set -o pipefail
 
 echo "Starting C++ QSP batch job at $(date)"
 echo "Array task ID: $SLURM_ARRAY_TASK_ID"
@@ -314,7 +318,9 @@ echo "Job completed at $(date)"
 #SBATCH --mem=4G
 #SBATCH --output={log_dir}/qsp_derive_%j.out
 #SBATCH --error={log_dir}/qsp_derive_%j.err
-{dependency_directive}
+{dependency_directive}set -e
+set -o pipefail
+
 # Activate Python virtual environment
 source {self.config.hpc_venv_path}/bin/activate
 
@@ -354,9 +360,7 @@ python3 -m qsp_hpc.batch.derive_test_stats_worker "{test_stats_config}"
         if dependency:
             self.logger.info(f"  Dependency: {dependency}")
 
-        script_content = self._generate_combine_slurm_script(
-            combine_config, dependency=dependency
-        )
+        script_content = self._generate_combine_slurm_script(combine_config, dependency=dependency)
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
             f.write(script_content)
@@ -366,9 +370,7 @@ python3 -m qsp_hpc.batch.derive_test_stats_worker "{test_stats_config}"
             remote_script = f"{combine_dir}/combine_script.sh"
             self.transport.upload(temp_script, remote_script)
 
-            submit_cmd = (
-                f'cd "{self.config.remote_project_path}" && sbatch "{remote_script}"'
-            )
+            submit_cmd = f'cd "{self.config.remote_project_path}" && sbatch "{remote_script}"'
             returncode, output = self.transport.exec(submit_cmd, timeout=30)
 
             if returncode != 0:
@@ -397,7 +399,9 @@ python3 -m qsp_hpc.batch.derive_test_stats_worker "{test_stats_config}"
 #SBATCH --mem=4G
 #SBATCH --output={log_dir}/qsp_combine_%j.out
 #SBATCH --error={log_dir}/qsp_combine_%j.err
-{dependency_directive}
+{dependency_directive}set -e
+set -o pipefail
+
 source {self.config.hpc_venv_path}/bin/activate
 
 cd {self.config.remote_project_path}
@@ -431,6 +435,8 @@ python3 -m qsp_hpc.batch.cpp_combine_batch_worker "{combine_config}"
 #SBATCH --mem=8G
 #SBATCH --output={log_dir}/qsp_traj_grid_%j.out
 #SBATCH --error={log_dir}/qsp_traj_grid_%j.err
+set -e
+set -o pipefail
 
 # Activate Python virtual environment
 source {self.config.hpc_venv_path}/bin/activate

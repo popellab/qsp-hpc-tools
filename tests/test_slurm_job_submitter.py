@@ -278,6 +278,39 @@ class TestDerivationWorkerCompatibility:
         assert "--output-dir" not in script
 
 
+class TestFailFastOnErrors:
+    """Generated sbatch scripts must exit non-zero when inner commands fail.
+
+    Without `set -e`, a failing python/matlab worker leaves the trailing
+    `echo "Job completed"` as the script's exit status, so SLURM reports
+    COMPLETED and downstream `afterok` dependencies run on garbage data.
+    """
+
+    def test_matlab_array_script_sets_errexit(self, submitter):
+        script = submitter._generate_slurm_script(n_jobs=5)
+        assert "set -e" in script
+        assert "set -o pipefail" in script
+
+    def test_cpp_array_script_sets_errexit(self, submitter):
+        script = submitter._generate_cpp_slurm_script(n_jobs=5, cpus_per_task=1, memory="4G")
+        assert "set -e" in script
+        assert "set -o pipefail" in script
+
+    def test_derivation_script_sets_errexit(self, submitter):
+        script = submitter._generate_derivation_slurm_script(
+            pool_path="/scratch/pool",
+            test_stats_config="/scratch/config.json",
+            derivation_dir="/scratch/derive",
+        )
+        assert "set -e" in script
+        assert "set -o pipefail" in script
+
+    def test_combine_script_sets_errexit(self, submitter):
+        script = submitter._generate_combine_slurm_script(combine_config="/scratch/combine.json")
+        assert "set -e" in script
+        assert "set -o pipefail" in script
+
+
 class TestSubmissionError:
     """Tests for SubmissionError exception."""
 

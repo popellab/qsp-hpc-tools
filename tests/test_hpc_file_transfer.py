@@ -58,6 +58,58 @@ def test_setup_remote_directories_requires_remote_root(base_config):
         transfer.setup_remote_directories()
 
 
+class RecordingTransport(SimpleNamespace):
+    """Transport stub that records every exec() command verbatim."""
+
+    def __init__(self):
+        super().__init__()
+        self.commands = []
+
+    def exec(self, cmd, *_args, **_kwargs):
+        self.commands.append(cmd)
+        return 0, ""
+
+    def upload(self, *_args, **_kwargs):
+        return None
+
+
+def test_setup_remote_directories_does_not_wipe_logs(base_config):
+    """Regression for #37: logs/ must survive across submissions.
+
+    Wiping logs/ mid-session erased batch 1's .out/.err before batch 2
+    finished, so post-mortem debugging had nothing to read. Setup should
+    rotate loose logs into archive_<ts>/ rather than rm -rf logs/.
+    """
+    transport = RecordingTransport()
+    transfer = HPCFileTransfer(base_config, transport)
+
+    transfer.setup_remote_directories()
+
+    log_cmds = [c for c in transport.commands if "/batch_jobs/logs" in c]
+    assert log_cmds, "expected some command to touch the logs directory"
+    for cmd in log_cmds:
+        assert (
+            "rm -rf" not in cmd or "archive_" in cmd
+        ), f"logs/ must not be wiped wholesale; only archive subdirs pruned. cmd={cmd!r}"
+
+
+def test_setup_remote_directories_archives_and_prunes_logs(base_config):
+    """Loose .out/.err from a prior submission get archived; only the
+    most recent LOGS_ARCHIVE_KEEP archives are retained."""
+    transport = RecordingTransport()
+    transfer = HPCFileTransfer(base_config, transport)
+
+    transfer.setup_remote_directories()
+
+    # The rotation command should: mkdir logs, move loose *.out/*.err
+    # into archive_<ts>/, and prune old archive_* subdirs.
+    rotate = next((c for c in transport.commands if "archive_" in c), None)
+    assert rotate is not None, "expected a logs-rotation command"
+    assert "mkdir -p" in rotate
+    assert "*.out" in rotate and "*.err" in rotate
+    assert f"tail -n +{transfer.LOGS_ARCHIVE_KEEP + 1}" in rotate
+
+
 def test_sync_codebase_handles_ssh_config_alias_with_empty_user(monkeypatch, tmp_path):
     """Test that empty ssh_user works with SSH config aliases (no @ symbol)."""
     monkeypatch.chdir(tmp_path)

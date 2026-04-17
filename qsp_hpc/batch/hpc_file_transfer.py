@@ -277,8 +277,22 @@ echo "Python venv setup complete!"
         else:
             self.logger.info("HPC Python environment configured")
 
+    # How many prior-submission log archives to retain under logs/. Older
+    # archives are removed at the start of each submission so cumulative
+    # growth stays bounded without requiring manual cleanup.
+    LOGS_ARCHIVE_KEEP = 10
+
     def setup_remote_directories(self) -> None:
-        """Create necessary directories on remote cluster and clean old files."""
+        """Create remote batch_jobs subdirs.
+
+        input/output/scripts are rewritten fresh each submission. ``logs``
+        is rotated rather than wiped — loose .out/.err files left in the
+        root from the previous submission are moved into a timestamped
+        ``logs/archive_<ts>/`` so a back-to-back second submission can't
+        destroy the first batch's forensic evidence (see #37). We then
+        prune archive subdirs down to the most recent ``LOGS_ARCHIVE_KEEP``
+        so the directory doesn't grow without bound.
+        """
         remote_root = (self.config.remote_project_path or "").strip()
         if not remote_root or remote_root in {"/", ".", "//"}:
             raise ValueError(
@@ -286,13 +300,30 @@ echo "Python venv setup complete!"
             )
 
         remote_base = f"{remote_root}/batch_jobs"
-        dirs = ["input", "output", "scripts", "logs"]
 
-        for d in dirs:
-            remote_dir = f"{remote_base}/{d}"
-            # Remove all files in directory, then recreate it
-            safe_dir = safe_shell_quote(remote_dir)
+        for d in ("input", "output", "scripts"):
+            safe_dir = safe_shell_quote(f"{remote_base}/{d}")
             self.transport.exec(f"rm -rf {safe_dir} && mkdir -p {safe_dir}")
+
+        safe_logs = safe_shell_quote(f"{remote_base}/logs")
+        keep = int(self.LOGS_ARCHIVE_KEEP)
+        # Single shell block: mkdir logs; if it has loose .out/.err files,
+        # move them into archive_<ts>/; then keep only the most recent
+        # `keep` archive dirs.
+        rotate_cmd = (
+            f"set -e; mkdir -p {safe_logs}; "
+            f"if ls {safe_logs}/*.out {safe_logs}/*.err >/dev/null 2>&1; then "
+            f'  ts="$(date +%Y%m%d_%H%M%S)"; '
+            f"  archive={safe_logs}/archive_$ts; "
+            f'  mkdir -p "$archive"; '
+            f'  mv {safe_logs}/*.out {safe_logs}/*.err "$archive/" 2>/dev/null || true; '
+            f"fi; "
+            # Prune: list archive_* newest-first, drop the first `keep`,
+            # remove the rest. `ls -1td` puts newest on top.
+            f"ls -1td {safe_logs}/archive_* 2>/dev/null | tail -n +{keep + 1} | "
+            f"xargs -I {{}} rm -rf {{}}"
+        )
+        self.transport.exec(rotate_cmd)
 
     def upload_job_config(
         self,

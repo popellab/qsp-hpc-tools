@@ -61,6 +61,7 @@ class QSPResultLoader:
         test_stats_csv: Optional[Union[str, Path]] = None,
         calibration_targets: Optional[Union[str, Path]] = None,
         submodel_priors_yaml: Optional[Union[str, Path]] = None,
+        seed: Optional[int] = None,
     ) -> None:
         if test_stats_csv is not None and calibration_targets is not None:
             raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
@@ -75,6 +76,7 @@ class QSPResultLoader:
         self.submodel_priors_yaml = (
             Path(submodel_priors_yaml) if submodel_priors_yaml is not None else None
         )
+        self.seed = seed
 
         self._temp_csv: Optional[Path] = None
         self._test_stats_df: Optional[pd.DataFrame] = None
@@ -107,6 +109,7 @@ class QSPResultLoader:
             model_script=self.model_script,
             model_version=self.model_version,
             submodel_priors_yaml=self.submodel_priors_yaml,
+            seed=self.seed,
         )
 
     def test_stats_hash(self) -> str:

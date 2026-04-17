@@ -238,6 +238,7 @@ class CppSimulator:
             model_script="",
             model_version=self.model_version,
             submodel_priors_yaml=self.submodel_priors_yaml,
+            seed=self.seed,
         )
 
         h = hashlib.sha256(base_hash.encode())
@@ -567,10 +568,7 @@ class CppSimulator:
             sample_index = None
             self.last_sample_index = None
         param_names = getattr(self.job_manager, "_last_param_names", None)
-        if not (
-            isinstance(param_names, list)
-            and len(param_names) == params.shape[1]
-        ):
+        if not (isinstance(param_names, list) and len(param_names) == params.shape[1]):
             param_names = None
         # Persist the full set (all param:* columns) so cal-target code
         # and future re-derivations can reach any template parameter.
@@ -751,9 +749,7 @@ class CppSimulator:
             # Tier 4: empty pool — submit a fresh full sweep.
             n_needed = n
             start_index = 0
-            self.logger.info(
-                "HPC pool empty — submitting fresh sweep of %d sims", n_needed
-            )
+            self.logger.info("HPC pool empty — submitting fresh sweep of %d sims", n_needed)
 
         params_csv = self._write_params_csv(n_needed, start_index=start_index)
         try:

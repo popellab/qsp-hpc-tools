@@ -155,6 +155,41 @@ class TestCppBatchWorker:
         assert table.num_rows == 1
         np.testing.assert_allclose(table.column("param:A").to_numpy(), [1.4])
 
+    def test_run_chunk_honors_staging_dir_override(
+        self, tmp_path, fake_binary, template_path, params_csv
+    ):
+        """Retry submissions (#29) need their chunks to land in the ORIGINAL
+        array's staging dir, not their own SLURM_ARRAY_JOB_ID dir —
+        otherwise the combine worker can't see them. The `staging_dir`
+        config field overrides the SLURM-derived default."""
+        from qsp_hpc.batch.cpp_batch_worker import run_chunk
+
+        pool_dir = tmp_path / "pool"
+        # Simulate the original array's staging path that a retry must reuse.
+        original_staging = pool_dir / "test_pool" / ".staging" / "12345"
+        config = {
+            "binary_path": str(fake_binary),
+            "template_path": str(template_path),
+            "subtree": "QSP",
+            "param_csv": str(params_csv),
+            "n_simulations": 5,
+            "seed": 42,
+            "jobs_per_chunk": 2,
+            "t_end_days": 0.2,
+            "dt_days": 0.1,
+            "simulation_pool_id": "test_pool",
+            "simulation_pool_path": str(pool_dir),
+            "scenario": "ctrl",
+            "staging_dir": str(original_staging),
+        }
+
+        run_chunk(config, array_idx=2)
+        parquets = list(original_staging.glob("*.parquet"))
+        assert len(parquets) == 1
+        assert parquets[0].name == "chunk_002.parquet"
+        # Must NOT have fallen back to a .staging/local dir.
+        assert not (pool_dir / "test_pool" / ".staging" / "local").exists()
+
     def test_run_chunk_past_end_is_noop(self, tmp_path, fake_binary, template_path, params_csv):
         from qsp_hpc.batch.cpp_batch_worker import run_chunk
 

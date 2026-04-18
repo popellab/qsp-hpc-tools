@@ -144,6 +144,10 @@ echo "Job completed at $(date)"
         n_jobs: int,
         cpus_per_task: int = 1,
         memory: str = "4G",
+        array_spec: str | None = None,
+        config_path: str | None = None,
+        dependency: str | None = None,
+        script_name: str = "qsp_cpp_batch_job.sh",
     ) -> str:
         """Submit a C++ simulation array job.
 
@@ -151,9 +155,25 @@ echo "Job completed at $(date)"
         :mod:`qsp_hpc.batch.cpp_batch_worker` — no MATLAB module is loaded.
 
         Args:
-            n_jobs: Number of array tasks.
+            n_jobs: Number of array tasks. Used for the default
+                ``--array=0-{n_jobs-1}`` spec and for logging. When
+                ``array_spec`` is provided, ``n_jobs`` is purely cosmetic.
             cpus_per_task: CPUs per task (controls CppBatchRunner parallelism).
             memory: Memory per task (e.g. ``"4G"``).
+            array_spec: Override the SLURM array spec string. Accepts the
+                sparse syntax (``"7,22,41-45"``) for retrying a specific
+                set of task indices without resubmitting the full range
+                (#29). ``None`` → default range ``0-{n_jobs-1}``.
+            config_path: Override the cpp_job_config.json path that the
+                worker reads. Used by retry submissions to pass a
+                staging-dir-overriding config without clobbering the
+                original. ``None`` → default
+                ``batch_jobs/input/cpp_job_config.json``.
+            dependency: Optional SLURM ``--dependency=...`` expression.
+                Used by retry submissions to wait on the original array.
+            script_name: Name of the sbatch script file uploaded to
+                ``batch_jobs/scripts/``. Retry submissions pass a distinct
+                name so the original script isn't overwritten.
 
         Returns:
             Job ID string.
@@ -163,9 +183,21 @@ echo "Job completed at $(date)"
         self.logger.info(f"  Time limit: {self.config.time_limit}")
         self.logger.info(f"  Memory: {memory}")
         self.logger.info(f"  CPUs/task: {cpus_per_task}")
-        self.logger.info(f"  Array size: {n_jobs} tasks")
+        if array_spec is not None:
+            self.logger.info(f"  Array spec: {array_spec}")
+        else:
+            self.logger.info(f"  Array size: {n_jobs} tasks")
+        if dependency:
+            self.logger.info(f"  Dependency: {dependency}")
 
-        script_content = self._generate_cpp_slurm_script(n_jobs, cpus_per_task, memory)
+        script_content = self._generate_cpp_slurm_script(
+            n_jobs,
+            cpus_per_task,
+            memory,
+            array_spec=array_spec,
+            config_path=config_path,
+            dependency=dependency,
+        )
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
             f.write(script_content)
@@ -173,7 +205,7 @@ echo "Job completed at $(date)"
 
         try:
             remote_script_dir = f"{self.config.remote_project_path}/batch_jobs/scripts"
-            remote_script = f"{remote_script_dir}/qsp_cpp_batch_job.sh"
+            remote_script = f"{remote_script_dir}/{script_name}"
 
             self.transport.upload(temp_script, remote_script)
 
@@ -193,10 +225,21 @@ echo "Job completed at $(date)"
         finally:
             Path(temp_script).unlink()
 
-    def _generate_cpp_slurm_script(self, n_jobs: int, cpus_per_task: int, memory: str) -> str:
+    def _generate_cpp_slurm_script(
+        self,
+        n_jobs: int,
+        cpus_per_task: int,
+        memory: str,
+        array_spec: str | None = None,
+        config_path: str | None = None,
+        dependency: str | None = None,
+    ) -> str:
         """Generate SLURM script for C++ simulation array job."""
         project_path = self.config.remote_project_path
         log_dir = f"{project_path}/batch_jobs/logs"
+        array_directive = array_spec if array_spec is not None else f"0-{n_jobs - 1}"
+        worker_config = config_path or "batch_jobs/input/cpp_job_config.json"
+        dependency_directive = f"#SBATCH --dependency={dependency}\n" if dependency else ""
 
         # Runtime modules: qsp_sim is dynamically linked against GCC 13's
         # libstdc++ (GLIBCXX_3.4.32) and Boost 1.83.  These need to be on the
@@ -213,10 +256,10 @@ echo "Job completed at $(date)"
 #SBATCH --time={self.config.time_limit}
 #SBATCH --mem={memory}
 #SBATCH --cpus-per-task={cpus_per_task}
-#SBATCH --array=0-{n_jobs - 1}
+#SBATCH --array={array_directive}
 #SBATCH --output={log_dir}/qsp_cpp_%A_%a.out
 #SBATCH --error={log_dir}/qsp_cpp_%A_%a.err
-set -e
+{dependency_directive}set -e
 set -o pipefail
 
 echo "Starting C++ QSP batch job at $(date)"
@@ -228,7 +271,7 @@ echo "Job ID: $SLURM_JOB_ID"
 source "{self.config.hpc_venv_path}/bin/activate"
 
 cd "{project_path}"
-python3 -m qsp_hpc.batch.cpp_batch_worker batch_jobs/input/cpp_job_config.json
+python3 -m qsp_hpc.batch.cpp_batch_worker {worker_config}
 echo "Job completed at $(date)"
 """
 

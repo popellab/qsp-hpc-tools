@@ -1807,6 +1807,7 @@ class HPCJobManager:
         seed: int,
         expected_chunks: int,
         dependency: str,
+        strict: bool = False,
     ) -> str:
         """Submit SLURM job to combine array-task chunks into one batch parquet.
 
@@ -1861,6 +1862,11 @@ class HPCJobManager:
             "n_simulations": n_simulations,
             "seed": seed,
             "expected_chunks": expected_chunks,
+            # When True, combine raises MissingChunksError on short staging
+            # instead of writing a truncated batch. Failure propagates via
+            # the afterok:combine dep so downstream derivation skips. Used
+            # by the #29 retry orchestration path.
+            "strict": strict,
         }
 
         import json as _json

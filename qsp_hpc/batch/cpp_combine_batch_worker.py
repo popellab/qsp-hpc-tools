@@ -28,17 +28,26 @@ Config JSON schema::
         "scenario": "baseline",
         "n_simulations": 1000,
         "seed": 2025,
-        "expected_chunks": 50
+        "expected_chunks": 50,
+        "strict": false
     }
+
+When ``strict`` is true, missing chunks raise :class:`MissingChunksError`
+listing the dropped task ids so the SLURM chain fails the ``afterok``
+dependency and prevents downstream derivation from running on an
+incomplete batch. This is how ``run_hpc(n)`` gets its "exactly n sims"
+contract — see issue #29.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import List
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -46,6 +55,48 @@ import pyarrow.parquet as pq
 from qsp_hpc.utils.logging_config import setup_logger
 
 logger = setup_logger(__name__, verbose=True)
+
+
+_CHUNK_RE = re.compile(r"chunk_(\d+)\.parquet$")
+
+
+class MissingChunksError(RuntimeError):
+    """Raised in strict mode when the staging dir is short on chunks.
+
+    Exposes the missing task-id list as :attr:`missing` so callers /
+    orchestrators can build a sparse SLURM ``--array=...`` retry spec.
+    """
+
+    def __init__(self, expected: int, present: List[int], missing: List[int]):
+        self.expected = expected
+        self.present = present
+        self.missing = missing
+        super().__init__(
+            f"Expected {expected} chunks, found {len(present)} "
+            f"({len(missing)} missing: {missing[:10]}"
+            f"{'...' if len(missing) > 10 else ''})"
+        )
+
+
+def _parse_chunk_indices(chunk_files: List[Path]) -> List[int]:
+    """Extract the integer task id from each ``chunk_NNN.parquet`` filename."""
+    indices: List[int] = []
+    for cf in chunk_files:
+        m = _CHUNK_RE.match(cf.name)
+        if m:
+            indices.append(int(m.group(1)))
+    return sorted(indices)
+
+
+def compute_missing_chunks(expected: int, chunk_files: List[Path]) -> List[int]:
+    """Return sorted task ids in ``[0, expected)`` not present in ``chunk_files``.
+
+    Used by both the combine worker (strict-mode check) and the laptop
+    orchestrator (building a sparse retry ``--array=...`` spec). Kept as
+    a pure function so tests can exercise it without filesystem setup.
+    """
+    present = set(_parse_chunk_indices(chunk_files))
+    return sorted(set(range(expected)) - present)
 
 
 def combine_chunks(config: dict) -> Path:
@@ -60,6 +111,7 @@ def combine_chunks(config: dict) -> Path:
     n_sims = int(config["n_simulations"])
     seed = int(config["seed"])
     expected_chunks = int(config.get("expected_chunks", 0))
+    strict = bool(config.get("strict", False))
 
     pool_dir = pool_base / pool_id
 
@@ -71,10 +123,20 @@ def combine_chunks(config: dict) -> Path:
         raise RuntimeError(f"No chunk parquets in staging dir: {staging_dir}")
 
     if expected_chunks and len(chunk_files) != expected_chunks:
+        present = _parse_chunk_indices(chunk_files)
+        missing = compute_missing_chunks(expected_chunks, chunk_files)
+        if strict:
+            # Raise BEFORE writing any output so the SLURM job exits
+            # non-zero, the afterok:combine dep cancels derivation, and
+            # the orchestrator sees a loud failure instead of silently
+            # truncating to (expected_chunks - len(missing)) tasks.
+            raise MissingChunksError(expected_chunks, present, missing)
         logger.warning(
-            "Found %d chunks but expected %d — proceeding with what's present",
+            "Found %d chunks but expected %d — proceeding with what's present "
+            "(missing task ids: %s)",
             len(chunk_files),
             expected_chunks,
+            missing[:20] + (["..."] if len(missing) > 20 else []),
         )
 
     logger.info("Combining %d chunks from %s", len(chunk_files), staging_dir)

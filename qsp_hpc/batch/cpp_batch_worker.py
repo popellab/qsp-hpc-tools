@@ -117,8 +117,17 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # SLURM_ARRAY_JOB_ID is shared by every task in the array, so all
     # chunks from one submission land in the same staging dir. Using
     # "local" as the fallback keeps unit tests runnable without SLURM.
-    array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID", "local")
-    staging_dir = pool_dir / ".staging" / str(array_job_id)
+    #
+    # config["staging_dir"] override: retry submissions (#29) need their
+    # chunks to land in the ORIGINAL array's staging dir, not the retry
+    # array's — otherwise combine can't see them. When set, this absolute
+    # path wins over the SLURM_ARRAY_JOB_ID-derived default.
+    staging_override = config.get("staging_dir")
+    if staging_override:
+        staging_dir = Path(staging_override)
+    else:
+        array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID", "local")
+        staging_dir = pool_dir / ".staging" / str(array_job_id)
     staging_dir.mkdir(parents=True, exist_ok=True)
     filename = f"chunk_{array_idx:03d}.parquet"
     output_path = staging_dir / filename

@@ -311,6 +311,56 @@ class TestFailFastOnErrors:
         assert "set -o pipefail" in script
 
 
+class TestCppArraySpec:
+    """Sparse `--array=...` spec + config override (#29 retry infrastructure)."""
+
+    def test_default_array_spec_is_contiguous_range(self, submitter):
+        script = submitter._generate_cpp_slurm_script(n_jobs=5, cpus_per_task=1, memory="4G")
+        assert "#SBATCH --array=0-4" in script
+
+    def test_custom_array_spec_preserved_verbatim(self, submitter):
+        """Sparse retry: pass a comma/range spec and expect it emitted
+        as-is into the sbatch directive. The worker's row-slice addressing
+        means sparse task ids hit the right params CSV rows without any
+        CSV rewriting."""
+        script = submitter._generate_cpp_slurm_script(
+            n_jobs=50,
+            cpus_per_task=1,
+            memory="4G",
+            array_spec="7,15,22-25,41",
+        )
+        assert "#SBATCH --array=7,15,22-25,41" in script
+        # n_jobs is purely cosmetic when array_spec is provided.
+        assert "#SBATCH --array=0-49" not in script
+
+    def test_custom_worker_config_path_used_in_script(self, submitter):
+        """Retry submissions upload a distinct config JSON that pins the
+        staging_dir to the original array's dir. The sbatch script must
+        invoke the worker with that config path."""
+        script = submitter._generate_cpp_slurm_script(
+            n_jobs=5,
+            cpus_per_task=1,
+            memory="4G",
+            config_path="batch_jobs/input/cpp_retry_config_7654321.json",
+        )
+        assert "cpp_batch_worker batch_jobs/input/cpp_retry_config_7654321.json" in script
+        # Default path must NOT appear when an override is provided.
+        assert "cpp_batch_worker batch_jobs/input/cpp_job_config.json" not in script
+
+    def test_dependency_directive_when_set(self, submitter):
+        script = submitter._generate_cpp_slurm_script(
+            n_jobs=3,
+            cpus_per_task=1,
+            memory="4G",
+            dependency="afterany:7654321",
+        )
+        assert "#SBATCH --dependency=afterany:7654321" in script
+
+    def test_no_dependency_directive_by_default(self, submitter):
+        script = submitter._generate_cpp_slurm_script(n_jobs=3, cpus_per_task=1, memory="4G")
+        assert "--dependency=" not in script
+
+
 class TestSubmissionError:
     """Tests for SubmissionError exception."""
 

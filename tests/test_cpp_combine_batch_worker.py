@@ -199,6 +199,88 @@ class TestCombineChunks:
                 }
             )
 
+    def test_strict_mode_raises_with_missing_task_ids(self, tmp_path):
+        """Strict mode is the whole point of #29: fail loud on dropped
+        chunks so the SLURM afterok:combine dep cancels derivation, and
+        the orchestrator has a missing-task-id list to build a sparse
+        retry --array=... spec from."""
+        from qsp_hpc.batch.cpp_combine_batch_worker import (
+            MissingChunksError,
+            combine_chunks,
+        )
+
+        pool_base = tmp_path / "pools"
+        pool_id = "v1_abc12345_scen"
+        staging = pool_base / pool_id / ".staging" / "7654321"
+        staging.mkdir(parents=True)
+
+        # Expect 5 tasks; only 0, 2, 4 arrived (1 and 3 dropped).
+        for idx in (0, 2, 4):
+            _write_chunk(
+                staging / f"chunk_{idx:03d}.parquet",
+                n_sims=4,
+                param_names=["k1"],
+                species=["Tumor"],
+            )
+
+        with pytest.raises(MissingChunksError) as exc_info:
+            combine_chunks(
+                {
+                    "pool_base": str(pool_base),
+                    "pool_id": pool_id,
+                    "staging_dir": str(staging),
+                    "scenario": "scen",
+                    "n_simulations": 20,
+                    "seed": 2025,
+                    "expected_chunks": 5,
+                    "strict": True,
+                }
+            )
+        assert exc_info.value.missing == [1, 3]
+        assert exc_info.value.expected == 5
+        assert exc_info.value.present == [0, 2, 4]
+        # Output batch must NOT have been written — combine's afterok
+        # derivation dep should cancel on the raise.
+        assert not list((pool_base / pool_id).glob("batch_*.parquet"))
+
+    def test_strict_mode_passes_when_complete(self, staging_pool):
+        """Strict mode is a no-op when all expected chunks are present."""
+        from qsp_hpc.batch.cpp_combine_batch_worker import combine_chunks
+
+        pool_base, staging = staging_pool
+        pool_id = staging.parent.parent.name
+
+        out = combine_chunks(
+            {
+                "pool_base": str(pool_base),
+                "pool_id": pool_id,
+                "staging_dir": str(staging),
+                "scenario": "scen",
+                "n_simulations": 12,
+                "seed": 2025,
+                "expected_chunks": 3,
+                "strict": True,
+            }
+        )
+        assert out.exists()
+
+    def test_compute_missing_chunks_helper(self, tmp_path):
+        """The pure-function helper is what the orchestrator calls
+        post-array (via SSH ls) to build a sparse retry --array spec."""
+        from qsp_hpc.batch.cpp_combine_batch_worker import compute_missing_chunks
+
+        staging = tmp_path / "stg"
+        staging.mkdir()
+        for idx in (0, 2, 3, 7):
+            (staging / f"chunk_{idx:03d}.parquet").touch()
+        # Ignore non-chunk files
+        (staging / "unrelated.txt").touch()
+
+        missing = compute_missing_chunks(
+            expected=10, chunk_files=sorted(staging.glob("chunk_*.parquet"))
+        )
+        assert missing == [1, 4, 5, 6, 8, 9]
+
     def test_fewer_chunks_than_expected_still_succeeds(self, staging_pool):
         """If a pathological task fails to write its chunk (e.g. wall-time
         kill after log-flush but before parquet flush), combine should still

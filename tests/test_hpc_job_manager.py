@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -33,6 +34,7 @@ from qsp_hpc.batch.hpc_job_manager import (
     RemoteCommandError,
     SSHTransport,
     SubmissionError,
+    _format_array_spec,
     _is_transient_ssh_error,
 )
 
@@ -532,6 +534,252 @@ class TestCommandExecutionBehaviors:
             with pytest.raises(RemoteCommandError) as exc_info:
                 manager.transport.download("/remote/file", "/tmp")
             assert "scp download" in str(exc_info.value)
+
+
+class TestFormatArraySpec:
+    """Sparse-array formatter (#29). Consecutive runs collapse to N-M,
+    singletons and length-2 runs stay comma-separated."""
+
+    def test_single_id(self):
+        assert _format_array_spec([7]) == "7"
+
+    def test_two_consecutive_stays_comma_form(self):
+        # Length-2 runs are the same character count either way;
+        # comma form is easier to eyeball at a glance.
+        assert _format_array_spec([7, 8]) == "7,8"
+
+    def test_three_consecutive_collapses(self):
+        assert _format_array_spec([7, 8, 9]) == "7-9"
+
+    def test_mixed(self):
+        assert _format_array_spec([7, 15, 22, 23, 24, 25, 41]) == "7,15,22-25,41"
+
+    def test_multiple_runs(self):
+        assert _format_array_spec([0, 1, 2, 5, 6, 9, 10, 11, 12]) == "0-2,5,6,9-12"
+
+    def test_dedup_and_sort(self):
+        assert _format_array_spec([41, 7, 8, 7, 9]) == "7-9,41"
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="empty"):
+            _format_array_spec([])
+
+
+class TestListMissingChunksOnHPC:
+    """Post-array staging inspection via SSH ls."""
+
+    def test_parses_chunk_filenames(self, mock_hpc_config):
+        manager = HPCJobManager(config=mock_hpc_config)
+        # `ls | sed` output one id per line, zero-padded in the filename
+        # but sed strips the zeros.
+        manager.transport.exec = Mock(return_value=(0, "0\n2\n4\n7\n"))
+
+        missing = manager._list_missing_chunks_on_hpc("/scratch/pool/.staging/12345", expected=10)
+        assert missing == [1, 3, 5, 6, 8, 9]
+
+    def test_empty_staging_returns_all_as_missing(self, mock_hpc_config):
+        """Staging dir absent / no chunks — treat as "everything missing"
+        so the orchestrator can still build a full retry spec."""
+        manager = HPCJobManager(config=mock_hpc_config)
+        manager.transport.exec = Mock(return_value=(0, ""))
+        missing = manager._list_missing_chunks_on_hpc("/scratch/x", expected=5)
+        assert missing == [0, 1, 2, 3, 4]
+
+    def test_complete_staging(self, mock_hpc_config):
+        manager = HPCJobManager(config=mock_hpc_config)
+        manager.transport.exec = Mock(return_value=(0, "0\n1\n2\n"))
+        assert manager._list_missing_chunks_on_hpc("/x", expected=3) == []
+
+
+class TestSubmitCppJobsRetryLoop:
+    """End-to-end #29: retry_missing_chunks loops on short staging,
+    builds a sparse retry array, and chains strict combine afterok
+    of the last retry."""
+
+    def _make_manager(self, tmp_path, monkeypatch):
+        config = BatchConfig(
+            ssh_host="test.edu",
+            ssh_user="testuser",
+            simulation_pool_path="/scratch/sims",
+            hpc_venv_path="/home/testuser/.venv/qsp",
+            remote_project_path="/home/testuser/project",
+            partition="shared",
+            time_limit="01:00:00",
+            cpp_binary_path="/usr/bin/qsp_sim",
+            cpp_template_path="/tmp/p.xml",
+            cpp_repo_path="/home/testuser/SPQSP_PDAC",
+        )
+        transport = Mock()
+
+        # Most exec calls succeed and parse as sbatch submissions; tests
+        # install call-sequence side_effect to return distinct job ids.
+        transport.exec.return_value = (0, "OK")
+        transport.upload.return_value = None
+        transport.download.return_value = None
+        manager = HPCJobManager(config=config, transport=transport)
+        # No real wait; the test controls the "missing" return directly.
+        monkeypatch.setattr(manager, "_wait_for_array_completion", lambda *a, **k: {})
+        return manager, transport
+
+    def test_no_missing_chunks_skips_retry(self, tmp_path, monkeypatch):
+        manager, transport = self._make_manager(tmp_path, monkeypatch)
+        manager._list_missing_chunks_on_hpc = Mock(return_value=[])
+
+        # Return distinct ids so we can verify no retry was submitted.
+        transport.exec.side_effect = [
+            # ensure_cpp_binary existence check + git steps — first match
+            # short-circuits to generic (0, "OK"). Use a flexible approach:
+            # the sbatch submissions will be the only ones returning job ids.
+            (0, "OK"),
+        ] + [(0, "Submitted batch job 9000")] * 30
+        transport.exec.return_value = (0, "OK")
+
+        def side(cmd, *a, **kw):
+            if "sbatch" in cmd:
+                return (0, "Submitted batch job 9000")
+            return (0, "OK")
+
+        transport.exec.side_effect = side
+
+        csv = tmp_path / "params.csv"
+        csv.write_text("A\n1.0\n2.0\n")
+
+        info = manager.submit_cpp_jobs(
+            samples_csv=str(csv),
+            num_simulations=2,
+            simulation_pool_id="pool",
+            skip_sync=True,
+            retry_missing_chunks=3,
+        )
+        # Array + combine, no retry.
+        assert len(info.job_ids) == 2
+        manager._list_missing_chunks_on_hpc.assert_called_once()
+
+    def test_missing_chunks_trigger_sparse_retry(self, tmp_path, monkeypatch):
+        manager, transport = self._make_manager(tmp_path, monkeypatch)
+
+        # Round 1: [1, 3, 7] missing → submit retry
+        # Round 2: complete
+        manager._list_missing_chunks_on_hpc = Mock(side_effect=[[1, 3, 7], []])
+
+        submitted_array_specs: list[str] = []
+        submitted_configs: list[str] = []
+        submitted_deps: list[Optional[str]] = []
+        sbatch_counter = [1000]
+
+        def fake_submit_cpp_job(**kwargs):
+            submitted_array_specs.append(kwargs.get("array_spec"))
+            submitted_configs.append(kwargs.get("config_path"))
+            submitted_deps.append(kwargs.get("dependency"))
+            sbatch_counter[0] += 1
+            return f"arr{sbatch_counter[0]}"
+
+        monkeypatch.setattr(manager.slurm_submitter, "submit_cpp_job", fake_submit_cpp_job)
+
+        combine_calls: list[dict] = []
+
+        def fake_combine(**kwargs):
+            combine_calls.append(kwargs)
+            return "cmb5000"
+
+        monkeypatch.setattr(manager, "submit_combine_batch_job", fake_combine)
+
+        # transport.exec handles `echo $HOME` + ls + sbatch-not-used-here.
+        def side(cmd, *a, **kw):
+            if "echo $HOME" in cmd:
+                return (0, "/home/testuser\n")
+            if "echo OK" in cmd:
+                return (0, "OK")
+            return (0, "")
+
+        transport.exec.side_effect = side
+
+        # _upload_cpp_retry_config runs a real download+upload; stub it.
+        manager._upload_cpp_retry_config = Mock(
+            return_value="/home/testuser/project/batch_jobs/input/cpp_retry_config_r1.json"
+        )
+
+        csv = tmp_path / "params.csv"
+        csv.write_text("A\n" + "\n".join(str(float(i)) for i in range(10)) + "\n")
+
+        info = manager.submit_cpp_jobs(
+            samples_csv=str(csv),
+            num_simulations=10,
+            simulation_pool_id="pool",
+            skip_sync=True,
+            jobs_per_chunk=1,  # one task per sim → 10 tasks → ids 0..9
+            retry_missing_chunks=3,
+        )
+
+        # Two array submits: the original + one retry.
+        assert len(submitted_array_specs) == 2
+        # First submit is the original 0-9 (no sparse spec → default range).
+        assert submitted_array_specs[0] is None
+        # Retry uses collapsed sparse spec.
+        assert submitted_array_specs[1] == "1,3,7"
+        # Retry points at the override config.
+        assert submitted_configs[1] and "cpp_retry_config_" in submitted_configs[1]
+
+        # Combine was chained afterok:<last array id> with strict=True.
+        assert len(combine_calls) == 1
+        assert combine_calls[0]["strict"] is True
+        assert combine_calls[0]["dependency"] == f"afterok:arr{sbatch_counter[0]}"
+
+        # JobInfo.job_ids: [original_array, retry_array, combine]
+        assert len(info.job_ids) == 3
+        assert info.job_ids[-1] == "cmb5000"
+
+    def test_retry_budget_exhausted_still_submits_strict_combine(self, tmp_path, monkeypatch):
+        """When staging stays short after N rounds, combine still runs —
+        strict=True so it fails the afterok dep and skips derivation."""
+        manager, transport = self._make_manager(tmp_path, monkeypatch)
+        # Every round finds the same missing chunk — pathological.
+        manager._list_missing_chunks_on_hpc = Mock(return_value=[5])
+
+        sbatch_counter = [2000]
+
+        def fake_submit_cpp_job(**kwargs):
+            sbatch_counter[0] += 1
+            return f"arr{sbatch_counter[0]}"
+
+        monkeypatch.setattr(manager.slurm_submitter, "submit_cpp_job", fake_submit_cpp_job)
+
+        combine_calls: list[dict] = []
+        monkeypatch.setattr(
+            manager,
+            "submit_combine_batch_job",
+            lambda **kw: (combine_calls.append(kw), "cmb9999")[1],
+        )
+
+        def side(cmd, *a, **kw):
+            if "echo $HOME" in cmd:
+                return (0, "/home/testuser\n")
+            return (0, "OK")
+
+        transport.exec.side_effect = side
+        manager._upload_cpp_retry_config = Mock(return_value="/tmp/retry.json")
+
+        csv = tmp_path / "params.csv"
+        csv.write_text("A\n" + "\n".join(str(float(i)) for i in range(6)) + "\n")
+
+        info = manager.submit_cpp_jobs(
+            samples_csv=str(csv),
+            num_simulations=6,
+            simulation_pool_id="pool",
+            skip_sync=True,
+            jobs_per_chunk=1,
+            retry_missing_chunks=2,
+        )
+        # 1 original + 2 retries + 1 combine = 4 ids.
+        assert len(info.job_ids) == 4
+        assert combine_calls[0]["strict"] is True
+        # Inspected 2 times (once per retry attempt — post-final-retry round
+        # enters the loop, finds missing again, submits retry, and that's the
+        # 2nd retry; we do NOT re-inspect after attempt 2 — we exit the loop
+        # because the budget is exhausted).
+        # Actually: attempt=1 inspects (missing), submits retry1; attempt=2
+        # inspects (missing), submits retry2. Two inspections.
+        assert manager._list_missing_chunks_on_hpc.call_count == 2
 
 
 class TestSSHRetry:

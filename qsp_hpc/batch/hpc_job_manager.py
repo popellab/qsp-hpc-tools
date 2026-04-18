@@ -149,6 +149,46 @@ def _is_transient_ssh_error(message: Optional[str]) -> bool:
     return any(pat in message for pat in _TRANSIENT_SSH_PATTERNS)
 
 
+def _format_array_spec(task_ids: List[int]) -> str:
+    """Collapse a task-id list into a SLURM ``--array=...`` spec.
+
+    Consecutive runs collapse to ``N1-N2`` form — SLURM accepts both
+    ``7,15,22,23,24,25,41`` and ``7,15,22-25,41``, but the collapsed
+    form keeps the submit line (and ``squeue`` output) readable when
+    the drop set is large. Single ids and runs of length 2 stay as
+    comma-separated entries.
+
+    Raises:
+        ValueError: If ``task_ids`` is empty — SLURM rejects an empty
+            ``--array=``, so callers should avoid submitting in that
+            case rather than rely on us producing a placeholder.
+    """
+    if not task_ids:
+        raise ValueError("Cannot build --array spec from empty task id list")
+    ids = sorted(set(task_ids))
+    runs: List[str] = []
+    start = prev = ids[0]
+
+    def flush() -> None:
+        if prev == start:
+            runs.append(str(start))
+        elif prev == start + 1:
+            # Length-2 runs stay comma-separated; the range form "N-N+1"
+            # is the same character count but harder to eyeball.
+            runs.append(f"{start},{prev}")
+        else:
+            runs.append(f"{start}-{prev}")
+
+    for tid in ids[1:]:
+        if tid == prev + 1:
+            prev = tid
+        else:
+            flush()
+            start = prev = tid
+    flush()
+    return ",".join(runs)
+
+
 class RemoteCommandError(RuntimeError):
     """Raised when a remote command fails."""
 
@@ -892,6 +932,7 @@ class HPCJobManager:
         test_stats_hash: Optional[str] = None,
         model_structure_file: Optional[str] = None,
         evolve_cache: bool = True,
+        retry_missing_chunks: int = 0,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
 
@@ -966,11 +1007,29 @@ class HPCJobManager:
                 the QSTH blob under an ``fcntl`` lock, later tasks skip
                 evolve via ``--initial-state``. No effect when
                 ``healthy_state_yaml`` is None (no evolve phase to cache).
+            retry_missing_chunks: Max rounds of laptop-side sparse retry
+                (#29). 0 (default) preserves the fire-and-forget
+                ``array → combine → derive`` chain that tolerates a
+                silently-truncated batch. N>0: after each array
+                completes, the laptop SSH-lists the staging dir; if
+                any ``chunk_NNN.parquet`` is missing, it submits a
+                sparse ``--array=N1,N2,N3-N5`` retry with the
+                original array's ``staging_dir`` overridden in config
+                so chunks land alongside the originals, then
+                re-inspects. Once staging is complete or N rounds are
+                exhausted, the orchestrator submits the combine step
+                with ``strict=True`` (so a still-incomplete batch
+                fails loudly via the ``afterok:combine`` dep and
+                skips derivation). All submitted array + combine +
+                derive job ids are returned in ``JobInfo.job_ids``.
 
         Returns:
             :class:`JobInfo` with job ID(s) and state file. When
             ``derive_test_stats=True``, ``job_ids`` has two entries:
-            ``[cpp_array_id, derivation_id]``.
+            ``[cpp_array_id, derivation_id]``. When
+            ``retry_missing_chunks>0`` and retries fire, ``job_ids``
+            grows by one id per retry round — the derivation id (if
+            requested) is always last.
         """
         if derive_test_stats:
             if not test_stats_csv:
@@ -1080,15 +1139,75 @@ class HPCJobManager:
         self.logger.info("Job submitted: %s", job_id)
 
         job_ids = [job_id]
-
-        # Chain a combine step afterok:array_job_id. The array tasks write
-        # chunks to .staging/{SLURM_ARRAY_JOB_ID}/, and the combine worker
-        # consolidates them into one pool-level batch_*.parquet matching
-        # the MATLAB "one file per submission" shape. Derivation then
-        # chains afterok:combine, so it sees a single new batch file per
-        # submission instead of n_jobs task-sharded parquets.
         hpc_pool_path = f"{self.config.simulation_pool_path}/{simulation_pool_id}"
-        self.logger.info("Chaining batch combine after C++ array (afterok:%s)", job_id)
+
+        # Resolve the staging dir used by every task in the original array
+        # (plus any retries that override the SLURM_ARRAY_JOB_ID-derived
+        # default). Combine worker reads this same path from its config.
+        _, home_dir = self.transport.exec("echo $HOME")
+        expanded_pool_base = self.config.simulation_pool_path.replace("$HOME", home_dir.strip())
+        staging_dir = f"{expanded_pool_base}/{simulation_pool_id}/.staging/{job_id}"
+        base_config_remote = (
+            f"{self.config.remote_project_path}/batch_jobs/input/cpp_job_config.json"
+        )
+
+        # #29: optional laptop-side retry loop. When enabled, block for
+        # the array to finish, SSH-inspect staging, and (if any
+        # chunk_NNN.parquet is missing) submit a sparse --array=... retry
+        # with the original staging_dir overridden in its config — so
+        # chunks still land alongside the originals. Repeat until complete
+        # or retry budget exhausted, then chain a STRICT combine.
+        if retry_missing_chunks > 0:
+            last_array_id = job_id
+            for attempt in range(1, retry_missing_chunks + 1):
+                self.logger.info(
+                    "Waiting for array %s to complete before chunk inspection...",
+                    last_array_id,
+                )
+                self._wait_for_array_completion(last_array_id)
+                missing = self._list_missing_chunks_on_hpc(staging_dir, expected=n_jobs)
+                if not missing:
+                    self.logger.info(
+                        "Staging complete after array %s — all %d chunks present",
+                        last_array_id,
+                        n_jobs,
+                    )
+                    break
+                self.logger.warning(
+                    "Array %s left %d/%d chunks missing (attempt %d/%d): %s%s",
+                    last_array_id,
+                    len(missing),
+                    n_jobs,
+                    attempt,
+                    retry_missing_chunks,
+                    missing[:20],
+                    "..." if len(missing) > 20 else "",
+                )
+                last_array_id = self._submit_cpp_retry_array(
+                    missing_task_ids=missing,
+                    base_config_remote=base_config_remote,
+                    staging_dir=staging_dir,
+                    cpus_per_task=cpp_cpus_per_task,
+                    memory=cpp_memory,
+                    retry_suffix=f"r{attempt}_{job_id}",
+                )
+                job_ids.append(last_array_id)
+            combine_dep_id = last_array_id
+            strict_combine = True
+        else:
+            combine_dep_id = job_id
+            strict_combine = False
+
+        # Chain a combine step afterok:<last_array_id>. When retries ran,
+        # every retry array has already landed its chunks into the
+        # original staging dir, so combine sees one coherent set. strict
+        # combine failing on a residual short count propagates via the
+        # afterok chain and (when requested) blocks derivation.
+        self.logger.info(
+            "Chaining batch combine after C++ array (afterok:%s%s)",
+            combine_dep_id,
+            " strict" if strict_combine else "",
+        )
         combine_job_id = self.submit_combine_batch_job(
             pool_path=hpc_pool_path,
             pool_base=self.config.simulation_pool_path,
@@ -1098,7 +1217,8 @@ class HPCJobManager:
             n_simulations=num_simulations,
             seed=seed,
             expected_chunks=n_jobs,
-            dependency=f"afterok:{job_id}",
+            dependency=f"afterok:{combine_dep_id}",
+            strict=strict_combine,
         )
         job_ids.append(combine_job_id)
 
@@ -1199,6 +1319,149 @@ class HPCJobManager:
             self.transport.upload(temp_file, remote_file)
         finally:
             Path(temp_file).unlink()
+
+    def _upload_cpp_retry_config(
+        self, base_config_remote: str, staging_dir: str, retry_suffix: str
+    ) -> str:
+        """Download the base cpp_job_config.json, add a staging_dir override,
+        and upload as a distinct retry-scoped config. Returns the remote path.
+
+        The retry array's SLURM_ARRAY_JOB_ID differs from the original, so
+        without this override each retry task would write its chunks into
+        a fresh ``.staging/{new_array_id}/`` — invisible to the combine
+        worker. Forcing ``staging_dir`` in config keeps all retry chunks
+        landing alongside the originals.
+        """
+        import json as _json
+        import tempfile as _tempfile
+
+        with _tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            self.transport.download(base_config_remote, str(tmp_path))
+            local_base = tmp_path / Path(base_config_remote).name
+            with open(local_base) as fh:
+                config = _json.load(fh)
+            config["staging_dir"] = staging_dir
+
+            with _tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as out:
+                _json.dump(config, out, indent=2)
+                local_retry = out.name
+
+        try:
+            remote_retry = (
+                f"{self.config.remote_project_path}/batch_jobs/input/"
+                f"cpp_retry_config_{retry_suffix}.json"
+            )
+            self.transport.upload(local_retry, remote_retry)
+            return remote_retry
+        finally:
+            Path(local_retry).unlink()
+
+    def _list_missing_chunks_on_hpc(self, staging_dir: str, expected: int) -> List[int]:
+        """SSH-list ``staging_dir`` and return sorted missing task ids.
+
+        Uses a shell glob + sed to extract the integer task id from each
+        ``chunk_NNN.parquet`` filename — cheaper than downloading a
+        directory listing. Missing dir / no chunks is treated as "all
+        task ids missing" so the orchestrator can still build a retry
+        spec (e.g. the whole array failed before any chunk flushed).
+        """
+        cmd = (
+            f'ls -1 "{staging_dir}"/chunk_*.parquet 2>/dev/null '
+            f"| sed -E 's|.*/chunk_0*([0-9]+)\\.parquet$|\\1|'"
+        )
+        rc, out = self.transport.exec(cmd, timeout=30)
+        present: set[int] = set()
+        if rc == 0 and out.strip():
+            for line in out.strip().split("\n"):
+                line = line.strip()
+                if line.isdigit():
+                    present.add(int(line))
+        return sorted(set(range(expected)) - present)
+
+    def _wait_for_array_completion(
+        self,
+        array_id: str,
+        poll_s: float = 20.0,
+        timeout_s: Optional[float] = None,
+    ) -> Dict[str, int]:
+        """Block until ``array_id`` has no running/pending tasks.
+
+        Uses :meth:`check_job_status` (squeue + sacct) at ``poll_s``
+        intervals. Returns the final status dict so the caller can log
+        failed/completed counts alongside the staging inspection.
+
+        SLURM can take a few seconds to register a freshly-submitted
+        array, so we tolerate an initial all-zeros window — the loop
+        gives up only once we've SEEN the array live and it's now empty.
+        """
+        start = time.time()
+        max_seen = 0
+        while True:
+            status = self.check_job_status(array_id)
+            total = sum(status.values())
+            max_seen = max(max_seen, total)
+            elapsed = time.time() - start
+            active = status["running"] + status["pending"]
+            if total > 0 and active == 0:
+                return status
+            # Array is "gone" — either it finished too fast for sacct
+            # propagation, or it never registered. Only give up if we've
+            # waited past a generous registration window.
+            if total == 0 and max_seen > 0 and elapsed > 30:
+                return status
+            if total == 0 and elapsed > 120:
+                self.logger.warning(
+                    "Array %s not visible after %.0fs — assuming complete",
+                    array_id,
+                    elapsed,
+                )
+                return status
+            if timeout_s is not None and elapsed > timeout_s:
+                raise TimeoutError(
+                    f"Array {array_id} incomplete after {timeout_s}s " f"(last status: {status})"
+                )
+            time.sleep(poll_s)
+
+    def _submit_cpp_retry_array(
+        self,
+        missing_task_ids: List[int],
+        base_config_remote: str,
+        staging_dir: str,
+        cpus_per_task: int,
+        memory: str,
+        dependency: Optional[str] = None,
+        retry_suffix: str = "retry",
+    ) -> str:
+        """Submit a sparse SLURM array for a specific task-id list.
+
+        Writes a retry-scoped cpp_job_config with ``staging_dir`` override
+        (so chunks land alongside the original array's), emits the
+        sbatch with ``--array={sparse_spec}``, and returns the new
+        array job id.
+
+        Called from :meth:`submit_cpp_jobs` when
+        ``retry_missing_chunks > 0`` and post-array inspection found a
+        short staging dir.
+        """
+        if not missing_task_ids:
+            raise ValueError("_submit_cpp_retry_array called with no missing ids")
+        array_spec = _format_array_spec(missing_task_ids)
+        retry_config = self._upload_cpp_retry_config(base_config_remote, staging_dir, retry_suffix)
+        self.logger.info(
+            "Submitting retry array for %d missing tasks (--array=%s)",
+            len(missing_task_ids),
+            array_spec,
+        )
+        return self.slurm_submitter.submit_cpp_job(
+            n_jobs=len(missing_task_ids),
+            cpus_per_task=cpus_per_task,
+            memory=memory,
+            array_spec=array_spec,
+            config_path=retry_config,
+            dependency=dependency,
+            script_name=f"qsp_cpp_batch_job_{retry_suffix}.sh",
+        )
 
     def _setup_remote_directories(self) -> None:
         """Create necessary directories on remote cluster and clean old files."""

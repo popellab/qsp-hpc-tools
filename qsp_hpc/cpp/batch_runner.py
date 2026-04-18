@@ -23,6 +23,7 @@ just like the MATLAB SimBiology output.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -44,6 +45,68 @@ logger = logging.getLogger(__name__)
 
 STATUS_OK = 0
 STATUS_FAILED = 1
+
+
+POOL_MANIFEST_FILENAME = "pool_manifest.json"
+POOL_MANIFEST_SCHEMA = "thin-v1"
+
+
+def write_pool_manifest(
+    pool_dir: Path | str,
+    template_defaults: dict[str, float],
+    sampled_params: Sequence[str],
+) -> Path:
+    """Write ``pool_manifest.json`` with template defaults + sampled set.
+
+    One manifest per pool dir, written once (idempotent — existing
+    manifests are left alone). Downstream consumers (derive_test_stats
+    worker, CppSimulator local cache loader) fall back to these defaults
+    when a parameter's ``param:{name}`` column is missing from the thin
+    parquet — see #23.
+
+    Layout::
+
+        {
+            "schema_version": "thin-v1",
+            "template_defaults": {"A": 1.5, "B": 2.0, ...},  # EVERY model param
+            "sampled_params": ["A", "C", ...]                # subset varied
+        }
+
+    The ``sampled_params`` list is informational — writers put those
+    columns into the parquet; readers can trust the parquet columns for
+    sampled values and the manifest for everything else.
+    """
+    pool_dir = Path(pool_dir)
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = pool_dir / POOL_MANIFEST_FILENAME
+    if manifest_path.exists():
+        return manifest_path
+    payload = {
+        "schema_version": POOL_MANIFEST_SCHEMA,
+        "template_defaults": {str(k): float(v) for k, v in template_defaults.items()},
+        "sampled_params": list(sampled_params),
+    }
+    # Atomic write so a partial read never happens: a parallel cal-target
+    # evaluator could race a first-run write otherwise.
+    tmp_path = manifest_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+    tmp_path.replace(manifest_path)
+    return manifest_path
+
+
+def load_pool_manifest(pool_dir: Path | str) -> dict | None:
+    """Load ``pool_manifest.json`` from a pool dir, or None if absent.
+
+    Pre-#23 pools have no manifest — parquets carry the full param set
+    inline, so callers treat None as "no fallback needed".
+    """
+    pool_dir = Path(pool_dir)
+    manifest_path = pool_dir / POOL_MANIFEST_FILENAME
+    if not manifest_path.exists():
+        return None
+    with open(manifest_path) as fh:
+        return json.load(fh)
 
 
 @dataclass
@@ -209,12 +272,13 @@ class CppBatchRunner:
             )
             evolve_cache_root = None
         self.evolve_cache_root = Path(evolve_cache_root).resolve() if evolve_cache_root else None
-        # Cache template defaults so the Parquet writer can broadcast every
-        # model parameter as a column — sampled params get their per-sim
-        # values, non-sampled params get the constant template value. This
-        # keeps cal-target functions like phi_collagen working when they
-        # reach for a model parameter (e.g. rho_collagen) that isn't part
-        # of the current sweep's sampled set.
+        # Cache template defaults for the pool manifest (#23): only
+        # sampled params land as parquet columns, and non-sampled
+        # defaults live in pool_manifest.json alongside the batch
+        # parquets. cal-target functions that reach for a non-sampled
+        # parameter (e.g. rho_collagen) get it from the manifest
+        # fallback in derive_test_stats_worker, not from a broadcast
+        # parquet column.
         self.template_defaults = probe.template_defaults
 
     def run(
@@ -367,7 +431,6 @@ class CppBatchRunner:
             species_names=species_names,
             compartment_names=compartment_names,
             rule_names=rule_names,
-            template_defaults=self.template_defaults,
             t_end_days=t_end_days,
             dt_days=dt_days,
             n_times=n_times,
@@ -406,7 +469,6 @@ def _write_batch_parquet(
     species_names: list[str],
     compartment_names: list[str],
     rule_names: list[str],
-    template_defaults: dict[str, float],
     t_end_days: float,
     dt_days: float,
     n_times: int,
@@ -419,12 +481,14 @@ def _write_batch_parquet(
     layout). Each is emitted as a bare column name so downstream code
     reads them via ``species_dict[name]`` uniformly.
 
-    Every model parameter in ``template_defaults`` is also emitted as a
-    ``param:<name>`` column. Sampled params take their values from
-    ``theta_matrix``; non-sampled params are broadcast as the constant
-    template default. This lets calibration-target functions reach for
-    any model parameter (e.g. ``rho_collagen``) regardless of whether
-    the current sweep is varying it.
+    Only **sampled** model parameters land as ``param:<name>`` columns
+    (one per entry in ``param_names``). Non-sampled template defaults
+    live in the pool's sidecar ``pool_manifest.json`` and are injected
+    by readers when a calibration-target function asks for a parameter
+    that isn't in the sampled set. See #23 — the prior behavior
+    broadcast every template default into every row, tripling parquet
+    width and creating a recurring source of "which set do I want?"
+    ambiguity between callers.
     """
     n_sims = len(statuses)
 
@@ -451,17 +515,8 @@ def _write_batch_parquet(
         "status": pa.array(np.asarray(statuses, dtype=np.int64)),
         "time": pa.array(time_lists, type=pa.list_(pa.float64())),
     }
-    sampled_set = set(param_names)
     for j, name in enumerate(param_names):
         columns[f"param:{name}"] = pa.array(theta_matrix[:, j].astype(np.float64))
-    # Broadcast non-sampled template defaults as constant columns. Snappy
-    # compresses identical-value columns to roughly nothing, so the
-    # storage cost is negligible compared to the cal-target fix.
-    for name in sorted(template_defaults):
-        if name in sampled_set:
-            continue
-        default = float(template_defaults[name])
-        columns[f"param:{name}"] = pa.array(np.full(n_sims, default, dtype=np.float64))
 
     # Trajectory columns in the same order they appear in the v2 binary:
     # species first, then compartments, then assignment rules. Indexing

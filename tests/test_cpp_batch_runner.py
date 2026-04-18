@@ -219,15 +219,14 @@ def test_batch_filename_format():
     )
 
 
-def test_batch_runner_emits_template_defaults_for_unsampled_params(
+def test_batch_runner_writes_only_sampled_param_columns(
     tmp_path: Path, template_path: Path, ok_binary: Path
 ):
-    """Every model parameter in the template should land as a `param:*`
-    column. Sampled params get their per-sim values; unsampled params get
-    the template default broadcast across all rows. Lets cal-target
-    functions read any model parameter via species_dict[name] regardless
-    of what the current sweep is varying.
-    """
+    """Thin parquets (#23): only sampled params appear as ``param:*``
+    columns. Non-sampled template defaults live in pool_manifest.json
+    (written by the caller at pool creation time) and are resolved by
+    derive_test_stats_worker at cal-target eval time, not broadcast
+    into every row."""
     runner = CppBatchRunner(ok_binary, template_path)
     # Vary only A; B is in the template but not sampled.
     theta = np.array([[1.1], [1.2], [1.3]])
@@ -241,10 +240,49 @@ def test_batch_runner_emits_template_defaults_for_unsampled_params(
         max_workers=2,
     )
     table = pq.read_table(out)
-    # Sampled column varies per-sim.
+    # Sampled column present, varying per-sim.
     np.testing.assert_allclose(table.column("param:A").to_numpy(), [1.1, 1.2, 1.3])
-    # Unsampled B is broadcast as the template default (2.0 from MINI_TEMPLATE).
-    np.testing.assert_allclose(table.column("param:B").to_numpy(), [2.0, 2.0, 2.0])
+    # Unsampled B is NOT broadcast — template default lives only in
+    # pool_manifest.json, accessed by cal-target functions via the
+    # manifest fallback in derive_test_stats_worker.
+    assert "param:B" not in table.column_names
+
+
+def test_write_pool_manifest_round_trip(tmp_path: Path):
+    """write_pool_manifest is idempotent (concurrent array tasks safe);
+    load_pool_manifest round-trips the content."""
+    from qsp_hpc.cpp.batch_runner import (
+        POOL_MANIFEST_FILENAME,
+        POOL_MANIFEST_SCHEMA,
+        load_pool_manifest,
+        write_pool_manifest,
+    )
+
+    defaults = {"A": 1.5, "B": 2.0, "C": 3.14}
+    sampled = ["A"]
+    path = write_pool_manifest(tmp_path / "pool", defaults, sampled)
+    assert path.name == POOL_MANIFEST_FILENAME
+    loaded = load_pool_manifest(tmp_path / "pool")
+    assert loaded["schema_version"] == POOL_MANIFEST_SCHEMA
+    assert loaded["template_defaults"] == defaults
+    assert loaded["sampled_params"] == sampled
+
+    # Idempotent: second call doesn't overwrite. Concurrent array tasks
+    # all racing to write the manifest produce one consistent file.
+    write_pool_manifest(tmp_path / "pool", {"A": 999.0}, [])
+    loaded2 = load_pool_manifest(tmp_path / "pool")
+    assert loaded2["template_defaults"] == defaults
+
+
+def test_load_pool_manifest_missing_returns_none(tmp_path: Path):
+    """Pre-#23 pools have no manifest; readers treat None as 'no
+    fallback needed' and look only at parquet columns (which carry
+    the full param set in the wide layout)."""
+    from qsp_hpc.cpp.batch_runner import load_pool_manifest
+
+    assert load_pool_manifest(tmp_path / "nonexistent") is None
+    (tmp_path / "empty").mkdir()
+    assert load_pool_manifest(tmp_path / "empty") is None
 
 
 def test_batch_runner_all_fail_raises(tmp_path: Path, template_path: Path):

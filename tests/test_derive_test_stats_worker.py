@@ -197,6 +197,112 @@ class TestBuildTestStatRegistry:
         assert registry["stat3"](time, species_dict, ureg) == 10.0
 
 
+class TestTemplateDefaultsFallback:
+    """#23: when a calibration-target function asks for a parameter that
+    isn't a parquet column (thin-parquet pools), the derive worker
+    resolves it via the pool manifest's template_defaults."""
+
+    def test_manifest_default_resolves_missing_param(self):
+        # cal-target references rho_collagen, which isn't in the parquet
+        # (not sampled) — should come from template_defaults.
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["k_times_rho"],
+                "required_species": ["V_T.C1, rho_collagen"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return species_dict['rho_collagen'].magnitude "
+                    "* np.mean(species_dict['V_T.C1'].magnitude)"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0],
+                "status": [0],
+                "time": [[0.0, 1.0, 2.0]],
+                "V_T.C1": [[10.0, 20.0, 30.0]],  # mean = 20
+                # NO param:rho_collagen column — the thin-parquet case.
+            }
+        )
+        species_units = {"V_T.C1": "cell", "rho_collagen": "dimensionless"}
+        template_defaults = {"rho_collagen": 0.5}
+
+        result = compute_test_statistics_batch(
+            sim_df,
+            test_stats_df,
+            registry,
+            species_units,
+            template_defaults=template_defaults,
+        )
+        # 0.5 (manifest default) × 20 (mean V_T.C1) = 10
+        assert result[0, 0] == pytest.approx(10.0)
+
+    def test_parquet_column_wins_over_manifest(self):
+        """When a param:* column IS in the parquet (sampled), it takes
+        precedence over the manifest default. Test with an unambiguous
+        value difference."""
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["return_k"],
+                "required_species": ["k"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return species_dict['k'].magnitude"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0],
+                "status": [0],
+                "time": [[0.0]],
+                "param:k": [7.5],  # sampled value
+            }
+        )
+        species_units = {"k": "dimensionless"}
+        template_defaults = {"k": 0.1}  # manifest default should be IGNORED
+
+        result = compute_test_statistics_batch(
+            sim_df,
+            test_stats_df,
+            registry,
+            species_units,
+            template_defaults=template_defaults,
+        )
+        assert result[0, 0] == pytest.approx(7.5)
+
+    def test_missing_param_without_manifest_raises(self):
+        """Pre-#23 behavior: without a manifest, a missing param raises
+        ValueError (via the .warning + nan-row path in the inner loop).
+        Cal-target functions that depend on a now-absent column blow up
+        loudly instead of silently returning garbage."""
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["needs_z"],
+                "required_species": ["z"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return species_dict['z'].magnitude"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0],
+                "status": [0],
+                "time": [[0.0]],
+            }
+        )
+        species_units = {}
+        # No template_defaults supplied → should NaN (error logged + caught).
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
+        assert np.isnan(result[0, 0])
+
+
 class TestComputeTestStatisticsBatch:
     """Test computing test statistics from simulation DataFrame."""
 

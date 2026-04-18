@@ -31,6 +31,7 @@ from qsp_hpc.utils.unit_registry import ureg
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
+from qsp_hpc.cpp.batch_runner import load_pool_manifest  # noqa: E402
 from qsp_hpc.utils.logging_config import setup_logger  # noqa: E402
 from qsp_hpc.utils.model_structure_units import load_units_from_model_structure  # noqa: E402
 
@@ -121,6 +122,7 @@ def compute_test_statistics_batch(
     test_stats_df: pd.DataFrame,
     test_stat_registry: dict,
     species_units: dict,
+    template_defaults: dict[str, float] | None = None,
 ) -> np.ndarray:
     """
     Compute test statistics for a batch of simulations.
@@ -133,10 +135,18 @@ def compute_test_statistics_batch(
         test_stat_registry: Dict mapping test_statistic_id -> compiled function
                            Functions have signature: compute_test_statistic(time, species_dict, ureg)
         species_units: Dict mapping species names to unit strings (e.g., {'V_T.CD8': 'cell'})
+        template_defaults: Optional ``{name: default}`` map loaded from the
+            pool's ``pool_manifest.json``. When a calibration-target
+            function's ``required_species`` lists a parameter that
+            isn't in ``sim_df`` (thin-parquet pools post-#23), we fall
+            back to ``template_defaults[name]`` as a scalar. ``None``
+            preserves the pre-#23 behavior: every parameter has to be
+            a parquet column or raise.
 
     Returns:
         test_stats_matrix: Array of shape (n_sims, n_test_stats)
     """
+    template_defaults = template_defaults or {}
     n_sims = len(sim_df)
     n_test_stats = len(test_stats_df)
 
@@ -177,14 +187,22 @@ def compute_test_statistics_batch(
                 # Also supports scalar parameters (not just time-series species)
                 species_dict = {}
                 for species_name in required_species:
-                    # Resolve column name: try bare name first, then param:-prefixed
+                    # Resolve column name: try bare name first, then param:-prefixed.
+                    # Thin-parquet pools (#23) drop the broadcast param:*
+                    # columns for non-sampled params; those fall back to
+                    # the pool manifest's template_defaults as a scalar.
+                    val: object
                     if species_name in sim_df.columns:
-                        col_name = species_name
+                        val = sim_row[species_name]
                     elif f"param:{species_name}" in sim_df.columns:
-                        col_name = f"param:{species_name}"
+                        val = sim_row[f"param:{species_name}"]
+                    elif species_name in template_defaults:
+                        val = template_defaults[species_name]
                     else:
-                        raise ValueError(f"Species '{species_name}' not found in simulation data")
-                    val = sim_row[col_name]
+                        raise ValueError(
+                            f"Species '{species_name}' not found in simulation "
+                            f"data or pool manifest template_defaults"
+                        )
 
                     # Get unit string from species_units, default to dimensionless
                     # Handle both flat format ("cell") and nested format ({"units": "cell", ...})
@@ -230,6 +248,7 @@ def process_single_batch(
     test_stat_registry: dict,
     species_units: dict,
     test_stats_output_dir: Path,
+    template_defaults: dict[str, float] | None = None,
 ) -> int:
     """
     Process a single batch file and save results.
@@ -278,7 +297,11 @@ def process_single_batch(
 
     # Compute test statistics
     test_stats_matrix = compute_test_statistics_batch(
-        sim_df, test_stats_df, test_stat_registry, species_units
+        sim_df,
+        test_stats_df,
+        test_stat_registry,
+        species_units,
+        template_defaults=template_defaults,
     )
 
     # Save results
@@ -346,6 +369,25 @@ def main():
     logger.info("Building test statistic function registry from CSV...")
     test_stat_registry = build_test_stat_registry(test_stats_df)
 
+    # #23: load the pool's template_defaults manifest if present. Thin
+    # parquets drop broadcast columns for non-sampled params; the
+    # manifest is what cal-target functions fall back to when they ask
+    # for one. Pre-#23 pools have no manifest — the parquet columns
+    # still cover everything, so None is a safe default.
+    pool_manifest = load_pool_manifest(simulation_pool_dir)
+    template_defaults: dict[str, float] | None = None
+    if pool_manifest is not None:
+        template_defaults = {
+            str(k): float(v) for k, v in pool_manifest.get("template_defaults", {}).items()
+        }
+        logger.info(
+            "Loaded pool manifest (schema=%s): %d template defaults available",
+            pool_manifest.get("schema_version", "unknown"),
+            len(template_defaults),
+        )
+    else:
+        logger.info("No pool_manifest.json found — assuming wide parquets (pre-#23 layout)")
+
     # Find all Parquet files in simulation pool
     parquet_files = sorted(simulation_pool_dir.glob("batch_*.parquet"))
     if not parquet_files:
@@ -372,6 +414,7 @@ def main():
             test_stat_registry=test_stat_registry,
             species_units=species_units,
             test_stats_output_dir=test_stats_output_dir,
+            template_defaults=template_defaults,
         )
         total_sims += n_sims
 

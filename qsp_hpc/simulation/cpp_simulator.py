@@ -26,7 +26,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from qsp_hpc.constants import HASH_PREFIX_LENGTH, JOB_QUEUE_TIMEOUT, SLURM_REGISTRATION_DELAY
-from qsp_hpc.cpp.batch_runner import CppBatchRunner
+from qsp_hpc.cpp.batch_runner import CppBatchRunner, write_pool_manifest
 from qsp_hpc.utils.logging_config import create_child_logger, format_config, setup_logger
 
 if TYPE_CHECKING:
@@ -389,6 +389,12 @@ class CppSimulator:
         filename = f"batch_{ts}_{self.scenario}_seed{self.seed}.parquet"
         output_path = self.pool_dir / filename
 
+        # #23: sidecar manifest at the pool dir so downstream consumers
+        # can resolve non-sampled template defaults without each parquet
+        # carrying every one as a broadcast column. Idempotent — reused
+        # across every batch into this pool.
+        write_pool_manifest(self.pool_dir, self._runner.template_defaults, self.param_names)
+
         self._runner.run(
             theta_matrix=theta_new,
             param_names=self.param_names,
@@ -588,8 +594,12 @@ class CppSimulator:
         if param_names is not None and len(param_names) != params.shape[1]:
             param_names = None
 
-        # Persist the full set (all param:* columns) so cal-target code
-        # and future re-derivations can reach any template parameter.
+        # Persist whatever param:* columns HPC sent. Post-#23 this is
+        # sampled-only (thin parquets); pre-#23 pools shipped the full
+        # template set. Either way, we pass through verbatim — the
+        # local cache loader only looks for sampled columns, and
+        # cal-target re-derivation is HPC-only (no local path needs
+        # template defaults).
         self._persist_local_test_stats(
             self._local_test_stats_path(test_stats_hash),
             params,

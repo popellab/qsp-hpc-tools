@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from qsp_hpc.cpp.batch_runner import CppBatchRunner
+from qsp_hpc.cpp.batch_runner import CppBatchRunner, write_pool_manifest
 from qsp_hpc.utils.logging_config import setup_logger
 
 # Configure the `qsp_hpc` parent logger so descendant loggers —
@@ -144,6 +144,14 @@ def run_chunk(config: dict, array_idx: int) -> None:
         healthy_state_yaml=healthy_state_yaml,
         evolve_cache_root=evolve_cache_root,
     )
+
+    # #23: pool_manifest.json lives at the POOL dir (one per pool), not
+    # the per-submission staging dir. Every array task races to write it
+    # on first run of a fresh pool; write_pool_manifest is idempotent so
+    # the second+ writers no-op. Defaults come from the XML template the
+    # CppBatchRunner probed at init time, so the snapshot always matches
+    # the binary this submission ran against.
+    write_pool_manifest(pool_dir, runner.template_defaults, param_names)
 
     result = runner.run(
         theta_matrix=theta_chunk,

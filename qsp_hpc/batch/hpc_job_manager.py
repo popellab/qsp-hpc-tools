@@ -29,6 +29,7 @@ Usage:
     # Use with qsp_simulator for monitoring
 """
 
+import logging
 import pickle
 import shlex
 import subprocess
@@ -36,7 +37,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 import numpy as np
 import pandas as pd
@@ -114,6 +115,38 @@ class BatchConfig:
     cpp_build_modules: str = (
         ""  # Modules for build-time (cmake, git). Falls back to runtime_modules.
     )
+    # SSH retry config. Transient login-node failures (Connection reset, kex
+    # timeouts, stale control sockets) have killed multi-hour smoke runs — see
+    # issue #26. Defaults: 3 attempts with 5s/10s backoff = ~15s worst-case
+    # added latency on a clean run; up to 60s cap between tries.
+    ssh_retry_max_attempts: int = 3
+    ssh_retry_base_delay_s: float = 5.0
+    ssh_retry_max_delay_s: float = 60.0
+    # scp has no built-in timeout; a stale control socket can hang indefinitely.
+    # Fail fast at 10 minutes so the retry loop can kick in instead.
+    scp_timeout_s: int = 600
+
+
+# Substrings observed in transient SSH/SCP failures against Rockfish login
+# nodes. Matching any of these on exec stderr or scp CalledProcessError output
+# flips a failure to "retryable". Order doesn't matter.
+_TRANSIENT_SSH_PATTERNS: Tuple[str, ...] = (
+    "Connection reset by peer",
+    "Operation timed out",
+    "Broken pipe",
+    "kex_exchange_identification",
+    "Connection closed by remote host",
+    "client_loop: send disconnect",
+    "Connection timed out",
+    "ssh_exchange_identification",
+)
+
+
+def _is_transient_ssh_error(message: Optional[str]) -> bool:
+    """Return True if message looks like a retryable login-node failure."""
+    if not message:
+        return False
+    return any(pat in message for pat in _TRANSIENT_SSH_PATTERNS)
 
 
 class RemoteCommandError(RuntimeError):
@@ -126,12 +159,64 @@ class RemoteCommandError(RuntimeError):
         super().__init__(f"Command failed (rc={returncode}): {command}\n{output}")
 
 
+T = TypeVar("T")
+
+
 class SSHTransport:
     """Thin SSH/SCP transport layer to allow swapping/mocking."""
 
-    def __init__(self, config: BatchConfig):
+    def __init__(self, config: BatchConfig, logger: Optional[logging.Logger] = None):
         self.config = config
         self._warned_about_host_key_checking = False
+        self._logger = logger or logging.getLogger(__name__)
+
+    def _retry(self, fn: Callable[[], T], description: str) -> T:
+        """Run ``fn`` with backoff on transient SSH failures.
+
+        Retryable: :class:`subprocess.TimeoutExpired` (scp hang) and any
+        :class:`RemoteCommandError` / :class:`subprocess.CalledProcessError`
+        whose text matches :data:`_TRANSIENT_SSH_PATTERNS`. Non-transient
+        errors (genuine remote-command failures, missing files) propagate
+        immediately — we don't want to paper over real bugs.
+
+        Backoff is exponential (``base * 2**(attempt-1)``) capped at
+        ``max_delay``. ``max_attempts=1`` disables retry entirely.
+        """
+        max_attempts = max(1, int(self.config.ssh_retry_max_attempts))
+        base_delay = float(self.config.ssh_retry_base_delay_s)
+        max_delay = float(self.config.ssh_retry_max_delay_s)
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return fn()
+            except subprocess.TimeoutExpired as exc:
+                if attempt >= max_attempts:
+                    raise
+                message = f"timeout after {exc.timeout}s"
+            except RemoteCommandError as exc:
+                if not _is_transient_ssh_error(exc.output) or attempt >= max_attempts:
+                    raise
+                message = (exc.output or "").splitlines()[0][:200]
+            except subprocess.CalledProcessError as exc:
+                combined = (exc.stderr or "") + (exc.stdout or "")
+                if not _is_transient_ssh_error(combined) or attempt >= max_attempts:
+                    raise
+                message = combined.splitlines()[0][:200] if combined else str(exc)
+
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            self._logger.warning(
+                "SSH transient on %s: %s; retrying %d/%d in %.1fs",
+                description,
+                message,
+                attempt,
+                max_attempts,
+                delay,
+            )
+            time.sleep(delay)
+
+        # Unreachable: the loop either returns on success or raises on the
+        # final attempt via the except clauses above.
+        raise RuntimeError("unreachable: _retry exited loop without return/raise")
 
     def _build_ssh_target(self) -> str:
         if self.config.ssh_user:
@@ -164,7 +249,14 @@ class SSHTransport:
             Tuple of (return_code, combined_output)
 
         Raises:
-            subprocess.TimeoutExpired: If command exceeds timeout
+            subprocess.TimeoutExpired: If command exceeds timeout on the
+                final retry attempt.
+            RemoteCommandError: If ssh itself fails with a transient
+                connection error on the final retry attempt. Non-transient
+                remote-command failures return ``(rc, output)`` as usual —
+                the retry wrapper only triggers on ssh-layer problems
+                (rc=255 plus a known transient pattern), not on legitimate
+                nonzero exits from the remote program.
 
         Note:
             This method does not automatically escape arguments. Use build_safe_ssh_command()
@@ -193,9 +285,18 @@ class SSHTransport:
         ssh_cmd.append(self._build_ssh_target())
         ssh_cmd.append(command)
 
-        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
+        def _once() -> Tuple[int, str]:
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
+            output = result.stdout + result.stderr
+            # ssh itself exits 255 on its own connection failures. When rc=255
+            # and the output matches a transient pattern, raise so the retry
+            # wrapper sees it — otherwise the (rc, output) tuple would
+            # silently pass a dead connection back to the caller.
+            if result.returncode == 255 and _is_transient_ssh_error(output):
+                raise RemoteCommandError(f"ssh exec: {command[:80]}", result.returncode, output)
+            return result.returncode, output
 
-        return result.returncode, result.stdout + result.stderr
+        return self._retry(_once, description="ssh exec")
 
     def upload(self, local_path: str, remote_path: str) -> None:
         """
@@ -206,7 +307,7 @@ class SSHTransport:
             remote_path: Remote destination path
 
         Raises:
-            subprocess.CalledProcessError: If upload fails
+            RemoteCommandError: If upload fails on the final retry attempt.
         """
         self._warn_insecure_ssh()
 
@@ -228,12 +329,17 @@ class SSHTransport:
             ]
         )
 
-        try:
-            subprocess.run(scp_cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as exc:
-            raise RemoteCommandError(
-                f"scp upload to {remote_path}", exc.returncode, exc.stderr or str(exc)
-            ) from exc
+        timeout = self.config.scp_timeout_s or None
+
+        def _once() -> None:
+            try:
+                subprocess.run(scp_cmd, check=True, capture_output=True, text=True, timeout=timeout)
+            except subprocess.CalledProcessError as exc:
+                raise RemoteCommandError(
+                    f"scp upload to {remote_path}", exc.returncode, exc.stderr or str(exc)
+                ) from exc
+
+        self._retry(_once, description=f"scp upload {Path(local_path).name}")
 
     def download(self, remote_path: str, local_dir: str) -> None:
         """
@@ -244,7 +350,7 @@ class SSHTransport:
             local_dir: Local destination directory
 
         Raises:
-            subprocess.CalledProcessError: If download fails
+            RemoteCommandError: If download fails on the final retry attempt.
         """
         self._warn_insecure_ssh()
 
@@ -264,12 +370,17 @@ class SSHTransport:
             ]
         )
 
-        try:
-            subprocess.run(scp_cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as exc:
-            raise RemoteCommandError(
-                f"scp download {remote_path}", exc.returncode, exc.stderr or str(exc)
-            ) from exc
+        timeout = self.config.scp_timeout_s or None
+
+        def _once() -> None:
+            try:
+                subprocess.run(scp_cmd, check=True, capture_output=True, text=True, timeout=timeout)
+            except subprocess.CalledProcessError as exc:
+                raise RemoteCommandError(
+                    f"scp download {remote_path}", exc.returncode, exc.stderr or str(exc)
+                ) from exc
+
+        self._retry(_once, description=f"scp download {Path(remote_path).name}")
 
 
 class HPCJobManager:
@@ -305,7 +416,7 @@ class HPCJobManager:
         self.config = config
         self.verbose = verbose
         self.logger = setup_logger(__name__, verbose=verbose)
-        self.transport = transport or SSHTransport(self.config)
+        self.transport = transport or SSHTransport(self.config, logger=self.logger)
 
         # Initialize component classes (Composition over inheritance)
         self.slurm_submitter = SLURMJobSubmitter(self.config, self.transport, verbose)
@@ -431,6 +542,8 @@ class HPCJobManager:
                 "Expected format: <number><unit> (e.g., '4G', '512M')"
             )
 
+        ssh_retry = (ssh.get("retry") or {}) if isinstance(ssh.get("retry"), dict) else {}
+
         return BatchConfig(
             ssh_host=ssh_host,
             ssh_user=ssh.get("user", "").strip(),
@@ -458,6 +571,10 @@ class HPCJobManager:
             cpp_repo_path=cpp.get("repo_path", "").strip(),
             cpp_branch=cpp.get("branch", "cpp-sweep-binary-io").strip(),
             cpp_build_modules=cpp.get("build_modules", "").strip(),
+            ssh_retry_max_attempts=int(ssh_retry.get("max_attempts", 3)),
+            ssh_retry_base_delay_s=float(ssh_retry.get("base_delay_s", 5.0)),
+            ssh_retry_max_delay_s=float(ssh_retry.get("max_delay_s", 60.0)),
+            scp_timeout_s=int(ssh.get("scp_timeout_s", 600)),
         )
 
     @staticmethod

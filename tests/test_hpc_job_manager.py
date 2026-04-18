@@ -31,7 +31,9 @@ from qsp_hpc.batch.hpc_job_manager import (
     JobInfo,
     MissingOutputError,
     RemoteCommandError,
+    SSHTransport,
     SubmissionError,
+    _is_transient_ssh_error,
 )
 
 # ============================================================================
@@ -530,6 +532,137 @@ class TestCommandExecutionBehaviors:
             with pytest.raises(RemoteCommandError) as exc_info:
                 manager.transport.download("/remote/file", "/tmp")
             assert "scp download" in str(exc_info.value)
+
+
+class TestSSHRetry:
+    """Retry-on-transient-SSH-error behavior for SSHTransport."""
+
+    @pytest.fixture
+    def retry_config(self, mock_hpc_config):
+        # Keep defaults realistic but predictable for tests
+        return BatchConfig(
+            **{
+                **{
+                    f.name: getattr(mock_hpc_config, f.name)
+                    for f in mock_hpc_config.__dataclass_fields__.values()
+                },
+                "ssh_retry_max_attempts": 3,
+                "ssh_retry_base_delay_s": 0.0,
+                "ssh_retry_max_delay_s": 0.0,
+            }
+        )
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch):
+        # Keep tests fast regardless of backoff values
+        monkeypatch.setattr("qsp_hpc.batch.hpc_job_manager.time.sleep", lambda s: None)
+
+    def test_is_transient_detects_known_patterns(self):
+        assert _is_transient_ssh_error("ssh: Connection reset by peer")
+        assert _is_transient_ssh_error("Operation timed out")
+        assert _is_transient_ssh_error("Broken pipe")
+        assert _is_transient_ssh_error("kex_exchange_identification: foo")
+        assert _is_transient_ssh_error("client_loop: send disconnect: Broken pipe")
+        assert not _is_transient_ssh_error("No such file or directory")
+        assert not _is_transient_ssh_error("")
+        assert not _is_transient_ssh_error(None)
+
+    def test_exec_retries_on_transient_ssh_255(self, retry_config):
+        transport = SSHTransport(retry_config)
+        # ssh returns rc=255 with transient text twice, then succeeds
+        bad = subprocess.CompletedProcess(
+            args=[], returncode=255, stdout="", stderr="kex_exchange_identification: read"
+        )
+        good = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok\n", stderr="")
+        with patch("subprocess.run", side_effect=[bad, bad, good]) as run:
+            rc, out = transport.exec("echo hi", timeout=5)
+        assert rc == 0
+        assert "ok" in out
+        assert run.call_count == 3
+
+    def test_exec_does_not_retry_on_genuine_remote_failure(self, retry_config):
+        transport = SSHTransport(retry_config)
+        # Remote command exits 1 — NOT an ssh-layer failure, so no retry
+        result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="bash: command not found"
+        )
+        with patch("subprocess.run", return_value=result) as run:
+            rc, out = transport.exec("bogus", timeout=5)
+        assert rc == 1
+        assert run.call_count == 1
+
+    def test_exec_gives_up_after_max_attempts(self, retry_config):
+        transport = SSHTransport(retry_config)
+        bad = subprocess.CompletedProcess(
+            args=[], returncode=255, stdout="", stderr="Connection reset by peer"
+        )
+        with patch("subprocess.run", return_value=bad) as run:
+            with pytest.raises(RemoteCommandError):
+                transport.exec("echo hi", timeout=5)
+        assert run.call_count == retry_config.ssh_retry_max_attempts
+
+    def test_upload_retries_on_transient_stderr(self, retry_config, tmp_path):
+        transport = SSHTransport(retry_config)
+        local = tmp_path / "f.txt"
+        local.write_text("x")
+        transient = subprocess.CalledProcessError(
+            1, ["scp"], stderr="scp: Connection reset by peer\n"
+        )
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", side_effect=[transient, transient, ok]) as run:
+            transport.upload(str(local), "/remote/f.txt")
+        assert run.call_count == 3
+
+    def test_upload_does_not_retry_on_permanent_error(self, retry_config, tmp_path):
+        transport = SSHTransport(retry_config)
+        local = tmp_path / "f.txt"
+        local.write_text("x")
+        permanent = subprocess.CalledProcessError(
+            1, ["scp"], stderr="scp: /remote/f.txt: Permission denied\n"
+        )
+        with patch("subprocess.run", side_effect=permanent) as run:
+            with pytest.raises(RemoteCommandError):
+                transport.upload(str(local), "/remote/f.txt")
+        assert run.call_count == 1
+
+    def test_upload_retries_on_timeout(self, retry_config, tmp_path):
+        transport = SSHTransport(retry_config)
+        local = tmp_path / "f.txt"
+        local.write_text("x")
+        timeout_exc = subprocess.TimeoutExpired(cmd=["scp"], timeout=600)
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", side_effect=[timeout_exc, ok]) as run:
+            transport.upload(str(local), "/remote/f.txt")
+        assert run.call_count == 2
+
+    def test_download_retries_on_transient_stderr(self, retry_config, tmp_path):
+        transport = SSHTransport(retry_config)
+        transient = subprocess.CalledProcessError(
+            1, ["scp"], stderr="client_loop: send disconnect: Broken pipe"
+        )
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", side_effect=[transient, ok]) as run:
+            transport.download("/remote/f.txt", str(tmp_path))
+        assert run.call_count == 2
+
+    def test_retry_disabled_with_max_attempts_1(self, mock_hpc_config, tmp_path):
+        cfg = BatchConfig(
+            **{
+                **{
+                    f.name: getattr(mock_hpc_config, f.name)
+                    for f in mock_hpc_config.__dataclass_fields__.values()
+                },
+                "ssh_retry_max_attempts": 1,
+            }
+        )
+        transport = SSHTransport(cfg)
+        local = tmp_path / "f.txt"
+        local.write_text("x")
+        transient = subprocess.CalledProcessError(1, ["scp"], stderr="Connection reset by peer")
+        with patch("subprocess.run", side_effect=transient) as run:
+            with pytest.raises(RemoteCommandError):
+                transport.upload(str(local), "/remote/f.txt")
+        assert run.call_count == 1
 
 
 # ============================================================================

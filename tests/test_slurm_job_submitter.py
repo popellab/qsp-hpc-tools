@@ -193,7 +193,9 @@ class TestDerivationJobSubmission:
         assert "#SBATCH --job-name=qsp_derive" in script_content
         assert "#SBATCH --partition=normal" in script_content
         assert "#SBATCH --time=00:15:00" in script_content  # Fixed time for derivation
-        assert "#SBATCH --mem=4G" in script_content  # Fixed memory (not --mem-per-cpu)
+        assert (
+            "#SBATCH --mem=32G" in script_content
+        )  # Bumped from 4G — full-parquet read on wide scenarios OOM'd at 4G
         # Should NOT have array directive - single task processes all batches
         assert "#SBATCH --array" not in script_content
         assert "source /home/testuser/.venv/hpc-qsp/bin/activate" in script_content
@@ -242,7 +244,9 @@ class TestScriptGeneration:
         assert "#SBATCH --job-name=qsp_derive" in script
         assert "#SBATCH --partition=normal" in script
         assert "#SBATCH --time=00:15:00" in script
-        assert "#SBATCH --mem=4G" in script  # Not --mem-per-cpu
+        assert (
+            "#SBATCH --mem=32G" in script
+        )  # Bumped from 4G — full-parquet read on wide scenarios OOM'd at 4G
         # Should NOT have array directive
         assert "#SBATCH --array" not in script
 

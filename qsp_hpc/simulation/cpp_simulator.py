@@ -654,6 +654,43 @@ class CppSimulator:
         tmp.close()
         return Path(tmp.name)
 
+    def validate(self) -> None:
+        """Run pre-flight checks that don't require HPC access.
+
+        Catches bugs that would otherwise burn ~2 minutes of HPC submit
+        time + a full array's worth of doomed compute before surfacing
+        as a worker crash. Failures raise immediately with messages
+        pointing at the offending file (see #31).
+
+        Currently checks: priors CSV column names ⊆ XML template
+        parameter names. Future checks (test_stats observables ⊆
+        model_structure species, scenario-yaml initialization_function
+        when evolve-to-diagnosis is required) can be appended as
+        ``_validate_*`` helpers and invoked from here.
+        """
+        self._validate_priors_in_xml()
+
+    def _validate_priors_in_xml(self) -> None:
+        """Every priors CSV name must exist in the XML template.
+
+        Concrete failure mode: 50 array tasks each crash at
+        CppBatchRunner.run with ParamNotFoundError because the priors
+        CSV carries 40 orphan rows (left over from an older model
+        version) that aren't in param_all.xml. Without set -e in the
+        sbatch (#27) this used to look like 50/50 COMPLETED, then the
+        derivation found zero parquets and reported "no batches".
+        Surfacing this locally takes ~ms and saves the round-trip.
+        """
+        unknown = sorted(set(self.param_names) - self._runner.parameter_names)
+        if unknown:
+            raise ValueError(
+                f"{len(unknown)} priors CSV column(s) not in XML template "
+                f"({self.template_xml.name}): {unknown[:10]}"
+                + (f" ...(+{len(unknown) - 10} more)" if len(unknown) > 10 else "")
+                + f". Drop these rows from {self.priors_csv} or add them to the "
+                "template before submitting."
+            )
+
     def run_hpc(self, n: int) -> Tuple[np.ndarray, np.ndarray]:
         """Run ``n`` simulations through the 3-tier HPC cache.
 
@@ -674,6 +711,10 @@ class CppSimulator:
             raise RuntimeError("run_hpc() requires job_manager")
         if self.test_stats_csv is None:
             raise RuntimeError("run_hpc() requires test_stats_csv")
+        # Pre-flight (#31): surface priors/template mismatches before any
+        # ssh / sbatch round-trip. Local tier hits skip HPC entirely so
+        # validation runs only on the path that would actually submit.
+        self.validate()
 
         # Resolve HPC-side paths: explicit ctor arg → credentials → error.
         # Laptop-resident self.binary_path / self.template_xml are unsuitable

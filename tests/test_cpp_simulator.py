@@ -896,3 +896,118 @@ class TestCppSimulatorCalibrationTargets:
         )
         expected = compute_test_stats_hash(sim.test_stats_csv)
         assert sim._compute_test_stats_hash() == expected
+
+
+# ---------------------------------------------------------------------------
+# #31: CppSimulator.validate() pre-flight checks
+# ---------------------------------------------------------------------------
+
+
+class TestCppSimulatorValidate:
+    """validate() catches local mistakes before any HPC round-trip.
+
+    Motivating bug: 50 array tasks each crashed with ParamNotFoundError
+    because pdac_priors.csv carried 40 orphan rows not in param_all.xml.
+    Without set -e (#27) the workflow saw 50/50 done, failed=0; the bug
+    only surfaced ~30min later when derivation found zero parquets.
+    """
+
+    def test_passes_when_priors_subset_of_template(
+        self, priors_csv, binary_path, template_path, cache_dir
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+        )
+        # Fixture priors lists A, B; template fixture exposes A, B.
+        sim.validate()  # no raise
+
+    def test_raises_when_priors_have_orphan_name(
+        self, binary_path, template_path, cache_dir, tmp_path
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        bad_priors = tmp_path / "bad_priors.csv"
+        bad_priors.write_text(
+            "name,distribution,dist_param1,dist_param2\n"
+            "A,lognormal,0.0,0.5\n"
+            "ORPHAN_NOT_IN_XML,lognormal,0.0,0.5\n"
+        )
+        sim = CppSimulator(
+            priors_csv=bad_priors,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+        )
+        with pytest.raises(ValueError, match="not in XML template"):
+            sim.validate()
+
+    def test_error_message_names_offending_columns(
+        self, binary_path, template_path, cache_dir, tmp_path
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        bad_priors = tmp_path / "bad_priors.csv"
+        bad_priors.write_text(
+            "name,distribution,dist_param1,dist_param2\n"
+            "A,lognormal,0.0,0.5\n"
+            "GHOST_PARAM_1,lognormal,0.0,0.5\n"
+            "GHOST_PARAM_2,lognormal,0.0,0.5\n"
+        )
+        sim = CppSimulator(
+            priors_csv=bad_priors,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+        )
+        with pytest.raises(ValueError) as exc_info:
+            sim.validate()
+        msg = str(exc_info.value)
+        assert "GHOST_PARAM_1" in msg
+        assert "GHOST_PARAM_2" in msg
+        assert "bad_priors.csv" in msg
+
+    def test_run_hpc_invokes_validate_before_submit(
+        self, binary_path, template_path, cache_dir, tmp_path
+    ):
+        """run_hpc must short-circuit on validation failure — no SSH /
+        sbatch calls should fire when the priors are obviously broken."""
+        from unittest.mock import MagicMock
+
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        bad_priors = tmp_path / "bad_priors.csv"
+        bad_priors.write_text(
+            "name,distribution,dist_param1,dist_param2\n" "ORPHAN,lognormal,0.0,0.5\n"
+        )
+        ts_csv = tmp_path / "test_stats.csv"
+        ts_csv.write_text("name,model_output_code\n")
+        ms_file = tmp_path / "model_structure.json"
+        ms_file.write_text("{}\n")
+
+        job_manager = MagicMock()
+        job_manager.config.simulation_pool_path = "/scratch/sims"
+        job_manager.config.cpp_binary_path = "/hpc/bin/qsp_sim"
+        job_manager.config.cpp_template_path = "/hpc/template.xml"
+
+        sim = CppSimulator(
+            priors_csv=bad_priors,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            job_manager=job_manager,
+            test_stats_csv=ts_csv,
+            model_structure_file=ms_file,
+        )
+
+        with pytest.raises(ValueError, match="not in XML template"):
+            sim.run_hpc(10)
+
+        # No HPC traffic of any kind.
+        job_manager.check_hpc_test_stats.assert_not_called()
+        job_manager.submit_cpp_jobs.assert_not_called()
+        job_manager.submit_derivation_job.assert_not_called()

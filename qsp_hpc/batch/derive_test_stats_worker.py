@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from qsp_hpc.utils.unit_registry import ureg
 
@@ -266,15 +267,25 @@ def process_single_batch(
     """
     logger.info(f"Processing batch {batch_idx}: {parquet_file.name}")
 
-    # Load simulation batch
-    sim_df = pd.read_parquet(parquet_file)
-    n_sims = len(sim_df)
-    logger.info(f"  Loaded {n_sims} simulations")
+    # Stream the parquet row-group-by-row-group rather than loading the
+    # full file with pd.read_parquet. For wide scenarios (15k-sim
+    # clinical_progression: 11 GB on disk, 300 row groups, list-typed
+    # time-series columns) a single pd.read_parquet blows past any
+    # reasonable SLURM --mem limit — the list cells become Python lists
+    # in pandas (~80 B / element) instead of packed numpy arrays
+    # (~8 B / element), so the working set can reach 100+ GB. Streaming
+    # keeps peak memory at one row group (~50 sims for our combiner's
+    # output layout).
+    pf = pq.ParquetFile(str(parquet_file))
+    n_row_groups = pf.num_row_groups
+    schema_names = pf.schema_arrow.names
+    n_sims_total = pf.metadata.num_rows
+    logger.info(f"  Streaming {n_sims_total} simulations across {n_row_groups} row group(s)")
 
-    # Extract parameter columns (identified by "param:" prefix in parquet)
     param_prefix = "param:"
-    param_cols = [col for col in sim_df.columns if col.startswith(param_prefix)]
+    param_cols = [col for col in schema_names if col.startswith(param_prefix)]
     clean_names = [col[len(param_prefix) :] for col in param_cols]
+    has_sample_index = "sample_index" in schema_names
 
     if param_cols:
         logger.debug(
@@ -282,37 +293,61 @@ def process_single_batch(
             f"{clean_names[:5]}{'...' if len(clean_names) > 5 else ''}"
         )
 
-        # Save parameters to chunk_XXX_params.csv (strip prefix for clean names).
-        # Prepend sample_index so the combined CSV carries cross-scenario
-        # alignment keys; missing column (legacy parquets) → fall back to
-        # batch-relative position downstream.
-        params_output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_params.csv"
-        params_df = sim_df[param_cols].copy()
-        params_df.columns = clean_names
-        if "sample_index" in sim_df.columns:
-            params_df.insert(0, "sample_index", sim_df["sample_index"].astype("int64").values)
-        params_df.to_csv(params_output_file, index=False, float_format="%.12e")
+    # Open output files once; write each row group's slice incrementally.
+    # For params we write the header on the first row group only so the
+    # final chunk_XXX_params.csv matches the pre-streaming single-CSV
+    # layout (header row + data rows) that combine_test_stats_chunks.py
+    # downstream expects.
+    params_output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_params.csv"
+    test_stats_output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_test_stats.csv"
 
+    params_f = open(params_output_file, "w") if param_cols else None
+    params_header_written = False
+
+    try:
+        with open(test_stats_output_file, "w") as ts_f:
+            for rg_idx in range(n_row_groups):
+                sim_df = pf.read_row_group(rg_idx).to_pandas()
+                # compute_test_statistics_batch uses positional indexing on
+                # its preallocated (n_sims, n_test_stats) matrix via
+                # sim_df.iterrows(); force a fresh 0..N-1 index in case
+                # pyarrow hands back a non-RangeIndex on some builds.
+                sim_df = sim_df.reset_index(drop=True)
+
+                if params_f is not None:
+                    rg_params_df = sim_df[param_cols].copy()
+                    rg_params_df.columns = clean_names
+                    if has_sample_index:
+                        rg_params_df.insert(
+                            0,
+                            "sample_index",
+                            sim_df["sample_index"].astype("int64").values,
+                        )
+                    rg_params_df.to_csv(
+                        params_f,
+                        index=False,
+                        header=not params_header_written,
+                        float_format="%.12e",
+                    )
+                    params_header_written = True
+
+                test_stats_matrix_rg = compute_test_statistics_batch(
+                    sim_df,
+                    test_stats_df,
+                    test_stat_registry,
+                    species_units,
+                    template_defaults=template_defaults,
+                )
+                np.savetxt(ts_f, test_stats_matrix_rg, delimiter=",", fmt="%.12e")
+    finally:
+        if params_f is not None:
+            params_f.close()
+
+    if param_cols:
         logger.debug(f"  ✓ Parameters saved: {params_output_file.name}")
+    logger.info(f"  ✓ Saved: {test_stats_output_file.name}")
 
-    # Compute test statistics
-    test_stats_matrix = compute_test_statistics_batch(
-        sim_df,
-        test_stats_df,
-        test_stat_registry,
-        species_units,
-        template_defaults=template_defaults,
-    )
-
-    # Save results
-    output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_test_stats.csv"
-
-    # Save as CSV (n_sims x n_test_stats)
-    np.savetxt(output_file, test_stats_matrix, delimiter=",", fmt="%.12e")
-
-    logger.info(f"  ✓ Saved: {output_file.name}")
-
-    return n_sims
+    return n_sims_total
 
 
 def main():

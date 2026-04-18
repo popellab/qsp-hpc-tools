@@ -13,7 +13,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-
 # --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
@@ -54,7 +53,9 @@ def staging_pool(tmp_path: Path) -> tuple[Path, Path]:
     params = ["k1", "k2"]
     species = ["Tumor", "Immune"]
     for idx in range(3):
-        _write_chunk(staging / f"chunk_{idx:03d}.parquet", n_sims=4, param_names=params, species=species)
+        _write_chunk(
+            staging / f"chunk_{idx:03d}.parquet", n_sims=4, param_names=params, species=species
+        )
 
     return pool_base, staging
 
@@ -84,9 +85,13 @@ class TestCombineChunks:
         )
         assert out.exists()
         # MATLAB-style filename: no _taskNNN, no chunk_NNN — one batch per submission.
+        # Post-#21: no `_{N}sims_` segment either; the row count lives in the
+        # parquet footer (verified separately via num_rows).
         assert out.name.startswith("batch_")
         assert "_task" not in out.name
-        assert out.name.endswith("_scen_12sims_seed2025.parquet")
+        assert "sims_seed" not in out.name
+        assert out.name.endswith("_scen_seed2025.parquet")
+        assert pq.read_table(str(out)).num_rows == 12
 
     def test_consolidates_all_chunk_rows(self, staging_pool):
         from qsp_hpc.batch.cpp_combine_batch_worker import combine_chunks
@@ -218,10 +223,11 @@ class TestCombineChunks:
             }
         )
         assert out.exists()
-        # Filename reflects actual delivered count (12 = 3 chunks × 4 sims),
-        # not the 20 originally requested.
-        assert out.name.endswith("_scen_12sims_seed2025.parquet")
-        assert "_scen_20sims_" not in out.name
+        # Post-#21: filename no longer encodes a row count. The parquet
+        # footer is the source of truth and shows the actual delivered
+        # 12 rows (3 chunks × 4 sims), not the 20 originally requested.
+        assert out.name.endswith("_scen_seed2025.parquet")
+        assert "sims_seed" not in out.name
         table = pq.read_table(str(out))
         assert table.num_rows == 12
 
@@ -258,6 +264,6 @@ class TestCombineChunks:
         batches = sorted(pool_dir.glob("batch_*.parquet"))
         # Either two distinct files OR one combined — we require two so
         # the pool keeps the append-only semantics MATLAB relies on.
-        assert len(batches) == 2, (
-            f"Expected 2 batch files, got {len(batches)}: {[b.name for b in batches]}"
-        )
+        assert (
+            len(batches) == 2
+        ), f"Expected 2 batch files, got {len(batches)}: {[b.name for b in batches]}"

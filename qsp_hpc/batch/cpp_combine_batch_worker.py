@@ -97,26 +97,21 @@ def combine_chunks(config: dict) -> Path:
         idx = combined.column_names.index("simulation_id")
         combined = combined.set_column(idx, "simulation_id", new_ids)
 
-    # Filename encodes the ACTUAL number of rows written (combined.num_rows),
-    # not n_sims from the config. When some array tasks fail to flush their
-    # parquet (e.g. wall-time kills on oversubscribed nodes), the combined
-    # batch has fewer rows than requested. Trusting the config count here
-    # would cause count_pool_simulations (which parses `{N}sims` from the
-    # filename) to overreport, and the Tier 2 check_hpc_test_stats would
-    # then keep nuking the derived test_stats and re-deriving them
-    # indefinitely because derived_count < filename_count.
+    # Filename no longer encodes a row count (#21). Row counts come from
+    # the parquet's footer metadata at scan time, which always agrees
+    # with the actual on-disk data — even when array tasks drop chunks
+    # mid-run and the consolidated batch ends up shorter than requested.
     #
     # Microsecond-resolution timestamp prevents filename collisions when
     # two combines for the same pool complete within the same wall-second
     # (e.g. quick top-up after the initial batch finishes).
     n_rows_written = combined.num_rows
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"batch_{ts}_{scenario}_{n_rows_written}sims_seed{seed}.parquet"
+    filename = f"batch_{ts}_{scenario}_seed{seed}.parquet"
     output_path = pool_dir / filename
     if n_rows_written != n_sims:
         logger.warning(
-            "Actual row count %d differs from requested %d "
-            "(%d chunks lost) — naming batch by actual count",
+            "Actual row count %d differs from requested %d (%d chunks lost)",
             n_rows_written,
             n_sims,
             n_sims - n_rows_written,

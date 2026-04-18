@@ -188,11 +188,14 @@ class CppSimulator:
         # The combine worker writes a microsecond-resolution timestamp to
         # avoid filename collisions when two combines land in the same
         # wall-second (e.g. quick top-up chained onto the initial run).
-        # The `_task{N}` segment is kept in the regex only for backward
-        # compatibility with pre-existing pools seeded before the unify
-        # refactor; new runs never produce it.
+        # `_task{N}` and `_{N}sims` segments are kept optional in the
+        # regex for backward compatibility with pre-#21 pools; new runs
+        # don't emit them and read row counts from parquet metadata
+        # instead (see #21 — filename-as-truth was a footgun once
+        # array-task chunks started dropping silently).
         self._batch_pattern = re.compile(
-            r"batch_(\d{8}_\d{6}(?:_\d{6})?)(?:_task\d+)?_(.+?)_(\d+)sims_seed(\d+)\.parquet"
+            r"batch_(\d{8}_\d{6}(?:_\d{6})?)(?:_task\d+)?_(.+?)"
+            r"(?:_(\d+)sims)?_seed(\d+)\.parquet"
         )
 
         base_logger = setup_logger(__name__, verbose=verbose)
@@ -266,15 +269,23 @@ class CppSimulator:
     # ------------------------------------------------------------------
 
     def _scan_pool(self) -> list[dict]:
-        """Scan pool directory for cached Parquet batch files."""
+        """Scan pool directory for cached Parquet batch files.
+
+        Row counts come from parquet metadata (footer-only read) rather
+        than the filename's ``_{N}sims`` token — the token was unreliable
+        once array-task chunk drops started producing batches with fewer
+        rows than originally requested (see #21). The token is still
+        accepted by the regex for back-compat but ignored when present.
+        """
         batches = []
         for f in sorted(self.pool_dir.glob("batch_*.parquet")):
             m = self._batch_pattern.match(f.name)
             if not m:
                 continue
-            ts, file_scenario, n_sims, file_seed = m.groups()
+            ts, file_scenario, _legacy_n_sims, file_seed = m.groups()
             if file_scenario != self.scenario:
                 continue
+            n_sims = pq.read_metadata(str(f)).num_rows
             batches.append(
                 {
                     "filepath": f,
@@ -372,7 +383,10 @@ class CppSimulator:
         theta_new = self._generate_parameters(indices)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"batch_{ts}_{self.scenario}_{n_needed}sims_seed{self.seed}.parquet"
+        # No `_{N}sims_` segment — actual row count comes from parquet
+        # metadata at scan time (#21). Filename stays stable even if
+        # some sims fail and the on-disk row count diverges from n_needed.
+        filename = f"batch_{ts}_{self.scenario}_seed{self.seed}.parquet"
         output_path = self.pool_dir / filename
 
         self._runner.run(

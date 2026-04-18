@@ -358,6 +358,50 @@ class TestPoolCaching:
         assert theta.shape[0] == 5
         assert table.num_rows == 5
 
+    def test_scan_reads_count_from_parquet_metadata_not_filename(
+        self, priors_csv, binary_path, template_path, cache_dir
+    ):
+        """Regression for #21: filename-based row counts overreported when
+        array-task chunks dropped. _scan_pool now reads num_rows from the
+        parquet footer, so a legacy file claiming '1000sims' but holding
+        only 620 rows reports 620 — the truth.
+        """
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="ctrl",
+        )
+        # Filename lies about the count; metadata holds the truth.
+        _write_synthetic_parquet(
+            sim.pool_dir / "batch_20260415_120000_ctrl_1000sims_seed42.parquet",
+            n_sims=620,
+        )
+        assert sim.get_available_simulations() == 620
+
+    def test_scan_accepts_new_filename_without_nsims_token(
+        self, priors_csv, binary_path, template_path, cache_dir
+    ):
+        """New combine-worker filenames omit the _{N}sims_ segment (#21).
+        _scan_pool must still match them and pull the count from metadata."""
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            scenario="ctrl",
+        )
+        _write_synthetic_parquet(
+            sim.pool_dir / "batch_20260415_120000_ctrl_seed42.parquet",
+            n_sims=15,
+        )
+        assert sim.get_available_simulations() == 15
+
 
 class TestCall:
     def test_call_uses_cache_when_available(

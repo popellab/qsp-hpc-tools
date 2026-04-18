@@ -56,17 +56,41 @@ class ResultCollector:
         return "not_found" not in output
 
     def count_pool_simulations(self, pool_path: str) -> int:
-        """Count number of simulations in pool from manifest or filenames."""
+        """Count simulations in a remote pool.
+
+        Prefers parquet footer metadata (cheap O(1) per file) over the
+        legacy ``_{N}sims_`` filename token, which silently overreported
+        when array-task chunk drops left the consolidated batch shorter
+        than the requested N (#21). Manifest.json takes precedence when
+        present (MATLAB pools historically wrote one).
+        """
+        # The python one-liner walks batch_*.parquet, sums num_rows from
+        # each file's footer, and prints `N_SIMS:<sum>`. Footer reads
+        # don't materialise rows, so this stays O(num_files), not O(rows).
+        py_count = (
+            "import sys, glob; "
+            "import pyarrow.parquet as pq; "
+            "files = sorted(glob.glob('batch_*.parquet')); "
+            "total = sum(pq.read_metadata(f).num_rows for f in files); "
+            "print(f'N_FILES:{len(files)}'); "
+            "print(f'N_SIMS:{total}')"
+        )
+        venv_python = f"{self.config.hpc_venv_path}/bin/python"
         count_cmd = f"""
             cd "{pool_path}" 2>/dev/null || exit 1
 
             if [ -f manifest.json ]; then
                 echo "MANIFEST_FOUND"
                 cat manifest.json
+            elif ls batch_*.parquet >/dev/null 2>&1; then
+                echo "COUNTING_PARQUET_METADATA"
+                "{venv_python}" -c "{py_count}"
             else
-                echo "COUNTING_FILES"
-                ls batch_*.parquet 2>/dev/null | wc -l | awk '{{print "N_FILES:" $1}}'
-                ls batch_*.parquet 2>/dev/null | \
+                # No parquets — fall back to the legacy MATLAB .mat path
+                # which still encodes N in the filename.
+                echo "COUNTING_MAT_FILES"
+                ls batch_*.mat 2>/dev/null | wc -l | awk '{{print "N_FILES:" $1}}'
+                ls batch_*.mat 2>/dev/null | \
                 grep -oE '[0-9]+sims' | \
                 sed 's/sims//' | \
                 awk '{{sum+=$1}} END {{print "N_SIMS:" sum}}'
@@ -99,12 +123,14 @@ class ResultCollector:
                 if self.verbose:
                     self.logger.debug(f"Parsed manifest: {n_available} simulations")
 
-            elif "COUNTING_FILES" in output:
-                # Extract N_SIMS value
+            elif "COUNTING_PARQUET_METADATA" in output or "COUNTING_MAT_FILES" in output:
+                source = (
+                    "parquet metadata" if "COUNTING_PARQUET_METADATA" in output else "filenames"
+                )
                 for line in output.split("\n"):
                     if line.startswith("N_SIMS:"):
                         n_available = int(line.split(":")[1].strip())
-                        self.logger.debug(f"Counted from filenames: {n_available} simulations")
+                        self.logger.debug(f"Counted from {source}: {n_available} simulations")
                         break
             else:
                 self.logger.debug("Could not parse output format")

@@ -677,6 +677,69 @@ class TestCppSimulatorRunHpc:
         # Local cache must be populated for next-call hit
         assert sim._local_test_stats_path(ts_hash).exists()
 
+    def test_run_hpc_tier2_partial_falls_through_to_topup(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        """Regression: Tier 2 returned TRUE for partial hits (e.g. 40
+        derived stats on HPC when 1000 were requested), then
+        ``_download_and_persist`` pulled the 40, ``_sample_first_n``
+        returned all 40, and ``run_hpc`` silently returned an undersized
+        array. Caught by the N=1000 SBI smoke — user requested 1000,
+        got 40. Fix: after downloading, if count < n, fall through to
+        Tier 3 / 3.5 so the pool gets topped up."""
+        from qsp_hpc.batch.hpc_job_manager import DownloadResult, JobInfo
+
+        sim, jm = self._make_sim(priors_csv, binary_path, template_path, cache_dir, tmp_path)
+
+        # HPC has 40 test stats but we ask for 1000 → partial hit.
+        rng = np.random.default_rng(10)
+        partial_params = rng.uniform(size=(40, 2))
+        partial_ts = rng.uniform(size=(40, 3))
+        jm.check_hpc_test_stats.return_value = True
+
+        # After Tier 2 downloads the 40 partial rows, Tier 3 should
+        # see the pool has 40 sims and fall into Tier 3.5 (top-up).
+        jm.result_collector.check_pool_directory_exists.return_value = True
+        jm.result_collector.count_pool_simulations.return_value = 40
+
+        # Tier 3.5 submits a delta C++ array + chained derivation; then
+        # the final download pulls 1000 rows (old 40 + new 960).
+        jm.submit_cpp_jobs.return_value = JobInfo(
+            job_ids=["array", "combine", "derive"],
+            state_file="",
+            n_jobs=1,
+            n_simulations=960,
+            submission_time="now",
+        )
+        full_params = rng.uniform(size=(1000, 2))
+        full_ts = rng.uniform(size=(1000, 3))
+        # First call (Tier 2 partial download) returns 40;
+        # second call (after Tier 3.5 derivation) returns 1000.
+        jm.download_test_stats_full.side_effect = [
+            DownloadResult(
+                params=partial_params,
+                test_stats=partial_ts,
+                sample_index=np.arange(40, dtype=np.int64),
+                param_names=list(sim.param_names),
+            ),
+            DownloadResult(
+                params=full_params,
+                test_stats=full_ts,
+                sample_index=np.arange(1000, dtype=np.int64),
+                param_names=list(sim.param_names),
+            ),
+        ]
+
+        out_params, out_ts = sim.run_hpc(1000)
+        assert out_params.shape == (1000, 2)
+        assert out_ts.shape == (1000, 3)
+
+        # Tier 3.5 was entered: submit_cpp_jobs called for the delta.
+        jm.submit_cpp_jobs.assert_called_once()
+        # start_index should be 40 (already have those from pool).
+        _, kwargs = jm.submit_cpp_jobs.call_args
+        assert kwargs["num_simulations"] == 960
+
     def test_run_hpc_tier3_derives_when_full_sims_present(
         self, priors_csv, binary_path, template_path, cache_dir, tmp_path
     ):

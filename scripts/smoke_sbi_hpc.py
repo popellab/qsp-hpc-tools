@@ -209,6 +209,17 @@ def main() -> int:
 
     failures: list[str] = []
 
+    # Size check: run_hpc must return exactly n_sims rows. Partial returns
+    # (e.g. Tier 2 short-circuit on a pool with < n sims) are silent bugs —
+    # caller sees a too-small array. Caught once by the N=1000 run over a
+    # 40-sim pool where Tier 2 returned the 40 pre-existing sims instead
+    # of topping up to 1000.
+    for scen, (theta, _, _) in scenario_results.items():
+        if theta.shape[0] != args.n_sims:
+            failures.append(
+                f"{scen} returned {theta.shape[0]} sims but {args.n_sims} were requested"
+            )
+
     # Theta across scenarios must match (same seed → same pool → same first N).
     thetas = [r[0] for r in scenario_results.values()]
     ref_theta = thetas[0]

@@ -772,8 +772,24 @@ class CppSimulator:
         if self.job_manager.check_hpc_test_stats(hpc_pool_path, test_stats_hash, expected_n_sims=n):
             self.logger.info("✓ HPC test stats found — downloading")
             params, test_stats = self._download_and_persist(hpc_pool_path, test_stats_hash)
-            return self._sample_first_n(params, test_stats, n)
-        self.logger.info("No pre-derived test stats on HPC")
+            if params.shape[0] >= n:
+                return self._sample_first_n(params, test_stats, n)
+            # Partial — check_hpc_test_stats returned True because some
+            # stats exist, but we have fewer than n. _download_and_persist
+            # has already cached what's there locally (Tier 1 will pick
+            # it up next run). Fall through to Tier 3 / 3.5 so the pool
+            # can be topped up and a fresh derivation covers all rows.
+            # Without this fall-through, run_hpc(1000) over a 40-sim pool
+            # silently returns (40, ...) — caller sees N-too-small arrays
+            # and the "caller can top up" comment in check_hpc_test_stats
+            # goes unenforced.
+            self.logger.info(
+                "HPC test stats partial (%d/%d) — falling through to Tier 3 for top-up",
+                params.shape[0],
+                n,
+            )
+        else:
+            self.logger.info("No pre-derived test stats on HPC")
 
         # Tier 3: HPC full sims exist — derive on cluster, then download
         has_pool = self.job_manager.result_collector.check_pool_directory_exists(hpc_pool_path)

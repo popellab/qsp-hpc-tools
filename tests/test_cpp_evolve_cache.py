@@ -352,3 +352,31 @@ def test_batch_runner_shares_cache_across_scenarios(tmp_path: Path):
 
     blobs = list(cache_root.rglob("*.state.bin"))
     assert len(blobs) == 1, f"expected one shared evolve blob, got {len(blobs)}: {blobs}"
+
+
+@pytest.mark.skipif(_SKIP_INTEGRATION, reason=_SKIP_REASON)
+def test_batch_runner_warns_when_cache_requested_without_healthy_state(tmp_path: Path, caplog):
+    """Regression guard for #34: passing evolve_cache_root without
+    healthy_state_yaml used to DEBUG-log and silently disable. The fix
+    upgrades to WARNING so the mismatch surfaces even when the caller
+    runs at default log level (e.g. HPC workers where the smoke test
+    found 0 blobs written with no warning in .err)."""
+    import logging
+
+    from qsp_hpc.cpp.batch_runner import CppBatchRunner
+
+    cache_root = tmp_path / "evolve_cache"
+    with caplog.at_level(logging.WARNING, logger="qsp_hpc.cpp.batch_runner"):
+        br = CppBatchRunner(
+            binary_path=_real_binary_path(),
+            template_path=_real_template_path(),
+            # Intentionally omit healthy_state_yaml.
+            default_timeout_s=60.0,
+            evolve_cache_root=cache_root,
+        )
+    assert br.evolve_cache_root is None
+    assert any(
+        "evolve_cache_root" in rec.message and "ignored" in rec.message
+        for rec in caplog.records
+        if rec.levelno >= logging.WARNING
+    ), f"expected a WARNING about evolve_cache_root being ignored; got {caplog.records}"

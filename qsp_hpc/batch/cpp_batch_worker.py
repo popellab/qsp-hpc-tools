@@ -64,6 +64,18 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # the same theta skips evolve via --initial-state. None disables.
     evolve_cache_root = config.get("evolve_cache_root")
 
+    # #34: announce the cache-wiring inputs at INFO in the parent process.
+    # These are also implicitly checked by CppBatchRunner/_worker_init, but
+    # a partial config (e.g. evolve_cache_root set but healthy_state_yaml
+    # None) silently disables the cache — and the SLURM task still exits 0.
+    # Logging here pins down "0 blobs written" to a specific cause without
+    # needing a debug rerun.
+    logger.info(
+        "Evolve-cache config: healthy_state_yaml=%s evolve_cache_root=%s",
+        healthy_state_yaml,
+        evolve_cache_root,
+    )
+
     start = array_idx * jobs_per_chunk
     end = min(start + jobs_per_chunk, n_simulations)
     chunk_size = end - start

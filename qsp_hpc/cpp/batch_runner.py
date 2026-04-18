@@ -149,6 +149,16 @@ def _worker_init(
     evolve_cache_root: str | None,
 ) -> None:
     global _WORKER_RUNNER, _WORKER_WORKDIR, _WORKER_EVOLVE_CACHE
+    # Configure the qsp_hpc parent logger inside the worker so descendant
+    # loggers (qsp_hpc.cpp.evolve_cache, this module) emit to stdout even
+    # when the pool was created with the "spawn" start method (Python 3.14+
+    # on Linux). Under "fork" this no-ops since the logger is already
+    # configured by the parent cpp_batch_worker import — setup_logger is
+    # idempotent. See #34 / #36.
+    from qsp_hpc.utils.logging_config import setup_logger
+
+    setup_logger("qsp_hpc", verbose=True)
+
     _WORKER_RUNNER = CppRunner(
         binary_path=binary_path,
         template_path=template_path,
@@ -169,8 +179,19 @@ def _worker_init(
             renderer=_WORKER_RUNNER._renderer,
             runner=_WORKER_RUNNER,
         )
+        logger.info(
+            "worker %d: evolve cache ENABLED, cache_dir=%s",
+            os.getpid(),
+            _WORKER_EVOLVE_CACHE.cache_dir,
+        )
     else:
         _WORKER_EVOLVE_CACHE = None
+        logger.info(
+            "worker %d: evolve cache DISABLED " "(evolve_cache_root=%s, healthy_state_yaml=%s)",
+            os.getpid(),
+            evolve_cache_root,
+            healthy_state_yaml,
+        )
 
 
 def _run_one_in_worker(
@@ -263,10 +284,14 @@ class CppBatchRunner:
         self.parameter_names = probe.parameter_names
         # evolve_cache_root is propagated to workers. Only meaningful when
         # healthy_state_yaml is set — without an evolve phase there is
-        # nothing to cache. Silently ignored otherwise so callers that
-        # pass it unconditionally (e.g. CppSimulator) don't have to check.
+        # nothing to cache. When the caller explicitly asked for a cache
+        # but didn't provide a healthy_state, that's a config mismatch
+        # worth surfacing (see #34: silent disable produced "0 blobs
+        # written" with no log trail); otherwise the CppSimulator /
+        # submit_cpp_jobs callers that pass it unconditionally don't have
+        # to check.
         if evolve_cache_root is not None and probe.healthy_state_yaml is None:
-            logger.debug(
+            logger.warning(
                 "evolve_cache_root=%s ignored: no healthy_state_yaml " "(no evolve phase to cache)",
                 evolve_cache_root,
             )
@@ -354,6 +379,22 @@ class CppBatchRunner:
             scenario,
             seed,
         )
+        # #34: announce resolved cache state so "did the evolve cache
+        # engage?" is answerable from the SLURM stdout alone. Worker-side
+        # wiring runs inside _worker_init — those logs depend on the child
+        # process having the qsp_hpc logger configured, which isn't
+        # guaranteed under the spawn start method.
+        if self.evolve_cache_root is not None:
+            logger.info(
+                "Evolve-cache: ENABLED (root=%s, healthy_state_yaml=%s)",
+                self.evolve_cache_root,
+                self.healthy_state_yaml,
+            )
+        else:
+            logger.info(
+                "Evolve-cache: DISABLED (healthy_state_yaml=%s)",
+                self.healthy_state_yaml,
+            )
         trajectories: list[np.ndarray | None] = [None] * n_sims
         statuses: list[int] = [STATUS_FAILED] * n_sims
         errors: list[str | None] = [None] * n_sims

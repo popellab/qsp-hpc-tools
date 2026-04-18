@@ -218,10 +218,18 @@ def main() -> int:
     ap.add_argument(
         "--m13-branch",
         default="m13-evolve-cache",
-        help="Branch to track for both SPQSP_PDAC (cpp_branch) and "
-             "qsp-hpc-tools (pip install source). Must include M13's "
-             "--dump-state / --initial-state flags. Pass empty string "
-             "to use credentials-file defaults.",
+        help="SPQSP_PDAC branch to build qsp_sim from (sets cpp_branch). "
+        "Must include M13's --dump-state / --initial-state flags. "
+        "Pass empty string to use credentials-file defaults.",
+    )
+    ap.add_argument(
+        "--tools-branch",
+        default=None,
+        help="qsp-hpc-tools pip install ref (overrides the @<ref> suffix "
+        "of qsp_hpc_tools_source). Defaults to --m13-branch when "
+        "unset — split when the two repos don't share a branch name "
+        "(e.g. qsp-hpc-tools on cpp-backend-v1, SPQSP_PDAC on "
+        "cpp-sweep-binary-io).",
     )
     ap.add_argument(
         "--clear-cache-first",
@@ -265,11 +273,15 @@ def main() -> int:
 
     manager = HPCJobManager(verbose=True)
 
-    # Both Python package and C++ binary must come from the M13 feature
-    # branch for this test to exercise --dump-state / --initial-state.
-    # Default config tracks cpp-sweep-binary-io + main, which predate M13.
+    # Both Python package and C++ binary must come from a branch that
+    # includes M13's --dump-state / --initial-state for this test to
+    # exercise the cache. Default credentials track cpp-sweep-binary-io
+    # (SPQSP_PDAC) + feat/cpp-unified-pool-and-topup (qsp-hpc-tools),
+    # the latter of which predates M13 — override by default.
     if args.m13_branch:
         manager.config.cpp_branch = args.m13_branch
+    tools_ref = args.tools_branch if args.tools_branch else args.m13_branch
+    if tools_ref:
         # pip git URLs look like ``git+ssh://host/repo.git@<ref>``. If the
         # credentials source already has a ``@<ref>`` suffix, replace
         # it; otherwise append. Splitting on ``.git`` is unambiguous
@@ -277,12 +289,13 @@ def main() -> int:
         src = manager.config.qsp_hpc_tools_source
         if ".git" in src:
             head, _sep, _tail = src.partition(".git")
-            manager.config.qsp_hpc_tools_source = f"{head}.git@{args.m13_branch}"
+            manager.config.qsp_hpc_tools_source = f"{head}.git@{tools_ref}"
         else:
             # Fallback: no ``.git`` sentinel — append unconditionally.
-            manager.config.qsp_hpc_tools_source = f"{src}@{args.m13_branch}"
+            manager.config.qsp_hpc_tools_source = f"{src}@{tools_ref}"
+    if args.m13_branch or args.tools_branch:
         print(
-            f"\nOverriding for M13 branch: "
+            f"\nOverriding refs: "
             f"cpp_branch={manager.config.cpp_branch}, "
             f"qsp_hpc_tools_source={manager.config.qsp_hpc_tools_source}"
         )

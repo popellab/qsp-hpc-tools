@@ -274,6 +274,61 @@ def test_write_pool_manifest_round_trip(tmp_path: Path):
     assert loaded2["template_defaults"] == defaults
 
 
+def _manifest_race_writer(args: tuple) -> int:
+    """Module-level so ProcessPoolExecutor/spawn can pickle it.
+
+    Each process builds an intentionally different payload — the race is
+    visible if writers trample each other, because "last writer wins" on
+    the target path would leave differing content across runs. Here all
+    200 keys are the same shape so content IS identical; we're only
+    asserting that no writer raises FileNotFoundError on its tmp→final
+    rename."""
+    from qsp_hpc.cpp.batch_runner import write_pool_manifest
+
+    pool_dir, seed = args
+    defaults = {f"k_{i}": float(seed + i) for i in range(200)}
+    sampled = [f"k_{i}" for i in range(10)]
+    try:
+        write_pool_manifest(pool_dir, defaults, sampled)
+        return 0
+    except Exception as e:
+        print(f"writer {seed} failed: {type(e).__name__}: {e}")
+        return 1
+
+
+def test_write_pool_manifest_concurrent_writers(tmp_path: Path):
+    """Regression: SLURM array tasks racing to write the manifest must
+    all succeed. Before the fix they used a single shared
+    'pool_manifest.json.tmp' — task 0 renamed its tmp to the final path,
+    leaving task 1 with a FileNotFoundError on its own tmp_path.replace().
+    Caught in the SBI HPC smoke with a 2-task array."""
+    import multiprocessing
+
+    from qsp_hpc.cpp.batch_runner import load_pool_manifest
+
+    pool_dir = tmp_path / "pool"
+    pool_dir.mkdir()
+
+    # 8 concurrent processes racing — matches a real SLURM array's
+    # start-at-once cadence better than threads (separate PIDs, separate
+    # os.replace calls). Spawn start method for portability (matches
+    # Python 3.14+ default on Linux).
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=8) as pool:
+        rcs = pool.map(_manifest_race_writer, [(pool_dir, seed) for seed in range(8)])
+
+    assert all(rc == 0 for rc in rcs), f"some writers failed: {rcs}"
+
+    # Exactly one manifest; no tmp residue.
+    assert (pool_dir / "pool_manifest.json").exists()
+    residue = sorted(pool_dir.glob("pool_manifest.json.tmp*"))
+    assert residue == [], f"tmp files not cleaned up: {residue}"
+
+    loaded = load_pool_manifest(pool_dir)
+    assert "template_defaults" in loaded
+    assert len(loaded["template_defaults"]) == 200
+
+
 def test_load_pool_manifest_missing_returns_none(tmp_path: Path):
     """Pre-#23 pools have no manifest; readers treat None as 'no
     fallback needed' and look only at parquet columns (which carry

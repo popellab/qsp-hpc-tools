@@ -87,11 +87,26 @@ def write_pool_manifest(
         "sampled_params": list(sampled_params),
     }
     # Atomic write so a partial read never happens: a parallel cal-target
-    # evaluator could race a first-run write otherwise.
-    tmp_path = manifest_path.with_suffix(".json.tmp")
-    with open(tmp_path, "w") as fh:
-        json.dump(payload, fh, indent=2, sort_keys=True)
-    tmp_path.replace(manifest_path)
+    # evaluator could race a first-run write otherwise. Every SLURM array
+    # task races to write this on first run of a fresh pool, so the tmp
+    # filename MUST be unique per-process — a single shared
+    # "pool_manifest.json.tmp" lets task 0 rename its tmp to the final
+    # path and leaves task 1 without a tmp to rename (FileNotFoundError,
+    # #hit on SBI smoke 2026-04-17). os.getpid() is enough even across
+    # different hosts because two tasks writing simultaneously into the
+    # same scratch dir with the same PID would need the same PID to be
+    # reused within milliseconds — negligible. Content is identical
+    # across writers so "last writer wins" is safe.
+    tmp_path = manifest_path.with_suffix(f".json.tmp.{os.getpid()}")
+    try:
+        with open(tmp_path, "w") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+        tmp_path.replace(manifest_path)
+    finally:
+        # If replace() succeeded the tmp file no longer exists (renamed);
+        # on failure we want to clean up to avoid littering the pool dir.
+        if tmp_path.exists():
+            tmp_path.unlink()
     return manifest_path
 
 

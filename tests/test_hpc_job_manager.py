@@ -1515,3 +1515,62 @@ class TestDownloadResultContract:
         out_params, out_ts = wrapped("/pool", "abc", tmp_path / "dest")
         np.testing.assert_array_equal(out_params, params)
         np.testing.assert_array_equal(out_ts, ts)
+
+
+class TestDownloadTestStatsFullChunkValidation:
+    """Regression for the 2026-04-18 failure: SSH dropped during a 15k
+    SBI run, jobs eventually left the queue with the derive job having
+    mkdir'd ``test_stats/<hash>/`` but written zero chunk files.
+    ``download_test_stats_full`` sailed past the ``test -d`` gate and
+    tried to combine; the caller got the unhelpful ``Failed to combine
+    chunks on HPC: WARNING: No test stats chunk files found``. This
+    test pins the new behavior: an empty chunk dir must raise a clear
+    error before we ever invoke the combiner.
+    """
+
+    def _manager(self):
+        manager = HPCJobManager.__new__(HPCJobManager)
+        manager.verbose = False
+        manager.logger = Mock()
+        manager.config = Mock()
+        manager.config.remote_project_path = "/home/testuser/qsp-hpc"
+        manager.transport = Mock()
+        return manager
+
+    def test_empty_chunk_dir_raises_before_combine(self, tmp_path):
+        manager = self._manager()
+        # Sequence: (1) echo $HOME doesn't fire because pool_path has no
+        # $HOME; (2) test -d succeeds with ls -la showing only . and ..;
+        # (3) ls chunk_*_test_stats.csv | wc -l returns 0.
+        manager.transport.exec.side_effect = [
+            (0, "total 0\ndrwx------ 2 u u 4096 .\ndrwx------ 3 u u 4096 .."),
+            (0, "0\n"),
+        ]
+        # If combine is reached, this will crash loudly in the assert below.
+        manager._combine_chunks_on_hpc = Mock(
+            side_effect=AssertionError("must not reach combine on empty dir")
+        )
+
+        with pytest.raises(RuntimeError) as exc:
+            manager.download_test_stats_full("/pool", "abc", tmp_path / "dest")
+
+        msg = str(exc.value)
+        assert "no chunk files" in msg
+        assert "qsp_derive_*.err" in msg
+        assert "/pool/test_stats/abc" in msg
+        manager._combine_chunks_on_hpc.assert_not_called()
+
+    def test_nonempty_chunk_dir_proceeds_to_combine(self, tmp_path):
+        manager = self._manager()
+        # test -d with ls output then chunk count = 3.
+        manager.transport.exec.side_effect = [
+            (0, "total 16\n...\nchunk_000_test_stats.csv\nchunk_001_test_stats.csv"),
+            (0, "3\n"),
+        ]
+        manager._combine_chunks_on_hpc = Mock()
+        manager._download_combined_files = Mock(return_value="sentinel")
+
+        result = manager.download_test_stats_full("/pool", "abc", tmp_path / "dest")
+
+        assert result == "sentinel"
+        manager._combine_chunks_on_hpc.assert_called_once_with("/pool/test_stats/abc")

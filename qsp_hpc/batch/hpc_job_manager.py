@@ -2310,6 +2310,31 @@ class HPCJobManager:
                 f"  {log_path}/qsp_derive_*.err"
             )
 
+        # Dir exists — confirm the derive job actually produced chunk files.
+        # Without this gate, a half-succeeded derive (dir mkdir'd but no
+        # chunks written — e.g. the job OOM'd or hit its time limit) would
+        # fall through to _combine_chunks_on_hpc and raise a vague
+        # "Failed to combine chunks" error 5s later. Raising here names
+        # the likely cause (failed/timed-out derive) and points at the
+        # SLURM logs so the user doesn't have to dig.
+        count_cmd = f'ls "{test_stats_dir}"/chunk_*_test_stats.csv 2>/dev/null | wc -l'
+        status_cnt, cnt_output = self.transport.exec(count_cmd)
+        try:
+            n_chunks = int(cnt_output.strip()) if status_cnt == 0 else 0
+        except ValueError:
+            n_chunks = 0
+
+        if n_chunks == 0:
+            log_path = f"{self.config.remote_project_path}/batch_jobs/logs"
+            raise RuntimeError(
+                f"Test statistics directory exists but has no chunk files: {test_stats_dir}\n"
+                f"The derivation job likely failed, timed out, or was cancelled. "
+                f"Check SLURM logs on HPC:\n"
+                f"  {log_path}/qsp_derive_*.err\n"
+                f"Remove the empty directory to force a clean rerun:\n"
+                f"  rm -rf {test_stats_dir}"
+            )
+
         # Combine chunks on HPC
         self._combine_chunks_on_hpc(test_stats_dir)
 

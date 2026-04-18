@@ -141,24 +141,14 @@ def combine_chunks(config: dict) -> Path:
 
     logger.info("Combining %d chunks from %s", len(chunk_files), staging_dir)
 
-    tables = []
-    total_rows = 0
-    for cf in chunk_files:
-        t = pq.read_table(str(cf))
-        tables.append(t)
-        total_rows += t.num_rows
-
-    combined = pa.concat_tables(tables, promote_options="default")
-    logger.info("  combined rows: %d (sum of chunk rows: %d)", combined.num_rows, total_rows)
-
-    # Re-number simulation_id so the combined batch has a contiguous range.
-    # Individual chunks reuse local ids 0..chunk_size-1; downstream tools
-    # that group by simulation_id need them unique within a batch file.
-    if "simulation_id" in combined.column_names:
-        new_ids = pa.array(range(combined.num_rows), type=pa.int64())
-        idx = combined.column_names.index("simulation_id")
-        combined = combined.set_column(idx, "simulation_id", new_ids)
-
+    # Stream chunk-by-chunk through a ParquetWriter so peak memory stays
+    # at one chunk instead of all N concatenated. The previous
+    # pa.concat_tables path OOM'd at 4 GB on a 15k × 365-day clinical
+    # scenario (each sim's trajectory lists balloon under
+    # concat_tables), and just bumping SLURM memory is a losing game as
+    # scenarios get longer. Renumber simulation_id on the fly with a
+    # cumulative offset so the output is still contiguously indexed.
+    #
     # Filename no longer encodes a row count (#21). Row counts come from
     # the parquet's footer metadata at scan time, which always agrees
     # with the actual on-disk data — even when array tasks drop chunks
@@ -167,10 +157,35 @@ def combine_chunks(config: dict) -> Path:
     # Microsecond-resolution timestamp prevents filename collisions when
     # two combines for the same pool complete within the same wall-second
     # (e.g. quick top-up after the initial batch finishes).
-    n_rows_written = combined.num_rows
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     filename = f"batch_{ts}_{scenario}_seed{seed}.parquet"
     output_path = pool_dir / filename
+    pool_dir.mkdir(parents=True, exist_ok=True)
+
+    # Atomic write: stream into a temp file in the same dir, then rename
+    # to the final path. Prevents a reader from seeing a partial parquet
+    # if the process is killed mid-write.
+    tmp_path = output_path.with_suffix(".parquet.tmp")
+    writer = None
+    total_rows = 0
+    try:
+        for cf in chunk_files:
+            t = pq.read_table(str(cf))
+            # Renumber simulation_id cumulatively across chunks.
+            if "simulation_id" in t.column_names:
+                new_ids = pa.array(range(total_rows, total_rows + t.num_rows), type=pa.int64())
+                idx = t.column_names.index("simulation_id")
+                t = t.set_column(idx, "simulation_id", new_ids)
+            if writer is None:
+                writer = pq.ParquetWriter(str(tmp_path), t.schema, compression="snappy")
+            writer.write_table(t)
+            total_rows += t.num_rows
+    finally:
+        if writer is not None:
+            writer.close()
+
+    logger.info("  combined rows: %d (streamed from %d chunks)", total_rows, len(chunk_files))
+    n_rows_written = total_rows
     if n_rows_written != n_sims:
         logger.warning(
             "Actual row count %d differs from requested %d (%d chunks lost)",
@@ -179,11 +194,6 @@ def combine_chunks(config: dict) -> Path:
             n_sims - n_rows_written,
         )
 
-    # Atomic write: temp file in same dir, then rename. Prevents a reader
-    # from seeing a partial parquet if the process is killed mid-write.
-    pool_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_suffix(".parquet.tmp")
-    pq.write_table(combined, str(tmp_path))
     tmp_path.replace(output_path)
     logger.info("Wrote consolidated batch: %s", output_path)
 

@@ -439,7 +439,7 @@ python3 -m qsp_hpc.batch.derive_test_stats_worker "{test_stats_config}"
 #SBATCH --job-name=qsp_combine
 #SBATCH --partition={self.config.partition}
 #SBATCH --time=00:10:00
-#SBATCH --mem=4G
+#SBATCH --mem=16G
 #SBATCH --output={log_dir}/qsp_combine_%j.out
 #SBATCH --error={log_dir}/qsp_combine_%j.err
 {dependency_directive}set -e

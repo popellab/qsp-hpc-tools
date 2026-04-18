@@ -15,6 +15,7 @@ Usage (invoked by the generated SLURM script)::
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
@@ -26,13 +27,37 @@ import pandas as pd
 from qsp_hpc.cpp.batch_runner import CppBatchRunner, write_pool_manifest
 from qsp_hpc.utils.logging_config import setup_logger
 
-# Configure the `qsp_hpc` parent logger so descendant loggers —
-# qsp_hpc.cpp.evolve_cache, qsp_hpc.cpp.batch_runner, etc. — propagate up
-# and their output lands in the SLURM .out/.err files. Without this, only
-# __main__ emits anything and post-mortem debugging of array-task runs
-# has nothing to work with (see #36, surfaced by #34).
-setup_logger("qsp_hpc", verbose=True)
-logger = setup_logger(__name__, verbose=True)
+# Plain getLogger at module scope so `import cpp_batch_worker` (tests,
+# subagents, etc.) doesn't mutate the root-logger-adjacent state.
+# Handler wiring happens inside main() — the actual script entry — via
+# setup_logger, which installs a stdout handler on the qsp_hpc parent
+# logger and sets propagate=False (so descendants still emit without
+# climbing to root, but root-handler-based captures like pytest's
+# caplog aren't fighting for the same child messages).
+logger = logging.getLogger(__name__)
+
+
+def _resolve_max_workers(config_value: int | None) -> int | None:
+    """Resolve the ProcessPoolExecutor worker count with SLURM awareness.
+
+    Precedence:
+      1. explicit config override (``max_workers`` in the job config)
+      2. ``SLURM_CPUS_PER_TASK`` environment variable (cgroup-correct on HPC)
+      3. ``None`` → downstream falls back to ``os.cpu_count()``
+
+    The SLURM fallback exists because Python 3.11's ``os.cpu_count()``
+    returns the NODE's physical core count, not the cgroup allocation —
+    so a default-None on a 64-core Rockfish node spawns 64 workers when
+    SLURM actually granted 1 CPU. Python 3.13+'s
+    ``os.process_cpu_count()`` respects the cgroup, but we can't assume
+    a modern interpreter on every cluster.
+    """
+    if config_value is not None:
+        return config_value
+    slurm = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm:
+        return int(slurm)
+    return None
 
 
 def run_chunk(config: dict, array_idx: int) -> None:
@@ -53,7 +78,8 @@ def run_chunk(config: dict, array_idx: int) -> None:
     pool_id = config["simulation_pool_id"]
     pool_base = config["simulation_pool_path"]
     scenario = config.get("scenario", "default")
-    max_workers = config.get("max_workers")
+    max_workers = _resolve_max_workers(config.get("max_workers"))
+    logger.info("ProcessPool max_workers resolved to %s", max_workers)
     per_sim_timeout_s = config.get("per_sim_timeout_s", 300.0)
     scenario_yaml = config.get("scenario_yaml")
     drug_metadata_yaml = config.get("drug_metadata_yaml")
@@ -190,6 +216,13 @@ def run_chunk(config: dict, array_idx: int) -> None:
 
 
 def main() -> None:
+    # Wire the qsp_hpc parent logger + this module's logger only when
+    # running as a script (i.e. SLURM worker invocation). Descendant
+    # loggers (qsp_hpc.cpp.evolve_cache etc.) propagate up to qsp_hpc
+    # and land in SLURM .out/.err. See #36 (observability) + #34.
+    setup_logger("qsp_hpc", verbose=True)
+    setup_logger(__name__, verbose=True)
+
     if len(sys.argv) != 2:
         print("Usage: python -m qsp_hpc.batch.cpp_batch_worker <config.json>", file=sys.stderr)
         sys.exit(1)

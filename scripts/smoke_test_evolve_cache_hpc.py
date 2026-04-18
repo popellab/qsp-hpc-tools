@@ -40,16 +40,19 @@ import pandas as pd
 
 
 def build_tiny_params_csv(priors_csv: Path, out_csv: Path, n_sims: int) -> list[str]:
-    """Emit a params.csv with n_sims IDENTICAL rows (template defaults).
+    """Emit a params.csv with n_sims IDENTICAL rows (prior medians).
 
     Identical rows is the whole point of the test: every sim should hash
-    to the same theta and share one cached evolve blob.
+    to the same theta and share one cached evolve blob. Uses the
+    ``median`` column — the parameter value itself, in its natural units
+    (positive rate constants, positive concentrations, etc.). An earlier
+    version of this function sampled ``dist_param1``, but for lognormal
+    priors that's the mean-of-log (μ, often NEGATIVE) — plugging a
+    negative μ in as a rate constant instantly destabilizes CVode
+    ("mxstep steps taken before reaching tout") and makes qsp_sim abort.
     """
     priors = pd.read_csv(priors_csv)
-    # Use the dist_param1 as a "default" — close enough to a real theta
-    # while keeping all rows identical. Any stable deterministic choice
-    # works for this test since we only care that every row is the same.
-    row = priors.set_index("name")["dist_param1"].to_dict()
+    row = priors.set_index("name")["median"].to_dict()
     names = list(row.keys())
     arr = np.tile(np.array([row[n] for n in names], dtype=float), (n_sims, 1))
     pd.DataFrame(arr, columns=names).to_csv(out_csv, index=False)

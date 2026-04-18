@@ -113,14 +113,13 @@ class TestCppBatchWorker:
             "scenario": "ctrl",
         }
 
-        # Task 0 processes sims [0, 2). Writes to per-submission staging dir,
-        # cpp_combine_batch_worker consolidates to a pool-level batch parquet
-        # during the post-array combine step.
+        # Task 0 processes sims [0, 2). Writes its chunk directly into a
+        # per-submission batch subdir (#43 option A: no combine step).
         run_chunk(config, array_idx=0)
         parquets = list((pool_dir / "test_pool").rglob("*.parquet"))
         assert len(parquets) == 1
-        assert parquets[0].parent.name == "local"  # SLURM_ARRAY_JOB_ID fallback
-        assert parquets[0].parent.parent.name == ".staging"
+        # SLURM_ARRAY_JOB_ID fallback -> "local" in dir name
+        assert parquets[0].parent.name == "batch_local_ctrl_seed42"
         assert parquets[0].name == "chunk_000.parquet"
         table = pq.read_table(str(parquets[0]))
         assert table.num_rows == 2
@@ -145,8 +144,8 @@ class TestCppBatchWorker:
             "scenario": "ctrl",
         }
 
-        # Task 2 processes sims [4, 5) — only 1 sim. Written to staging;
-        # combine step will later consolidate into the pool-level batch.
+        # Task 2 processes sims [4, 5) — only 1 sim. Chunk lands in the
+        # per-submission batch subdir (#43 option A).
         run_chunk(config, array_idx=2)
         parquets = list((pool_dir / "test_pool").rglob("*.parquet"))
         assert len(parquets) == 1
@@ -155,18 +154,19 @@ class TestCppBatchWorker:
         assert table.num_rows == 1
         np.testing.assert_allclose(table.column("param:A").to_numpy(), [1.4])
 
-    def test_run_chunk_honors_staging_dir_override(
+    def test_run_chunk_honors_batch_subdir_override(
         self, tmp_path, fake_binary, template_path, params_csv
     ):
         """Retry submissions (#29) need their chunks to land in the ORIGINAL
-        array's staging dir, not their own SLURM_ARRAY_JOB_ID dir —
-        otherwise the combine worker can't see them. The `staging_dir`
-        config field overrides the SLURM-derived default."""
+        array's batch subdir, not their own SLURM_ARRAY_JOB_ID-derived dir —
+        otherwise derive can't see them as one coherent batch. The
+        ``batch_subdir`` config field pins the dir regardless of
+        SLURM_ARRAY_JOB_ID."""
         from qsp_hpc.batch.cpp_batch_worker import run_chunk
 
         pool_dir = tmp_path / "pool"
-        # Simulate the original array's staging path that a retry must reuse.
-        original_staging = pool_dir / "test_pool" / ".staging" / "12345"
+        batch_subdir = "batch_20260418_120000_000000_ctrl_seed42"
+        original_batch_dir = pool_dir / "test_pool" / batch_subdir
         config = {
             "binary_path": str(fake_binary),
             "template_path": str(template_path),
@@ -180,15 +180,15 @@ class TestCppBatchWorker:
             "simulation_pool_id": "test_pool",
             "simulation_pool_path": str(pool_dir),
             "scenario": "ctrl",
-            "staging_dir": str(original_staging),
+            "batch_subdir": batch_subdir,
         }
 
         run_chunk(config, array_idx=2)
-        parquets = list(original_staging.glob("*.parquet"))
+        parquets = list(original_batch_dir.glob("*.parquet"))
         assert len(parquets) == 1
         assert parquets[0].name == "chunk_002.parquet"
-        # Must NOT have fallen back to a .staging/local dir.
-        assert not (pool_dir / "test_pool" / ".staging" / "local").exists()
+        # Must NOT have fallen back to the SLURM_ARRAY_JOB_ID-derived dir.
+        assert not (pool_dir / "test_pool" / "batch_local_ctrl_seed42").exists()
 
     def test_run_chunk_past_end_is_noop(self, tmp_path, fake_binary, template_path, params_csv):
         from qsp_hpc.batch.cpp_batch_worker import run_chunk
@@ -356,11 +356,10 @@ class TestSubmitCppJobs:
             skip_sync=True,
         )
 
-        # Two jobs: the C++ array and the chained combine step that
-        # consolidates per-task chunks into one pool-level batch parquet.
-        # The mock sbatch always returns the same id ("12345") so both
-        # appear identical, which is expected in this stub.
-        assert info.job_ids == ["12345", "12345"]
+        # One job — the C++ array. #43 option A retired the combine step
+        # (array tasks shard straight into a per-submission batch subdir)
+        # and derive isn't requested here.
+        assert info.job_ids == ["12345"]
         assert info.n_simulations == 2
         assert info.n_jobs >= 1
 
@@ -504,8 +503,9 @@ class TestSubmitCppJobs:
             binary_path="/override/qsp_sim",
             template_path="/override/param.xml",
         )
-        # Array + combine (no derivation — derive_test_stats defaults False).
-        assert info.job_ids == ["12345", "12345"]
+        # Array only (no derivation — derive_test_stats defaults False; and
+        # the combine step was retired in #43 option A).
+        assert info.job_ids == ["12345"]
 
 
 # ---------------------------------------------------------------------------
@@ -736,16 +736,15 @@ class TestSubmitCppJobsWithDerivation:
             model_structure_file=str(ms_file),
         )
 
-        # Three sbatch submissions chain together: array → combine →
-        # derivation. The combine step consolidates per-task chunks into
-        # one pool-level batch parquet before derivation walks the pool.
-        assert info.job_ids == ["11111", "22222", "33333"]
+        # Two sbatch submissions chain together: array → derivation.
+        # #43 option A removed the combine step — array tasks write chunks
+        # into a per-submission batch subdir and derive walks that directly.
+        assert info.job_ids == ["11111", "22222"]
 
-        # Derivation depends on the combine job (22222) — NOT directly on
-        # the array (11111) — so it only runs after the pool has a
-        # consolidated batch parquet instead of scattered chunks.
+        # Derivation depends on the array job (11111) — with no combine
+        # step in the middle, afterok:<array> is what gates derive now.
         assert len(captured_scripts) == 1
-        assert "#SBATCH --dependency=afterok:22222" in captured_scripts[0]
+        assert "#SBATCH --dependency=afterok:11111" in captured_scripts[0]
 
     def test_derive_test_stats_requires_csv(self, tmp_path):
         manager, _ = self._make_manager()
@@ -813,10 +812,9 @@ class TestSubmitCppJobsWithDerivation:
             skip_sync=True,
         )
 
-        # Array + combine, no derivation. The combine step is always
-        # chained regardless of derive_test_stats so the pool is left in
-        # a consolidated (MATLAB-compatible) shape even when the caller
-        # only wants raw sims.
-        assert info.job_ids == ["11111", "22222"]
+        # Array only — no derivation, and the combine step was retired
+        # (#43 option A: array tasks write chunks straight into a
+        # per-submission batch subdir).
+        assert info.job_ids == ["11111"]
         upload_dests = [call.args[1] for call in transport.upload.call_args_list]
         assert not any(d.endswith("derive_script.sh") for d in upload_dests)

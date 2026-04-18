@@ -182,17 +182,12 @@ class CppSimulator:
         self.pool_dir = self.cache_dir / pool_name
         self.pool_dir.mkdir(parents=True, exist_ok=True)
 
-        # HPC pool parquets now follow the MATLAB "one file per
-        # submission" shape — cpp_combine_batch_worker consolidates all
-        # array-task chunks into a single batch file before derivation.
-        # The combine worker writes a microsecond-resolution timestamp to
-        # avoid filename collisions when two combines land in the same
-        # wall-second (e.g. quick top-up chained onto the initial run).
-        # `_task{N}` and `_{N}sims` segments are kept optional in the
-        # regex for backward compatibility with pre-#21 pools; new runs
-        # don't emit them and read row counts from parquet metadata
-        # instead (see #21 — filename-as-truth was a footgun once
-        # array-task chunks started dropping silently).
+        # LOCAL pool only — CppSimulator writes one batch_*.parquet per
+        # top-up directly (no combine step; #43 option A applies only to
+        # HPC pools where array tasks shard into batch_*/chunk_*.parquet
+        # subdirs).  `_task{N}` and `_{N}sims` segments are optional for
+        # backward compatibility with pre-#21 pools; new runs don't emit
+        # them and read row counts from parquet metadata instead.
         self._batch_pattern = re.compile(
             r"batch_(\d{8}_\d{6}(?:_\d{6})?)(?:_task\d+)?_(.+?)"
             r"(?:_(\d+)sims)?_seed(\d+)\.parquet"
@@ -817,8 +812,9 @@ class CppSimulator:
         # Mirrors QSPSimulator._run_new_simulations(n_needed) — if the pool
         # has some sims but not enough, submit only (n - n_hpc) new draws
         # with theta indices [n_hpc, n) from the deterministic theta pool.
-        # The combine step appends one batch_*.parquet per submission, so
-        # the next derivation walks old + new transparently.
+        # Each submission drops a new batch_{ts}_*/chunk_*.parquet subdir
+        # in the pool (#43 option A), so the next derivation walks old +
+        # new transparently.
         if n_hpc > 0:
             n_needed = n - n_hpc
             start_index = n_hpc

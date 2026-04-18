@@ -63,14 +63,23 @@ class ResultCollector:
         when array-task chunk drops left the consolidated batch shorter
         than the requested N (#21). Manifest.json takes precedence when
         present (MATLAB pools historically wrote one).
+
+        Pool layouts recognised:
+          - Current (#43 option A): ``{pool}/batch_*/chunk_*.parquet`` —
+            array tasks write chunks straight into per-submission subdirs.
+          - Legacy (pre-#43): flat ``{pool}/batch_*.parquet`` produced
+            by the retired combine worker.
+          - MATLAB: ``{pool}/batch_*_{N}sims_*.mat``.
         """
-        # The python one-liner walks batch_*.parquet, sums num_rows from
-        # each file's footer, and prints `N_SIMS:<sum>`. Footer reads
-        # don't materialise rows, so this stays O(num_files), not O(rows).
+        # The python one-liner walks batch_*/chunk_*.parquet AND flat
+        # batch_*.parquet, sums num_rows from each file's footer, and
+        # prints ``N_SIMS:<sum>``. Footer reads don't materialise rows,
+        # so this stays O(num_files), not O(rows).
         py_count = (
             "import sys, glob; "
             "import pyarrow.parquet as pq; "
-            "files = sorted(glob.glob('batch_*.parquet')); "
+            "files = sorted(glob.glob('batch_*/chunk_*.parquet')) "
+            "+ sorted(glob.glob('batch_*.parquet')); "
             "total = sum(pq.read_metadata(f).num_rows for f in files); "
             "print(f'N_FILES:{len(files)}'); "
             "print(f'N_SIMS:{total}')"
@@ -82,7 +91,7 @@ class ResultCollector:
             if [ -f manifest.json ]; then
                 echo "MANIFEST_FOUND"
                 cat manifest.json
-            elif ls batch_*.parquet >/dev/null 2>&1; then
+            elif ls batch_*/chunk_*.parquet >/dev/null 2>&1 || ls batch_*.parquet >/dev/null 2>&1; then
                 echo "COUNTING_PARQUET_METADATA"
                 "{venv_python}" -c "{py_count}"
             else

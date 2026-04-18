@@ -145,30 +145,27 @@ def run_chunk(config: dict, array_idx: int) -> None:
     pool_dir = Path(pool_base) / pool_id
     pool_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write to a per-submission staging subdir. A downstream combine task
-    # (cpp_combine_batch_worker) consolidates all chunks into a single
-    # pool-level batch parquet, matching MATLAB's "one file per
-    # submission" layout. This avoids task-id sharding in the pool dir
-    # and lets partial top-up (n_hpc < n) work cleanly: each top-up is
-    # simply one additional batch file scanned by the pool loader.
+    # Write to a per-submission batch subdir (issue #43 option A: no
+    # combine step). Each submission deposits one
+    # ``batch_{ts}_{scenario}_seed{S}/`` subdir containing one
+    # ``chunk_NNN.parquet`` per array task. The derive worker walks
+    # subdirs instead of a consolidated parquet. The old
+    # ``.staging/{array_job_id}/`` layout + downstream combine job are
+    # gone.
     #
-    # SLURM_ARRAY_JOB_ID is shared by every task in the array, so all
-    # chunks from one submission land in the same staging dir. Using
-    # "local" as the fallback keeps unit tests runnable without SLURM.
-    #
-    # config["staging_dir"] override: retry submissions (#29) need their
-    # chunks to land in the ORIGINAL array's staging dir, not the retry
-    # array's — otherwise combine can't see them. When set, this absolute
-    # path wins over the SLURM_ARRAY_JOB_ID-derived default.
-    staging_override = config.get("staging_dir")
-    if staging_override:
-        staging_dir = Path(staging_override)
+    # ``batch_subdir`` comes from submit_cpp_jobs (hpc_job_manager) so
+    # every task in the array — and every retry submission — agrees on
+    # the same directory. Fallback to a SLURM_ARRAY_JOB_ID-anchored name
+    # keeps unit tests + ad-hoc runs working without the orchestrator.
+    batch_subdir_override = config.get("batch_subdir")
+    if batch_subdir_override:
+        batch_dir = pool_dir / batch_subdir_override
     else:
         array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID", "local")
-        staging_dir = pool_dir / ".staging" / str(array_job_id)
-    staging_dir.mkdir(parents=True, exist_ok=True)
+        batch_dir = pool_dir / f"batch_{array_job_id}_{scenario}_seed{seed}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
     filename = f"chunk_{array_idx:03d}.parquet"
-    output_path = staging_dir / filename
+    output_path = batch_dir / filename
 
     t0 = time.time()
 

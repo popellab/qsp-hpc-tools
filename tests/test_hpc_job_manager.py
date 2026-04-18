@@ -625,15 +625,6 @@ class TestSubmitCppJobsRetryLoop:
         manager, transport = self._make_manager(tmp_path, monkeypatch)
         manager._list_missing_chunks_on_hpc = Mock(return_value=[])
 
-        # Return distinct ids so we can verify no retry was submitted.
-        transport.exec.side_effect = [
-            # ensure_cpp_binary existence check + git steps — first match
-            # short-circuits to generic (0, "OK"). Use a flexible approach:
-            # the sbatch submissions will be the only ones returning job ids.
-            (0, "OK"),
-        ] + [(0, "Submitted batch job 9000")] * 30
-        transport.exec.return_value = (0, "OK")
-
         def side(cmd, *a, **kw):
             if "sbatch" in cmd:
                 return (0, "Submitted batch job 9000")
@@ -651,8 +642,8 @@ class TestSubmitCppJobsRetryLoop:
             skip_sync=True,
             retry_missing_chunks=3,
         )
-        # Array + combine, no retry.
-        assert len(info.job_ids) == 2
+        # Array only (no combine step post-#43; derive not requested).
+        assert len(info.job_ids) == 1
         manager._list_missing_chunks_on_hpc.assert_called_once()
 
     def test_missing_chunks_trigger_sparse_retry(self, tmp_path, monkeypatch):
@@ -675,14 +666,6 @@ class TestSubmitCppJobsRetryLoop:
             return f"arr{sbatch_counter[0]}"
 
         monkeypatch.setattr(manager.slurm_submitter, "submit_cpp_job", fake_submit_cpp_job)
-
-        combine_calls: list[dict] = []
-
-        def fake_combine(**kwargs):
-            combine_calls.append(kwargs)
-            return "cmb5000"
-
-        monkeypatch.setattr(manager, "submit_combine_batch_job", fake_combine)
 
         # transport.exec handles `echo $HOME` + ls + sbatch-not-used-here.
         def side(cmd, *a, **kw):
@@ -720,18 +703,19 @@ class TestSubmitCppJobsRetryLoop:
         # Retry points at the override config.
         assert submitted_configs[1] and "cpp_retry_config_" in submitted_configs[1]
 
-        # Combine was chained afterok:<last array id> with strict=True.
-        assert len(combine_calls) == 1
-        assert combine_calls[0]["strict"] is True
-        assert combine_calls[0]["dependency"] == f"afterok:arr{sbatch_counter[0]}"
+        # JobInfo.job_ids: [original_array, retry_array] — no combine, no derive.
+        assert len(info.job_ids) == 2
+        # _upload_cpp_retry_config was called with the batch_subdir override,
+        # not the retired staging_dir.
+        assert manager._upload_cpp_retry_config.call_count == 1
+        call_args = manager._upload_cpp_retry_config.call_args
+        assert isinstance(call_args.args[1], str)
+        assert call_args.args[1].startswith("batch_")
 
-        # JobInfo.job_ids: [original_array, retry_array, combine]
-        assert len(info.job_ids) == 3
-        assert info.job_ids[-1] == "cmb5000"
-
-    def test_retry_budget_exhausted_still_submits_strict_combine(self, tmp_path, monkeypatch):
-        """When staging stays short after N rounds, combine still runs —
-        strict=True so it fails the afterok dep and skips derivation."""
+    def test_retry_budget_exhausted(self, tmp_path, monkeypatch):
+        """When the batch subdir stays short after N rounds, job_ids records
+        every retry array id. Derive (not requested here) is what would
+        catch the short batch via its afterok dep — no combine job any more."""
         manager, transport = self._make_manager(tmp_path, monkeypatch)
         # Every round finds the same missing chunk — pathological.
         manager._list_missing_chunks_on_hpc = Mock(return_value=[5])
@@ -743,13 +727,6 @@ class TestSubmitCppJobsRetryLoop:
             return f"arr{sbatch_counter[0]}"
 
         monkeypatch.setattr(manager.slurm_submitter, "submit_cpp_job", fake_submit_cpp_job)
-
-        combine_calls: list[dict] = []
-        monkeypatch.setattr(
-            manager,
-            "submit_combine_batch_job",
-            lambda **kw: (combine_calls.append(kw), "cmb9999")[1],
-        )
 
         def side(cmd, *a, **kw):
             if "echo $HOME" in cmd:
@@ -770,15 +747,11 @@ class TestSubmitCppJobsRetryLoop:
             jobs_per_chunk=1,
             retry_missing_chunks=2,
         )
-        # 1 original + 2 retries + 1 combine = 4 ids.
-        assert len(info.job_ids) == 4
-        assert combine_calls[0]["strict"] is True
-        # Inspected 2 times (once per retry attempt — post-final-retry round
-        # enters the loop, finds missing again, submits retry, and that's the
-        # 2nd retry; we do NOT re-inspect after attempt 2 — we exit the loop
-        # because the budget is exhausted).
-        # Actually: attempt=1 inspects (missing), submits retry1; attempt=2
-        # inspects (missing), submits retry2. Two inspections.
+        # 1 original + 2 retries = 3 ids. No combine, no derive.
+        assert len(info.job_ids) == 3
+        # Inspected 2 times (attempt=1 finds missing, submits retry1;
+        # attempt=2 finds missing, submits retry2; loop exits with budget
+        # exhausted — we do NOT re-inspect after attempt 2).
         assert manager._list_missing_chunks_on_hpc.call_count == 2
 
 

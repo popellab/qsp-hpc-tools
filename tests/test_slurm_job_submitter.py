@@ -309,11 +309,6 @@ class TestFailFastOnErrors:
         assert "set -e" in script
         assert "set -o pipefail" in script
 
-    def test_combine_script_sets_errexit(self, submitter):
-        script = submitter._generate_combine_slurm_script(combine_config="/scratch/combine.json")
-        assert "set -e" in script
-        assert "set -o pipefail" in script
-
 
 class TestCppArraySpec:
     """Sparse `--array=...` spec + config override (#29 retry infrastructure)."""
@@ -339,8 +334,8 @@ class TestCppArraySpec:
 
     def test_custom_worker_config_path_used_in_script(self, submitter):
         """Retry submissions upload a distinct config JSON that pins the
-        staging_dir to the original array's dir. The sbatch script must
-        invoke the worker with that config path."""
+        batch_subdir to the original array's dir (#43 option A). The sbatch
+        script must invoke the worker with that config path."""
         script = submitter._generate_cpp_slurm_script(
             n_jobs=5,
             cpus_per_task=1,

@@ -244,7 +244,7 @@ def compute_test_statistics_batch(
 
 def process_single_batch(
     batch_idx: int,
-    parquet_file: Path,
+    parquet_source: Path,
     test_stats_df: pd.DataFrame,
     test_stat_registry: dict,
     species_units: dict,
@@ -252,11 +252,17 @@ def process_single_batch(
     template_defaults: dict[str, float] | None = None,
 ) -> int:
     """
-    Process a single batch file and save results.
+    Process a single batch and save results.
+
+    ``parquet_source`` is either:
+      - a single ``batch_*.parquet`` file (legacy pre-#43 layout), or
+      - a directory ``batch_*/`` containing ``chunk_NNN.parquet`` shards
+        (#43 option A: combine step removed; array tasks write chunks
+        directly into the batch dir).
 
     Args:
         batch_idx: Index of this batch (for output file naming)
-        parquet_file: Path to the Parquet file to process
+        parquet_source: Path to the Parquet file OR batch subdir to process
         test_stats_df: DataFrame with test statistics configuration
         test_stat_registry: Dict mapping test_statistic_id -> compiled function
         species_units: Dict mapping species names to unit strings
@@ -265,89 +271,103 @@ def process_single_batch(
     Returns:
         Number of simulations processed
     """
-    logger.info(f"Processing batch {batch_idx}: {parquet_file.name}")
+    logger.info(f"Processing batch {batch_idx}: {parquet_source.name}")
 
-    # Stream the parquet row-group-by-row-group rather than loading the
-    # full file with pd.read_parquet. For wide scenarios (15k-sim
+    if parquet_source.is_dir():
+        parquet_files = sorted(parquet_source.glob("chunk_*.parquet"))
+        if not parquet_files:
+            logger.warning(f"  No chunk_*.parquet found in {parquet_source} — skipping")
+            return 0
+        logger.info(f"  {len(parquet_files)} chunk file(s)")
+    else:
+        parquet_files = [parquet_source]
+
+    # Stream parquets row-group-by-row-group rather than loading the full
+    # file(s) with pd.read_parquet. For wide scenarios (15k-sim
     # clinical_progression: 11 GB on disk, 300 row groups, list-typed
     # time-series columns) a single pd.read_parquet blows past any
     # reasonable SLURM --mem limit — the list cells become Python lists
     # in pandas (~80 B / element) instead of packed numpy arrays
     # (~8 B / element), so the working set can reach 100+ GB. Streaming
-    # keeps peak memory at one row group (~50 sims for our combiner's
-    # output layout).
-    pf = pq.ParquetFile(str(parquet_file))
-    n_row_groups = pf.num_row_groups
-    schema_names = pf.schema_arrow.names
-    n_sims_total = pf.metadata.num_rows
-    logger.info(f"  Streaming {n_sims_total} simulations across {n_row_groups} row group(s)")
-
-    param_prefix = "param:"
-    param_cols = [col for col in schema_names if col.startswith(param_prefix)]
-    clean_names = [col[len(param_prefix) :] for col in param_cols]
-    has_sample_index = "sample_index" in schema_names
-
-    if param_cols:
-        logger.debug(
-            f"  Found {len(param_cols)} parameter columns: "
-            f"{clean_names[:5]}{'...' if len(clean_names) > 5 else ''}"
-        )
-
-    # Open output files once; write each row group's slice incrementally.
-    # For params we write the header on the first row group only so the
-    # final chunk_XXX_params.csv matches the pre-streaming single-CSV
-    # layout (header row + data rows) that combine_test_stats_chunks.py
-    # downstream expects.
+    # keeps peak memory at one row group (~50 sims for our chunk layout).
     params_output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_params.csv"
     test_stats_output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_test_stats.csv"
 
-    params_f = open(params_output_file, "w") if param_cols else None
+    params_f = None
     params_header_written = False
+    total_sims = 0
+    param_cols: list[str] = []
+    clean_names: list[str] = []
+    has_sample_index = False
 
     try:
         with open(test_stats_output_file, "w") as ts_f:
-            for rg_idx in range(n_row_groups):
-                sim_df = pf.read_row_group(rg_idx).to_pandas()
-                # compute_test_statistics_batch uses positional indexing on
-                # its preallocated (n_sims, n_test_stats) matrix via
-                # sim_df.iterrows(); force a fresh 0..N-1 index in case
-                # pyarrow hands back a non-RangeIndex on some builds.
-                sim_df = sim_df.reset_index(drop=True)
-
-                if params_f is not None:
-                    rg_params_df = sim_df[param_cols].copy()
-                    rg_params_df.columns = clean_names
-                    if has_sample_index:
-                        rg_params_df.insert(
-                            0,
-                            "sample_index",
-                            sim_df["sample_index"].astype("int64").values,
-                        )
-                    rg_params_df.to_csv(
-                        params_f,
-                        index=False,
-                        header=not params_header_written,
-                        float_format="%.12e",
-                    )
-                    params_header_written = True
-
-                test_stats_matrix_rg = compute_test_statistics_batch(
-                    sim_df,
-                    test_stats_df,
-                    test_stat_registry,
-                    species_units,
-                    template_defaults=template_defaults,
+            for pf_idx, parquet_file in enumerate(parquet_files):
+                pf = pq.ParquetFile(str(parquet_file))
+                n_row_groups = pf.num_row_groups
+                schema_names = pf.schema_arrow.names
+                n_sims_this_file = pf.metadata.num_rows
+                logger.info(
+                    f"  [{pf_idx + 1}/{len(parquet_files)}] {parquet_file.name}: "
+                    f"{n_sims_this_file} sims across {n_row_groups} row group(s)"
                 )
-                np.savetxt(ts_f, test_stats_matrix_rg, delimiter=",", fmt="%.12e")
+
+                if pf_idx == 0:
+                    param_prefix = "param:"
+                    param_cols = [col for col in schema_names if col.startswith(param_prefix)]
+                    clean_names = [col[len(param_prefix) :] for col in param_cols]
+                    has_sample_index = "sample_index" in schema_names
+                    if param_cols:
+                        logger.debug(
+                            f"  Found {len(param_cols)} parameter columns: "
+                            f"{clean_names[:5]}{'...' if len(clean_names) > 5 else ''}"
+                        )
+                        params_f = open(params_output_file, "w")
+
+                for rg_idx in range(n_row_groups):
+                    sim_df = pf.read_row_group(rg_idx).to_pandas()
+                    # compute_test_statistics_batch uses positional indexing
+                    # on its preallocated (n_sims, n_test_stats) matrix via
+                    # sim_df.iterrows(); force a fresh 0..N-1 index in case
+                    # pyarrow hands back a non-RangeIndex on some builds.
+                    sim_df = sim_df.reset_index(drop=True)
+
+                    if params_f is not None:
+                        rg_params_df = sim_df[param_cols].copy()
+                        rg_params_df.columns = clean_names
+                        if has_sample_index:
+                            rg_params_df.insert(
+                                0,
+                                "sample_index",
+                                sim_df["sample_index"].astype("int64").values,
+                            )
+                        rg_params_df.to_csv(
+                            params_f,
+                            index=False,
+                            header=not params_header_written,
+                            float_format="%.12e",
+                        )
+                        params_header_written = True
+
+                    test_stats_matrix_rg = compute_test_statistics_batch(
+                        sim_df,
+                        test_stats_df,
+                        test_stat_registry,
+                        species_units,
+                        template_defaults=template_defaults,
+                    )
+                    np.savetxt(ts_f, test_stats_matrix_rg, delimiter=",", fmt="%.12e")
+
+                total_sims += n_sims_this_file
     finally:
         if params_f is not None:
             params_f.close()
 
     if param_cols:
         logger.debug(f"  ✓ Parameters saved: {params_output_file.name}")
-    logger.info(f"  ✓ Saved: {test_stats_output_file.name}")
+    logger.info(f"  ✓ Saved: {test_stats_output_file.name} ({total_sims} sims)")
 
-    return n_sims_total
+    return total_sims
 
 
 def main():
@@ -423,28 +443,42 @@ def main():
     else:
         logger.info("No pool_manifest.json found — assuming wide parquets (pre-#23 layout)")
 
-    # Find all Parquet files in simulation pool
-    parquet_files = sorted(simulation_pool_dir.glob("batch_*.parquet"))
-    if not parquet_files:
+    # Find all batches in the pool. Supports two layouts:
+    #   - Legacy (pre-#43): flat batch_*.parquet files (one per submission,
+    #     produced by the retired cpp_combine_batch_worker).
+    #   - Current (#43 option A): batch_*/ subdirs containing
+    #     chunk_NNN.parquet shards written directly by array tasks.
+    # Both are enumerated and merged so derive works across mixed pools
+    # (e.g. an old pool topped up with a fresh submission).
+    batch_sources: list[Path] = []
+    for entry in sorted(simulation_pool_dir.iterdir()):
+        if not entry.name.startswith("batch_"):
+            continue
+        if entry.is_dir():
+            batch_sources.append(entry)
+        elif entry.is_file() and entry.suffix == ".parquet":
+            batch_sources.append(entry)
+
+    if not batch_sources:
         logger.error(f"No simulation batches found in {simulation_pool_dir}")
         sys.exit(1)
 
     # Limit to max_batches if specified
-    total_available = len(parquet_files)
+    total_available = len(batch_sources)
     if max_batches is not None and max_batches < total_available:
-        parquet_files = parquet_files[:max_batches]
+        batch_sources = batch_sources[:max_batches]
         logger.info(
-            f"Processing {len(parquet_files)} of {total_available} batches (limited by max_batches)"
+            f"Processing {len(batch_sources)} of {total_available} batches (limited by max_batches)"
         )
     else:
-        logger.info(f"Found {len(parquet_files)} simulation batches to process")
+        logger.info(f"Found {len(batch_sources)} simulation batches to process")
 
     # Process batches in a single task (no array job needed)
     total_sims = 0
-    for batch_idx, parquet_file in enumerate(parquet_files):
+    for batch_idx, parquet_source in enumerate(batch_sources):
         n_sims = process_single_batch(
             batch_idx=batch_idx,
-            parquet_file=parquet_file,
+            parquet_source=parquet_source,
             test_stats_df=test_stats_df,
             test_stat_registry=test_stat_registry,
             species_units=species_units,
@@ -454,7 +488,7 @@ def main():
         total_sims += n_sims
 
     logger.info(
-        f"✓ Derivation complete! Processed {total_sims} simulations from {len(parquet_files)} batches"
+        f"✓ Derivation complete! Processed {total_sims} simulations from {len(batch_sources)} batches"
     )
 
 

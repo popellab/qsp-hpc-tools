@@ -630,7 +630,7 @@ class TestProcessSingleBatch:
 
         n_sims = process_single_batch(
             batch_idx=0,
-            parquet_file=parquet_file,
+            parquet_source=parquet_file,
             test_stats_df=test_stats_df,
             test_stat_registry=test_stat_registry,
             species_units=species_units,
@@ -660,7 +660,7 @@ class TestProcessSingleBatch:
 
         process_single_batch(
             batch_idx=5,  # Test non-zero batch index
-            parquet_file=parquet_file,
+            parquet_source=parquet_file,
             test_stats_df=test_stats_df,
             test_stat_registry=test_stat_registry,
             species_units=species_units,
@@ -742,7 +742,7 @@ class TestMaxBatchesLimit:
         for batch_idx, parquet_file in enumerate(parquet_files):
             n_sims = process_single_batch(
                 batch_idx=batch_idx,
-                parquet_file=parquet_file,
+                parquet_source=parquet_file,
                 test_stats_df=test_stats_df,
                 test_stat_registry=registry,
                 species_units=species_units,
@@ -804,7 +804,7 @@ class TestMaxBatchesLimit:
         for batch_idx, parquet_file in enumerate(parquet_files):
             n_sims = process_single_batch(
                 batch_idx=batch_idx,
-                parquet_file=parquet_file,
+                parquet_source=parquet_file,
                 test_stats_df=test_stats_df,
                 test_stat_registry=registry,
                 species_units=species_units,
@@ -872,7 +872,7 @@ class TestSingleTaskDerivation:
         for batch_idx, parquet_file in enumerate(parquet_files):
             n_sims = process_single_batch(
                 batch_idx=batch_idx,
-                parquet_file=parquet_file,
+                parquet_source=parquet_file,
                 test_stats_df=test_stats_df,
                 test_stat_registry=registry,
                 species_units=species_units,
@@ -963,7 +963,7 @@ class TestProcessSingleBatchRowGroupStreaming:
 
         n_sims = process_single_batch(
             batch_idx=0,
-            parquet_file=parquet_file,
+            parquet_source=parquet_file,
             test_stats_df=test_stats_df,
             test_stat_registry=test_stat_registry,
             species_units=species_units,
@@ -1014,7 +1014,7 @@ class TestProcessSingleBatchRowGroupStreaming:
 
         n_sims = process_single_batch(
             batch_idx=0,
-            parquet_file=parquet_file,
+            parquet_source=parquet_file,
             test_stats_df=test_stats_df,
             test_stat_registry=test_stat_registry,
             species_units=species_units,
@@ -1023,3 +1023,103 @@ class TestProcessSingleBatchRowGroupStreaming:
         assert n_sims == 3
         ts_lines = (output_dir / "chunk_000_test_stats.csv").read_text().splitlines()
         assert len(ts_lines) == 3
+
+
+class TestProcessSingleBatchSubdirLayout:
+    """#43 option A: array tasks now drop chunks directly into a
+    per-submission ``batch_*/`` subdir, no combine step. process_single_batch
+    must treat the subdir as one batch — walking ``chunk_*.parquet`` within
+    — and produce the same CSVs as a single consolidated parquet would."""
+
+    @pytest.fixture
+    def test_stats_df(self):
+        return pd.DataFrame(
+            {
+                "test_statistic_id": ["mean_tumor"],
+                "required_species": ["V_T.C1"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return np.mean(species_dict['V_T.C1'].magnitude)"
+                ],
+            }
+        )
+
+    @pytest.fixture
+    def test_stat_registry(self, test_stats_df):
+        return build_test_stat_registry(test_stats_df)
+
+    @pytest.fixture
+    def species_units(self):
+        return {"V_T.C1": "cell"}
+
+    def test_batch_subdir_aggregates_chunks(
+        self, test_stats_df, test_stat_registry, species_units, tmp_path
+    ):
+        """A batch_*/ subdir with 3 chunk_*.parquet files (4 sims each) must
+        derive as one 12-row output — chunks iterated in filename order."""
+        batch_dir = tmp_path / "batch_20260418_000000_ctrl_seed42"
+        batch_dir.mkdir()
+
+        for task_idx in range(3):
+            sim_df = pd.DataFrame(
+                {
+                    "simulation_id": list(range(4)),  # local per-chunk ids
+                    "sample_index": list(range(task_idx * 4, (task_idx + 1) * 4)),
+                    "status": [0] * 4,
+                    "time": [[0.0, 1.0]] * 4,
+                    "V_T.C1": [
+                        [float(task_idx * 100 + i) * 10.0, float(task_idx * 100 + i) * 20.0]
+                        for i in range(4)
+                    ],
+                    "param:k_growth": [0.1 + 0.01 * (task_idx * 4 + i) for i in range(4)],
+                }
+            )
+            sim_df.to_parquet(batch_dir / f"chunk_{task_idx:03d}.parquet")
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        n_sims = process_single_batch(
+            batch_idx=0,
+            parquet_source=batch_dir,
+            test_stats_df=test_stats_df,
+            test_stat_registry=test_stat_registry,
+            species_units=species_units,
+            test_stats_output_dir=output_dir,
+        )
+
+        assert n_sims == 12
+
+        # 12 rows of test stats across 3 chunk files, concatenated in filename order.
+        ts_lines = (output_dir / "chunk_000_test_stats.csv").read_text().splitlines()
+        assert len(ts_lines) == 12
+
+        # sample_index preserved, exactly one header, covers chunk boundaries.
+        params_df = pd.read_csv(output_dir / "chunk_000_params.csv")
+        assert len(params_df) == 12
+        assert list(params_df["sample_index"]) == list(range(12))
+        params_text = (output_dir / "chunk_000_params.csv").read_text()
+        assert params_text.count("sample_index,k_growth") == 1
+
+    def test_empty_batch_subdir_returns_zero(
+        self, test_stats_df, test_stat_registry, species_units, tmp_path
+    ):
+        """A batch_*/ subdir with no chunks yet (task failed before flush)
+        must be skipped, not crash. Derive's top-level loop will still
+        record total_sims correctly."""
+        batch_dir = tmp_path / "batch_20260418_000000_ctrl_seed42"
+        batch_dir.mkdir()
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        n_sims = process_single_batch(
+            batch_idx=0,
+            parquet_source=batch_dir,
+            test_stats_df=test_stats_df,
+            test_stat_registry=test_stat_registry,
+            species_units=species_units,
+            test_stats_output_dir=output_dir,
+        )
+        assert n_sims == 0
+        assert not (output_dir / "chunk_000_test_stats.csv").exists()

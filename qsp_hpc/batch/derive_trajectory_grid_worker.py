@@ -149,8 +149,11 @@ def process_pool(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find all batch Parquet files
-    parquet_files = sorted(pool_dir.glob("batch_*.parquet"))
+    # Find all batch Parquet files. Walks #43 option A layout
+    # (batch_*/chunk_*.parquet) and legacy flat batch_*.parquet.
+    parquet_files = sorted(pool_dir.glob("batch_*/chunk_*.parquet")) + sorted(
+        pool_dir.glob("batch_*.parquet")
+    )
     if not parquet_files:
         raise FileNotFoundError(f"No batch_*.parquet files found in {pool_dir}")
 

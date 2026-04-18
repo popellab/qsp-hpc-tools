@@ -1008,20 +1008,17 @@ class HPCJobManager:
                 evolve via ``--initial-state``. No effect when
                 ``healthy_state_yaml`` is None (no evolve phase to cache).
             retry_missing_chunks: Max rounds of laptop-side sparse retry
-                (#29). 0 (default) preserves the fire-and-forget
-                ``array → combine → derive`` chain that tolerates a
+                (#29). 0 (default) fires array → derive and tolerates a
                 silently-truncated batch. N>0: after each array
-                completes, the laptop SSH-lists the staging dir; if
+                completes, the laptop SSH-lists the batch subdir; if
                 any ``chunk_NNN.parquet`` is missing, it submits a
-                sparse ``--array=N1,N2,N3-N5`` retry with the
-                original array's ``staging_dir`` overridden in config
-                so chunks land alongside the originals, then
-                re-inspects. Once staging is complete or N rounds are
-                exhausted, the orchestrator submits the combine step
-                with ``strict=True`` (so a still-incomplete batch
-                fails loudly via the ``afterok:combine`` dep and
-                skips derivation). All submitted array + combine +
-                derive job ids are returned in ``JobInfo.job_ids``.
+                sparse ``--array=N1,N2,N3-N5`` retry with the original
+                array's ``batch_subdir`` overridden in config so chunks
+                land alongside the originals, then re-inspects. Once
+                the batch is complete or N rounds are exhausted,
+                derivation is chained ``afterok`` the last array. All
+                submitted array + derive job ids are returned in
+                ``JobInfo.job_ids``.
 
         Returns:
             :class:`JobInfo` with job ID(s) and state file. When
@@ -1109,6 +1106,14 @@ class HPCJobManager:
         if evolve_cache and remote_healthy:
             evolve_cache_root = f"{self.config.simulation_pool_path}/evolve_cache"
 
+        # Per-submission batch subdir name — fixed at submit time so every
+        # array task (and every retry) writes into the same
+        # ``{pool}/batch_{ts}_{scenario}_seed{S}/`` directory (issue #43
+        # option A). Derive walks ``batch_*/chunk_*.parquet`` — no
+        # combine step.
+        batch_ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1e6) % 1_000_000:06d}"
+        batch_subdir = f"batch_{batch_ts}_{scenario}_seed{seed}"
+
         self.logger.info("Uploading C++ job configuration and parameters...")
         self._upload_cpp_job_config(
             binary_path=binary_path,
@@ -1127,6 +1132,7 @@ class HPCJobManager:
             drug_metadata_yaml=remote_drug_meta,
             healthy_state_yaml=remote_healthy,
             evolve_cache_root=evolve_cache_root,
+            batch_subdir=batch_subdir,
         )
         self._upload_parameter_csv(samples_csv)
 
@@ -1141,22 +1147,23 @@ class HPCJobManager:
         job_ids = [job_id]
         hpc_pool_path = f"{self.config.simulation_pool_path}/{simulation_pool_id}"
 
-        # Resolve the staging dir used by every task in the original array
-        # (plus any retries that override the SLURM_ARRAY_JOB_ID-derived
-        # default). Combine worker reads this same path from its config.
+        # Resolve the per-submission batch subdir (issue #43 option A:
+        # no combine step — tasks write chunks straight into the pool).
+        # Every task in the original array (plus any retries overriding
+        # the config) lands its chunk in this directory.
         _, home_dir = self.transport.exec("echo $HOME")
         expanded_pool_base = self.config.simulation_pool_path.replace("$HOME", home_dir.strip())
-        staging_dir = f"{expanded_pool_base}/{simulation_pool_id}/.staging/{job_id}"
+        batch_dir = f"{expanded_pool_base}/{simulation_pool_id}/{batch_subdir}"
         base_config_remote = (
             f"{self.config.remote_project_path}/batch_jobs/input/cpp_job_config.json"
         )
 
         # #29: optional laptop-side retry loop. When enabled, block for
-        # the array to finish, SSH-inspect staging, and (if any
+        # the array to finish, SSH-inspect the batch dir, and (if any
         # chunk_NNN.parquet is missing) submit a sparse --array=... retry
-        # with the original staging_dir overridden in its config — so
-        # chunks still land alongside the originals. Repeat until complete
-        # or retry budget exhausted, then chain a STRICT combine.
+        # with the original batch_subdir preserved in its config — so
+        # chunks still land alongside the originals. Repeat until
+        # complete or retry budget exhausted, then chain derivation.
         if retry_missing_chunks > 0:
             last_array_id = job_id
             for attempt in range(1, retry_missing_chunks + 1):
@@ -1165,10 +1172,10 @@ class HPCJobManager:
                     last_array_id,
                 )
                 self._wait_for_array_completion(last_array_id)
-                missing = self._list_missing_chunks_on_hpc(staging_dir, expected=n_jobs)
+                missing = self._list_missing_chunks_on_hpc(batch_dir, expected=n_jobs)
                 if not missing:
                     self.logger.info(
-                        "Staging complete after array %s — all %d chunks present",
+                        "Batch complete after array %s — all %d chunks present",
                         last_array_id,
                         n_jobs,
                     )
@@ -1186,53 +1193,27 @@ class HPCJobManager:
                 last_array_id = self._submit_cpp_retry_array(
                     missing_task_ids=missing,
                     base_config_remote=base_config_remote,
-                    staging_dir=staging_dir,
+                    batch_subdir=batch_subdir,
                     cpus_per_task=cpp_cpus_per_task,
                     memory=cpp_memory,
                     retry_suffix=f"r{attempt}_{job_id}",
                 )
                 job_ids.append(last_array_id)
-            combine_dep_id = last_array_id
-            strict_combine = True
+            derive_dep_id = last_array_id
         else:
-            combine_dep_id = job_id
-            strict_combine = False
-
-        # Chain a combine step afterok:<last_array_id>. When retries ran,
-        # every retry array has already landed its chunks into the
-        # original staging dir, so combine sees one coherent set. strict
-        # combine failing on a residual short count propagates via the
-        # afterok chain and (when requested) blocks derivation.
-        self.logger.info(
-            "Chaining batch combine after C++ array (afterok:%s%s)",
-            combine_dep_id,
-            " strict" if strict_combine else "",
-        )
-        combine_job_id = self.submit_combine_batch_job(
-            pool_path=hpc_pool_path,
-            pool_base=self.config.simulation_pool_path,
-            pool_id=simulation_pool_id,
-            array_job_id=job_id,
-            scenario=scenario,
-            n_simulations=num_simulations,
-            seed=seed,
-            expected_chunks=n_jobs,
-            dependency=f"afterok:{combine_dep_id}",
-            strict=strict_combine,
-        )
-        job_ids.append(combine_job_id)
+            derive_dep_id = job_id
 
         if derive_test_stats:
             self.logger.info(
-                "Chaining test-stats derivation after combine (afterok:%s)",
-                combine_job_id,
+                "Chaining test-stats derivation after C++ array (afterok:%s)",
+                derive_dep_id,
             )
             derive_job_id = self.submit_derivation_job(
                 pool_path=hpc_pool_path,
                 test_stats_csv=test_stats_csv,
                 test_stats_hash=test_stats_hash,
                 model_structure_file=model_structure_file,
-                dependency=f"afterok:{combine_job_id}",
+                dependency=f"afterok:{derive_dep_id}",
             )
             job_ids.append(derive_job_id)
 
@@ -1282,6 +1263,7 @@ class HPCJobManager:
         drug_metadata_yaml: Optional[str] = None,
         healthy_state_yaml: Optional[str] = None,
         evolve_cache_root: Optional[str] = None,
+        batch_subdir: Optional[str] = None,
     ) -> None:
         """Create and upload C++ job configuration JSON."""
         import json
@@ -1308,6 +1290,11 @@ class HPCJobManager:
             "healthy_state_yaml": healthy_state_yaml,
             # Absolute remote path; None disables the M13 evolve-cache.
             "evolve_cache_root": evolve_cache_root,
+            # Per-submission batch subdir name (issue #43 option A).
+            # Every task in the array writes chunks into
+            # ``{pool}/{batch_subdir}/chunk_NNN.parquet``. None falls back
+            # to a SLURM_ARRAY_JOB_ID-derived default in the worker.
+            "batch_subdir": batch_subdir,
         }
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -1321,16 +1308,15 @@ class HPCJobManager:
             Path(temp_file).unlink()
 
     def _upload_cpp_retry_config(
-        self, base_config_remote: str, staging_dir: str, retry_suffix: str
+        self, base_config_remote: str, batch_subdir: str, retry_suffix: str
     ) -> str:
-        """Download the base cpp_job_config.json, add a staging_dir override,
+        """Download the base cpp_job_config.json, pin ``batch_subdir``,
         and upload as a distinct retry-scoped config. Returns the remote path.
 
-        The retry array's SLURM_ARRAY_JOB_ID differs from the original, so
-        without this override each retry task would write its chunks into
-        a fresh ``.staging/{new_array_id}/`` — invisible to the combine
-        worker. Forcing ``staging_dir`` in config keeps all retry chunks
-        landing alongside the originals.
+        The retry array would otherwise default to a different
+        SLURM_ARRAY_JOB_ID-derived subdir; preserving the original
+        ``batch_subdir`` keeps retry chunks landing alongside the
+        originals so derive sees one coherent batch.
         """
         import json as _json
         import tempfile as _tempfile
@@ -1341,7 +1327,7 @@ class HPCJobManager:
             local_base = tmp_path / Path(base_config_remote).name
             with open(local_base) as fh:
                 config = _json.load(fh)
-            config["staging_dir"] = staging_dir
+            config["batch_subdir"] = batch_subdir
 
             with _tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as out:
                 _json.dump(config, out, indent=2)
@@ -1357,8 +1343,8 @@ class HPCJobManager:
         finally:
             Path(local_retry).unlink()
 
-    def _list_missing_chunks_on_hpc(self, staging_dir: str, expected: int) -> List[int]:
-        """SSH-list ``staging_dir`` and return sorted missing task ids.
+    def _list_missing_chunks_on_hpc(self, batch_dir: str, expected: int) -> List[int]:
+        """SSH-list ``batch_dir`` and return sorted missing task ids.
 
         Uses a shell glob + sed to extract the integer task id from each
         ``chunk_NNN.parquet`` filename — cheaper than downloading a
@@ -1367,7 +1353,7 @@ class HPCJobManager:
         spec (e.g. the whole array failed before any chunk flushed).
         """
         cmd = (
-            f'ls -1 "{staging_dir}"/chunk_*.parquet 2>/dev/null '
+            f'ls -1 "{batch_dir}"/chunk_*.parquet 2>/dev/null '
             f"| sed -E 's|.*/chunk_0*([0-9]+)\\.parquet$|\\1|'"
         )
         rc, out = self.transport.exec(cmd, timeout=30)
@@ -1427,7 +1413,7 @@ class HPCJobManager:
         self,
         missing_task_ids: List[int],
         base_config_remote: str,
-        staging_dir: str,
+        batch_subdir: str,
         cpus_per_task: int,
         memory: str,
         dependency: Optional[str] = None,
@@ -1435,19 +1421,19 @@ class HPCJobManager:
     ) -> str:
         """Submit a sparse SLURM array for a specific task-id list.
 
-        Writes a retry-scoped cpp_job_config with ``staging_dir`` override
-        (so chunks land alongside the original array's), emits the
-        sbatch with ``--array={sparse_spec}``, and returns the new
-        array job id.
+        Writes a retry-scoped cpp_job_config pinning ``batch_subdir`` to
+        the original array's (so chunks land alongside the originals),
+        emits the sbatch with ``--array={sparse_spec}``, and returns
+        the new array job id.
 
         Called from :meth:`submit_cpp_jobs` when
         ``retry_missing_chunks > 0`` and post-array inspection found a
-        short staging dir.
+        short batch dir.
         """
         if not missing_task_ids:
             raise ValueError("_submit_cpp_retry_array called with no missing ids")
         array_spec = _format_array_spec(missing_task_ids)
-        retry_config = self._upload_cpp_retry_config(base_config_remote, staging_dir, retry_suffix)
+        retry_config = self._upload_cpp_retry_config(base_config_remote, batch_subdir, retry_suffix)
         self.logger.info(
             "Submitting retry array for %d missing tasks (--array=%s)",
             len(missing_task_ids),
@@ -1619,11 +1605,13 @@ class HPCJobManager:
     def get_max_sample_index(self, hpc_pool_path: str) -> Optional[int]:
         """Return the largest ``sample_index`` already present in the HPC pool.
 
-        Scans ``batch_*.parquet`` files in ``hpc_pool_path`` and reads only
-        the ``sample_index`` column metadata (cheap). Returns ``None`` when
-        the dir doesn't exist, has no parquets, or the parquets predate the
-        sample_index schema. Used to assign contiguous index ranges to new
-        batches without re-using sample_indices already simulated.
+        Scans ``batch_*/chunk_*.parquet`` (#43 option A layout) AND flat
+        ``batch_*.parquet`` (legacy combine-era layout) in
+        ``hpc_pool_path`` and reads only the ``sample_index`` column
+        metadata (cheap). Returns ``None`` when the dir doesn't exist,
+        has no parquets, or the parquets predate the sample_index
+        schema. Used to assign contiguous index ranges to new batches
+        without re-using sample_indices already simulated.
         """
         py = self.config.hpc_venv_path + "/bin/python"
         cmd = (
@@ -1631,7 +1619,8 @@ class HPCJobManager:
             f'{py} -c "'
             f"import glob, sys; "
             f"import pyarrow.parquet as pq; "
-            f"files = sorted(glob.glob('{hpc_pool_path}/batch_*.parquet')); "
+            f"files = sorted(glob.glob('{hpc_pool_path}/batch_*/chunk_*.parquet')) "
+            f"+ sorted(glob.glob('{hpc_pool_path}/batch_*.parquet')); "
             f"max_i = -1; "
             f"missing = False\n"
             f"for f in files:\n"
@@ -1897,9 +1886,11 @@ class HPCJobManager:
         Returns:
             Number of batches to process
         """
-        # Count total batches
+        # Count total batches (#43 option A: batch_*/ subdirs; plus any
+        # legacy flat batch_*.parquet files from pre-#43 pools).
         status, output = self.transport.exec(
-            f'ls "{pool_path}"/batch_*.parquet 2>/dev/null | wc -l'
+            f'( ls -d "{pool_path}"/batch_*/ 2>/dev/null; '
+            f'ls "{pool_path}"/batch_*.parquet 2>/dev/null ) | wc -l'
         )
         # Extract numeric count robustly (HPC login wrapper may inject error text)
         total_batches = 0
@@ -2057,98 +2048,6 @@ class HPCJobManager:
             )
         else:
             self.logger.info(f"   🚀 Derivation job {job_id} (single task, {n_batches} batches)")
-        return job_id
-
-    def submit_combine_batch_job(
-        self,
-        pool_path: str,
-        pool_base: str,
-        pool_id: str,
-        array_job_id: str,
-        scenario: str,
-        n_simulations: int,
-        seed: int,
-        expected_chunks: int,
-        dependency: str,
-        strict: bool = False,
-    ) -> str:
-        """Submit SLURM job to combine array-task chunks into one batch parquet.
-
-        Generates a config JSON + sbatch script that runs
-        :mod:`qsp_hpc.batch.cpp_combine_batch_worker` as a single task
-        chained ``afterok:<array_job>``. The worker walks
-        ``{pool_path}/.staging/{array_job_id}/chunk_*.parquet``,
-        concatenates them into one pool-level ``batch_*.parquet``,
-        and removes the staging dir.
-
-        This unifies the C++ HPC pool layout with MATLAB's (one file per
-        submission, no task-id sharding) so partial top-ups append cleanly
-        and pool loaders scan a simple flat directory.
-
-        Args:
-            pool_path: Full HPC path to the simulation pool.
-            pool_base: Parent dir (``simulation_pool_path`` in credentials).
-            pool_id: Pool directory name (``{version}_{hash8}_{scenario}``).
-            array_job_id: SLURM job id of the upstream C++ array — used to
-                locate the staging dir.
-            scenario: Scenario name (embedded in final batch filename).
-            n_simulations: Total sims in this submission (embedded in
-                filename; combine worker warns on mismatch but does not
-                fail so pathological-sim drop-outs are tolerated).
-            seed: Seed (embedded in filename).
-            expected_chunks: Number of array tasks; combine warns if
-                fewer chunks are found.
-            dependency: ``afterok:<array_job_id>`` expression.
-
-        Returns:
-            SLURM job id of the combine task.
-        """
-        self.logger.info("Preparing combine-batch job:")
-        self.logger.info(f"  Pool: {pool_path}")
-        self.logger.info(f"  Upstream array: {array_job_id}")
-
-        # Scratch dir for combine script + config, shared with derivation.
-        combine_dir = f"{self.config.remote_project_path}/batch_jobs/derivation"
-        self.transport.exec(f'mkdir -p "{combine_dir}"')
-
-        # Resolve $HOME so the combine worker can stat the staging dir.
-        _, home_dir = self.transport.exec("echo $HOME")
-        home_dir = home_dir.strip()
-        expanded_pool_base = pool_base.replace("$HOME", home_dir)
-        staging_dir = f"{expanded_pool_base}/{pool_id}/.staging/{array_job_id}"
-
-        config = {
-            "pool_base": expanded_pool_base,
-            "pool_id": pool_id,
-            "staging_dir": staging_dir,
-            "scenario": scenario,
-            "n_simulations": n_simulations,
-            "seed": seed,
-            "expected_chunks": expected_chunks,
-            # When True, combine raises MissingChunksError on short staging
-            # instead of writing a truncated batch. Failure propagates via
-            # the afterok:combine dep so downstream derivation skips. Used
-            # by the #29 retry orchestration path.
-            "strict": strict,
-        }
-
-        import json as _json
-        import tempfile as _tempfile
-
-        with _tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            _json.dump(config, f, indent=2)
-            temp_config = f.name
-
-        remote_config = f"{combine_dir}/combine_config_{array_job_id}.json"
-        self.transport.upload(temp_config, remote_config)
-        Path(temp_config).unlink()
-
-        job_id = self.slurm_submitter.submit_combine_batch_job(
-            combine_config=remote_config,
-            combine_dir=combine_dir,
-            dependency=dependency,
-        )
-        self.logger.info(f"   🧩 Combine job {job_id} (single task, dependency={dependency})")
         return job_id
 
     def submit_trajectory_grid_job(
@@ -2377,8 +2276,14 @@ class HPCJobManager:
         self.logger.info(f"   Downloading {n_files} most recent Parquet batch(es) from HPC...")
         self.logger.info(f"   Pool path: {pool_path}")
 
-        # List Parquet files sorted by modification time (most recent first)
-        list_cmd = f'ls -t "{pool_path}"/batch_*.parquet 2>/dev/null | head -{n_files}'
+        # List Parquet files sorted by modification time (most recent first).
+        # Walks both #43 option A subdirs (batch_*/chunk_*.parquet) and legacy
+        # flat batch_*.parquet — used only for diagnostic downloads (e.g.
+        # `qsp-hpc inspect`), so returning chunk files directly is fine.
+        list_cmd = (
+            f'( ls -t "{pool_path}"/batch_*/chunk_*.parquet 2>/dev/null; '
+            f'ls -t "{pool_path}"/batch_*.parquet 2>/dev/null ) | head -{n_files}'
+        )
         status, output = self.transport.exec(list_cmd)
 
         if status != 0 or not output.strip():

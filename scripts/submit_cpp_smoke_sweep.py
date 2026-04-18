@@ -140,6 +140,17 @@ def main() -> None:
         default=None,
         help="Optional model_structure.json with species unit metadata.",
     )
+    ap.add_argument(
+        "--cpp-branch",
+        default=None,
+        help="Override SPQSP_PDAC branch (cpp_branch). Credentials default " "if unset.",
+    )
+    ap.add_argument(
+        "--tools-branch",
+        default=None,
+        help="Override the @<ref> suffix of qsp_hpc_tools_source so HPC "
+        "pip-installs the given branch. Credentials default if unset.",
+    )
     args = ap.parse_args()
 
     if args.calibration_targets and args.test_stats_csv:
@@ -185,6 +196,21 @@ def main() -> None:
 
     # Override time_limit for the C++ job (shorter than MATLAB default).
     manager.config.time_limit = args.time_limit
+
+    if args.cpp_branch:
+        manager.config.cpp_branch = args.cpp_branch
+    if args.tools_branch:
+        src = manager.config.qsp_hpc_tools_source
+        if ".git" in src:
+            head, _sep, _tail = src.partition(".git")
+            manager.config.qsp_hpc_tools_source = f"{head}.git@{args.tools_branch}"
+        else:
+            manager.config.qsp_hpc_tools_source = f"{src}@{args.tools_branch}"
+    if args.cpp_branch or args.tools_branch:
+        print(
+            f"\nOverriding refs: cpp_branch={manager.config.cpp_branch}, "
+            f"qsp_hpc_tools_source={manager.config.qsp_hpc_tools_source}"
+        )
 
     test_stats_hash: str | None = None
     test_stats_csv_for_submit: Path | None = args.test_stats_csv

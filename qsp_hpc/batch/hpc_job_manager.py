@@ -34,7 +34,7 @@ import shlex
 import subprocess
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -47,6 +47,29 @@ from qsp_hpc.batch.result_collector import MissingOutputError, ResultCollector
 from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter, SubmissionError  # noqa: F401
 from qsp_hpc.utils.logging_config import format_config, log_operation, setup_logger
 from qsp_hpc.utils.security import build_safe_ssh_command
+
+
+@dataclass(frozen=True)
+class DownloadResult:
+    """Everything a caller needs after pulling one scenario's derived
+    test stats off HPC.
+
+    Replaces the pre-#22 pattern where
+    :meth:`HPCJobManager.download_test_stats` returned
+    ``(params, test_stats)`` and stashed ``sample_index`` / param column
+    names on instance attributes (``_last_sample_index`` /
+    ``_last_param_names``). That was ordering-sensitive — back-to-back
+    downloads would clobber each other's sidecar — and spooky to mock
+    (AttributeError never fired under MagicMock).
+
+    ``sample_index`` is None for legacy MATLAB pools whose
+    ``combined_params.csv`` pre-dates the sample_index column.
+    """
+
+    params: Optional[np.ndarray]
+    test_stats: np.ndarray
+    sample_index: Optional[np.ndarray] = None
+    param_names: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -948,9 +971,7 @@ class HPCJobManager:
         # chains afterok:combine, so it sees a single new batch file per
         # submission instead of n_jobs task-sharded parquets.
         hpc_pool_path = f"{self.config.simulation_pool_path}/{simulation_pool_id}"
-        self.logger.info(
-            "Chaining batch combine after C++ array (afterok:%s)", job_id
-        )
+        self.logger.info("Chaining batch combine after C++ array (afterok:%s)", job_id)
         combine_job_id = self.submit_combine_batch_job(
             pool_path=hpc_pool_path,
             pool_base=self.config.simulation_pool_path,
@@ -1290,10 +1311,13 @@ class HPCJobManager:
         if status != 0:
             raise RuntimeError(f"Failed to combine chunks on HPC: {output}")
 
-    def _download_combined_files(
-        self, test_stats_dir: str, local_dest: Path
-    ) -> Tuple[Optional[np.ndarray], np.ndarray]:
-        """Download and load combined test statistics and parameters from HPC."""
+    def _download_combined_files(self, test_stats_dir: str, local_dest: Path) -> DownloadResult:
+        """Download and load combined test statistics and parameters from HPC.
+
+        Returns a :class:`DownloadResult`; the old ``(params, test_stats)``
+        tuple return lives on in :meth:`download_test_stats` as a thin
+        wrapper for MATLAB callers.
+        """
         local_dest.mkdir(parents=True, exist_ok=True)
 
         # Download test stats
@@ -1307,7 +1331,10 @@ class HPCJobManager:
         status_params, output_params = self.transport.exec(check_params_cmd)
         has_params = status_params == 0 and "exists" in output_params
 
-        params = None
+        params: Optional[np.ndarray] = None
+        sample_index: Optional[np.ndarray] = None
+        param_names: List[str] = []
+
         if has_params:
             remote_params_file = f"{test_stats_dir}/combined_params.csv"
             if self.verbose:
@@ -1328,32 +1355,17 @@ class HPCJobManager:
             if downloaded_params.exists():
                 downloaded_params.rename(local_params_file)
 
-                # Load params.
-                # combined_params.csv now carries ``sample_index`` as the first
-                # column (used for cross-scenario alignment at load time). Strip
-                # it before returning the params matrix — leaving it in would
-                # treat sample_index=0 as a real parameter value and downstream
-                # ``np.log(theta)`` produces -inf in NPE training.
-                import pandas as pd
-
+                # combined_params.csv carries ``sample_index`` as the first
+                # column (used for cross-scenario alignment). Strip it
+                # before assembling the params matrix — leaving it in
+                # would treat sample_index=0 as a real parameter value
+                # and downstream ``np.log(theta)`` produces -inf in NPE
+                # training.
                 params_df = pd.read_csv(local_params_file)
                 if "sample_index" in params_df.columns:
-                    # Keep a copy on the result_collector so callers that
-                    # care about cross-scenario alignment can retrieve it
-                    # via download_sample_index (C++ path uses this). The
-                    # ndarray return stays sample_index-free so existing
-                    # MATLAB callers don't see an extra column shifting
-                    # theta[:, 0] into what was previously an integer
-                    # index, breaking np.log(theta) and similar.
-                    self._last_sample_index = params_df["sample_index"].astype("int64").values
+                    sample_index = params_df["sample_index"].astype("int64").to_numpy()
                     params_df = params_df.drop(columns=["sample_index"])
-                else:
-                    self._last_sample_index = None
-                # Stash the column names so local-cache persistence can
-                # write them back with their true names (otherwise the
-                # cache mislabels columns by zipping data against an
-                # unrelated priors-CSV name list).
-                self._last_param_names = list(params_df.columns)
+                param_names = list(params_df.columns)
                 params = params_df.values
 
                 # Ensure 2D shape
@@ -1363,20 +1375,21 @@ class HPCJobManager:
                 if self.verbose:
                     self.logger.info(f"Downloaded parameters: {params.shape}")
 
-        # Load test stats using pandas (handles NaN/empty values properly)
-        import pandas as pd
-
         test_stats_df = pd.read_csv(local_test_stats_file, header=None)
         test_stats = test_stats_df.values
 
-        # Ensure 2D shape
         if test_stats.ndim == 1:
             test_stats = test_stats.reshape(1, -1)
 
         if self.verbose:
             self.logger.info(f"Downloaded test statistics: {test_stats.shape}")
 
-        return params, test_stats
+        return DownloadResult(
+            params=params,
+            test_stats=test_stats,
+            sample_index=sample_index,
+            param_names=param_names,
+        )
 
     def check_hpc_test_stats(
         self, pool_path: str, test_stats_hash: str, expected_n_sims: Optional[int] = None
@@ -1749,9 +1762,7 @@ class HPCJobManager:
             combine_dir=combine_dir,
             dependency=dependency,
         )
-        self.logger.info(
-            f"   🧩 Combine job {job_id} (single task, dependency={dependency})"
-        )
+        self.logger.info(f"   🧩 Combine job {job_id} (single task, dependency={dependency})")
         return job_id
 
     def submit_trajectory_grid_job(
@@ -1865,21 +1876,21 @@ class HPCJobManager:
         self.logger.info(f"  Downloaded: {grid_df.shape[0]} sims × {grid_df.shape[1]} columns")
         return grid_df, meta
 
-    def download_test_stats(
+    def download_test_stats_full(
         self, pool_path: str, test_stats_hash: str, local_dest: Path
-    ) -> Tuple[Optional[np.ndarray], np.ndarray]:
+    ) -> DownloadResult:
         """
         Download and combine derived parameters and test statistics from HPC.
+
+        Returns a :class:`DownloadResult` carrying params, test_stats,
+        sample_index, and param column names. Use this in new code;
+        :meth:`download_test_stats` is a thin ``(params, test_stats)``
+        wrapper kept for MATLAB-era callers.
 
         Args:
             pool_path: Path to simulation pool on HPC (may contain $HOME)
             test_stats_hash: Hash of test statistics CSV
             local_dest: Local destination directory
-
-        Returns:
-            Tuple of (params, test_stats):
-            - params: Numpy array of parameters (n_sims x n_params) or None if not available
-            - test_stats: Numpy array of test statistics (n_sims x n_test_stats)
         """
         # Expand $HOME if present (needed for scp)
         if "$HOME" in pool_path:
@@ -1918,6 +1929,20 @@ class HPCJobManager:
 
         # Download combined files and load
         return self._download_combined_files(test_stats_dir, local_dest)
+
+    def download_test_stats(
+        self, pool_path: str, test_stats_hash: str, local_dest: Path
+    ) -> Tuple[Optional[np.ndarray], np.ndarray]:
+        """Backward-compatible ``(params, test_stats)`` wrapper over
+        :meth:`download_test_stats_full`.
+
+        Kept so MATLAB-era call sites (``QSPSimulator._run_pipeline``)
+        don't have to change. New code should use
+        :meth:`download_test_stats_full` to get ``sample_index`` and
+        ``param_names`` without reaching for instance attributes.
+        """
+        result = self.download_test_stats_full(pool_path, test_stats_hash, local_dest)
+        return result.params, result.test_stats
 
     def download_latest_parquet_batch(
         self, pool_path: str, local_dest: Path, n_files: int = 1

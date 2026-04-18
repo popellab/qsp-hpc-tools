@@ -26,6 +26,7 @@ import yaml
 
 from qsp_hpc.batch.hpc_job_manager import (
     BatchConfig,
+    DownloadResult,
     HPCJobManager,
     JobInfo,
     MissingOutputError,
@@ -1000,3 +1001,136 @@ class TestWithMockedSSH:
     def test_rsync_upload_mocked(self, mock_subprocess, mock_hpc_config):
         """Test rsync upload with mocked subprocess."""
         pass
+
+
+# ============================================================================
+# DownloadResult / download_test_stats_full (#22)
+# ============================================================================
+
+
+class TestDownloadResultContract:
+    """Regression tests for the DownloadResult dataclass replacing the
+    pre-#22 ``_last_sample_index`` / ``_last_param_names`` side channels.
+
+    The old pattern was ordering-sensitive: two back-to-back downloads
+    clobbered each other's sidecar attributes, so callers that batched
+    downloads silently saw the second download's metadata for both.
+    """
+
+    @staticmethod
+    def _make_manager_with_fake_files(tmp_path, sample_index_for, params_for):
+        """Build an HPCJobManager whose ``_download_combined_files`` runs
+        against on-disk CSVs that we synthesise per-call. Returns
+        (manager, set_next_csvs)."""
+        manager = HPCJobManager.__new__(HPCJobManager)
+        manager.verbose = False
+        manager.logger = Mock()
+        # Stub transport: 'test -f combined_params.csv' check returns
+        # 'exists' so the params branch runs.
+        transport = Mock()
+        transport.exec.return_value = (0, "exists")
+
+        def write_files(staging_dir, sample_index_arr, params_arr, ts_arr):
+            staging_dir = Path(staging_dir)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            import pandas as _pd
+
+            df = _pd.DataFrame(
+                {
+                    "sample_index": sample_index_arr,
+                    "p0": params_arr[:, 0],
+                    "p1": params_arr[:, 1],
+                }
+            )
+            df.to_csv(staging_dir / "combined_params.csv", index=False)
+            _pd.DataFrame(ts_arr).to_csv(
+                staging_dir / "combined_test_stats.csv", header=False, index=False
+            )
+
+        next_payload = {}
+
+        def fake_download(remote_path, local_dir):
+            # Whatever file the caller asks for, we just write the
+            # expected combined_*.csv with the queued payload.
+            staging = Path(local_dir)
+            write_files(
+                staging,
+                next_payload["sample_index"],
+                next_payload["params"],
+                next_payload["test_stats"],
+            )
+
+        transport.download.side_effect = fake_download
+        manager.transport = transport
+
+        def set_next(sample_index_arr, params_arr, ts_arr):
+            next_payload["sample_index"] = sample_index_arr
+            next_payload["params"] = params_arr
+            next_payload["test_stats"] = ts_arr
+
+        return manager, set_next
+
+    def test_download_test_stats_full_returns_dataclass(self, tmp_path):
+        manager, set_next = self._make_manager_with_fake_files(tmp_path, None, None)
+        params = np.array([[1.0, 2.0], [3.0, 4.0]])
+        ts = np.array([[10.0], [20.0]])
+        sidx = np.array([7, 11], dtype=np.int64)
+        set_next(sidx, params, ts)
+
+        result = manager._download_combined_files(str(tmp_path / "ts_dir"), tmp_path / "out")
+
+        assert isinstance(result, DownloadResult)
+        np.testing.assert_array_equal(result.params, params)
+        np.testing.assert_array_equal(result.test_stats, ts)
+        np.testing.assert_array_equal(result.sample_index, sidx)
+        assert result.param_names == ["p0", "p1"]
+
+    def test_back_to_back_downloads_do_not_share_state(self, tmp_path):
+        """Two sequential downloads must each return their own metadata.
+
+        Pre-#22, the second download overwrote ``_last_sample_index``,
+        so a caller that did A.download(); B.download(); then read
+        ``_last_sample_index`` got B's data instead of A's.
+        """
+        manager, set_next = self._make_manager_with_fake_files(tmp_path, None, None)
+
+        params_a = np.array([[1.0, 1.0]])
+        ts_a = np.array([[100.0]])
+        sidx_a = np.array([42], dtype=np.int64)
+        set_next(sidx_a, params_a, ts_a)
+        result_a = manager._download_combined_files(str(tmp_path / "ts_a"), tmp_path / "out_a")
+
+        params_b = np.array([[9.0, 9.0]])
+        ts_b = np.array([[900.0]])
+        sidx_b = np.array([99], dtype=np.int64)
+        set_next(sidx_b, params_b, ts_b)
+        result_b = manager._download_combined_files(str(tmp_path / "ts_b"), tmp_path / "out_b")
+
+        # A's metadata must still describe A after B finishes.
+        np.testing.assert_array_equal(result_a.sample_index, sidx_a)
+        np.testing.assert_array_equal(result_b.sample_index, sidx_b)
+        # No instance-level sidecars: the side-channel attributes must
+        # not leak back in.
+        assert not hasattr(manager, "_last_sample_index")
+        assert not hasattr(manager, "_last_param_names")
+
+    def test_legacy_tuple_wrapper_still_works(self, tmp_path):
+        """``download_test_stats`` must keep returning a 2-tuple so the
+        MATLAB-era ``QSPSimulator._run_pipeline`` callers don't break."""
+        manager, _ = self._make_manager_with_fake_files(tmp_path, None, None)
+
+        params = np.array([[2.0, 3.0]])
+        ts = np.array([[33.0]])
+        manager.download_test_stats_full = Mock(
+            return_value=DownloadResult(
+                params=params,
+                test_stats=ts,
+                sample_index=np.array([5], dtype=np.int64),
+                param_names=["p0", "p1"],
+            )
+        )
+
+        wrapped = HPCJobManager.download_test_stats.__get__(manager)
+        out_params, out_ts = wrapped("/pool", "abc", tmp_path / "dest")
+        np.testing.assert_array_equal(out_params, params)
+        np.testing.assert_array_equal(out_ts, ts)

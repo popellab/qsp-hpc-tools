@@ -605,18 +605,25 @@ class TestCppSimulatorRunHpc:
         ts_hash = sim._compute_test_stats_hash()
 
         # No local cache — HPC has pre-derived stats
+        from qsp_hpc.batch.hpc_job_manager import DownloadResult
+
         rng = np.random.default_rng(1)
         hpc_params = rng.uniform(size=(4, 2))
         hpc_ts = rng.uniform(size=(4, 3))
         jm.check_hpc_test_stats.return_value = True
-        jm.download_test_stats.return_value = (hpc_params, hpc_ts)
+        jm.download_test_stats_full.return_value = DownloadResult(
+            params=hpc_params,
+            test_stats=hpc_ts,
+            sample_index=np.arange(4, dtype=np.int64),
+            param_names=list(sim.param_names),
+        )
 
         out_params, out_ts = sim.run_hpc(4)
         assert out_params.shape == (4, 2)
         assert out_ts.shape == (4, 3)
 
         jm.check_hpc_test_stats.assert_called_once()
-        jm.download_test_stats.assert_called_once()
+        jm.download_test_stats_full.assert_called_once()
         # Pool path passed to check_hpc_test_stats must be
         # {simulation_pool_path}/{simulation_pool_id} so HPC and local agree
         ((pool_path, _hash), kw) = jm.check_hpc_test_stats.call_args
@@ -631,6 +638,8 @@ class TestCppSimulatorRunHpc:
     ):
         sim, jm = self._make_sim(priors_csv, binary_path, template_path, cache_dir, tmp_path)
 
+        from qsp_hpc.batch.hpc_job_manager import DownloadResult
+
         rng = np.random.default_rng(2)
         params = rng.uniform(size=(3, 2))
         ts = rng.uniform(size=(3, 3))
@@ -638,7 +647,12 @@ class TestCppSimulatorRunHpc:
         jm.result_collector.check_pool_directory_exists.return_value = True
         jm.result_collector.count_pool_simulations.return_value = 3
         jm.submit_derivation_job.return_value = "9999"
-        jm.download_test_stats.return_value = (params, ts)
+        jm.download_test_stats_full.return_value = DownloadResult(
+            params=params,
+            test_stats=ts,
+            sample_index=np.arange(3, dtype=np.int64),
+            param_names=list(sim.param_names),
+        )
 
         out_params, out_ts = sim.run_hpc(3)
         assert out_params.shape == (3, 2)
@@ -652,7 +666,7 @@ class TestCppSimulatorRunHpc:
     def test_run_hpc_tier4_submits_array_with_chained_derivation(
         self, priors_csv, binary_path, template_path, cache_dir, tmp_path
     ):
-        from qsp_hpc.batch.hpc_job_manager import JobInfo
+        from qsp_hpc.batch.hpc_job_manager import DownloadResult, JobInfo
 
         sim, jm = self._make_sim(priors_csv, binary_path, template_path, cache_dir, tmp_path)
 
@@ -669,7 +683,12 @@ class TestCppSimulatorRunHpc:
             n_simulations=2,
             submission_time="now",
         )
-        jm.download_test_stats.return_value = (params, ts)
+        jm.download_test_stats_full.return_value = DownloadResult(
+            params=params,
+            test_stats=ts,
+            sample_index=np.arange(2, dtype=np.int64),
+            param_names=list(sim.param_names),
+        )
 
         out_params, out_ts = sim.run_hpc(2)
         assert out_params.shape == (2, 2)

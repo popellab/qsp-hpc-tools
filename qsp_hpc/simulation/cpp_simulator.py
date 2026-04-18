@@ -543,33 +543,37 @@ class CppSimulator:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Download HPC test stats and persist a local Parquet cache.
 
-        Captures ``sample_index`` from the HPC-side params CSV (via
-        :attr:`HPCJobManager._last_sample_index`) and both (a) stamps it
-        onto the local parquet so subsequent Tier-1 cache hits carry the
-        index, and (b) stashes it on ``self.last_sample_index`` for the
-        caller to inspect.
+        Uses :meth:`HPCJobManager.download_test_stats_full` so ``sample_index``
+        and the downloaded param column order ride on the return value
+        rather than instance side-channels (pre-#22 pattern). ``sample_index``
+        is stamped onto the local parquet for Tier-1 cache hits and stashed
+        on ``self.last_sample_index`` for cross-scenario alignment.
         """
         if self.job_manager is None:
             raise RuntimeError("job_manager required for download")
         with tempfile.TemporaryDirectory() as tmp:
-            params, test_stats = self.job_manager.download_test_stats(
+            result = self.job_manager.download_test_stats_full(
                 hpc_pool_path, test_stats_hash, Path(tmp)
             )
-        if params is None:
+        if result.params is None:
             raise RuntimeError("HPC has test stats but no params CSV — re-run derivation.")
-        sample_index = getattr(self.job_manager, "_last_sample_index", None)
-        # Defensive: in unit-test contexts where download_test_stats is
-        # mocked, the attribute may be a MagicMock rather than a real
-        # ndarray / None. Only treat it as valid when it's actually an
-        # ndarray whose length matches the params returned.
-        if isinstance(sample_index, np.ndarray) and len(sample_index) == len(params):
+
+        params = result.params
+        test_stats = result.test_stats
+        sample_index = result.sample_index
+        param_names: Optional[List[str]] = result.param_names or None
+
+        # Guard against mocks / malformed pools: require sample_index to
+        # line up with rows, else treat it as unavailable (legacy pool).
+        if sample_index is not None and len(sample_index) == len(params):
             self.last_sample_index = sample_index
         else:
             sample_index = None
             self.last_sample_index = None
-        param_names = getattr(self.job_manager, "_last_param_names", None)
-        if not (isinstance(param_names, list) and len(param_names) == params.shape[1]):
+
+        if param_names is not None and len(param_names) != params.shape[1]:
             param_names = None
+
         # Persist the full set (all param:* columns) so cal-target code
         # and future re-derivations can reach any template parameter.
         self._persist_local_test_stats(

@@ -1113,7 +1113,21 @@ class HPCJobManager:
             skip_build=skip_build,
             binary_path=binary_path,
         )
-        self._setup_remote_directories()
+        # #48 follow-up: we deliberately do NOT call
+        # _setup_remote_directories() here. Its historical behavior —
+        # ``rm -rf`` then ``mkdir -p`` of batch_jobs/{input,output,scripts}
+        # at the start of every submission — was a direct TOCTOU
+        # conflict with the pool-scoped upload layout. Thread A would
+        # upload its pool-scoped YAMLs into
+        # batch_jobs/input/<pool_A>/, then thread B's setup call would
+        # ``rm -rf batch_jobs/input`` and wipe A's subdir before A's
+        # array job ran — the array would fail with ``YAML not found``
+        # because its config still referenced the deleted paths.
+        # Pool-scoped uploads now each do their own ``mkdir -p`` (see
+        # _ensure_pool_input_dir / upload_parameter_csv), and the
+        # sbatch script upload mkdir -p's its own dir (see
+        # slurm_job_submitter.submit_cpp_job), so the up-front wipe is
+        # redundant as well as unsafe.
 
         if scenario_yaml and not drug_metadata_yaml:
             raise ValueError("scenario_yaml requires drug_metadata_yaml")

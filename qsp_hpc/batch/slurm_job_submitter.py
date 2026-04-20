@@ -307,7 +307,7 @@ echo "Job completed at $(date)"
         # Log configuration
         self.logger.info("SLURM Derivation Configuration:")
         self.logger.info(f"  Partition: {self.config.partition}")
-        self.logger.info("  Time limit: 00:15:00 (fixed for derivation)")
+        self.logger.info("  Time limit: 00:45:00 (fixed for derivation)")
         self.logger.info("  Memory: 32G (fixed for derivation)")
         self.logger.info("  Single task (processes all batches)")
         if dependency:
@@ -357,7 +357,7 @@ echo "Job completed at $(date)"
         return f"""#!/bin/bash
 #SBATCH --job-name=qsp_derive
 #SBATCH --partition={self.config.partition}
-#SBATCH --time=00:15:00
+#SBATCH --time=00:45:00
 #SBATCH --mem=32G
 #SBATCH --output={log_dir}/qsp_derive_%j.out
 #SBATCH --error={log_dir}/qsp_derive_%j.err

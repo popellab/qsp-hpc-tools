@@ -192,7 +192,7 @@ class TestDerivationJobSubmission:
 
         assert "#SBATCH --job-name=qsp_derive" in script_content
         assert "#SBATCH --partition=normal" in script_content
-        assert "#SBATCH --time=00:15:00" in script_content  # Fixed time for derivation
+        assert "#SBATCH --time=00:45:00" in script_content  # Fixed time for derivation
         assert (
             "#SBATCH --mem=32G" in script_content
         )  # Bumped from 4G — full-parquet read on wide scenarios OOM'd at 4G
@@ -243,7 +243,7 @@ class TestScriptGeneration:
         # Check SLURM directives
         assert "#SBATCH --job-name=qsp_derive" in script
         assert "#SBATCH --partition=normal" in script
-        assert "#SBATCH --time=00:15:00" in script
+        assert "#SBATCH --time=00:45:00" in script
         assert (
             "#SBATCH --mem=32G" in script
         )  # Bumped from 4G — full-parquet read on wide scenarios OOM'd at 4G

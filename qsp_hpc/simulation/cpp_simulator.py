@@ -898,3 +898,276 @@ class CppSimulator:
         self._wait_for_jobs(info.job_ids)
         params, test_stats = self._download_and_persist(hpc_pool_path, test_stats_hash)
         return self._sample_first_n(params, test_stats, n)
+
+    # ------------------------------------------------------------------
+    # Posterior predictive: run at user-supplied thetas + cache
+    # ------------------------------------------------------------------
+
+    def simulate_with_parameters(
+        self,
+        theta: np.ndarray,
+        *,
+        prediction_targets: Optional[str | Path] = None,
+        pool_suffix: str = "posterior_predictive",
+    ) -> Tuple[np.ndarray, pa.Table]:
+        """Run C++ simulations at explicit thetas and return derived test stats.
+
+        Mirrors :meth:`QSPSimulator.simulate_with_parameters` (local path):
+        the theta matrix is user-supplied (typically posterior draws), not
+        drawn from the prior theta pool. Each unique theta matrix maps to a
+        dedicated suffix pool dir keyed by SHA-256 of ``theta.tobytes()``
+        plus the calibration / prediction target hashes — so identical
+        inputs hit the cache without row-by-row matching, and edits to
+        either target set invalidate the cache automatically.
+
+        Test stats are derived locally after the batch runs: the parquet
+        from :meth:`CppBatchRunner.run` is fed through
+        :func:`compute_test_statistics_batch` along with the merged
+        calibration + prediction DataFrame. Output columns are named
+        ``ts:<test_statistic_id>`` (not positional ``ts:0 ts:1…``) so
+        callers can identify the 12 new prediction columns by id rather
+        than by ordering.
+
+        Args:
+            theta: Parameter matrix ``(n_samples, n_params)``, columns
+                aligned with ``self.param_names``.
+            prediction_targets: Optional directory of PredictionTarget
+                YAMLs (``prediction_target_id`` schema). When given, the
+                prediction rows are concatenated with calibration rows
+                before derivation and contribute extra ``ts:*`` columns.
+            pool_suffix: Label combined with the theta hash to build the
+                suffix-pool directory name. Only change this when you want
+                two logically distinct posterior-predictive runs to stay
+                cache-isolated even when the thetas happen to collide.
+
+        Returns:
+            ``(theta_out, table)`` where ``theta_out`` has the same shape
+            as the input (failed rows stay NaN-filled but are not dropped
+            — caller decides how to handle them) and ``table`` is a
+            pyarrow Table with columns:
+                - ``sample_index`` (int64) — ``arange(n_samples)``
+                - ``status`` (int64)       — 0 ok / nonzero failed
+                - ``param:<name>``         — one per sampled param
+                - ``ts:<target_id>``       — one per test-stat, NaN on fail
+        """
+        if self.test_stats_csv is None and self._calibration_targets_dir is None:
+            raise RuntimeError(
+                "simulate_with_parameters() requires test_stats_csv or "
+                "calibration_targets at construction; without them there is "
+                "nothing to derive."
+            )
+        if theta.ndim != 2:
+            raise ValueError(f"theta must be 2-D; got shape {theta.shape}")
+        if theta.shape[1] != len(self.param_names):
+            raise ValueError(
+                f"theta has {theta.shape[1]} columns but priors CSV has "
+                f"{len(self.param_names)} parameters"
+            )
+
+        theta = np.ascontiguousarray(theta, dtype=np.float64)
+        n_samples = theta.shape[0]
+
+        pred_dir: Optional[Path] = (
+            Path(prediction_targets).resolve() if prediction_targets is not None else None
+        )
+
+        # Cache key: theta + calibration targets + prediction targets.
+        # Without the target hashes, editing a YAML silently hits a stale
+        # pool and the caller sees endpoint columns derived from the old
+        # observable code.
+        theta_hash = hashlib.sha256(theta.tobytes()).hexdigest()
+        cal_hash = self._calibration_targets_hash()
+        pred_hash = self._prediction_targets_hash(pred_dir)
+        key_hash = hashlib.sha256(
+            (theta_hash + "|" + cal_hash + "|" + pred_hash).encode()
+        ).hexdigest()[:HASH_PREFIX_LENGTH]
+
+        suffix_pool_dir = self.pool_dir.parent / f"{self.pool_dir.name}_{pool_suffix}_{key_hash}"
+        suffix_pool_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = suffix_pool_dir / "test_stats.parquet"
+
+        self.logger.info(
+            f"simulate_with_parameters: n={n_samples}, "
+            f"theta_hash={theta_hash[:8]}, "
+            f"cal_hash={cal_hash[:8]}, pred_hash={pred_hash[:8]}"
+        )
+        self.logger.info(f"  suffix pool: {suffix_pool_dir.name}")
+
+        if cache_path.exists():
+            cached = pq.read_table(str(cache_path))
+            if cached.num_rows >= n_samples:
+                self.logger.info(f"✓ suffix-pool cache hit ({cached.num_rows} rows)")
+                cached = cached.slice(0, n_samples)
+                theta_out = self._theta_from_table(cached)
+                return theta_out, cached
+            self.logger.info(
+                f"suffix-pool cache has {cached.num_rows}/{n_samples} — "
+                "recomputing (partial caches are discarded)"
+            )
+
+        # Resolve the merged test-stats DataFrame. load_calibration_targets
+        # only runs when the caller didn't pre-flatten via test_stats_csv.
+        test_stats_df = self._load_test_stats_df(pred_dir)
+
+        # Run the sweep at the user's thetas. Sample indices are local
+        # (arange) — the suffix pool is isolated by theta_hash so there's
+        # no cross-scenario alignment to worry about.
+        sample_indices = np.arange(n_samples, dtype=np.int64)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        species_parquet = (
+            suffix_pool_dir / f"species_{ts}_{pool_suffix}_{n_samples}sims_seed{self.seed}.parquet"
+        )
+        # #23: the pool manifest is what lets derive look up non-sampled
+        # template defaults (e.g. parameters referenced by a calibration
+        # target but not varied by the priors CSV). Without it, those
+        # targets silently NaN out.
+        write_pool_manifest(suffix_pool_dir, self._runner.template_defaults, self.param_names)
+
+        self._runner.run(
+            theta_matrix=theta,
+            param_names=self.param_names,
+            sample_indices=sample_indices,
+            t_end_days=self.t_end_days,
+            dt_days=self.dt_days,
+            output_path=species_parquet,
+            scenario=pool_suffix,
+            seed=self.seed,
+            max_workers=self.max_workers,
+            per_sim_timeout_s=self.per_sim_timeout_s,
+        )
+
+        species_df = pd.read_parquet(species_parquet)
+        table = self._derive_test_stats_table(species_df, test_stats_df, theta, sample_indices)
+        pq.write_table(table, str(cache_path))
+        self.logger.info(
+            f"simulate_with_parameters complete: {table.num_rows} rows × "
+            f"{len(test_stats_df)} test stats → {cache_path.name}"
+        )
+        theta_out = self._theta_from_table(table)
+        return theta_out, table
+
+    # ------------------------------------------------------------------
+    # Helpers for simulate_with_parameters
+    # ------------------------------------------------------------------
+
+    def _calibration_targets_hash(self) -> str:
+        """Hash of the calibration-target directory, or of the flat CSV
+        when the caller passed ``test_stats_csv`` directly."""
+        if self._calibration_targets_dir is not None:
+            from qsp_hpc.calibration import hash_calibration_targets
+
+            return hash_calibration_targets(self._calibration_targets_dir)
+        if self.test_stats_csv is not None:
+            return hashlib.sha256(self.test_stats_csv.read_bytes()).hexdigest()
+        return ""
+
+    def _prediction_targets_hash(self, pred_dir: Optional[Path]) -> str:
+        """Hash of the prediction-target directory. Empty string when
+        prediction targets are not requested — keeps the cache key stable
+        for calibration-only callers."""
+        if pred_dir is None:
+            return ""
+        from qsp_hpc.calibration import hash_prediction_targets
+
+        return hash_prediction_targets(pred_dir)
+
+    def _load_test_stats_df(self, pred_dir: Optional[Path]) -> pd.DataFrame:
+        """Merge calibration + prediction rows into the single DataFrame
+        passed to ``compute_test_statistics_batch``.
+
+        When constructed with ``calibration_targets=`` (directory), we
+        reload from YAMLs so the ``is_prediction_only`` flag lines up with
+        the prediction rows. When constructed with the legacy
+        ``test_stats_csv=`` path we read that CSV and assume every row is
+        a calibration target (``is_prediction_only=False``) — the common
+        case for SBI training flows that don't care about predictions.
+        """
+        if self._calibration_targets_dir is not None:
+            from qsp_hpc.calibration import load_calibration_targets
+
+            cal_df = load_calibration_targets(self._calibration_targets_dir)
+        else:
+            cal_df = pd.read_csv(self.test_stats_csv)
+
+        # Calibration rows intentionally lack ``is_prediction_only`` — the
+        # column is dropped from the canonical CSV schema so
+        # compute_test_stats_hash stays byte-stable across HPC caches.
+        # Back-fill here to let the downstream concat produce a
+        # rectangular frame.
+        if "is_prediction_only" not in cal_df.columns:
+            cal_df = cal_df.copy()
+            cal_df["is_prediction_only"] = False
+
+        if pred_dir is None:
+            return cal_df
+
+        from qsp_hpc.calibration import load_prediction_targets
+
+        pred_df = load_prediction_targets(pred_dir)
+        # Guard against id collisions — calibration and prediction share
+        # the ``test_statistic_id`` column, and compute_test_statistics_batch
+        # keys its registry on that id. A collision would silently overwrite
+        # one function with the other.
+        dup = set(cal_df["test_statistic_id"]) & set(pred_df["test_statistic_id"])
+        if dup:
+            raise ValueError(
+                f"Prediction target id(s) collide with calibration target ids: {sorted(dup)}"
+            )
+        return pd.concat([cal_df, pred_df], ignore_index=True)
+
+    def _derive_test_stats_table(
+        self,
+        species_df: pd.DataFrame,
+        test_stats_df: pd.DataFrame,
+        theta: np.ndarray,
+        sample_indices: np.ndarray,
+    ) -> pa.Table:
+        """Build the output pa.Table: sample_index / status / param:* / ts:<id>."""
+        from qsp_hpc.batch.derive_test_stats_worker import (
+            build_test_stat_registry,
+            compute_test_statistics_batch,
+        )
+
+        registry = build_test_stat_registry(test_stats_df)
+
+        species_units: dict = {}
+        if self.model_structure_file is not None and self.model_structure_file.exists():
+            from qsp_hpc.utils.model_structure_units import load_units_from_model_structure
+
+            species_units = load_units_from_model_structure(self.model_structure_file)
+
+        template_defaults = dict(self._runner.template_defaults or {})
+
+        test_stats_matrix = compute_test_statistics_batch(
+            species_df,
+            test_stats_df,
+            registry,
+            species_units,
+            template_defaults=template_defaults,
+        )
+
+        status_np = (
+            species_df["status"].to_numpy().astype(np.int64)
+            if "status" in species_df.columns
+            else np.zeros(theta.shape[0], dtype=np.int64)
+        )
+
+        cols: dict[str, pa.Array] = {
+            "sample_index": pa.array(sample_indices, type=pa.int64()),
+            "status": pa.array(status_np, type=pa.int64()),
+        }
+        for j, name in enumerate(self.param_names):
+            cols[f"param:{name}"] = pa.array(theta[:, j].astype(np.float64))
+        for j, tsid in enumerate(test_stats_df["test_statistic_id"].tolist()):
+            cols[f"ts:{tsid}"] = pa.array(test_stats_matrix[:, j].astype(np.float64))
+        return pa.table(cols)
+
+    def _theta_from_table(self, table: pa.Table) -> np.ndarray:
+        """Recover the theta matrix from a cached suffix-pool table.
+
+        Reads ``param:<name>`` columns in priors-CSV order — not sorted —
+        so downstream callers see the same column semantics whether they
+        just ran a fresh sweep or hit the cache.
+        """
+        arrays = [table.column(f"param:{n}").to_numpy() for n in self.param_names]
+        return np.column_stack(arrays).astype(np.float64)

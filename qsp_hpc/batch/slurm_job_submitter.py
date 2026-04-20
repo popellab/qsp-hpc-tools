@@ -207,6 +207,14 @@ echo "Job completed at $(date)"
             remote_script_dir = f"{self.config.remote_project_path}/batch_jobs/scripts"
             remote_script = f"{remote_script_dir}/{script_name}"
 
+            # #48: hpc_job_manager.submit_cpp_jobs no longer calls
+            # setup_remote_directories up front (its rm -rf wiped
+            # pool-scoped subdirs mid-upload under parallel fan-out).
+            # Ensure batch_jobs/scripts/ exists here so first-run
+            # submissions still land.
+            import shlex as _shlex
+
+            self.transport.exec(f"mkdir -p {_shlex.quote(remote_script_dir)}")
             self.transport.upload(temp_script, remote_script)
 
             returncode, output = self.transport.exec(f'sbatch "{remote_script}"', timeout=30)

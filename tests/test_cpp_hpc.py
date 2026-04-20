@@ -461,16 +461,108 @@ class TestSubmitCppJobs:
             healthy_state_yaml=str(healthy),
         )
 
-        # All three YAMLs should have been uploaded to batch_jobs/input/.
+        # #48: YAMLs are uploaded to the per-pool subdir of batch_jobs/input.
         upload_dests = [call.args[1] for call in transport.upload.call_args_list]
-        assert any(d.endswith("/batch_jobs/input/scenario.yaml") for d in upload_dests)
-        assert any(d.endswith("/batch_jobs/input/drug_metadata.yaml") for d in upload_dests)
-        assert any(d.endswith("/batch_jobs/input/healthy_state.yaml") for d in upload_dests)
+        assert any(d.endswith("/batch_jobs/input/pool/scenario.yaml") for d in upload_dests)
+        assert any(d.endswith("/batch_jobs/input/pool/drug_metadata.yaml") for d in upload_dests)
+        assert any(d.endswith("/batch_jobs/input/pool/healthy_state.yaml") for d in upload_dests)
 
         cfg = captured["config"]
-        assert cfg["scenario_yaml"].endswith("/batch_jobs/input/scenario.yaml")
-        assert cfg["drug_metadata_yaml"].endswith("/batch_jobs/input/drug_metadata.yaml")
-        assert cfg["healthy_state_yaml"].endswith("/batch_jobs/input/healthy_state.yaml")
+        assert cfg["scenario_yaml"].endswith("/batch_jobs/input/pool/scenario.yaml")
+        assert cfg["drug_metadata_yaml"].endswith("/batch_jobs/input/pool/drug_metadata.yaml")
+        assert cfg["healthy_state_yaml"].endswith("/batch_jobs/input/pool/healthy_state.yaml")
+        # params.csv now also lives under the per-pool input dir.
+        assert cfg["param_csv"].endswith("/batch_jobs/input/pool/params.csv")
+
+    def test_submit_cpp_jobs_concurrent_pool_scoped_uploads(self, tmp_path):
+        """#48 regression: parallel submit_cpp_jobs() calls for different
+        simulation_pool_ids must land in distinct remote dirs, so an
+        observer could point at any single pool's input dir and see
+        only that scenario's config/params/yamls. Before the fix,
+        three concurrent scenarios overwrote each other's
+        batch_jobs/input/{cpp_job_config.json, params.csv, scenario.yaml}
+        and caused one scenario's array job to run with another
+        scenario's config.
+        """
+        import json as _json
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        manager, transport = self._make_manager()
+
+        csv = tmp_path / "params.csv"
+        csv.write_text("A\n1.0\n")
+        scen = tmp_path / "scen.yaml"
+        scen.write_text("dosing: {}\n")
+        drug = tmp_path / "drug.yaml"
+        drug.write_text("drugs: {}\n")
+
+        # Capture every upload's (local_path, remote_path) plus the
+        # config JSON body for config uploads. MagicMock's default
+        # call-tracking would also work, but a lock here makes the test
+        # robust to mock's internal threading semantics.
+        captured: list[tuple[str, str, dict | None]] = []
+        captured_lock = threading.Lock()
+
+        def capture_upload(local, remote):
+            body = None
+            if "cpp_job_config.json" in remote:
+                with open(local) as f:
+                    body = _json.load(f)
+            with captured_lock:
+                captured.append((local, remote, body))
+
+        transport.upload.side_effect = capture_upload
+
+        pool_ids = ["v1_scen_A", "v1_scen_B", "v1_scen_C"]
+
+        def submit(pool_id):
+            manager.submit_cpp_jobs(
+                samples_csv=str(csv),
+                num_simulations=1,
+                simulation_pool_id=pool_id,
+                skip_sync=True,
+                scenario_yaml=str(scen),
+                drug_metadata_yaml=str(drug),
+            )
+
+        with ThreadPoolExecutor(max_workers=len(pool_ids)) as ex:
+            list(ex.map(submit, pool_ids))
+
+        # Every scenario-related upload destination must contain the
+        # pool_id of exactly one submission — no mixing.
+        destinations = [remote for _, remote, _ in captured]
+        for pool_id in pool_ids:
+            pool_dests = [d for d in destinations if f"/batch_jobs/input/{pool_id}/" in d]
+            # One config, one params.csv, one scenario.yaml, one drug_metadata.yaml
+            # per pool id.
+            basenames = sorted(Path(d).name for d in pool_dests)
+            assert basenames == [
+                "cpp_job_config.json",
+                "drug_metadata.yaml",
+                "params.csv",
+                "scenario.yaml",
+            ], f"pool {pool_id} missing expected uploads, got {basenames}"
+
+        # Each uploaded config JSON must reference ITS OWN pool_id in
+        # every path field. Before the fix, three threads would see the
+        # last-written params.csv path regardless of which scenario
+        # they launched.
+        configs = [body for _, _, body in captured if body is not None]
+        assert len(configs) == len(pool_ids)
+        for cfg in configs:
+            pool_id = cfg["simulation_pool_id"]
+            assert (
+                cfg["param_csv"] == f"/home/testuser/project/batch_jobs/input/{pool_id}/params.csv"
+            )
+            assert (
+                cfg["scenario_yaml"]
+                == f"/home/testuser/project/batch_jobs/input/{pool_id}/scenario.yaml"
+            )
+            assert (
+                cfg["drug_metadata_yaml"]
+                == f"/home/testuser/project/batch_jobs/input/{pool_id}/drug_metadata.yaml"
+            )
 
     def test_submit_cpp_jobs_scenario_without_drug_meta_raises(self, tmp_path):
         manager, _ = self._make_manager()

@@ -730,6 +730,21 @@ class HPCJobManager:
 
         sim_dir = f"{repo_path}/PDAC/qsp/sim"
 
+        # #48: flock both the git pull and the cmake build against the
+        # same login-node lockfile so parallel run_hpc() invocations
+        # don't race on .git/index.lock (seen 2026-04-20: a 3-way
+        # scenario fan-out hit "Unable to create .git/index.lock: File
+        # exists" and aborted one of the three submissions). Keyed on
+        # the repo path so unrelated repos don't block each other.
+        # Waits up to 600s (covers a cold SUNDIALS+yaml-cpp build under
+        # the first holder) and fails loudly past that rather than
+        # hanging forever.
+        import hashlib as _hashlib
+
+        repo_tag = _hashlib.md5(repo_path.encode()).hexdigest()[:16]
+        lockfile = f"$HOME/.qsp_ensure_cpp_binary_{repo_tag}.lock"
+        flock_prefix = f"flock -x -w 600 {lockfile}"
+
         self.logger.info("Ensuring C++ qsp_sim binary is current on HPC:")
         for line in format_config(
             {
@@ -745,7 +760,7 @@ class HPCJobManager:
         #    fails loudly instead of merging or resetting the user's work.
         if not skip_git_pull:
             with log_operation(self.logger, f"git fetch + fast-forward to {branch}"):
-                pull_cmd = (
+                pull_inner = (
                     f"set -e && cd {shlex.quote(repo_path)} && "
                     'if [ -n "$(git status --porcelain)" ]; then '
                     "  echo 'HPC checkout has uncommitted changes:' >&2; "
@@ -757,7 +772,12 @@ class HPCJobManager:
                     f"git checkout {shlex.quote(branch)} && "
                     f"git pull --ff-only origin {shlex.quote(branch)}"
                 )
-                status, output = self.file_transfer.transport.exec(pull_cmd, timeout=120)
+                # flock -c runs the inner command in /bin/sh so we
+                # quote-pass the whole pipeline. Lockfile is created on
+                # first use; subsequent callers block here until the
+                # holder releases.
+                pull_cmd = f"{flock_prefix} -c {shlex.quote(pull_inner)}"
+                status, output = self.file_transfer.transport.exec(pull_cmd, timeout=720)
                 if status != 0:
                     raise RuntimeError(f"git pull failed on HPC (rc={status}):\n{output}")
 
@@ -770,7 +790,7 @@ class HPCJobManager:
         #    pays the full SUNDIALS+yaml-cpp fetch once.
         if not skip_build:
             with log_operation(self.logger, "cmake --build --target qsp_sim"):
-                build_cmd = (
+                build_inner = (
                     f"set -e && {module_prelude} && "
                     f"cd {shlex.quote(sim_dir)} && mkdir -p build && cd build && "
                     "if [ ! -f CMakeCache.txt ]; then "
@@ -778,8 +798,14 @@ class HPCJobManager:
                     "fi && "
                     'cmake --build . --target qsp_sim -j "$(nproc)"'
                 )
-                # 10 min ceiling covers a cold SUNDIALS+KLU+yaml-cpp fetch+build.
-                status, output = self.file_transfer.transport.exec(build_cmd, timeout=600)
+                # Parallel cmake invocations against the same build dir
+                # would race on object files — flock serializes them.
+                # Waiters pay only the ~0.1s "nothing to do" build once
+                # the first caller finishes.
+                build_cmd = f"{flock_prefix} -c {shlex.quote(build_inner)}"
+                # 10 min ceiling covers a cold SUNDIALS+KLU+yaml-cpp fetch+build,
+                # plus the flock 600s wait. Set exec timeout above both.
+                status, output = self.file_transfer.transport.exec(build_cmd, timeout=1200)
                 if status != 0:
                     raise RuntimeError(f"qsp_sim build failed on HPC (rc={status}):\n{output}")
 
@@ -1092,11 +1118,19 @@ class HPCJobManager:
         if scenario_yaml and not drug_metadata_yaml:
             raise ValueError("scenario_yaml requires drug_metadata_yaml")
 
-        # Upload scenario YAMLs to batch_jobs/input/ and record their remote
-        # paths so cpp_batch_worker can pass them into CppBatchRunner.
-        remote_scenario = self._upload_scenario_yaml(scenario_yaml, "scenario.yaml")
-        remote_drug_meta = self._upload_scenario_yaml(drug_metadata_yaml, "drug_metadata.yaml")
-        remote_healthy = self._upload_scenario_yaml(healthy_state_yaml, "healthy_state.yaml")
+        # Upload scenario YAMLs to the per-pool input dir and record
+        # their remote paths so cpp_batch_worker can pass them into
+        # CppBatchRunner. #48: pool_id scoping prevents parallel
+        # scenarios from overwriting each other's YAMLs.
+        remote_scenario = self._upload_scenario_yaml(
+            scenario_yaml, "scenario.yaml", simulation_pool_id
+        )
+        remote_drug_meta = self._upload_scenario_yaml(
+            drug_metadata_yaml, "drug_metadata.yaml", simulation_pool_id
+        )
+        remote_healthy = self._upload_scenario_yaml(
+            healthy_state_yaml, "healthy_state.yaml", simulation_pool_id
+        )
 
         # Evolve-cache root lives on scratch alongside the per-scenario
         # sim pools so every scenario job hitting the same theta shares
@@ -1134,13 +1168,19 @@ class HPCJobManager:
             evolve_cache_root=evolve_cache_root,
             batch_subdir=batch_subdir,
         )
-        self._upload_parameter_csv(samples_csv)
+        self._upload_parameter_csv(samples_csv, simulation_pool_id=simulation_pool_id)
 
+        # #48: pool-scoped sbatch script + worker config so parallel
+        # submissions for different scenarios don't overwrite each
+        # other's SLURM script or point to the same config path.
+        pool_input_dir_rel = f"batch_jobs/input/{simulation_pool_id}"
         self.logger.info("Submitting C++ SLURM array job with %d tasks...", n_jobs)
         job_id = self.slurm_submitter.submit_cpp_job(
             n_jobs=n_jobs,
             cpus_per_task=cpp_cpus_per_task,
             memory=cpp_memory,
+            config_path=f"{pool_input_dir_rel}/cpp_job_config.json",
+            script_name=f"qsp_cpp_batch_job_{simulation_pool_id}.sh",
         )
         self.logger.info("Job submitted: %s", job_id)
 
@@ -1155,7 +1195,7 @@ class HPCJobManager:
         expanded_pool_base = self.config.simulation_pool_path.replace("$HOME", home_dir.strip())
         batch_dir = f"{expanded_pool_base}/{simulation_pool_id}/{batch_subdir}"
         base_config_remote = (
-            f"{self.config.remote_project_path}/batch_jobs/input/cpp_job_config.json"
+            f"{self.config.remote_project_path}/{pool_input_dir_rel}/cpp_job_config.json"
         )
 
         # #29: optional laptop-side retry loop. When enabled, block for
@@ -1196,6 +1236,7 @@ class HPCJobManager:
                     batch_subdir=batch_subdir,
                     cpus_per_task=cpp_cpus_per_task,
                     memory=cpp_memory,
+                    simulation_pool_id=simulation_pool_id,
                     retry_suffix=f"r{attempt}_{job_id}",
                 )
                 job_ids.append(last_array_id)
@@ -1229,8 +1270,36 @@ class HPCJobManager:
 
         return job_info
 
-    def _upload_scenario_yaml(self, local_path: Optional[str], remote_name: str) -> Optional[str]:
-        """Upload a scenario-related YAML to ``batch_jobs/input/``.
+    def _pool_input_dir(self, simulation_pool_id: str) -> str:
+        """Per-pool HPC upload directory for job config, params, scenario YAMLs.
+
+        #48: Every run_hpc() call used to overwrite
+        ``batch_jobs/input/{cpp_job_config.json, params.csv, scenario.yaml, ...}``,
+        which meant parallel invocations for different scenarios raced
+        and silently ran array tasks with whichever config was last
+        written. Scoping these paths by ``simulation_pool_id`` makes
+        concurrent run_hpc() calls safe: each scenario writes into its
+        own input dir.
+        """
+        if not simulation_pool_id:
+            # Defensive: a missing pool_id here would collapse us back to
+            # the old shared dir. Fail loudly instead of silently racing.
+            raise ValueError("simulation_pool_id is required for pool-scoped HPC uploads")
+        return f"{self.config.remote_project_path}/batch_jobs/input/{simulation_pool_id}"
+
+    def _ensure_pool_input_dir(self, simulation_pool_id: str) -> str:
+        """Ensure the per-pool input dir exists on HPC. Returns the dir."""
+        pool_dir = self._pool_input_dir(simulation_pool_id)
+        self.transport.exec(f"mkdir -p {shlex.quote(pool_dir)}")
+        return pool_dir
+
+    def _upload_scenario_yaml(
+        self,
+        local_path: Optional[str],
+        remote_name: str,
+        simulation_pool_id: str,
+    ) -> Optional[str]:
+        """Upload a scenario-related YAML to the per-pool input dir.
 
         Returns the absolute remote path on HPC, or ``None`` when
         ``local_path`` is ``None`` (so the caller can leave the field
@@ -1241,7 +1310,8 @@ class HPCJobManager:
         local = Path(local_path)
         if not local.exists():
             raise FileNotFoundError(f"YAML not found: {local}")
-        remote = f"{self.config.remote_project_path}/batch_jobs/input/{remote_name}"
+        pool_dir = self._ensure_pool_input_dir(simulation_pool_id)
+        remote = f"{pool_dir}/{remote_name}"
         self.transport.upload(str(local), remote)
         return remote
 
@@ -1269,11 +1339,14 @@ class HPCJobManager:
         import json
         import tempfile
 
+        pool_input_dir = self._ensure_pool_input_dir(simulation_pool_id)
         config = {
             "binary_path": binary_path,
             "template_path": template_path,
             "subtree": subtree,
-            "param_csv": f"{self.config.remote_project_path}/batch_jobs/input/params.csv",
+            # #48: pool-scoped params path so concurrent scenarios don't
+            # overwrite each other's params.csv upload.
+            "param_csv": f"{pool_input_dir}/params.csv",
             "n_simulations": num_simulations,
             "seed": seed,
             "jobs_per_chunk": jobs_per_chunk,
@@ -1302,13 +1375,19 @@ class HPCJobManager:
             temp_file = f.name
 
         try:
-            remote_file = f"{self.config.remote_project_path}/batch_jobs/input/cpp_job_config.json"
+            # #48: write the config to the per-pool input dir so parallel
+            # scenario submissions don't overwrite each other.
+            remote_file = f"{pool_input_dir}/cpp_job_config.json"
             self.transport.upload(temp_file, remote_file)
         finally:
             Path(temp_file).unlink()
 
     def _upload_cpp_retry_config(
-        self, base_config_remote: str, batch_subdir: str, retry_suffix: str
+        self,
+        base_config_remote: str,
+        batch_subdir: str,
+        retry_suffix: str,
+        simulation_pool_id: str,
     ) -> str:
         """Download the base cpp_job_config.json, pin ``batch_subdir``,
         and upload as a distinct retry-scoped config. Returns the remote path.
@@ -1317,6 +1396,9 @@ class HPCJobManager:
         SLURM_ARRAY_JOB_ID-derived subdir; preserving the original
         ``batch_subdir`` keeps retry chunks landing alongside the
         originals so derive sees one coherent batch.
+
+        #48: retry config uploads now land under the per-pool input dir
+        so parallel scenario retries don't overwrite each other.
         """
         import json as _json
         import tempfile as _tempfile
@@ -1334,10 +1416,8 @@ class HPCJobManager:
                 local_retry = out.name
 
         try:
-            remote_retry = (
-                f"{self.config.remote_project_path}/batch_jobs/input/"
-                f"cpp_retry_config_{retry_suffix}.json"
-            )
+            pool_dir = self._ensure_pool_input_dir(simulation_pool_id)
+            remote_retry = f"{pool_dir}/cpp_retry_config_{retry_suffix}.json"
             self.transport.upload(local_retry, remote_retry)
             return remote_retry
         finally:
@@ -1416,6 +1496,7 @@ class HPCJobManager:
         batch_subdir: str,
         cpus_per_task: int,
         memory: str,
+        simulation_pool_id: str,
         dependency: Optional[str] = None,
         retry_suffix: str = "retry",
     ) -> str:
@@ -1429,11 +1510,16 @@ class HPCJobManager:
         Called from :meth:`submit_cpp_jobs` when
         ``retry_missing_chunks > 0`` and post-array inspection found a
         short batch dir.
+
+        #48: retry config and retry SLURM script names are pool-scoped
+        so concurrent scenarios don't overwrite each other's retries.
         """
         if not missing_task_ids:
             raise ValueError("_submit_cpp_retry_array called with no missing ids")
         array_spec = _format_array_spec(missing_task_ids)
-        retry_config = self._upload_cpp_retry_config(base_config_remote, batch_subdir, retry_suffix)
+        retry_config = self._upload_cpp_retry_config(
+            base_config_remote, batch_subdir, retry_suffix, simulation_pool_id
+        )
         self.logger.info(
             "Submitting retry array for %d missing tasks (--array=%s)",
             len(missing_task_ids),
@@ -1446,7 +1532,7 @@ class HPCJobManager:
             array_spec=array_spec,
             config_path=retry_config,
             dependency=dependency,
-            script_name=f"qsp_cpp_batch_job_{retry_suffix}.sh",
+            script_name=f"qsp_cpp_batch_job_{simulation_pool_id}_{retry_suffix}.sh",
         )
 
     def _setup_remote_directories(self) -> None:
@@ -1478,9 +1564,20 @@ class HPCJobManager:
             dosing,
         )
 
-    def _upload_parameter_csv(self, csv_path: str) -> None:
-        """Upload parameter samples CSV."""
-        return self.file_transfer.upload_parameter_csv(csv_path)
+    def _upload_parameter_csv(
+        self, csv_path: str, simulation_pool_id: Optional[str] = None
+    ) -> None:
+        """Upload parameter samples CSV.
+
+        When ``simulation_pool_id`` is given the CSV is written to
+        ``batch_jobs/input/<pool_id>/params.csv`` (#48 — prevents
+        parallel scenarios from overwriting each other). ``None``
+        preserves the legacy shared path for any callers that still
+        rely on it.
+        """
+        return self.file_transfer.upload_parameter_csv(
+            csv_path, simulation_pool_id=simulation_pool_id
+        )
 
     def _upload_test_statistics(self, test_stats_csv: str) -> None:
         """Upload test statistics CSV and extract embedded functions as tarball."""

@@ -66,6 +66,8 @@ class CppSimulator:
         cache_dir: str | Path = "cache/sbi_simulations",
         seed: int = 2025,
         theta_pool_size: int = 100_000,
+        restriction_classifier_dir: Optional[str | Path] = None,
+        restriction_threshold: float = 0.5,
         max_workers: int | None = None,
         per_sim_timeout_s: float | None = None,
         submodel_priors_yaml: Optional[str | Path] = None,
@@ -98,6 +100,17 @@ class CppSimulator:
         self.cache_dir = Path(cache_dir)
         self.seed = seed
         self.theta_pool_size = theta_pool_size
+        # Optional classifier-based prior restriction. When set, the theta
+        # pool is rejection-sampled against the classifier so only thetas
+        # with p(valid) >= restriction_threshold are included. The hash of
+        # the classifier dir becomes part of the pool cache key, so a
+        # restricted pool lives alongside the unrestricted one on disk.
+        self.restriction_classifier_dir = (
+            Path(restriction_classifier_dir).resolve()
+            if restriction_classifier_dir is not None
+            else None
+        )
+        self.restriction_threshold = float(restriction_threshold)
         self.max_workers = max_workers
         self.per_sim_timeout_s = per_sim_timeout_s
         self.submodel_priors_yaml = Path(submodel_priors_yaml) if submodel_priors_yaml else None
@@ -335,6 +348,8 @@ class CppSimulator:
             seed=self.seed,
             n_total=self.theta_pool_size,
             cache_dir=self.cache_dir / "theta_pools",
+            restriction_classifier_dir=self.restriction_classifier_dir,
+            restriction_threshold=self.restriction_threshold,
         )
 
     # ------------------------------------------------------------------

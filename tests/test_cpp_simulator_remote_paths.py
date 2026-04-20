@@ -1,3 +1,8 @@
+# ruff: noqa: F811
+# Pytest fixture names (binary_path, priors_csv, etc.) are imported from a
+# sibling test module and re-declared as method parameters for pytest
+# injection — that's the intended pattern but ruff flags every injection
+# as a redefinition of the import.
 """Regression tests for CppSimulator local-vs-HPC path separation.
 
 ``CppSimulator`` keeps a laptop-resident ``binary_path`` / ``template_xml``
@@ -132,9 +137,7 @@ class TestTopUpTier35:
         # Tier-3 miss (pool exists but n_hpc < n_requested):
         jm.result_collector.check_pool_directory_exists.return_value = True
         jm.result_collector.count_pool_simulations.return_value = n_hpc
-        jm.submit_cpp_jobs.return_value = SimpleNamespace(
-            job_ids=["array", "combine", "derive"]
-        )
+        jm.submit_cpp_jobs.return_value = SimpleNamespace(job_ids=["array", "combine", "derive"])
         return jm
 
     def test_partial_pool_submits_only_the_delta(
@@ -166,9 +169,9 @@ class TestTopUpTier35:
         self._shortcircuit(sim, monkeypatch)
 
         kwargs = jm.submit_cpp_jobs.call_args.kwargs
-        assert kwargs["num_simulations"] == 280, (
-            f"Expected delta submission of 280, got {kwargs['num_simulations']}"
-        )
+        assert (
+            kwargs["num_simulations"] == 280
+        ), f"Expected delta submission of 280, got {kwargs['num_simulations']}"
 
     def test_partial_pool_uses_offset_theta_indices(
         self,

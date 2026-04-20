@@ -262,6 +262,40 @@ class TestCppSimulatorInit:
         s2 = CppSimulator(**common, healthy_state_yaml=h2)
         assert s1.config_hash != s2.config_hash
 
+    def test_config_hash_changes_with_restriction_classifier(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        """Restricted and unrestricted pools (same other config) must have
+        distinct config hashes so they get distinct on-disk pool dirs."""
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        common = dict(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+        )
+        clf_a = tmp_path / "clf_a"
+        clf_a.mkdir()
+        (clf_a / "classifier.pkl").write_bytes(b"clf-A-bytes")
+        (clf_a / "metadata.json").write_text('{"v": 1}')
+        clf_b = tmp_path / "clf_b"
+        clf_b.mkdir()
+        (clf_b / "classifier.pkl").write_bytes(b"clf-B-bytes")
+        (clf_b / "metadata.json").write_text('{"v": 2}')
+
+        s_none = CppSimulator(**common)
+        s_a = CppSimulator(**common, restriction_classifier_dir=clf_a)
+        s_b = CppSimulator(**common, restriction_classifier_dir=clf_b)
+        s_a_tau9 = CppSimulator(
+            **common, restriction_classifier_dir=clf_a, restriction_threshold=0.9
+        )
+
+        # All four hashes distinct: unrestricted vs restricted, different
+        # classifiers, different thresholds.
+        hashes = {s_none.config_hash, s_a.config_hash, s_b.config_hash, s_a_tau9.config_hash}
+        assert len(hashes) == 4
+
 
 class TestPoolCaching:
     def test_scan_empty_pool(self, priors_csv, binary_path, template_path, cache_dir):

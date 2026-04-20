@@ -240,7 +240,10 @@ class CppSimulator:
 
         Extends the standard pool-id hash with the binary's SHA-256 and
         the template XML content so rebuilding the C++ core or editing
-        the template invalidates the cache.
+        the template invalidates the cache. When a restriction classifier
+        is configured, its bytes + threshold are folded in so restricted
+        and unrestricted pools (sharing all other config) get distinct
+        on-disk pool dirs.
         """
         from qsp_hpc.utils.hash_utils import compute_pool_id_hash
 
@@ -261,6 +264,19 @@ class CppSimulator:
         for yml in (self.scenario_yaml, self.drug_metadata_yaml, self.healthy_state_yaml):
             if yml is not None:
                 h.update(yml.read_bytes())
+        # Restriction classifier: when set, the theta pool is a rejection-
+        # sampled subset of the prior. Fold classifier bytes + threshold
+        # into the hash so restricted and unrestricted pools (sharing all
+        # other config) get distinct on-disk directories.
+        if self.restriction_classifier_dir is not None:
+            h.update(b"|restriction|")
+            pkl = self.restriction_classifier_dir / "classifier.pkl"
+            meta = self.restriction_classifier_dir / "metadata.json"
+            if pkl.exists():
+                h.update(pkl.read_bytes())
+            if meta.exists():
+                h.update(meta.read_bytes())
+            h.update(f"|tau={self.restriction_threshold:.6f}".encode("utf-8"))
         return h.hexdigest()
 
     def __del__(self):

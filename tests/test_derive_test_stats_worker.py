@@ -496,6 +496,131 @@ class TestComputeTestStatisticsBatch:
         assert np.isnan(result[0, 0])
 
 
+class TestSharedSpeciesDictAcrossTestStats:
+    """Regression tests for the 2026-04-20 loop-order refactor (swap sim/
+    test-stat nesting, hoist unit parsing). These exercise invariants that
+    the old per-(test_stat, sim) species_dict rebuild satisfied trivially
+    but which the new shared species_dict must preserve:
+
+      1. A missing species in one test stat's required list must not
+         corrupt or silently NaN a sibling test stat that doesn't need it.
+      2. Test stats sharing species must receive the same Pint Quantity
+         values across both dispatches (no stale-dict aliasing).
+      3. Pre-wrapped template_defaults shared across sims must not mutate
+         between sims (test stats treat Quantities as immutable in
+         practice, but the refactor explicitly reuses the same Python
+         object to skip rewrap work).
+    """
+
+    def test_missing_species_in_one_stat_does_not_break_others(self):
+        """Batch with test stat A (needs missing species) + test stat B
+        (needs present species). A→NaN, B→correct value. Old code
+        naturally handled this via independent rebuilds; new code has to
+        get it right with a shared plan."""
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["needs_missing", "needs_present"],
+                "required_species": ["V_T.missing", "V_T.C1"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return species_dict['V_T.missing'].magnitude",
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return np.mean(species_dict['V_T.C1'].magnitude)",
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0, 1],
+                "status": [0, 0],
+                "time": [[0.0, 1.0, 2.0]] * 2,
+                "V_T.C1": [[100.0, 200.0, 300.0], [10.0, 20.0, 30.0]],
+                # No V_T.missing column, no param:V_T.missing, no template.
+            }
+        )
+        species_units = {"V_T.C1": "cell"}
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
+        assert result.shape == (2, 2)
+        # needs_missing → NaN for every sim
+        assert np.all(np.isnan(result[:, 0]))
+        # needs_present → correct mean for every sim (not contaminated by
+        # the sibling's missing-species failure)
+        assert result[0, 1] == pytest.approx(200.0)
+        assert result[1, 1] == pytest.approx(20.0)
+
+    def test_shared_species_across_stats_sees_same_values(self):
+        """Two test stats requiring the same species must see the same
+        per-sim array. A plan-level aliasing bug could, e.g., reuse the
+        first sim's quantity across all subsequent sims."""
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["mean_c1", "max_c1"],
+                "required_species": ["V_T.C1", "V_T.C1"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return np.mean(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return np.max(species_dict['V_T.C1'].magnitude)",
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        # Three sims with deliberately distinct trajectories so an
+        # aliasing bug would surface as repeated values.
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0, 1, 2],
+                "status": [0, 0, 0],
+                "time": [[0.0, 1.0, 2.0]] * 3,
+                "V_T.C1": [
+                    [1.0, 2.0, 3.0],  # mean=2, max=3
+                    [10.0, 20.0, 30.0],  # mean=20, max=30
+                    [100.0, 200.0, 300.0],  # mean=200, max=300
+                ],
+            }
+        )
+        species_units = {"V_T.C1": "cell"}
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
+        np.testing.assert_allclose(result[:, 0], [2.0, 20.0, 200.0])
+        np.testing.assert_allclose(result[:, 1], [3.0, 30.0, 300.0])
+
+    def test_template_default_shared_across_sims_stays_stable(self):
+        """The plan wraps template_defaults once and reuses the Pint
+        Quantity across every sim in the batch. Verify the scalar value
+        each test stat receives is the original template value (not a
+        previous-sim's overwritten reference)."""
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["return_rho"],
+                "required_species": ["rho_collagen"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return species_dict['rho_collagen'].magnitude"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0, 1, 2, 3],
+                "status": [0, 0, 0, 0],
+                "time": [[0.0, 1.0]] * 4,
+                # Deliberately NOT including rho_collagen or param:rho_collagen
+            }
+        )
+        species_units = {"rho_collagen": "dimensionless"}
+        template_defaults = {"rho_collagen": 1.27}
+        result = compute_test_statistics_batch(
+            sim_df,
+            test_stats_df,
+            registry,
+            species_units,
+            template_defaults=template_defaults,
+        )
+        np.testing.assert_allclose(result[:, 0], [1.27, 1.27, 1.27, 1.27])
+
+
 class TestNonSpeciesResolution:
     """Test that compartments and scalar parameters resolve correctly.
 

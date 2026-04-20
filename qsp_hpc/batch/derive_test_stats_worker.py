@@ -155,83 +155,153 @@ def compute_test_statistics_batch(
 
     logger.info(f"Computing {n_test_stats} test statistics for {n_sims} simulations...")
 
+    # ── Plan phase (once per batch) ──────────────────────────────────────────
+    #
+    # The previous implementation nested `for test_stat: for sim: for species:`
+    # and called ``ureg.parse_expression(unit_str)`` and re-wrapped every
+    # species as a fresh Pint Quantity inside the innermost loop. For the
+    # 110k-sim PDAC baseline scenario that put ~60-75% of derive wall-clock
+    # on Pint symbolic algebra that reduces to compile-time constants
+    # (unit strings, template defaults, registry lookups never change between
+    # iterations). This plan phase hoists all of it.
+
+    def _parse_unit(species_name: str):
+        unit_info = species_units.get(species_name, "dimensionless")
+        unit_str = unit_info["units"] if isinstance(unit_info, dict) else unit_info
+        return ureg.parse_expression(unit_str)
+
+    time_unit = ureg.day
+
+    # Per-test-stat metadata: (col_j, tsid, func, required_species, missing_required)
+    # ``func is None`` → registry miss (logged once); ``missing_required`` is
+    # the subset of required species that can't be resolved from sim_df or
+    # template_defaults for this batch. Both cases leave the output column
+    # as NaN without entering the hot path.
+    tests_meta: list[tuple[int, str, object, list[str], list[str]]] = []
+    all_required: set[str] = set()
     for j, row in test_stats_df.iterrows():
-        test_stat_id = row["test_statistic_id"]
-        required_species_str = row["required_species"]
-
-        # Parse required species (comma-separated)
-        # Species names use dots (e.g., V_T.CD8) in both CSV and parquet columns
-        required_species = [s.strip() for s in required_species_str.split(",")]
-
-        # Get test statistic function from registry
-        if test_stat_id not in test_stat_registry:
+        tsid = row["test_statistic_id"]
+        required = [s.strip() for s in row["required_species"].split(",")]
+        func = test_stat_registry.get(tsid)
+        if func is None:
             logger.warning(
-                f"Test statistic '{test_stat_id}' not found in registry. "
+                f"Test statistic '{tsid}' not found in registry. "
                 "Skipping (function may have failed to compile)."
             )
+        tests_meta.append((j, tsid, func, required, []))
+        all_required.update(required)
+
+    # Per-species resolution plan. Strategies:
+    #   ('series', unit)        — time-series column (or scalar compartment)
+    #   ('param', col, unit)    — param:<name> column (always scalar per sim)
+    #   ('template', qty)       — pre-wrapped template_defaults value (reused
+    #                             across every sim in the batch, zero
+    #                             per-sim Pint work)
+    #   ('missing',)            — unresolvable; every test stat that requires
+    #                             this species fails fast with NaN
+    species_plan: dict[str, tuple] = {}
+    sim_cols = set(sim_df.columns)
+    for s in all_required:
+        if s in sim_cols:
+            species_plan[s] = ("series", _parse_unit(s))
+        elif f"param:{s}" in sim_cols:
+            species_plan[s] = ("param", f"param:{s}", _parse_unit(s))
+        elif s in template_defaults:
+            species_plan[s] = ("template", float(template_defaults[s]) * _parse_unit(s))
+        else:
+            species_plan[s] = ("missing",)
+
+    # Back-fill each test stat's list of unresolvable species so the inner
+    # loop can short-circuit without catching ValueError.
+    for meta_idx, (j, tsid, func, required, _) in enumerate(tests_meta):
+        missing = [s for s in required if species_plan[s][0] == "missing"]
+        tests_meta[meta_idx] = (j, tsid, func, required, missing)
+
+    # Pre-materialize column arrays we index per sim. `.to_numpy()` on
+    # list-typed columns yields an object array; indexing into it is
+    # ~10x cheaper than `sim_df.iloc[i][col]` or `sim_row[col]`.
+    series_cols_np = {
+        s: sim_df[s].to_numpy() for s, plan in species_plan.items() if plan[0] == "series"
+    }
+    param_cols_np = {
+        s: sim_df[plan[1]].to_numpy() for s, plan in species_plan.items() if plan[0] == "param"
+    }
+    time_col_np = sim_df["time"].to_numpy() if "time" in sim_cols else None
+    status_np = sim_df["status"].to_numpy() if "status" in sim_cols else np.zeros(n_sims, dtype=int)
+
+    # ── Execute phase (sim outer, test-stat inner) ──────────────────────────
+    #
+    # Per sim we build ``time`` and ``species_dict`` once and hand them to
+    # every test stat. Pint algebra still runs per (test_stat, sim) — the
+    # test stat bodies may call .to(...) or parse new unit exprs internally —
+    # but the wrapping work done by the derive worker itself is now O(n_sims)
+    # instead of O(n_sims × n_test_stats × n_required).
+
+    for i in range(n_sims):
+        if status_np[i] != 0:
+            # status==0 = success; anything else = qsp_sim/MATLAB failure,
+            # leave the whole row NaN.
             continue
 
-        test_stat_func = test_stat_registry[test_stat_id]
+        # Build time Quantity once per sim.
+        try:
+            if time_col_np is not None:
+                time_q = np.asarray(time_col_np[i]) * time_unit
+            else:
+                time_q = None  # pragma: no cover — guarded by upstream
+        except Exception as e:
+            logger.warning(f"Error extracting time for simulation {i}: {e}")
+            continue
 
-        # Apply function to each simulation
-        for i, sim_row in sim_df.iterrows():
-            if sim_row["status"] != 0:
-                # status==0 means the simulation succeeded; skip anything
-                # else (status==1 = qsp_sim/MATLAB failure → all-NaN row).
-                continue
-
-            try:
-                # Extract time with units (days)
-                time = np.array(sim_row["time"]) * ureg.day
-
-                # Build species_dict with Pint Quantities
-                # Also supports scalar parameters (not just time-series species)
-                species_dict = {}
-                for species_name in required_species:
-                    # Resolve column name: try bare name first, then param:-prefixed.
-                    # Thin-parquet pools (#23) drop the broadcast param:*
-                    # columns for non-sampled params; those fall back to
-                    # the pool manifest's template_defaults as a scalar.
-                    val: object
-                    if species_name in sim_df.columns:
-                        val = sim_row[species_name]
-                    elif f"param:{species_name}" in sim_df.columns:
-                        val = sim_row[f"param:{species_name}"]
-                    elif species_name in template_defaults:
-                        val = template_defaults[species_name]
-                    else:
-                        raise ValueError(
-                            f"Species '{species_name}' not found in simulation "
-                            f"data or pool manifest template_defaults"
-                        )
-
-                    # Get unit string from species_units, default to dimensionless
-                    # Handle both flat format ("cell") and nested format ({"units": "cell", ...})
-                    unit_info = species_units.get(species_name, "dimensionless")
-                    unit_str = unit_info["units"] if isinstance(unit_info, dict) else unit_info
-                    unit = ureg.parse_expression(unit_str)
-
-                    # Check if it's a scalar (parameter) or array (species time-series)
-                    if isinstance(val, (int, float, np.integer, np.floating)):
-                        # Scalar parameter - wrap with units
-                        species_dict[species_name] = float(val) * unit
-                    else:
-                        # Time-series species - convert to array with units
-                        species_dict[species_name] = np.array(val) * unit
-
-                # Compute test statistic (signature: time, species_dict, ureg)
-                result = test_stat_func(time, species_dict, ureg)
-
-                # Extract magnitude from Pint Quantity result
-                if hasattr(result, "magnitude"):
-                    test_stat_value = float(result.magnitude)
+        # Build species_dict once per sim — the union over all test stats'
+        # required species. Handing extra entries to a test stat is free
+        # (functions index by key), so we avoid rebuilding per test stat.
+        species_dict: dict[str, object] = {}
+        for s, plan in species_plan.items():
+            kind = plan[0]
+            if kind == "series":
+                val = series_cols_np[s][i]
+                # Compartment columns (e.g. V_T) and non-time-series species
+                # arrive as Python/numpy scalars; time-series species arrive
+                # as list-of-floats. Distinguish to avoid wrapping a scalar
+                # as a 0-d array, which some test stats don't expect.
+                if isinstance(val, (int, float, np.integer, np.floating)):
+                    species_dict[s] = float(val) * plan[1]
                 else:
-                    test_stat_value = float(result)
-                test_stats_matrix[i, j] = test_stat_value
+                    species_dict[s] = np.asarray(val) * plan[1]
+            elif kind == "param":
+                species_dict[s] = float(param_cols_np[s][i]) * plan[2]
+            elif kind == "template":
+                # Pre-wrapped quantity — the same Pint object is handed to
+                # every sim. Safe because test stats don't mutate inputs
+                # (arithmetic returns new Quantities).
+                species_dict[s] = plan[1]
+            # 'missing' → not populated; any test stat requiring this
+            # species was already marked NaN in tests_meta.
 
+        # Dispatch each test stat against the shared time_q + species_dict.
+        for j, tsid, func, required, missing in tests_meta:
+            if func is None:
+                continue
+            if missing:
+                # Fire once per (test_stat, sim) to preserve the original
+                # logging volume — helps spot systematic missing-species
+                # bugs without swallowing the signal.
+                logger.warning(
+                    f"Error computing {tsid} for simulation {i}: "
+                    f"Species {missing} not found in simulation data or "
+                    "pool manifest template_defaults"
+                )
+                continue
+            try:
+                result = func(time_q, species_dict, ureg)
+                if hasattr(result, "magnitude"):
+                    test_stats_matrix[i, j] = float(result.magnitude)
+                else:
+                    test_stats_matrix[i, j] = float(result)
             except Exception as e:
-                logger.warning(f"Error computing {test_stat_id} for simulation {i}: {e}")
-                test_stats_matrix[i, j] = np.nan
+                logger.warning(f"Error computing {tsid} for simulation {i}: {e}")
+                # test_stats_matrix[i, j] already NaN from np.full
 
     n_computed: int = int(np.sum(~np.isnan(test_stats_matrix)))
     n_total = test_stats_matrix.size

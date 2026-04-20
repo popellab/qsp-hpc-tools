@@ -70,7 +70,8 @@ def extract_trajectory_grid_batch(
             column_names.append(f"{species}__t{t:.1f}")
 
     for i, (_, sim_row) in enumerate(sim_df.iterrows()):
-        if sim_row["status"] != 1:
+        # status==0 = success; skip status==1 (qsp_sim/MATLAB failure → NaN row).
+        if sim_row["status"] != 0:
             continue
 
         try:
@@ -148,8 +149,11 @@ def process_pool(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find all batch Parquet files
-    parquet_files = sorted(pool_dir.glob("batch_*.parquet"))
+    # Find all batch Parquet files. Walks #43 option A layout
+    # (batch_*/chunk_*.parquet) and legacy flat batch_*.parquet.
+    parquet_files = sorted(pool_dir.glob("batch_*/chunk_*.parquet")) + sorted(
+        pool_dir.glob("batch_*.parquet")
+    )
     if not parquet_files:
         raise FileNotFoundError(f"No batch_*.parquet files found in {pool_dir}")
 

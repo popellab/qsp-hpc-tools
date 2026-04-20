@@ -36,6 +36,27 @@ This document provides context for AI assistants (particularly Claude Code) work
    - `batch_worker.m`: Main SLURM array job worker
    - `extract_all_species_arrays.m`: Extracts simulation timecourse data
    - `save_species_to_parquet.m`: MATLAB→Python bridge for Parquet writing
+   - Status convention: `0`=success, `1`=failure (matches C++ backend; was
+     formerly tri-state `{1, 0, -1}` but standardized 2026-04-16 — see
+     git log for the cross-cutting change).
+
+5. **C++ backend** (`qsp_hpc/cpp/` + `qsp_hpc/simulation/cpp_simulator.py`)
+   - `CppSimulator`: drop-in for the simulation step; `run_hpc(n)` mirrors
+     `QSPSimulator.__call__`'s 3-tier walk against C++ pools. Constructor
+     takes `binary_path`, `template_xml`, optional `scenario_yaml` /
+     `drug_metadata_yaml` / `healthy_state_yaml`, and either
+     `calibration_targets` (YAML dir) or `test_stats_csv`.
+   - `CppRunner` / `CppBatchRunner`: invoke the `qsp_sim` binary, parse
+     the v2 raw-binary trajectory format (56-byte header + species +
+     compartments + assignment-rules columns), write MATLAB-compatible
+     Parquet. Every model parameter is broadcast as a `param:*` column
+     (sampled values from theta_matrix; non-sampled defaults from the
+     template) so calibration-target functions can read any parameter
+     via `species_dict[name]`.
+   - `HPCJobManager.submit_cpp_jobs(derive_test_stats=True, ...)`: chains
+     a derivation job with `--dependency=afterok:<array_id>` so test
+     stats land on HPC without raw-trajectory download.
+   - Full plan + history in `docs/CPP_SIMULATION_PLAN.md`.
 
 ### File Organization (Recently Updated)
 

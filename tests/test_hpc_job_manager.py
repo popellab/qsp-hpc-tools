@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -26,11 +27,15 @@ import yaml
 
 from qsp_hpc.batch.hpc_job_manager import (
     BatchConfig,
+    DownloadResult,
     HPCJobManager,
     JobInfo,
     MissingOutputError,
     RemoteCommandError,
+    SSHTransport,
     SubmissionError,
+    _format_array_spec,
+    _is_transient_ssh_error,
 )
 
 # ============================================================================
@@ -531,6 +536,356 @@ class TestCommandExecutionBehaviors:
             assert "scp download" in str(exc_info.value)
 
 
+class TestFormatArraySpec:
+    """Sparse-array formatter (#29). Consecutive runs collapse to N-M,
+    singletons and length-2 runs stay comma-separated."""
+
+    def test_single_id(self):
+        assert _format_array_spec([7]) == "7"
+
+    def test_two_consecutive_stays_comma_form(self):
+        # Length-2 runs are the same character count either way;
+        # comma form is easier to eyeball at a glance.
+        assert _format_array_spec([7, 8]) == "7,8"
+
+    def test_three_consecutive_collapses(self):
+        assert _format_array_spec([7, 8, 9]) == "7-9"
+
+    def test_mixed(self):
+        assert _format_array_spec([7, 15, 22, 23, 24, 25, 41]) == "7,15,22-25,41"
+
+    def test_multiple_runs(self):
+        assert _format_array_spec([0, 1, 2, 5, 6, 9, 10, 11, 12]) == "0-2,5,6,9-12"
+
+    def test_dedup_and_sort(self):
+        assert _format_array_spec([41, 7, 8, 7, 9]) == "7-9,41"
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="empty"):
+            _format_array_spec([])
+
+
+class TestListMissingChunksOnHPC:
+    """Post-array staging inspection via SSH ls."""
+
+    def test_parses_chunk_filenames(self, mock_hpc_config):
+        manager = HPCJobManager(config=mock_hpc_config)
+        # `ls | sed` output one id per line, zero-padded in the filename
+        # but sed strips the zeros.
+        manager.transport.exec = Mock(return_value=(0, "0\n2\n4\n7\n"))
+
+        missing = manager._list_missing_chunks_on_hpc("/scratch/pool/.staging/12345", expected=10)
+        assert missing == [1, 3, 5, 6, 8, 9]
+
+    def test_empty_staging_returns_all_as_missing(self, mock_hpc_config):
+        """Staging dir absent / no chunks — treat as "everything missing"
+        so the orchestrator can still build a full retry spec."""
+        manager = HPCJobManager(config=mock_hpc_config)
+        manager.transport.exec = Mock(return_value=(0, ""))
+        missing = manager._list_missing_chunks_on_hpc("/scratch/x", expected=5)
+        assert missing == [0, 1, 2, 3, 4]
+
+    def test_complete_staging(self, mock_hpc_config):
+        manager = HPCJobManager(config=mock_hpc_config)
+        manager.transport.exec = Mock(return_value=(0, "0\n1\n2\n"))
+        assert manager._list_missing_chunks_on_hpc("/x", expected=3) == []
+
+
+class TestSubmitCppJobsRetryLoop:
+    """End-to-end #29: retry_missing_chunks loops on short staging,
+    builds a sparse retry array, and chains strict combine afterok
+    of the last retry."""
+
+    def _make_manager(self, tmp_path, monkeypatch):
+        config = BatchConfig(
+            ssh_host="test.edu",
+            ssh_user="testuser",
+            simulation_pool_path="/scratch/sims",
+            hpc_venv_path="/home/testuser/.venv/qsp",
+            remote_project_path="/home/testuser/project",
+            partition="shared",
+            time_limit="01:00:00",
+            cpp_binary_path="/usr/bin/qsp_sim",
+            cpp_template_path="/tmp/p.xml",
+            cpp_repo_path="/home/testuser/SPQSP_PDAC",
+        )
+        transport = Mock()
+
+        # Most exec calls succeed and parse as sbatch submissions; tests
+        # install call-sequence side_effect to return distinct job ids.
+        transport.exec.return_value = (0, "OK")
+        transport.upload.return_value = None
+        transport.download.return_value = None
+        manager = HPCJobManager(config=config, transport=transport)
+        # No real wait; the test controls the "missing" return directly.
+        monkeypatch.setattr(manager, "_wait_for_array_completion", lambda *a, **k: {})
+        return manager, transport
+
+    def test_no_missing_chunks_skips_retry(self, tmp_path, monkeypatch):
+        manager, transport = self._make_manager(tmp_path, monkeypatch)
+        manager._list_missing_chunks_on_hpc = Mock(return_value=[])
+
+        def side(cmd, *a, **kw):
+            if "sbatch" in cmd:
+                return (0, "Submitted batch job 9000")
+            return (0, "OK")
+
+        transport.exec.side_effect = side
+
+        csv = tmp_path / "params.csv"
+        csv.write_text("A\n1.0\n2.0\n")
+
+        info = manager.submit_cpp_jobs(
+            samples_csv=str(csv),
+            num_simulations=2,
+            simulation_pool_id="pool",
+            skip_sync=True,
+            retry_missing_chunks=3,
+        )
+        # Array only (no combine step post-#43; derive not requested).
+        assert len(info.job_ids) == 1
+        manager._list_missing_chunks_on_hpc.assert_called_once()
+
+    def test_missing_chunks_trigger_sparse_retry(self, tmp_path, monkeypatch):
+        manager, transport = self._make_manager(tmp_path, monkeypatch)
+
+        # Round 1: [1, 3, 7] missing → submit retry
+        # Round 2: complete
+        manager._list_missing_chunks_on_hpc = Mock(side_effect=[[1, 3, 7], []])
+
+        submitted_array_specs: list[str] = []
+        submitted_configs: list[str] = []
+        submitted_deps: list[Optional[str]] = []
+        sbatch_counter = [1000]
+
+        def fake_submit_cpp_job(**kwargs):
+            submitted_array_specs.append(kwargs.get("array_spec"))
+            submitted_configs.append(kwargs.get("config_path"))
+            submitted_deps.append(kwargs.get("dependency"))
+            sbatch_counter[0] += 1
+            return f"arr{sbatch_counter[0]}"
+
+        monkeypatch.setattr(manager.slurm_submitter, "submit_cpp_job", fake_submit_cpp_job)
+
+        # transport.exec handles `echo $HOME` + ls + sbatch-not-used-here.
+        def side(cmd, *a, **kw):
+            if "echo $HOME" in cmd:
+                return (0, "/home/testuser\n")
+            if "echo OK" in cmd:
+                return (0, "OK")
+            return (0, "")
+
+        transport.exec.side_effect = side
+
+        # _upload_cpp_retry_config runs a real download+upload; stub it.
+        manager._upload_cpp_retry_config = Mock(
+            return_value="/home/testuser/project/batch_jobs/input/cpp_retry_config_r1.json"
+        )
+
+        csv = tmp_path / "params.csv"
+        csv.write_text("A\n" + "\n".join(str(float(i)) for i in range(10)) + "\n")
+
+        info = manager.submit_cpp_jobs(
+            samples_csv=str(csv),
+            num_simulations=10,
+            simulation_pool_id="pool",
+            skip_sync=True,
+            jobs_per_chunk=1,  # one task per sim → 10 tasks → ids 0..9
+            retry_missing_chunks=3,
+        )
+
+        # Two array submits: the original + one retry.
+        assert len(submitted_array_specs) == 2
+        # First submit is the original 0-9 (no sparse spec → default range).
+        assert submitted_array_specs[0] is None
+        # Retry uses collapsed sparse spec.
+        assert submitted_array_specs[1] == "1,3,7"
+        # Retry points at the override config.
+        assert submitted_configs[1] and "cpp_retry_config_" in submitted_configs[1]
+
+        # JobInfo.job_ids: [original_array, retry_array] — no combine, no derive.
+        assert len(info.job_ids) == 2
+        # _upload_cpp_retry_config was called with the batch_subdir override,
+        # not the retired staging_dir.
+        assert manager._upload_cpp_retry_config.call_count == 1
+        call_args = manager._upload_cpp_retry_config.call_args
+        assert isinstance(call_args.args[1], str)
+        assert call_args.args[1].startswith("batch_")
+
+    def test_retry_budget_exhausted(self, tmp_path, monkeypatch):
+        """When the batch subdir stays short after N rounds, job_ids records
+        every retry array id. Derive (not requested here) is what would
+        catch the short batch via its afterok dep — no combine job any more."""
+        manager, transport = self._make_manager(tmp_path, monkeypatch)
+        # Every round finds the same missing chunk — pathological.
+        manager._list_missing_chunks_on_hpc = Mock(return_value=[5])
+
+        sbatch_counter = [2000]
+
+        def fake_submit_cpp_job(**kwargs):
+            sbatch_counter[0] += 1
+            return f"arr{sbatch_counter[0]}"
+
+        monkeypatch.setattr(manager.slurm_submitter, "submit_cpp_job", fake_submit_cpp_job)
+
+        def side(cmd, *a, **kw):
+            if "echo $HOME" in cmd:
+                return (0, "/home/testuser\n")
+            return (0, "OK")
+
+        transport.exec.side_effect = side
+        manager._upload_cpp_retry_config = Mock(return_value="/tmp/retry.json")
+
+        csv = tmp_path / "params.csv"
+        csv.write_text("A\n" + "\n".join(str(float(i)) for i in range(6)) + "\n")
+
+        info = manager.submit_cpp_jobs(
+            samples_csv=str(csv),
+            num_simulations=6,
+            simulation_pool_id="pool",
+            skip_sync=True,
+            jobs_per_chunk=1,
+            retry_missing_chunks=2,
+        )
+        # 1 original + 2 retries = 3 ids. No combine, no derive.
+        assert len(info.job_ids) == 3
+        # Inspected 2 times (attempt=1 finds missing, submits retry1;
+        # attempt=2 finds missing, submits retry2; loop exits with budget
+        # exhausted — we do NOT re-inspect after attempt 2).
+        assert manager._list_missing_chunks_on_hpc.call_count == 2
+
+
+class TestSSHRetry:
+    """Retry-on-transient-SSH-error behavior for SSHTransport."""
+
+    @pytest.fixture
+    def retry_config(self, mock_hpc_config):
+        # Keep defaults realistic but predictable for tests
+        return BatchConfig(
+            **{
+                **{
+                    f.name: getattr(mock_hpc_config, f.name)
+                    for f in mock_hpc_config.__dataclass_fields__.values()
+                },
+                "ssh_retry_max_attempts": 3,
+                "ssh_retry_base_delay_s": 0.0,
+                "ssh_retry_max_delay_s": 0.0,
+            }
+        )
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch):
+        # Keep tests fast regardless of backoff values
+        monkeypatch.setattr("qsp_hpc.batch.hpc_job_manager.time.sleep", lambda s: None)
+
+    def test_is_transient_detects_known_patterns(self):
+        assert _is_transient_ssh_error("ssh: Connection reset by peer")
+        assert _is_transient_ssh_error("Operation timed out")
+        assert _is_transient_ssh_error("Broken pipe")
+        assert _is_transient_ssh_error("kex_exchange_identification: foo")
+        assert _is_transient_ssh_error("client_loop: send disconnect: Broken pipe")
+        assert not _is_transient_ssh_error("No such file or directory")
+        assert not _is_transient_ssh_error("")
+        assert not _is_transient_ssh_error(None)
+
+    def test_exec_retries_on_transient_ssh_255(self, retry_config):
+        transport = SSHTransport(retry_config)
+        # ssh returns rc=255 with transient text twice, then succeeds
+        bad = subprocess.CompletedProcess(
+            args=[], returncode=255, stdout="", stderr="kex_exchange_identification: read"
+        )
+        good = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok\n", stderr="")
+        with patch("subprocess.run", side_effect=[bad, bad, good]) as run:
+            rc, out = transport.exec("echo hi", timeout=5)
+        assert rc == 0
+        assert "ok" in out
+        assert run.call_count == 3
+
+    def test_exec_does_not_retry_on_genuine_remote_failure(self, retry_config):
+        transport = SSHTransport(retry_config)
+        # Remote command exits 1 — NOT an ssh-layer failure, so no retry
+        result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="bash: command not found"
+        )
+        with patch("subprocess.run", return_value=result) as run:
+            rc, out = transport.exec("bogus", timeout=5)
+        assert rc == 1
+        assert run.call_count == 1
+
+    def test_exec_gives_up_after_max_attempts(self, retry_config):
+        transport = SSHTransport(retry_config)
+        bad = subprocess.CompletedProcess(
+            args=[], returncode=255, stdout="", stderr="Connection reset by peer"
+        )
+        with patch("subprocess.run", return_value=bad) as run:
+            with pytest.raises(RemoteCommandError):
+                transport.exec("echo hi", timeout=5)
+        assert run.call_count == retry_config.ssh_retry_max_attempts
+
+    def test_upload_retries_on_transient_stderr(self, retry_config, tmp_path):
+        transport = SSHTransport(retry_config)
+        local = tmp_path / "f.txt"
+        local.write_text("x")
+        transient = subprocess.CalledProcessError(
+            1, ["scp"], stderr="scp: Connection reset by peer\n"
+        )
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", side_effect=[transient, transient, ok]) as run:
+            transport.upload(str(local), "/remote/f.txt")
+        assert run.call_count == 3
+
+    def test_upload_does_not_retry_on_permanent_error(self, retry_config, tmp_path):
+        transport = SSHTransport(retry_config)
+        local = tmp_path / "f.txt"
+        local.write_text("x")
+        permanent = subprocess.CalledProcessError(
+            1, ["scp"], stderr="scp: /remote/f.txt: Permission denied\n"
+        )
+        with patch("subprocess.run", side_effect=permanent) as run:
+            with pytest.raises(RemoteCommandError):
+                transport.upload(str(local), "/remote/f.txt")
+        assert run.call_count == 1
+
+    def test_upload_retries_on_timeout(self, retry_config, tmp_path):
+        transport = SSHTransport(retry_config)
+        local = tmp_path / "f.txt"
+        local.write_text("x")
+        timeout_exc = subprocess.TimeoutExpired(cmd=["scp"], timeout=600)
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", side_effect=[timeout_exc, ok]) as run:
+            transport.upload(str(local), "/remote/f.txt")
+        assert run.call_count == 2
+
+    def test_download_retries_on_transient_stderr(self, retry_config, tmp_path):
+        transport = SSHTransport(retry_config)
+        transient = subprocess.CalledProcessError(
+            1, ["scp"], stderr="client_loop: send disconnect: Broken pipe"
+        )
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", side_effect=[transient, ok]) as run:
+            transport.download("/remote/f.txt", str(tmp_path))
+        assert run.call_count == 2
+
+    def test_retry_disabled_with_max_attempts_1(self, mock_hpc_config, tmp_path):
+        cfg = BatchConfig(
+            **{
+                **{
+                    f.name: getattr(mock_hpc_config, f.name)
+                    for f in mock_hpc_config.__dataclass_fields__.values()
+                },
+                "ssh_retry_max_attempts": 1,
+            }
+        )
+        transport = SSHTransport(cfg)
+        local = tmp_path / "f.txt"
+        local.write_text("x")
+        transient = subprocess.CalledProcessError(1, ["scp"], stderr="Connection reset by peer")
+        with patch("subprocess.run", side_effect=transient) as run:
+            with pytest.raises(RemoteCommandError):
+                transport.upload(str(local), "/remote/f.txt")
+        assert run.call_count == 1
+
+
 # ============================================================================
 # Integration Tests (Require Real HPC)
 # ============================================================================
@@ -1000,3 +1355,195 @@ class TestWithMockedSSH:
     def test_rsync_upload_mocked(self, mock_subprocess, mock_hpc_config):
         """Test rsync upload with mocked subprocess."""
         pass
+
+
+# ============================================================================
+# DownloadResult / download_test_stats_full (#22)
+# ============================================================================
+
+
+class TestDownloadResultContract:
+    """Regression tests for the DownloadResult dataclass replacing the
+    pre-#22 ``_last_sample_index`` / ``_last_param_names`` side channels.
+
+    The old pattern was ordering-sensitive: two back-to-back downloads
+    clobbered each other's sidecar attributes, so callers that batched
+    downloads silently saw the second download's metadata for both.
+    """
+
+    @staticmethod
+    def _make_manager_with_fake_files(tmp_path, sample_index_for, params_for):
+        """Build an HPCJobManager whose ``_download_combined_files`` runs
+        against on-disk CSVs that we synthesise per-call. Returns
+        (manager, set_next_csvs)."""
+        manager = HPCJobManager.__new__(HPCJobManager)
+        manager.verbose = False
+        manager.logger = Mock()
+        # Stub transport: 'test -f combined_params.csv' check returns
+        # 'exists' so the params branch runs.
+        transport = Mock()
+        transport.exec.return_value = (0, "exists")
+
+        def write_files(staging_dir, sample_index_arr, params_arr, ts_arr):
+            staging_dir = Path(staging_dir)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            import pandas as _pd
+
+            df = _pd.DataFrame(
+                {
+                    "sample_index": sample_index_arr,
+                    "p0": params_arr[:, 0],
+                    "p1": params_arr[:, 1],
+                }
+            )
+            df.to_csv(staging_dir / "combined_params.csv", index=False)
+            _pd.DataFrame(ts_arr).to_csv(
+                staging_dir / "combined_test_stats.csv", header=False, index=False
+            )
+
+        next_payload = {}
+
+        def fake_download(remote_path, local_dir):
+            # Whatever file the caller asks for, we just write the
+            # expected combined_*.csv with the queued payload.
+            staging = Path(local_dir)
+            write_files(
+                staging,
+                next_payload["sample_index"],
+                next_payload["params"],
+                next_payload["test_stats"],
+            )
+
+        transport.download.side_effect = fake_download
+        manager.transport = transport
+
+        def set_next(sample_index_arr, params_arr, ts_arr):
+            next_payload["sample_index"] = sample_index_arr
+            next_payload["params"] = params_arr
+            next_payload["test_stats"] = ts_arr
+
+        return manager, set_next
+
+    def test_download_test_stats_full_returns_dataclass(self, tmp_path):
+        manager, set_next = self._make_manager_with_fake_files(tmp_path, None, None)
+        params = np.array([[1.0, 2.0], [3.0, 4.0]])
+        ts = np.array([[10.0], [20.0]])
+        sidx = np.array([7, 11], dtype=np.int64)
+        set_next(sidx, params, ts)
+
+        result = manager._download_combined_files(str(tmp_path / "ts_dir"), tmp_path / "out")
+
+        assert isinstance(result, DownloadResult)
+        np.testing.assert_array_equal(result.params, params)
+        np.testing.assert_array_equal(result.test_stats, ts)
+        np.testing.assert_array_equal(result.sample_index, sidx)
+        assert result.param_names == ["p0", "p1"]
+
+    def test_back_to_back_downloads_do_not_share_state(self, tmp_path):
+        """Two sequential downloads must each return their own metadata.
+
+        Pre-#22, the second download overwrote ``_last_sample_index``,
+        so a caller that did A.download(); B.download(); then read
+        ``_last_sample_index`` got B's data instead of A's.
+        """
+        manager, set_next = self._make_manager_with_fake_files(tmp_path, None, None)
+
+        params_a = np.array([[1.0, 1.0]])
+        ts_a = np.array([[100.0]])
+        sidx_a = np.array([42], dtype=np.int64)
+        set_next(sidx_a, params_a, ts_a)
+        result_a = manager._download_combined_files(str(tmp_path / "ts_a"), tmp_path / "out_a")
+
+        params_b = np.array([[9.0, 9.0]])
+        ts_b = np.array([[900.0]])
+        sidx_b = np.array([99], dtype=np.int64)
+        set_next(sidx_b, params_b, ts_b)
+        result_b = manager._download_combined_files(str(tmp_path / "ts_b"), tmp_path / "out_b")
+
+        # A's metadata must still describe A after B finishes.
+        np.testing.assert_array_equal(result_a.sample_index, sidx_a)
+        np.testing.assert_array_equal(result_b.sample_index, sidx_b)
+        # No instance-level sidecars: the side-channel attributes must
+        # not leak back in.
+        assert not hasattr(manager, "_last_sample_index")
+        assert not hasattr(manager, "_last_param_names")
+
+    def test_legacy_tuple_wrapper_still_works(self, tmp_path):
+        """``download_test_stats`` must keep returning a 2-tuple so the
+        MATLAB-era ``QSPSimulator._run_pipeline`` callers don't break."""
+        manager, _ = self._make_manager_with_fake_files(tmp_path, None, None)
+
+        params = np.array([[2.0, 3.0]])
+        ts = np.array([[33.0]])
+        manager.download_test_stats_full = Mock(
+            return_value=DownloadResult(
+                params=params,
+                test_stats=ts,
+                sample_index=np.array([5], dtype=np.int64),
+                param_names=["p0", "p1"],
+            )
+        )
+
+        wrapped = HPCJobManager.download_test_stats.__get__(manager)
+        out_params, out_ts = wrapped("/pool", "abc", tmp_path / "dest")
+        np.testing.assert_array_equal(out_params, params)
+        np.testing.assert_array_equal(out_ts, ts)
+
+
+class TestDownloadTestStatsFullChunkValidation:
+    """Regression for the 2026-04-18 failure: SSH dropped during a 15k
+    SBI run, jobs eventually left the queue with the derive job having
+    mkdir'd ``test_stats/<hash>/`` but written zero chunk files.
+    ``download_test_stats_full`` sailed past the ``test -d`` gate and
+    tried to combine; the caller got the unhelpful ``Failed to combine
+    chunks on HPC: WARNING: No test stats chunk files found``. This
+    test pins the new behavior: an empty chunk dir must raise a clear
+    error before we ever invoke the combiner.
+    """
+
+    def _manager(self):
+        manager = HPCJobManager.__new__(HPCJobManager)
+        manager.verbose = False
+        manager.logger = Mock()
+        manager.config = Mock()
+        manager.config.remote_project_path = "/home/testuser/qsp-hpc"
+        manager.transport = Mock()
+        return manager
+
+    def test_empty_chunk_dir_raises_before_combine(self, tmp_path):
+        manager = self._manager()
+        # Sequence: (1) echo $HOME doesn't fire because pool_path has no
+        # $HOME; (2) test -d succeeds with ls -la showing only . and ..;
+        # (3) ls chunk_*_test_stats.csv | wc -l returns 0.
+        manager.transport.exec.side_effect = [
+            (0, "total 0\ndrwx------ 2 u u 4096 .\ndrwx------ 3 u u 4096 .."),
+            (0, "0\n"),
+        ]
+        # If combine is reached, this will crash loudly in the assert below.
+        manager._combine_chunks_on_hpc = Mock(
+            side_effect=AssertionError("must not reach combine on empty dir")
+        )
+
+        with pytest.raises(RuntimeError) as exc:
+            manager.download_test_stats_full("/pool", "abc", tmp_path / "dest")
+
+        msg = str(exc.value)
+        assert "no chunk files" in msg
+        assert "qsp_derive_*.err" in msg
+        assert "/pool/test_stats/abc" in msg
+        manager._combine_chunks_on_hpc.assert_not_called()
+
+    def test_nonempty_chunk_dir_proceeds_to_combine(self, tmp_path):
+        manager = self._manager()
+        # test -d with ls output then chunk count = 3.
+        manager.transport.exec.side_effect = [
+            (0, "total 16\n...\nchunk_000_test_stats.csv\nchunk_001_test_stats.csv"),
+            (0, "3\n"),
+        ]
+        manager._combine_chunks_on_hpc = Mock()
+        manager._download_combined_files = Mock(return_value="sentinel")
+
+        result = manager.download_test_stats_full("/pool", "abc", tmp_path / "dest")
+
+        assert result == "sentinel"
+        manager._combine_chunks_on_hpc.assert_called_once_with("/pool/test_stats/abc")

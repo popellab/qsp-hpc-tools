@@ -193,7 +193,9 @@ class TestDerivationJobSubmission:
         assert "#SBATCH --job-name=qsp_derive" in script_content
         assert "#SBATCH --partition=normal" in script_content
         assert "#SBATCH --time=00:15:00" in script_content  # Fixed time for derivation
-        assert "#SBATCH --mem=4G" in script_content  # Fixed memory (not --mem-per-cpu)
+        assert (
+            "#SBATCH --mem=32G" in script_content
+        )  # Bumped from 4G — full-parquet read on wide scenarios OOM'd at 4G
         # Should NOT have array directive - single task processes all batches
         assert "#SBATCH --array" not in script_content
         assert "source /home/testuser/.venv/hpc-qsp/bin/activate" in script_content
@@ -242,7 +244,9 @@ class TestScriptGeneration:
         assert "#SBATCH --job-name=qsp_derive" in script
         assert "#SBATCH --partition=normal" in script
         assert "#SBATCH --time=00:15:00" in script
-        assert "#SBATCH --mem=4G" in script  # Not --mem-per-cpu
+        assert (
+            "#SBATCH --mem=32G" in script
+        )  # Bumped from 4G — full-parquet read on wide scenarios OOM'd at 4G
         # Should NOT have array directive
         assert "#SBATCH --array" not in script
 
@@ -276,6 +280,84 @@ class TestDerivationWorkerCompatibility:
         assert "--pool-path" not in script
         assert "--config" not in script
         assert "--output-dir" not in script
+
+
+class TestFailFastOnErrors:
+    """Generated sbatch scripts must exit non-zero when inner commands fail.
+
+    Without `set -e`, a failing python/matlab worker leaves the trailing
+    `echo "Job completed"` as the script's exit status, so SLURM reports
+    COMPLETED and downstream `afterok` dependencies run on garbage data.
+    """
+
+    def test_matlab_array_script_sets_errexit(self, submitter):
+        script = submitter._generate_slurm_script(n_jobs=5)
+        assert "set -e" in script
+        assert "set -o pipefail" in script
+
+    def test_cpp_array_script_sets_errexit(self, submitter):
+        script = submitter._generate_cpp_slurm_script(n_jobs=5, cpus_per_task=1, memory="4G")
+        assert "set -e" in script
+        assert "set -o pipefail" in script
+
+    def test_derivation_script_sets_errexit(self, submitter):
+        script = submitter._generate_derivation_slurm_script(
+            pool_path="/scratch/pool",
+            test_stats_config="/scratch/config.json",
+            derivation_dir="/scratch/derive",
+        )
+        assert "set -e" in script
+        assert "set -o pipefail" in script
+
+
+class TestCppArraySpec:
+    """Sparse `--array=...` spec + config override (#29 retry infrastructure)."""
+
+    def test_default_array_spec_is_contiguous_range(self, submitter):
+        script = submitter._generate_cpp_slurm_script(n_jobs=5, cpus_per_task=1, memory="4G")
+        assert "#SBATCH --array=0-4" in script
+
+    def test_custom_array_spec_preserved_verbatim(self, submitter):
+        """Sparse retry: pass a comma/range spec and expect it emitted
+        as-is into the sbatch directive. The worker's row-slice addressing
+        means sparse task ids hit the right params CSV rows without any
+        CSV rewriting."""
+        script = submitter._generate_cpp_slurm_script(
+            n_jobs=50,
+            cpus_per_task=1,
+            memory="4G",
+            array_spec="7,15,22-25,41",
+        )
+        assert "#SBATCH --array=7,15,22-25,41" in script
+        # n_jobs is purely cosmetic when array_spec is provided.
+        assert "#SBATCH --array=0-49" not in script
+
+    def test_custom_worker_config_path_used_in_script(self, submitter):
+        """Retry submissions upload a distinct config JSON that pins the
+        batch_subdir to the original array's dir (#43 option A). The sbatch
+        script must invoke the worker with that config path."""
+        script = submitter._generate_cpp_slurm_script(
+            n_jobs=5,
+            cpus_per_task=1,
+            memory="4G",
+            config_path="batch_jobs/input/cpp_retry_config_7654321.json",
+        )
+        assert "cpp_batch_worker batch_jobs/input/cpp_retry_config_7654321.json" in script
+        # Default path must NOT appear when an override is provided.
+        assert "cpp_batch_worker batch_jobs/input/cpp_job_config.json" not in script
+
+    def test_dependency_directive_when_set(self, submitter):
+        script = submitter._generate_cpp_slurm_script(
+            n_jobs=3,
+            cpus_per_task=1,
+            memory="4G",
+            dependency="afterany:7654321",
+        )
+        assert "#SBATCH --dependency=afterany:7654321" in script
+
+    def test_no_dependency_directive_by_default(self, submitter):
+        script = submitter._generate_cpp_slurm_script(n_jobs=3, cpus_per_task=1, memory="4G")
+        assert "--dependency=" not in script
 
 
 class TestSubmissionError:

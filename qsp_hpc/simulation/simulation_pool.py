@@ -95,6 +95,7 @@ class SimulationPoolManager:
         model_script: str = "",
         scenario: str = "default",
         submodel_priors_yaml: Optional[Union[str, Path]] = None,
+        seed: Optional[int] = None,
     ):
         """
         Initialize simulation pool manager.
@@ -127,6 +128,7 @@ class SimulationPoolManager:
         )
         self.model_script = model_script
         self.scenario = scenario
+        self.seed = seed
         self._calibration_targets_dir = None
 
         if calibration_targets is not None:
@@ -196,6 +198,7 @@ class SimulationPoolManager:
             model_script=self.model_script,
             model_version=self.model_version,
             submodel_priors_yaml=self.submodel_priors_yaml,
+            seed=self.seed,
         )
 
     def _scan_batches(self, scenario: Optional[str] = None) -> List[Dict]:

@@ -5,6 +5,7 @@ import pytest
 from qsp_hpc.utils.hash_utils import (
     _safe_sort_key,
     compute_definition_hash,
+    compute_pool_id_hash,
     generate_filename,
     normalize_model_context,
 )
@@ -301,6 +302,49 @@ class TestGenerateFilename:
         assert name in filename
         assert hash_val in filename
         assert filename.endswith(".yaml")
+
+
+class TestComputePoolIdHash:
+    """Regression tests for compute_pool_id_hash seed behaviour (#20).
+
+    Theta-pool draws are seed-dependent (qsp_hpc/simulation/theta_pool.py
+    keys on seed), so row sample_index=i points at a different theta
+    under a different seed. Before #20, the sim-pool dir was seed-blind,
+    so Run 2 at seed=B silently served cached sims from Run 1 at seed=A.
+    """
+
+    @staticmethod
+    def _write_priors(path, content="a,b\n1,2\n"):
+        path.write_text(content)
+        return path
+
+    def test_different_seeds_produce_different_hashes(self, tmp_path):
+        priors = self._write_priors(tmp_path / "priors.csv")
+        h_a = compute_pool_id_hash(priors, "m", "v1", seed=2025)
+        h_b = compute_pool_id_hash(priors, "m", "v1", seed=2026)
+        assert h_a != h_b
+
+    def test_same_seed_produces_stable_hash(self, tmp_path):
+        priors = self._write_priors(tmp_path / "priors.csv")
+        h1 = compute_pool_id_hash(priors, "m", "v1", seed=2025)
+        h2 = compute_pool_id_hash(priors, "m", "v1", seed=2025)
+        assert h1 == h2
+
+    def test_seed_none_matches_legacy_hash(self, tmp_path):
+        """seed=None (default) reproduces the pre-#20 hash so legacy
+        pools remain readable during migration."""
+        priors = self._write_priors(tmp_path / "priors.csv")
+        with_none = compute_pool_id_hash(priors, "m", "v1", seed=None)
+        without_seed = compute_pool_id_hash(priors, "m", "v1")
+        assert with_none == without_seed
+
+    def test_seed_changes_hash_vs_legacy(self, tmp_path):
+        """Passing seed must produce a different hash than omitting it,
+        otherwise the migration is a no-op and the bug isn't fixed."""
+        priors = self._write_priors(tmp_path / "priors.csv")
+        h_legacy = compute_pool_id_hash(priors, "m", "v1")
+        h_seeded = compute_pool_id_hash(priors, "m", "v1", seed=2025)
+        assert h_legacy != h_seeded
 
 
 class TestHashIntegration:

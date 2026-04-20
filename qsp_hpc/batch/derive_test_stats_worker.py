@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from qsp_hpc.utils.unit_registry import ureg
 
@@ -31,6 +32,7 @@ from qsp_hpc.utils.unit_registry import ureg
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
+from qsp_hpc.cpp.batch_runner import load_pool_manifest  # noqa: E402
 from qsp_hpc.utils.logging_config import setup_logger  # noqa: E402
 from qsp_hpc.utils.model_structure_units import load_units_from_model_structure  # noqa: E402
 
@@ -121,6 +123,7 @@ def compute_test_statistics_batch(
     test_stats_df: pd.DataFrame,
     test_stat_registry: dict,
     species_units: dict,
+    template_defaults: dict[str, float] | None = None,
 ) -> np.ndarray:
     """
     Compute test statistics for a batch of simulations.
@@ -133,10 +136,18 @@ def compute_test_statistics_batch(
         test_stat_registry: Dict mapping test_statistic_id -> compiled function
                            Functions have signature: compute_test_statistic(time, species_dict, ureg)
         species_units: Dict mapping species names to unit strings (e.g., {'V_T.CD8': 'cell'})
+        template_defaults: Optional ``{name: default}`` map loaded from the
+            pool's ``pool_manifest.json``. When a calibration-target
+            function's ``required_species`` lists a parameter that
+            isn't in ``sim_df`` (thin-parquet pools post-#23), we fall
+            back to ``template_defaults[name]`` as a scalar. ``None``
+            preserves the pre-#23 behavior: every parameter has to be
+            a parquet column or raise.
 
     Returns:
         test_stats_matrix: Array of shape (n_sims, n_test_stats)
     """
+    template_defaults = template_defaults or {}
     n_sims = len(sim_df)
     n_test_stats = len(test_stats_df)
 
@@ -164,8 +175,9 @@ def compute_test_statistics_batch(
 
         # Apply function to each simulation
         for i, sim_row in sim_df.iterrows():
-            if sim_row["status"] != 1:
-                # Failed simulation - skip
+            if sim_row["status"] != 0:
+                # status==0 means the simulation succeeded; skip anything
+                # else (status==1 = qsp_sim/MATLAB failure → all-NaN row).
                 continue
 
             try:
@@ -176,14 +188,22 @@ def compute_test_statistics_batch(
                 # Also supports scalar parameters (not just time-series species)
                 species_dict = {}
                 for species_name in required_species:
-                    # Resolve column name: try bare name first, then param:-prefixed
+                    # Resolve column name: try bare name first, then param:-prefixed.
+                    # Thin-parquet pools (#23) drop the broadcast param:*
+                    # columns for non-sampled params; those fall back to
+                    # the pool manifest's template_defaults as a scalar.
+                    val: object
                     if species_name in sim_df.columns:
-                        col_name = species_name
+                        val = sim_row[species_name]
                     elif f"param:{species_name}" in sim_df.columns:
-                        col_name = f"param:{species_name}"
+                        val = sim_row[f"param:{species_name}"]
+                    elif species_name in template_defaults:
+                        val = template_defaults[species_name]
                     else:
-                        raise ValueError(f"Species '{species_name}' not found in simulation data")
-                    val = sim_row[col_name]
+                        raise ValueError(
+                            f"Species '{species_name}' not found in simulation "
+                            f"data or pool manifest template_defaults"
+                        )
 
                     # Get unit string from species_units, default to dimensionless
                     # Handle both flat format ("cell") and nested format ({"units": "cell", ...})
@@ -224,18 +244,25 @@ def compute_test_statistics_batch(
 
 def process_single_batch(
     batch_idx: int,
-    parquet_file: Path,
+    parquet_source: Path,
     test_stats_df: pd.DataFrame,
     test_stat_registry: dict,
     species_units: dict,
     test_stats_output_dir: Path,
+    template_defaults: dict[str, float] | None = None,
 ) -> int:
     """
-    Process a single batch file and save results.
+    Process a single batch and save results.
+
+    ``parquet_source`` is either:
+      - a single ``batch_*.parquet`` file (legacy pre-#43 layout), or
+      - a directory ``batch_*/`` containing ``chunk_NNN.parquet`` shards
+        (#43 option A: combine step removed; array tasks write chunks
+        directly into the batch dir).
 
     Args:
         batch_idx: Index of this batch (for output file naming)
-        parquet_file: Path to the Parquet file to process
+        parquet_source: Path to the Parquet file OR batch subdir to process
         test_stats_df: DataFrame with test statistics configuration
         test_stat_registry: Dict mapping test_statistic_id -> compiled function
         species_units: Dict mapping species names to unit strings
@@ -244,51 +271,103 @@ def process_single_batch(
     Returns:
         Number of simulations processed
     """
-    logger.info(f"Processing batch {batch_idx}: {parquet_file.name}")
+    logger.info(f"Processing batch {batch_idx}: {parquet_source.name}")
 
-    # Load simulation batch
-    sim_df = pd.read_parquet(parquet_file)
-    n_sims = len(sim_df)
-    logger.info(f"  Loaded {n_sims} simulations")
+    if parquet_source.is_dir():
+        parquet_files = sorted(parquet_source.glob("chunk_*.parquet"))
+        if not parquet_files:
+            logger.warning(f"  No chunk_*.parquet found in {parquet_source} — skipping")
+            return 0
+        logger.info(f"  {len(parquet_files)} chunk file(s)")
+    else:
+        parquet_files = [parquet_source]
 
-    # Extract parameter columns (identified by "param:" prefix in parquet)
-    param_prefix = "param:"
-    param_cols = [col for col in sim_df.columns if col.startswith(param_prefix)]
-    clean_names = [col[len(param_prefix) :] for col in param_cols]
+    # Stream parquets row-group-by-row-group rather than loading the full
+    # file(s) with pd.read_parquet. For wide scenarios (15k-sim
+    # clinical_progression: 11 GB on disk, 300 row groups, list-typed
+    # time-series columns) a single pd.read_parquet blows past any
+    # reasonable SLURM --mem limit — the list cells become Python lists
+    # in pandas (~80 B / element) instead of packed numpy arrays
+    # (~8 B / element), so the working set can reach 100+ GB. Streaming
+    # keeps peak memory at one row group (~50 sims for our chunk layout).
+    params_output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_params.csv"
+    test_stats_output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_test_stats.csv"
+
+    params_f = None
+    params_header_written = False
+    total_sims = 0
+    param_cols: list[str] = []
+    clean_names: list[str] = []
+    has_sample_index = False
+
+    try:
+        with open(test_stats_output_file, "w") as ts_f:
+            for pf_idx, parquet_file in enumerate(parquet_files):
+                pf = pq.ParquetFile(str(parquet_file))
+                n_row_groups = pf.num_row_groups
+                schema_names = pf.schema_arrow.names
+                n_sims_this_file = pf.metadata.num_rows
+                logger.info(
+                    f"  [{pf_idx + 1}/{len(parquet_files)}] {parquet_file.name}: "
+                    f"{n_sims_this_file} sims across {n_row_groups} row group(s)"
+                )
+
+                if pf_idx == 0:
+                    param_prefix = "param:"
+                    param_cols = [col for col in schema_names if col.startswith(param_prefix)]
+                    clean_names = [col[len(param_prefix) :] for col in param_cols]
+                    has_sample_index = "sample_index" in schema_names
+                    if param_cols:
+                        logger.debug(
+                            f"  Found {len(param_cols)} parameter columns: "
+                            f"{clean_names[:5]}{'...' if len(clean_names) > 5 else ''}"
+                        )
+                        params_f = open(params_output_file, "w")
+
+                for rg_idx in range(n_row_groups):
+                    sim_df = pf.read_row_group(rg_idx).to_pandas()
+                    # compute_test_statistics_batch uses positional indexing
+                    # on its preallocated (n_sims, n_test_stats) matrix via
+                    # sim_df.iterrows(); force a fresh 0..N-1 index in case
+                    # pyarrow hands back a non-RangeIndex on some builds.
+                    sim_df = sim_df.reset_index(drop=True)
+
+                    if params_f is not None:
+                        rg_params_df = sim_df[param_cols].copy()
+                        rg_params_df.columns = clean_names
+                        if has_sample_index:
+                            rg_params_df.insert(
+                                0,
+                                "sample_index",
+                                sim_df["sample_index"].astype("int64").values,
+                            )
+                        rg_params_df.to_csv(
+                            params_f,
+                            index=False,
+                            header=not params_header_written,
+                            float_format="%.12e",
+                        )
+                        params_header_written = True
+
+                    test_stats_matrix_rg = compute_test_statistics_batch(
+                        sim_df,
+                        test_stats_df,
+                        test_stat_registry,
+                        species_units,
+                        template_defaults=template_defaults,
+                    )
+                    np.savetxt(ts_f, test_stats_matrix_rg, delimiter=",", fmt="%.12e")
+
+                total_sims += n_sims_this_file
+    finally:
+        if params_f is not None:
+            params_f.close()
 
     if param_cols:
-        logger.debug(
-            f"  Found {len(param_cols)} parameter columns: "
-            f"{clean_names[:5]}{'...' if len(clean_names) > 5 else ''}"
-        )
-
-        # Save parameters to chunk_XXX_params.csv (strip prefix for clean names).
-        # Prepend sample_index so the combined CSV carries cross-scenario
-        # alignment keys; missing column (legacy parquets) → fall back to
-        # batch-relative position downstream.
-        params_output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_params.csv"
-        params_df = sim_df[param_cols].copy()
-        params_df.columns = clean_names
-        if "sample_index" in sim_df.columns:
-            params_df.insert(0, "sample_index", sim_df["sample_index"].astype("int64").values)
-        params_df.to_csv(params_output_file, index=False, float_format="%.12e")
-
         logger.debug(f"  ✓ Parameters saved: {params_output_file.name}")
+    logger.info(f"  ✓ Saved: {test_stats_output_file.name} ({total_sims} sims)")
 
-    # Compute test statistics
-    test_stats_matrix = compute_test_statistics_batch(
-        sim_df, test_stats_df, test_stat_registry, species_units
-    )
-
-    # Save results
-    output_file = test_stats_output_dir / f"chunk_{batch_idx:03d}_test_stats.csv"
-
-    # Save as CSV (n_sims x n_test_stats)
-    np.savetxt(output_file, test_stats_matrix, delimiter=",", fmt="%.12e")
-
-    logger.info(f"  ✓ Saved: {output_file.name}")
-
-    return n_sims
+    return total_sims
 
 
 def main():
@@ -345,37 +424,71 @@ def main():
     logger.info("Building test statistic function registry from CSV...")
     test_stat_registry = build_test_stat_registry(test_stats_df)
 
-    # Find all Parquet files in simulation pool
-    parquet_files = sorted(simulation_pool_dir.glob("batch_*.parquet"))
-    if not parquet_files:
+    # #23: load the pool's template_defaults manifest if present. Thin
+    # parquets drop broadcast columns for non-sampled params; the
+    # manifest is what cal-target functions fall back to when they ask
+    # for one. Pre-#23 pools have no manifest — the parquet columns
+    # still cover everything, so None is a safe default.
+    pool_manifest = load_pool_manifest(simulation_pool_dir)
+    template_defaults: dict[str, float] | None = None
+    if pool_manifest is not None:
+        template_defaults = {
+            str(k): float(v) for k, v in pool_manifest.get("template_defaults", {}).items()
+        }
+        logger.info(
+            "Loaded pool manifest (schema=%s): %d template defaults available",
+            pool_manifest.get("schema_version", "unknown"),
+            len(template_defaults),
+        )
+    else:
+        logger.info("No pool_manifest.json found — assuming wide parquets (pre-#23 layout)")
+
+    # Find all batches in the pool. Supports two layouts:
+    #   - Legacy (pre-#43): flat batch_*.parquet files (one per submission,
+    #     produced by the retired cpp_combine_batch_worker).
+    #   - Current (#43 option A): batch_*/ subdirs containing
+    #     chunk_NNN.parquet shards written directly by array tasks.
+    # Both are enumerated and merged so derive works across mixed pools
+    # (e.g. an old pool topped up with a fresh submission).
+    batch_sources: list[Path] = []
+    for entry in sorted(simulation_pool_dir.iterdir()):
+        if not entry.name.startswith("batch_"):
+            continue
+        if entry.is_dir():
+            batch_sources.append(entry)
+        elif entry.is_file() and entry.suffix == ".parquet":
+            batch_sources.append(entry)
+
+    if not batch_sources:
         logger.error(f"No simulation batches found in {simulation_pool_dir}")
         sys.exit(1)
 
     # Limit to max_batches if specified
-    total_available = len(parquet_files)
+    total_available = len(batch_sources)
     if max_batches is not None and max_batches < total_available:
-        parquet_files = parquet_files[:max_batches]
+        batch_sources = batch_sources[:max_batches]
         logger.info(
-            f"Processing {len(parquet_files)} of {total_available} batches (limited by max_batches)"
+            f"Processing {len(batch_sources)} of {total_available} batches (limited by max_batches)"
         )
     else:
-        logger.info(f"Found {len(parquet_files)} simulation batches to process")
+        logger.info(f"Found {len(batch_sources)} simulation batches to process")
 
     # Process batches in a single task (no array job needed)
     total_sims = 0
-    for batch_idx, parquet_file in enumerate(parquet_files):
+    for batch_idx, parquet_source in enumerate(batch_sources):
         n_sims = process_single_batch(
             batch_idx=batch_idx,
-            parquet_file=parquet_file,
+            parquet_source=parquet_source,
             test_stats_df=test_stats_df,
             test_stat_registry=test_stat_registry,
             species_units=species_units,
             test_stats_output_dir=test_stats_output_dir,
+            template_defaults=template_defaults,
         )
         total_sims += n_sims
 
     logger.info(
-        f"✓ Derivation complete! Processed {total_sims} simulations from {len(parquet_files)} batches"
+        f"✓ Derivation complete! Processed {total_sims} simulations from {len(batch_sources)} batches"
     )
 
 

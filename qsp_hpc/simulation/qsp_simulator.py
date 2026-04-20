@@ -241,6 +241,7 @@ class QSPSimulator:
                 model_script=model_script,
                 scenario=scenario,
                 submodel_priors_yaml=submodel_priors_yaml,
+                seed=self.seed,
             )
             if self._calibration_targets_dir is not None:
                 pool_kwargs["calibration_targets"] = self._calibration_targets_dir
@@ -1821,6 +1822,7 @@ class QSPSimulator:
             model_script=self.model_script,
             model_version=self.model_version,
             submodel_priors_yaml=self.submodel_priors_yaml,
+            seed=self.seed,
         )
 
     def _compute_test_stats_hash(self) -> str:
@@ -1868,6 +1870,7 @@ class QSPSimulator:
                 priors_csv=self.priors_csv,
                 model_script=self.model_script,
                 scenario=pool_scenario,
+                seed=self.seed,
             )
             if self._calibration_targets_dir is not None:
                 pool_kwargs["calibration_targets"] = self._calibration_targets_dir

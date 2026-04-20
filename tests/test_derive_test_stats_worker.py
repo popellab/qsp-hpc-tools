@@ -197,6 +197,112 @@ class TestBuildTestStatRegistry:
         assert registry["stat3"](time, species_dict, ureg) == 10.0
 
 
+class TestTemplateDefaultsFallback:
+    """#23: when a calibration-target function asks for a parameter that
+    isn't a parquet column (thin-parquet pools), the derive worker
+    resolves it via the pool manifest's template_defaults."""
+
+    def test_manifest_default_resolves_missing_param(self):
+        # cal-target references rho_collagen, which isn't in the parquet
+        # (not sampled) — should come from template_defaults.
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["k_times_rho"],
+                "required_species": ["V_T.C1, rho_collagen"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return species_dict['rho_collagen'].magnitude "
+                    "* np.mean(species_dict['V_T.C1'].magnitude)"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0],
+                "status": [0],
+                "time": [[0.0, 1.0, 2.0]],
+                "V_T.C1": [[10.0, 20.0, 30.0]],  # mean = 20
+                # NO param:rho_collagen column — the thin-parquet case.
+            }
+        )
+        species_units = {"V_T.C1": "cell", "rho_collagen": "dimensionless"}
+        template_defaults = {"rho_collagen": 0.5}
+
+        result = compute_test_statistics_batch(
+            sim_df,
+            test_stats_df,
+            registry,
+            species_units,
+            template_defaults=template_defaults,
+        )
+        # 0.5 (manifest default) × 20 (mean V_T.C1) = 10
+        assert result[0, 0] == pytest.approx(10.0)
+
+    def test_parquet_column_wins_over_manifest(self):
+        """When a param:* column IS in the parquet (sampled), it takes
+        precedence over the manifest default. Test with an unambiguous
+        value difference."""
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["return_k"],
+                "required_species": ["k"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return species_dict['k'].magnitude"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0],
+                "status": [0],
+                "time": [[0.0]],
+                "param:k": [7.5],  # sampled value
+            }
+        )
+        species_units = {"k": "dimensionless"}
+        template_defaults = {"k": 0.1}  # manifest default should be IGNORED
+
+        result = compute_test_statistics_batch(
+            sim_df,
+            test_stats_df,
+            registry,
+            species_units,
+            template_defaults=template_defaults,
+        )
+        assert result[0, 0] == pytest.approx(7.5)
+
+    def test_missing_param_without_manifest_raises(self):
+        """Pre-#23 behavior: without a manifest, a missing param raises
+        ValueError (via the .warning + nan-row path in the inner loop).
+        Cal-target functions that depend on a now-absent column blow up
+        loudly instead of silently returning garbage."""
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["needs_z"],
+                "required_species": ["z"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return species_dict['z'].magnitude"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0],
+                "status": [0],
+                "time": [[0.0]],
+            }
+        )
+        species_units = {}
+        # No template_defaults supplied → should NaN (error logged + caught).
+        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
+        assert np.isnan(result[0, 0])
+
+
 class TestComputeTestStatisticsBatch:
     """Test computing test statistics from simulation DataFrame."""
 
@@ -220,7 +326,7 @@ class TestComputeTestStatisticsBatch:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0, 1],
-                "status": [1, 1],  # Both successful
+                "status": [0, 0],  # Both successful (status==0 = success)
                 "time": [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]],
                 "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],  # Mean = 200  # Mean = 100
             }
@@ -249,11 +355,11 @@ class TestComputeTestStatisticsBatch:
 
         registry = build_test_stat_registry(test_stats_df)
 
-        # Simulation 1 failed (status != 1)
+        # Simulation 1 failed (status==1 = failure)
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0, 1],
-                "status": [1, 0],  # Second simulation failed
+                "status": [0, 1],  # First successful, second failed
                 "time": [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]],
                 "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],
             }
@@ -286,7 +392,7 @@ class TestComputeTestStatisticsBatch:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0],
-                "status": [1],
+                "status": [0],
                 "time": [[0.0, 1.0, 2.0]],
                 "V_T.C1": [[100.0, 200.0, 300.0]],
             }
@@ -321,7 +427,7 @@ class TestComputeTestStatisticsBatch:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0],
-                "status": [1],
+                "status": [0],
                 "time": [[0.0, 1.0, 2.0]],
                 "V_T.CD8": [[100.0, 110.0, 120.0]],
                 "V_T.Treg": [[50.0, 55.0, 60.0]],
@@ -351,7 +457,7 @@ class TestComputeTestStatisticsBatch:
         registry = {}
 
         sim_df = pd.DataFrame(
-            {"simulation_id": [0], "status": [1], "time": [[0.0, 1.0]], "V_T.C1": [[100.0, 200.0]]}
+            {"simulation_id": [0], "status": [0], "time": [[0.0, 1.0]], "V_T.C1": [[100.0, 200.0]]}
         )
 
         species_units = {"V_T.C1": "cell"}
@@ -378,7 +484,7 @@ class TestComputeTestStatisticsBatch:
         registry = build_test_stat_registry(test_stats_df)
 
         sim_df = pd.DataFrame(
-            {"simulation_id": [0], "status": [1], "time": [[0.0, 1.0]], "V_T.C1": [[100.0, 200.0]]}
+            {"simulation_id": [0], "status": [0], "time": [[0.0, 1.0]], "V_T.C1": [[100.0, 200.0]]}
         )
 
         species_units = {"V_T.C1": "cell"}
@@ -417,7 +523,7 @@ class TestNonSpeciesResolution:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0],
-                "status": [1],
+                "status": [0],
                 "time": [[0.0, 1.0]],
                 "V_T.C1": [[1e8, 1e8]],
                 "V_T": [0.5],  # scalar compartment volume
@@ -444,7 +550,7 @@ class TestNonSpeciesResolution:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0],
-                "status": [1],
+                "status": [0],
                 "time": [[0.0]],
                 "param:rho_collagen": [0.025],
             }
@@ -468,7 +574,7 @@ class TestNonSpeciesResolution:
             }
         )
         registry = build_test_stat_registry(test_stats_df)
-        sim_df = pd.DataFrame({"simulation_id": [0], "status": [1], "time": [[0.0]], "V_T": [0.5]})
+        sim_df = pd.DataFrame({"simulation_id": [0], "status": [0], "time": [[0.0]], "V_T": [0.5]})
         # Deliberately omit V_T from species_units → defaults to dimensionless
         species_units = {}
         result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
@@ -510,7 +616,7 @@ class TestProcessSingleBatch:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0, 1, 2],
-                "status": [1, 1, 1],
+                "status": [0, 0, 0],
                 "time": [[0.0, 1.0, 2.0]] * 3,
                 "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0], [10.0, 20.0, 30.0]],
             }
@@ -524,7 +630,7 @@ class TestProcessSingleBatch:
 
         n_sims = process_single_batch(
             batch_idx=0,
-            parquet_file=parquet_file,
+            parquet_source=parquet_file,
             test_stats_df=test_stats_df,
             test_stat_registry=test_stat_registry,
             species_units=species_units,
@@ -540,7 +646,7 @@ class TestProcessSingleBatch:
         sim_df = pd.DataFrame(
             {
                 "simulation_id": [0, 1],
-                "status": [1, 1],
+                "status": [0, 0],
                 "time": [[0.0, 1.0, 2.0]] * 2,
                 "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0]],
             }
@@ -554,7 +660,7 @@ class TestProcessSingleBatch:
 
         process_single_batch(
             batch_idx=5,  # Test non-zero batch index
-            parquet_file=parquet_file,
+            parquet_source=parquet_file,
             test_stats_df=test_stats_df,
             test_stat_registry=test_stat_registry,
             species_units=species_units,
@@ -615,7 +721,7 @@ class TestMaxBatchesLimit:
             sim_df = pd.DataFrame(
                 {
                     "simulation_id": [i * 10 + j for j in range(10)],
-                    "status": [1] * 10,
+                    "status": [0] * 10,
                     "time": [[0.0, 1.0]] * 10,
                     "value": [[float(i * 100 + j)] * 2 for j in range(10)],
                 }
@@ -636,7 +742,7 @@ class TestMaxBatchesLimit:
         for batch_idx, parquet_file in enumerate(parquet_files):
             n_sims = process_single_batch(
                 batch_idx=batch_idx,
-                parquet_file=parquet_file,
+                parquet_source=parquet_file,
                 test_stats_df=test_stats_df,
                 test_stat_registry=registry,
                 species_units=species_units,
@@ -677,7 +783,7 @@ class TestMaxBatchesLimit:
             sim_df = pd.DataFrame(
                 {
                     "simulation_id": [i * 5 + j for j in range(5)],
-                    "status": [1] * 5,
+                    "status": [0] * 5,
                     "time": [[0.0, 1.0]] * 5,
                     "value": [[float(i * 100 + j)] * 2 for j in range(5)],
                 }
@@ -698,7 +804,7 @@ class TestMaxBatchesLimit:
         for batch_idx, parquet_file in enumerate(parquet_files):
             n_sims = process_single_batch(
                 batch_idx=batch_idx,
-                parquet_file=parquet_file,
+                parquet_source=parquet_file,
                 test_stats_df=test_stats_df,
                 test_stat_registry=registry,
                 species_units=species_units,
@@ -748,7 +854,7 @@ class TestSingleTaskDerivation:
             sim_df = pd.DataFrame(
                 {
                     "simulation_id": [i * 10 + j for j in range(5)],
-                    "status": [1] * 5,
+                    "status": [0] * 5,
                     "time": [[0.0, 1.0]] * 5,
                     "value": [[float(i * 100 + j)] * 2 for j in range(5)],
                 }
@@ -766,7 +872,7 @@ class TestSingleTaskDerivation:
         for batch_idx, parquet_file in enumerate(parquet_files):
             n_sims = process_single_batch(
                 batch_idx=batch_idx,
-                parquet_file=parquet_file,
+                parquet_source=parquet_file,
                 test_stats_df=test_stats_df,
                 test_stat_registry=registry,
                 species_units=species_units,
@@ -781,3 +887,239 @@ class TestSingleTaskDerivation:
         assert (output_dir / "chunk_000_test_stats.csv").exists()
         assert (output_dir / "chunk_001_test_stats.csv").exists()
         assert (output_dir / "chunk_002_test_stats.csv").exists()
+
+
+class TestProcessSingleBatchRowGroupStreaming:
+    """Regression for the 2026-04-18 OOM on the 15k clinical_progression
+    batch: derive used to do ``pd.read_parquet`` on the whole file, which
+    spiked to ~100 GB on wide list-typed parquets even with --mem=32G.
+    Now we stream row-groups. The on-disk output for a multi-row-group
+    parquet must exactly match what the single-read path produced, so
+    downstream ``combine_test_stats_chunks.py`` stays oblivious."""
+
+    @pytest.fixture
+    def test_stats_df(self):
+        return pd.DataFrame(
+            {
+                "test_statistic_id": ["mean_tumor", "max_tumor"],
+                "required_species": ["V_T.C1", "V_T.C1"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return np.mean(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return np.max(species_dict['V_T.C1'].magnitude)",
+                ],
+            }
+        )
+
+    @pytest.fixture
+    def test_stat_registry(self, test_stats_df):
+        return build_test_stat_registry(test_stats_df)
+
+    @pytest.fixture
+    def species_units(self):
+        return {"V_T.C1": "cell"}
+
+    def _write_multi_row_group_parquet(self, path, n_sims, rows_per_group):
+        """Write a parquet with multiple row groups so we can verify
+        the streaming path actually iterates over them."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": list(range(n_sims)),
+                "sample_index": list(range(n_sims)),
+                "status": [0] * n_sims,
+                "time": [[0.0, 1.0, 2.0]] * n_sims,
+                "V_T.C1": [
+                    [float(i) * 10.0, float(i) * 20.0, float(i) * 30.0] for i in range(n_sims)
+                ],
+                "param:k_growth": [0.1 + 0.01 * i for i in range(n_sims)],
+            }
+        )
+        table = pa.Table.from_pandas(sim_df)
+        # chunksize controls row group size — critical for the test.
+        pq.write_table(table, str(path), row_group_size=rows_per_group)
+        return sim_df
+
+    def test_multi_row_group_parquet_matches_single_read(
+        self, test_stats_df, test_stat_registry, species_units, tmp_path
+    ):
+        """12 sims in 3 row groups of 4 must produce the same on-disk
+        CSV as a hypothetical single-read, and the header must appear
+        exactly once in the params CSV."""
+        parquet_file = tmp_path / "batch.parquet"
+        self._write_multi_row_group_parquet(parquet_file, n_sims=12, rows_per_group=4)
+
+        # Sanity-check the fixture produced >1 row group — if it didn't,
+        # this test wouldn't exercise the streaming path.
+        import pyarrow.parquet as pq
+
+        assert pq.ParquetFile(str(parquet_file)).num_row_groups == 3
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        n_sims = process_single_batch(
+            batch_idx=0,
+            parquet_source=parquet_file,
+            test_stats_df=test_stats_df,
+            test_stat_registry=test_stat_registry,
+            species_units=species_units,
+            test_stats_output_dir=output_dir,
+        )
+
+        assert n_sims == 12
+
+        # test_stats CSV: 12 data rows, no header, 2 columns.
+        ts_lines = (output_dir / "chunk_000_test_stats.csv").read_text().splitlines()
+        assert len(ts_lines) == 12
+        # First sim: time series [0, 0, 0] → mean=0, max=0.
+        first_row = [float(x) for x in ts_lines[0].split(",")]
+        assert first_row == [0.0, 0.0]
+        # Last sim (i=11): [110, 220, 330] → mean=220, max=330.
+        last_row = [float(x) for x in ts_lines[-1].split(",")]
+        assert last_row == pytest.approx([220.0, 330.0])
+
+        # Params CSV: exactly ONE header row, 12 data rows, sample_index
+        # preserved across row-group boundaries.
+        params_df = pd.read_csv(output_dir / "chunk_000_params.csv")
+        assert len(params_df) == 12
+        assert list(params_df["sample_index"]) == list(range(12))
+        # Header must appear exactly once — regression against a bug
+        # where each row group wrote its own header.
+        params_text = (output_dir / "chunk_000_params.csv").read_text()
+        assert params_text.count("sample_index,k_growth") == 1
+
+    def test_single_row_group_parquet_still_works(
+        self, test_stats_df, test_stat_registry, species_units, tmp_path
+    ):
+        """The streaming path must handle a 1-row-group parquet (what
+        pd.to_parquet produces by default in the rest of the test suite)
+        exactly like the old single-read path."""
+        parquet_file = tmp_path / "batch.parquet"
+        sim_df = pd.DataFrame(
+            {
+                "simulation_id": [0, 1, 2],
+                "status": [0, 0, 0],
+                "time": [[0.0, 1.0, 2.0]] * 3,
+                "V_T.C1": [[100.0, 200.0, 300.0], [50.0, 100.0, 150.0], [10.0, 20.0, 30.0]],
+            }
+        )
+        sim_df.to_parquet(parquet_file)
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        n_sims = process_single_batch(
+            batch_idx=0,
+            parquet_source=parquet_file,
+            test_stats_df=test_stats_df,
+            test_stat_registry=test_stat_registry,
+            species_units=species_units,
+            test_stats_output_dir=output_dir,
+        )
+        assert n_sims == 3
+        ts_lines = (output_dir / "chunk_000_test_stats.csv").read_text().splitlines()
+        assert len(ts_lines) == 3
+
+
+class TestProcessSingleBatchSubdirLayout:
+    """#43 option A: array tasks now drop chunks directly into a
+    per-submission ``batch_*/`` subdir, no combine step. process_single_batch
+    must treat the subdir as one batch — walking ``chunk_*.parquet`` within
+    — and produce the same CSVs as a single consolidated parquet would."""
+
+    @pytest.fixture
+    def test_stats_df(self):
+        return pd.DataFrame(
+            {
+                "test_statistic_id": ["mean_tumor"],
+                "required_species": ["V_T.C1"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return np.mean(species_dict['V_T.C1'].magnitude)"
+                ],
+            }
+        )
+
+    @pytest.fixture
+    def test_stat_registry(self, test_stats_df):
+        return build_test_stat_registry(test_stats_df)
+
+    @pytest.fixture
+    def species_units(self):
+        return {"V_T.C1": "cell"}
+
+    def test_batch_subdir_aggregates_chunks(
+        self, test_stats_df, test_stat_registry, species_units, tmp_path
+    ):
+        """A batch_*/ subdir with 3 chunk_*.parquet files (4 sims each) must
+        derive as one 12-row output — chunks iterated in filename order."""
+        batch_dir = tmp_path / "batch_20260418_000000_ctrl_seed42"
+        batch_dir.mkdir()
+
+        for task_idx in range(3):
+            sim_df = pd.DataFrame(
+                {
+                    "simulation_id": list(range(4)),  # local per-chunk ids
+                    "sample_index": list(range(task_idx * 4, (task_idx + 1) * 4)),
+                    "status": [0] * 4,
+                    "time": [[0.0, 1.0]] * 4,
+                    "V_T.C1": [
+                        [float(task_idx * 100 + i) * 10.0, float(task_idx * 100 + i) * 20.0]
+                        for i in range(4)
+                    ],
+                    "param:k_growth": [0.1 + 0.01 * (task_idx * 4 + i) for i in range(4)],
+                }
+            )
+            sim_df.to_parquet(batch_dir / f"chunk_{task_idx:03d}.parquet")
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        n_sims = process_single_batch(
+            batch_idx=0,
+            parquet_source=batch_dir,
+            test_stats_df=test_stats_df,
+            test_stat_registry=test_stat_registry,
+            species_units=species_units,
+            test_stats_output_dir=output_dir,
+        )
+
+        assert n_sims == 12
+
+        # 12 rows of test stats across 3 chunk files, concatenated in filename order.
+        ts_lines = (output_dir / "chunk_000_test_stats.csv").read_text().splitlines()
+        assert len(ts_lines) == 12
+
+        # sample_index preserved, exactly one header, covers chunk boundaries.
+        params_df = pd.read_csv(output_dir / "chunk_000_params.csv")
+        assert len(params_df) == 12
+        assert list(params_df["sample_index"]) == list(range(12))
+        params_text = (output_dir / "chunk_000_params.csv").read_text()
+        assert params_text.count("sample_index,k_growth") == 1
+
+    def test_empty_batch_subdir_returns_zero(
+        self, test_stats_df, test_stat_registry, species_units, tmp_path
+    ):
+        """A batch_*/ subdir with no chunks yet (task failed before flush)
+        must be skipped, not crash. Derive's top-level loop will still
+        record total_sims correctly."""
+        batch_dir = tmp_path / "batch_20260418_000000_ctrl_seed42"
+        batch_dir.mkdir()
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        n_sims = process_single_batch(
+            batch_idx=0,
+            parquet_source=batch_dir,
+            test_stats_df=test_stats_df,
+            test_stat_registry=test_stat_registry,
+            species_units=species_units,
+            test_stats_output_dir=output_dir,
+        )
+        assert n_sims == 0
+        assert not (output_dir / "chunk_000_test_stats.csv").exists()

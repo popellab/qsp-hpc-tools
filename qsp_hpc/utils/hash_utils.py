@@ -18,6 +18,7 @@ def compute_pool_id_hash(
     model_script: str,
     model_version: str,
     submodel_priors_yaml: Optional[Union[str, Path]] = None,
+    seed: Optional[int] = None,
 ) -> str:
     """Hash inputs that determine raw simulation outputs (full sha256 hex).
 
@@ -25,6 +26,14 @@ def compute_pool_id_hash(
     the pool directory's 8-hex prefix. Includes only inputs that change the
     parameter draws or sim trajectories — NOT test_stats (those live in a
     subdir) and NOT scenario (it's the dir-name suffix).
+
+    ``seed`` is part of the hash because ``theta_pool`` draws are
+    seed-dependent: row ``sample_index=i`` points at a different theta
+    under a different seed, so pools from different seeds cannot be
+    mixed. Leaving seed out silently served stale draws when users
+    reran with a new seed (see #20). ``seed=None`` reproduces the
+    pre-fix hash for backward compatibility with legacy pools; new
+    callers should always pass the seed they use for theta sampling.
     """
     h = hashlib.sha256()
     h.update(Path(priors_csv).read_text().encode("utf-8"))
@@ -34,6 +43,8 @@ def compute_pool_id_hash(
             h.update(smp.read_text().encode("utf-8"))
     h.update(model_script.encode("utf-8"))
     h.update(model_version.encode("utf-8"))
+    if seed is not None:
+        h.update(f"seed={int(seed)}".encode("utf-8"))
     return h.hexdigest()
 
 

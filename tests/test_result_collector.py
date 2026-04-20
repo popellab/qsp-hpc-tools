@@ -95,7 +95,7 @@ class TestCountPoolSimulations:
 
     def test_count_from_filenames(self, result_collector, mock_transport):
         """Test counting simulations from filenames when no manifest."""
-        output = """COUNTING_FILES
+        output = """COUNTING_PARQUET_METADATA
 N_FILES:5
 N_SIMS:500"""
         mock_transport.exec.return_value = (0, output)
@@ -106,7 +106,7 @@ N_SIMS:500"""
 
     def test_count_no_files(self, result_collector, mock_transport):
         """Test counting when no simulation files exist."""
-        output = """COUNTING_FILES
+        output = """COUNTING_PARQUET_METADATA
 N_FILES:0
 N_SIMS:0"""
         mock_transport.exec.return_value = (0, output)
@@ -145,7 +145,7 @@ N_SIMS:0"""
 
     def test_count_malformed_filename_output(self, result_collector, mock_transport):
         """Test handling of malformed filename counting output."""
-        output = """COUNTING_FILES
+        output = """COUNTING_PARQUET_METADATA
 N_FILES:5
 N_SIMS:not_a_number"""
         mock_transport.exec.return_value = (0, output)
@@ -172,7 +172,7 @@ class TestCheckHPCFullSimulations:
         # Directory exists
         mock_transport.exec.side_effect = [
             (0, "exists\n"),  # check directory
-            (0, "COUNTING_FILES\nN_FILES:10\nN_SIMS:1000"),  # count sims
+            (0, "COUNTING_PARQUET_METADATA\nN_FILES:10\nN_SIMS:1000"),  # count sims
         ]
 
         has_enough, pool_path, n_available = result_collector.check_hpc_full_simulations(
@@ -187,7 +187,7 @@ class TestCheckHPCFullSimulations:
         """Test when HPC pool has insufficient simulations."""
         mock_transport.exec.side_effect = [
             (0, "exists\n"),  # check directory
-            (0, "COUNTING_FILES\nN_FILES:3\nN_SIMS:300"),  # count sims
+            (0, "COUNTING_PARQUET_METADATA\nN_FILES:3\nN_SIMS:300"),  # count sims
         ]
 
         has_enough, pool_path, n_available = result_collector.check_hpc_full_simulations(

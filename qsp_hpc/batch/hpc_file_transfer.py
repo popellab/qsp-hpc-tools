@@ -376,11 +376,26 @@ echo "Python venv setup complete!"
         finally:
             Path(temp_file).unlink()
 
-    def upload_parameter_csv(self, csv_path: str) -> None:
-        """Upload parameter samples CSV."""
+    def upload_parameter_csv(self, csv_path: str, simulation_pool_id: Optional[str] = None) -> None:
+        """Upload parameter samples CSV.
+
+        When ``simulation_pool_id`` is given, the CSV is written to a
+        per-pool subdir (``batch_jobs/input/<pool_id>/params.csv``).
+        #48: this prevents parallel ``run_hpc()`` invocations for
+        different scenarios from overwriting each other's params.
+        ``None`` preserves the legacy shared path for direct callers
+        that haven't been migrated yet.
+        """
+        import shlex as _shlex
+
         start_time = time.time()
 
-        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
+        base_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
+        if simulation_pool_id:
+            remote_input_dir = f"{base_input_dir}/{simulation_pool_id}"
+            self.transport.exec(f"mkdir -p {_shlex.quote(remote_input_dir)}")
+        else:
+            remote_input_dir = base_input_dir
         remote_file = f"{remote_input_dir}/params.csv"
 
         self.transport.upload(csv_path, remote_file)

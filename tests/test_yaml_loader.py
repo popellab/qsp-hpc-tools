@@ -12,7 +12,9 @@ import yaml
 from qsp_hpc.calibration.yaml_loader import (
     _generate_wrapper_code,
     hash_calibration_targets,
+    hash_prediction_targets,
     load_calibration_targets,
+    load_prediction_targets,
 )
 from qsp_hpc.utils.unit_registry import ureg
 
@@ -504,3 +506,157 @@ class TestRoundTrip:
         # Each entry should be a callable function
         for fn in registry.values():
             assert callable(fn)
+
+
+# ============================================================================
+# Prediction-target fixtures + tests
+# ============================================================================
+
+PREDICTION_YAML = {
+    "prediction_target_id": "os_at_12mo",
+    "description": "Overall survival at 12 months (alive=1 / dead=0).",
+    "observable": {
+        "code": (
+            "def compute_observable(time, species_dict, constants, ureg):\n"
+            "    import numpy as np\n"
+            "    c1 = species_dict['V_T.C1'].to('cell').magnitude\n"
+            "    t = time.to('day').magnitude\n"
+            "    mask = t <= 365.0\n"
+            "    alive = 0.0 if (c1[mask].max() >= 1.0e11) else 1.0\n"
+            "    return np.full_like(t, alive) * ureg.dimensionless\n"
+        ),
+        "units": "dimensionless",
+        "species": ["V_T.C1"],
+        "constants": [],
+    },
+    "scenario": "clinical_progression",
+    "index_values": [365.0],
+    "index_unit": "day",
+    "index_type": "time",
+    "rationale": "12-month OS is the standard adjuvant PDAC landmark.",
+    "tags": [],
+}
+
+PREDICTION_YAML_TTP = {
+    "prediction_target_id": "time_to_progression",
+    "description": "Days to first RECIST PD; censored at 1095.",
+    "observable": {
+        "code": (
+            "def compute_observable(time, species_dict, constants, ureg):\n"
+            "    import numpy as np\n"
+            "    # Censored implementation: always return censoring time.\n"
+            "    t = time.to('day').magnitude\n"
+            "    return np.full_like(t, 1095.0) * ureg.day\n"
+        ),
+        "units": "day",
+        "species": ["V_T.C1"],
+        "constants": [],
+    },
+    "scenario": "clinical_progression",
+    "index_values": [1095.0],
+    "index_unit": "day",
+    "index_type": "time",
+    "rationale": "TTP landmark at censoring horizon.",
+    "tags": [],
+}
+
+
+@pytest.fixture
+def prediction_yaml_dir(temp_dir):
+    """Directory with two prediction-target YAMLs."""
+    yaml_dir = temp_dir / "predictions"
+    yaml_dir.mkdir()
+    for name, data in [
+        ("os_at_12mo.yaml", PREDICTION_YAML),
+        ("time_to_progression.yaml", PREDICTION_YAML_TTP),
+    ]:
+        with open(yaml_dir / name, "w") as f:
+            yaml.dump(data, f)
+    return yaml_dir
+
+
+class TestLoadPredictionTargets:
+    def test_schema_adds_prediction_marker(self, prediction_yaml_dir, single_baseline_dir):
+        """Prediction rows carry the ``is_prediction_only`` marker;
+        calibration rows do not (by design — keeps the serialized
+        test-stats CSV byte-stable so HPC cache hashes don't break)."""
+        pred_df = load_prediction_targets(prediction_yaml_dir)
+        cal_df = load_calibration_targets(single_baseline_dir)
+        assert "is_prediction_only" in pred_df.columns
+        assert "is_prediction_only" not in cal_df.columns
+        # Prediction columns are a superset of calibration columns, in order.
+        assert list(pred_df.columns)[: len(cal_df.columns)] == list(cal_df.columns)
+
+    def test_empirical_columns_are_nan(self, prediction_yaml_dir):
+        df = load_prediction_targets(prediction_yaml_dir)
+        assert df["median"].isna().all()
+        assert df["ci95_lower"].isna().all()
+        assert df["ci95_upper"].isna().all()
+        assert df["sample_size"].isna().all()
+
+    def test_is_prediction_only_flag(self, prediction_yaml_dir):
+        df = load_prediction_targets(prediction_yaml_dir)
+        assert df["is_prediction_only"].all()
+
+    def test_ids_and_species(self, prediction_yaml_dir):
+        df = load_prediction_targets(prediction_yaml_dir)
+        assert set(df["test_statistic_id"]) == {"os_at_12mo", "time_to_progression"}
+        assert all("V_T.C1" in s for s in df["required_species"])
+
+    def test_wrapper_compiles_and_returns_scalar(self, prediction_yaml_dir):
+        """The generated wrapper should compile and return a Pint scalar
+        when fed a minimal species_dict/time grid."""
+        df = load_prediction_targets(prediction_yaml_dir)
+        os_row = df[df["test_statistic_id"] == "os_at_12mo"].iloc[0]
+        ns: dict = {"np": np, "ureg": ureg}
+        exec(os_row["model_output_code"], ns)
+        fn = ns["compute_test_statistic"]
+
+        time_q = np.linspace(0, 400, 50) * ureg.day
+        c1 = np.full_like(time_q.magnitude, 1e9) * ureg.parse_expression("cell")
+        result = fn(time_q, {"V_T.C1": c1}, ureg)
+        assert result.to("dimensionless").magnitude == pytest.approx(1.0)
+
+    def test_nonexistent_dir_raises(self, temp_dir):
+        with pytest.raises(FileNotFoundError):
+            load_prediction_targets(temp_dir / "missing")
+
+    def test_empty_dir_raises(self, empty_yaml_dir):
+        with pytest.raises(ValueError, match="No YAML files"):
+            load_prediction_targets(empty_yaml_dir)
+
+    def test_round_trip_with_calibration(self, prediction_yaml_dir, multi_yaml_dir):
+        """Calibration + prediction rows concat into a registry-safe frame."""
+        from qsp_hpc.batch.derive_test_stats_worker import build_test_stat_registry
+
+        cal_df = load_calibration_targets(multi_yaml_dir)
+        pred_df = load_prediction_targets(prediction_yaml_dir)
+        merged = pd.concat([cal_df, pred_df], ignore_index=True)
+
+        registry = build_test_stat_registry(merged)
+        assert len(registry) == len(merged)
+        assert "os_at_12mo" in registry
+        assert "time_to_progression" in registry
+        assert "m1_m2_ratio" in registry
+
+
+class TestHashPredictionTargets:
+    def test_deterministic(self, prediction_yaml_dir):
+        h1 = hash_prediction_targets(prediction_yaml_dir)
+        h2 = hash_prediction_targets(prediction_yaml_dir)
+        assert h1 == h2
+        assert len(h1) == 64
+
+    def test_changes_when_yaml_edited(self, prediction_yaml_dir):
+        h1 = hash_prediction_targets(prediction_yaml_dir)
+        yaml_file = prediction_yaml_dir / "os_at_12mo.yaml"
+        data = yaml.safe_load(yaml_file.read_text())
+        data["rationale"] = "edited"
+        with open(yaml_file, "w") as f:
+            yaml.dump(data, f)
+        h2 = hash_prediction_targets(prediction_yaml_dir)
+        assert h1 != h2
+
+    def test_nonexistent_dir_raises(self, temp_dir):
+        with pytest.raises(FileNotFoundError):
+            hash_prediction_targets(temp_dir / "missing")

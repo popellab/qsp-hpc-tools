@@ -1,15 +1,25 @@
 """
-YAML Calibration Target Loader
+YAML Calibration / Prediction Target Loader
 
 Loads calibration target YAML files (from MAPLE) and converts them
 into the DataFrame format expected by the qsp-hpc-tools pipeline. Each YAML
-contains a 4-arg `compute_observable` function, optional constants, and empirical
-data with CI95 bounds. The loader generates 3-arg `compute_test_statistic` wrapper
-functions that inline constants and extract scalar values at target times.
+contains a 4-arg ``compute_observable`` function, optional constants, and
+empirical data with CI95 bounds. The loader generates 3-arg
+``compute_test_statistic`` wrapper functions that inline constants and extract
+scalar values at target times.
+
+Prediction targets (``prediction_target_id`` / no empirical block) share the
+observable-code protocol but carry no measurement. They are loaded through a
+parallel API that emits the same DataFrame schema — empirical columns are NaN
+and the ``is_prediction_only`` flag is ``True`` — so calibration and prediction
+rows can be concatenated and handed to ``build_test_stat_registry`` /
+``compute_test_statistics_batch`` unchanged.
 
 Public API:
     load_calibration_targets(yaml_dir) -> pd.DataFrame
     hash_calibration_targets(yaml_dir) -> str
+    load_prediction_targets(yaml_dir) -> pd.DataFrame
+    hash_prediction_targets(yaml_dir) -> str
 """
 
 import hashlib
@@ -19,6 +29,29 @@ from typing import List
 
 import pandas as pd
 import yaml
+
+# Column order used by both loaders (calibration-only columns are the
+# canonical layout; the prediction loader appends ``is_prediction_only``
+# for callers that need to distinguish rows after concat).
+#
+# NOTE: ``load_calibration_targets`` must preserve the pre-2026-04
+# column set byte-for-byte when serialized to CSV — the HPC test-stats
+# pool is keyed by ``compute_test_stats_hash(csv)`` and any schema change
+# invalidates every existing derived-stats cache. The ``is_prediction_only``
+# marker is therefore only emitted by ``load_prediction_targets`` and
+# back-filled on calibration rows at concat time (see CppSimulator
+# ``_load_test_stats_df``).
+_CALIBRATION_COLUMNS = [
+    "test_statistic_id",
+    "required_species",
+    "model_output_code",
+    "median",
+    "ci95_lower",
+    "ci95_upper",
+    "units",
+    "sample_size",
+]
+_PREDICTION_COLUMNS = [*_CALIBRATION_COLUMNS, "is_prediction_only"]
 
 
 def load_calibration_targets(yaml_dir: Path) -> pd.DataFrame:
@@ -35,6 +68,11 @@ def load_calibration_targets(yaml_dir: Path) -> pd.DataFrame:
         DataFrame with columns:
             test_statistic_id, required_species, model_output_code,
             median, ci95_lower, ci95_upper, units, sample_size
+
+        The ``is_prediction_only`` marker used to separate prediction rows
+        from calibration rows is intentionally *not* emitted here — see
+        the note on ``_CALIBRATION_COLUMNS`` above for why CSV stability
+        matters — and is back-filled by callers (CppSimulator) at concat.
 
     Raises:
         ValueError: If directory contains no YAML files.
@@ -100,7 +138,7 @@ def load_calibration_targets(yaml_dir: Path) -> pd.DataFrame:
             }
         )
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=_CALIBRATION_COLUMNS)
 
 
 def hash_calibration_targets(yaml_dir: Path) -> str:
@@ -128,6 +166,104 @@ def hash_calibration_targets(yaml_dir: Path) -> str:
 
     for yaml_file in yaml_files:
         # Include filename in hash for ordering sensitivity
+        hasher.update(yaml_file.name.encode("utf-8"))
+        hasher.update(yaml_file.read_bytes())
+
+    return hasher.hexdigest()
+
+
+def load_prediction_targets(yaml_dir: Path) -> pd.DataFrame:
+    """Load PredictionTarget YAMLs into the same test-statistics DataFrame shape.
+
+    Each YAML must define the PredictionTarget schema (see
+    ``pdac-build/scripts/prediction_target.py``): ``prediction_target_id``,
+    ``observable.code`` / ``observable.units`` / ``observable.species`` /
+    ``observable.constants``, optional ``index_values`` / ``index_unit`` /
+    ``index_type``. No empirical data and no provenance — those columns come
+    back NaN so calibration and prediction rows can be concatenated into a
+    single registry.
+
+    Args:
+        yaml_dir: Directory containing prediction target YAML files.
+
+    Returns:
+        DataFrame with the same columns as ``load_calibration_targets``:
+            test_statistic_id, required_species, model_output_code,
+            median=NaN, ci95_lower=NaN, ci95_upper=NaN, units, sample_size=NaN,
+            is_prediction_only=True.
+
+    Raises:
+        ValueError: If directory contains no YAML files.
+        FileNotFoundError: If yaml_dir does not exist.
+    """
+    yaml_dir = Path(yaml_dir)
+    if not yaml_dir.exists():
+        raise FileNotFoundError(f"Prediction targets directory not found: {yaml_dir}")
+
+    yaml_files = sorted(yaml_dir.glob("*.yaml"))
+    if not yaml_files:
+        raise ValueError(f"No YAML files found in {yaml_dir}")
+
+    rows: List[dict] = []
+    for yaml_file in yaml_files:
+        with open(yaml_file, "r") as f:
+            data = yaml.safe_load(f)
+
+        # PredictionTarget IDs live under `prediction_target_id` — the
+        # test_statistic_id column is the common name used by the derive
+        # worker, so we rename here rather than forking the schema.
+        target_id = data["prediction_target_id"]
+        observable = data["observable"]
+
+        species_list = observable.get("species", [])
+        required_species = ",".join(species_list) if species_list else ""
+        units = observable.get("units", "")
+
+        # Prediction targets keep their index_values at the top level
+        # (PredictionTarget schema), not under empirical_data. Fall back
+        # to None so the wrapper code evaluates at t=0 when absent.
+        index_values = data.get("index_values")
+
+        wrapper_code = _generate_wrapper_code(
+            observable_code=observable["code"],
+            constants=observable.get("constants") or [],
+            index_values=index_values,
+        )
+
+        rows.append(
+            {
+                "test_statistic_id": target_id,
+                "required_species": required_species,
+                "model_output_code": wrapper_code,
+                "median": float("nan"),
+                "ci95_lower": float("nan"),
+                "ci95_upper": float("nan"),
+                "units": units,
+                "sample_size": float("nan"),
+                "is_prediction_only": True,
+            }
+        )
+
+    return pd.DataFrame(rows, columns=_PREDICTION_COLUMNS)
+
+
+def hash_prediction_targets(yaml_dir: Path) -> str:
+    """Deterministic SHA256 of prediction-target YAMLs (parallel to
+    :func:`hash_calibration_targets`).
+
+    The digest feeds into theta-scoped pool / cache keys alongside the
+    calibration-target hash so edits to prediction YAMLs invalidate the
+    suffix pool — otherwise a stale cache would hand back endpoint columns
+    computed against the old observable code.
+    """
+    yaml_dir = Path(yaml_dir)
+    if not yaml_dir.exists():
+        raise FileNotFoundError(f"Prediction targets directory not found: {yaml_dir}")
+
+    hasher = hashlib.sha256()
+    yaml_files = sorted(yaml_dir.glob("*.yaml"))
+
+    for yaml_file in yaml_files:
         hasher.update(yaml_file.name.encode("utf-8"))
         hasher.update(yaml_file.read_bytes())
 

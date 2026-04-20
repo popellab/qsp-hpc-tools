@@ -1108,3 +1108,332 @@ class TestCppSimulatorValidate:
         job_manager.check_hpc_test_stats.assert_not_called()
         job_manager.submit_cpp_jobs.assert_not_called()
         job_manager.submit_derivation_job.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase-D: simulate_with_parameters — posterior-predictive + prediction targets
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def prediction_targets_dir(tmp_path: Path) -> Path:
+    """Prediction-target YAMLs whose observable picks off spA at t=0.
+
+    Keeps the species surface minimal so the fake qsp_sim binary
+    (produces 'spA'/'spB') can feed the derive worker without shims.
+    """
+    import yaml as _yaml
+
+    pred_dir = tmp_path / "predictions"
+    pred_dir.mkdir()
+    target = {
+        "prediction_target_id": "pred_spa_at_t0",
+        "description": "Prediction of spA species at t=0.",
+        "observable": {
+            "code": (
+                "def compute_observable(time, species_dict, constants, ureg):\n"
+                "    return species_dict['spA']\n"
+            ),
+            "units": "cell",
+            "species": ["spA"],
+            "constants": [],
+        },
+        "scenario": "ctrl",
+        "index_values": None,
+        "index_unit": None,
+        "index_type": None,
+        "rationale": "smoke test.",
+        "tags": [],
+    }
+    (pred_dir / "pred_spa_at_t0.yaml").write_text(_yaml.dump(target))
+    return pred_dir
+
+
+def _fake_run_factory(species=("spA", "spB")):
+    """Build a fake ``_runner.run`` that writes a synthetic parquet matching
+    the requested theta/param layout. Mirrors the helper the other
+    TestCall tests use but preserves the exact sample_indices handed in
+    (posterior-predictive needs row-level alignment)."""
+
+    def fake_run(**kwargs):
+        theta_matrix = kwargs["theta_matrix"]
+        param_names = list(kwargs["param_names"])
+        output_path = kwargs["output_path"]
+        sample_indices = kwargs.get("sample_indices")
+
+        n_sims = theta_matrix.shape[0]
+        n_times = 2
+        dt = 0.1
+        time_rows = [(np.arange(n_times) * dt).tolist()] * n_sims
+        cols = {
+            "sample_index": pa.array(
+                np.asarray(sample_indices, dtype=np.int64)
+                if sample_indices is not None
+                else np.arange(n_sims, dtype=np.int64)
+            ),
+            "simulation_id": pa.array(np.arange(n_sims, dtype=np.int64)),
+            "status": pa.array(np.zeros(n_sims, dtype=np.int64)),
+            "time": pa.array(time_rows, type=pa.list_(pa.float64())),
+        }
+        for j, name in enumerate(param_names):
+            cols[f"param:{name}"] = pa.array(theta_matrix[:, j])
+        # Deterministic species: spA = row index, spB = 2 * row index
+        # so test stats can identify which row they came from.
+        for sp_idx, sp in enumerate(species):
+            trajectories = []
+            for i in range(n_sims):
+                base = float(i + 1) * (1.0 if sp_idx == 0 else 2.0)
+                trajectories.append([base, base + 0.1])
+            cols[sp] = pa.array(trajectories, type=pa.list_(pa.float64()))
+        pq.write_table(pa.table(cols), str(output_path))
+        return BatchResult(
+            parquet_path=output_path,
+            n_sims=n_sims,
+            n_failed=0,
+            species_names=list(species),
+            n_times=n_times,
+        )
+
+    return fake_run
+
+
+class TestSimulateWithParameters:
+    """CppSimulator.simulate_with_parameters: posterior-predictive at
+    user-supplied thetas, with optional prediction targets mixed into the
+    output columns alongside calibration targets."""
+
+    def test_requires_targets_csv_or_yaml(self, priors_csv, binary_path, template_path, cache_dir):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+        )
+        with pytest.raises(RuntimeError, match="test_stats_csv or calibration_targets"):
+            sim.simulate_with_parameters(np.zeros((2, 2)))
+
+    def test_rejects_wrong_shape(
+        self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            calibration_targets=sample_calibration_targets_dir,
+        )
+        with pytest.raises(ValueError, match="2-D"):
+            sim.simulate_with_parameters(np.zeros(5))
+        with pytest.raises(ValueError, match="priors CSV has"):
+            sim.simulate_with_parameters(np.zeros((3, 7)))
+
+    def test_returns_table_with_named_ts_columns(
+        self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            calibration_targets=sample_calibration_targets_dir,
+            scenario="ctrl",
+            t_end_days=0.2,
+            dt_days=0.1,
+        )
+        theta = np.array([[0.5, 1.0], [1.5, 2.0], [3.0, 4.0]])
+        with patch.object(sim._runner, "run", side_effect=_fake_run_factory()):
+            theta_out, table = sim.simulate_with_parameters(theta)
+
+        assert theta_out.shape == theta.shape
+        np.testing.assert_allclose(theta_out, theta)
+        assert "sample_index" in table.column_names
+        assert "status" in table.column_names
+        assert "param:A" in table.column_names
+        assert "param:B" in table.column_names
+        # spA_t0 reads species_dict['spA'] → equals spA at t=0 = row+1.
+        ts_col = table.column("ts:spA_t0").to_numpy()
+        np.testing.assert_allclose(ts_col, [1.0, 2.0, 3.0])
+
+    def test_prediction_columns_appear(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        sample_calibration_targets_dir,
+        prediction_targets_dir,
+    ):
+        """Handoff acceptance criterion: 'prediction columns appear in the
+        output test_stats DataFrame' when prediction_targets is supplied."""
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            calibration_targets=sample_calibration_targets_dir,
+            scenario="ctrl",
+            t_end_days=0.2,
+            dt_days=0.1,
+        )
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])
+        with patch.object(sim._runner, "run", side_effect=_fake_run_factory()):
+            _, table = sim.simulate_with_parameters(
+                theta, prediction_targets=prediction_targets_dir
+            )
+        assert "ts:spA_t0" in table.column_names
+        assert "ts:pred_spa_at_t0" in table.column_names
+        # Same observable shape (spA at t=0) → values agree within tolerance.
+        np.testing.assert_allclose(
+            table.column("ts:pred_spa_at_t0").to_numpy(),
+            table.column("ts:spA_t0").to_numpy(),
+        )
+
+    def test_second_call_hits_cache_without_rerunning_sim(
+        self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            calibration_targets=sample_calibration_targets_dir,
+            scenario="ctrl",
+            t_end_days=0.2,
+            dt_days=0.1,
+        )
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])
+        with patch.object(sim._runner, "run", side_effect=_fake_run_factory()) as mock_run:
+            sim.simulate_with_parameters(theta)
+            assert mock_run.call_count == 1
+            # Identical theta + targets → cached. No second run.
+            sim.simulate_with_parameters(theta)
+            assert mock_run.call_count == 1
+
+    def test_different_theta_produces_different_cache_dir(
+        self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            calibration_targets=sample_calibration_targets_dir,
+            scenario="ctrl",
+            t_end_days=0.2,
+            dt_days=0.1,
+        )
+        theta_a = np.array([[0.5, 1.0], [1.5, 2.0]])
+        theta_b = np.array([[0.5, 1.0], [9.0, 9.0]])  # different row 1
+        with patch.object(sim._runner, "run", side_effect=_fake_run_factory()) as mock_run:
+            sim.simulate_with_parameters(theta_a)
+            sim.simulate_with_parameters(theta_b)
+            assert mock_run.call_count == 2
+        # Two suffix-pool dirs: the sibling pools carry the hashes.
+        siblings = [
+            p
+            for p in sim.pool_dir.parent.iterdir()
+            if p.is_dir()
+            and p.name.startswith(sim.pool_dir.name)
+            and "_posterior_predictive_" in p.name
+        ]
+        assert len(siblings) == 2
+
+    def test_prediction_targets_edit_invalidates_cache(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        sample_calibration_targets_dir,
+        prediction_targets_dir,
+    ):
+        """Editing a prediction YAML must force a re-derivation — otherwise
+        the cache returns endpoint values from the old observable code."""
+        import yaml as _yaml
+
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            calibration_targets=sample_calibration_targets_dir,
+            scenario="ctrl",
+            t_end_days=0.2,
+            dt_days=0.1,
+        )
+        theta = np.array([[0.5, 1.0]])
+        with patch.object(sim._runner, "run", side_effect=_fake_run_factory()) as mock_run:
+            sim.simulate_with_parameters(theta, prediction_targets=prediction_targets_dir)
+            assert mock_run.call_count == 1
+
+            # Edit the prediction YAML.
+            yaml_file = prediction_targets_dir / "pred_spa_at_t0.yaml"
+            data = _yaml.safe_load(yaml_file.read_text())
+            data["rationale"] = "rewritten for v2"
+            yaml_file.write_text(_yaml.dump(data))
+
+            sim.simulate_with_parameters(theta, prediction_targets=prediction_targets_dir)
+            assert mock_run.call_count == 2
+
+    def test_id_collision_raises(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        sample_calibration_targets_dir,
+        tmp_path,
+    ):
+        """Prediction id that collides with a calibration id would silently
+        overwrite one function in the registry — must raise early."""
+        import yaml as _yaml
+
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        pred_dir = tmp_path / "colliding"
+        pred_dir.mkdir()
+        (pred_dir / "spA_t0.yaml").write_text(
+            _yaml.dump(
+                {
+                    "prediction_target_id": "spA_t0",  # same as calibration id
+                    "description": "collision",
+                    "observable": {
+                        "code": (
+                            "def compute_observable(time, species_dict, constants, ureg):\n"
+                            "    return species_dict['spA']\n"
+                        ),
+                        "units": "cell",
+                        "species": ["spA"],
+                        "constants": [],
+                    },
+                    "scenario": "ctrl",
+                    "rationale": "collision test.",
+                    "tags": [],
+                }
+            )
+        )
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            calibration_targets=sample_calibration_targets_dir,
+            scenario="ctrl",
+        )
+        with patch.object(sim._runner, "run", side_effect=_fake_run_factory()):
+            with pytest.raises(ValueError, match="collide"):
+                sim.simulate_with_parameters(np.array([[0.1, 0.2]]), prediction_targets=pred_dir)

@@ -1437,3 +1437,245 @@ class TestSimulateWithParameters:
         with patch.object(sim._runner, "run", side_effect=_fake_run_factory()):
             with pytest.raises(ValueError, match="collide"):
                 sim.simulate_with_parameters(np.array([[0.1, 0.2]]), prediction_targets=pred_dir)
+
+
+class TestSimulateWithParametersHPC:
+    """simulate_with_parameters(backend='hpc'): submit user theta as a
+    dedicated HPC pool, wait, download, reshape to the local output schema."""
+
+    @staticmethod
+    def _make_sim(
+        priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir, tmp_path
+    ):
+        from unittest.mock import MagicMock
+
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        ms_file = tmp_path / "model_structure.json"
+        ms_file.write_text("{}\n")
+        job_manager = MagicMock()
+        job_manager.config.simulation_pool_path = "/scratch/sims"
+        job_manager.config.cpp_binary_path = "/scratch/qsp_sim"
+        job_manager.config.cpp_template_path = "/scratch/param_all.xml"
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            calibration_targets=sample_calibration_targets_dir,
+            job_manager=job_manager,
+            model_structure_file=ms_file,
+            scenario="ctrl",
+            poll_interval=0.001,
+        )
+        sim._wait_for_jobs = MagicMock()
+        return sim, job_manager
+
+    def test_hpc_backend_requires_job_manager(
+        self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
+    ):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            calibration_targets=sample_calibration_targets_dir,
+            scenario="ctrl",
+        )
+        with pytest.raises(RuntimeError, match="job_manager"):
+            sim.simulate_with_parameters(np.array([[0.1, 0.2]]), backend="hpc")
+
+    def test_hpc_backend_rejects_prediction_targets(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        sample_calibration_targets_dir,
+        prediction_targets_dir,
+        tmp_path,
+    ):
+        sim, _jm = self._make_sim(
+            priors_csv,
+            binary_path,
+            template_path,
+            cache_dir,
+            sample_calibration_targets_dir,
+            tmp_path,
+        )
+        with pytest.raises(NotImplementedError, match="prediction_targets"):
+            sim.simulate_with_parameters(
+                np.array([[0.1, 0.2]]),
+                backend="hpc",
+                prediction_targets=prediction_targets_dir,
+            )
+
+    def test_hpc_backend_fresh_submit_and_download(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        sample_calibration_targets_dir,
+        tmp_path,
+    ):
+        """Full HPC path: no pre-derived stats → submit_cpp_jobs + download →
+        reshape to (sample_index, status, param:*, ts:<id>) schema."""
+        from qsp_hpc.batch.hpc_job_manager import DownloadResult, JobInfo
+
+        sim, jm = self._make_sim(
+            priors_csv,
+            binary_path,
+            template_path,
+            cache_dir,
+            sample_calibration_targets_dir,
+            tmp_path,
+        )
+        jm.check_hpc_test_stats.return_value = False
+        jm.submit_cpp_jobs.return_value = JobInfo(
+            job_ids=["array", "derive"],
+            state_file="",
+            n_jobs=1,
+            n_simulations=3,
+            submission_time="now",
+        )
+        ts_values = np.array([[1.0], [2.0], [3.0]])  # one cal target: spA_t0
+        jm.download_test_stats_full.return_value = DownloadResult(
+            params=np.array([[0.5, 1.0], [1.5, 2.0], [3.0, 4.0]]),
+            test_stats=ts_values,
+            sample_index=np.arange(3, dtype=np.int64),
+            param_names=list(sim.param_names),
+        )
+
+        theta = np.array([[0.5, 1.0], [1.5, 2.0], [3.0, 4.0]])
+        theta_out, table = sim.simulate_with_parameters(theta, backend="hpc")
+
+        # Schema matches local path
+        assert theta_out.shape == theta.shape
+        np.testing.assert_allclose(theta_out, theta)
+        assert "sample_index" in table.column_names
+        assert "status" in table.column_names
+        assert "param:A" in table.column_names
+        assert "param:B" in table.column_names
+        assert "ts:spA_t0" in table.column_names
+        np.testing.assert_allclose(table.column("ts:spA_t0").to_numpy(), ts_values[:, 0])
+
+        # submit_cpp_jobs was called with derive_test_stats=True and the
+        # suffix-pool dir name as simulation_pool_id.
+        jm.submit_cpp_jobs.assert_called_once()
+        _, kw = jm.submit_cpp_jobs.call_args
+        assert kw["derive_test_stats"] is True
+        assert kw["num_simulations"] == 3
+        assert "_posterior_predictive_" in kw["simulation_pool_id"]
+
+    def test_hpc_backend_prederived_skips_submit(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        sample_calibration_targets_dir,
+        tmp_path,
+    ):
+        """If HPC already has derived test stats at the pool, skip
+        submit_cpp_jobs and go straight to download."""
+        from qsp_hpc.batch.hpc_job_manager import DownloadResult
+
+        sim, jm = self._make_sim(
+            priors_csv,
+            binary_path,
+            template_path,
+            cache_dir,
+            sample_calibration_targets_dir,
+            tmp_path,
+        )
+        jm.check_hpc_test_stats.return_value = True
+        jm.download_test_stats_full.return_value = DownloadResult(
+            params=np.array([[0.1, 0.2]]),
+            test_stats=np.array([[7.0]]),
+            sample_index=np.arange(1, dtype=np.int64),
+            param_names=list(sim.param_names),
+        )
+        theta = np.array([[0.1, 0.2]])
+        _, table = sim.simulate_with_parameters(theta, backend="hpc")
+
+        jm.submit_cpp_jobs.assert_not_called()
+        jm.download_test_stats_full.assert_called_once()
+        assert table.column("ts:spA_t0").to_numpy().tolist() == [7.0]
+
+    def test_hpc_backend_cache_hit_avoids_hpc(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        sample_calibration_targets_dir,
+        tmp_path,
+    ):
+        """Second call with the same theta should load from the local suffix
+        pool and not touch the job manager at all."""
+        from qsp_hpc.batch.hpc_job_manager import DownloadResult
+
+        sim, jm = self._make_sim(
+            priors_csv,
+            binary_path,
+            template_path,
+            cache_dir,
+            sample_calibration_targets_dir,
+            tmp_path,
+        )
+        jm.check_hpc_test_stats.return_value = True
+        jm.download_test_stats_full.return_value = DownloadResult(
+            params=np.array([[0.1, 0.2]]),
+            test_stats=np.array([[42.0]]),
+            sample_index=np.arange(1, dtype=np.int64),
+            param_names=list(sim.param_names),
+        )
+        theta = np.array([[0.1, 0.2]])
+        sim.simulate_with_parameters(theta, backend="hpc")
+        assert jm.download_test_stats_full.call_count == 1
+
+        # Second call: identical theta hashes to the same suffix-pool dir,
+        # local test_stats.parquet is read back, no HPC interaction.
+        jm.check_hpc_test_stats.reset_mock()
+        sim.simulate_with_parameters(theta, backend="hpc")
+        assert jm.download_test_stats_full.call_count == 1
+        jm.check_hpc_test_stats.assert_not_called()
+
+    def test_hpc_backend_reindexes_by_sample_index(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        sample_calibration_targets_dir,
+        tmp_path,
+    ):
+        """HPC may return rows in arbitrary order; the reshape must reindex
+        test stats back to caller's sample order so row j corresponds to
+        theta[j]."""
+        from qsp_hpc.batch.hpc_job_manager import DownloadResult
+
+        sim, jm = self._make_sim(
+            priors_csv,
+            binary_path,
+            template_path,
+            cache_dir,
+            sample_calibration_targets_dir,
+            tmp_path,
+        )
+        jm.check_hpc_test_stats.return_value = True
+        # HPC returns rows out of order: sample_index = [2, 0, 1]
+        jm.download_test_stats_full.return_value = DownloadResult(
+            params=np.array([[3.0, 4.0], [0.5, 1.0], [1.5, 2.0]]),
+            test_stats=np.array([[30.0], [10.0], [20.0]]),
+            sample_index=np.array([2, 0, 1], dtype=np.int64),
+            param_names=list(sim.param_names),
+        )
+        theta = np.array([[0.5, 1.0], [1.5, 2.0], [3.0, 4.0]])
+        _, table = sim.simulate_with_parameters(theta, backend="hpc")
+
+        # After reindexing, row j's ts aligns with theta[j]
+        assert table.column("ts:spA_t0").to_numpy().tolist() == [10.0, 20.0, 30.0]

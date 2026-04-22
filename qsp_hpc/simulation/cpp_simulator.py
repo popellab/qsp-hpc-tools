@@ -907,34 +907,36 @@ class CppSimulator:
         self,
         theta: np.ndarray,
         *,
+        backend: str = "local",
         prediction_targets: Optional[str | Path] = None,
         pool_suffix: str = "posterior_predictive",
     ) -> Tuple[np.ndarray, pa.Table]:
         """Run C++ simulations at explicit thetas and return derived test stats.
 
-        Mirrors :meth:`QSPSimulator.simulate_with_parameters` (local path):
-        the theta matrix is user-supplied (typically posterior draws), not
-        drawn from the prior theta pool. Each unique theta matrix maps to a
+        Mirrors :meth:`QSPSimulator.simulate_with_parameters`: the theta
+        matrix is user-supplied (typically posterior draws), not drawn
+        from the prior theta pool. Each unique theta matrix maps to a
         dedicated suffix pool dir keyed by SHA-256 of ``theta.tobytes()``
         plus the calibration / prediction target hashes — so identical
         inputs hit the cache without row-by-row matching, and edits to
         either target set invalidate the cache automatically.
 
-        Test stats are derived locally after the batch runs: the parquet
-        from :meth:`CppBatchRunner.run` is fed through
-        :func:`compute_test_statistics_batch` along with the merged
-        calibration + prediction DataFrame. Output columns are named
-        ``ts:<test_statistic_id>`` (not positional ``ts:0 ts:1…``) so
-        callers can identify the 12 new prediction columns by id rather
-        than by ordering.
-
         Args:
             theta: Parameter matrix ``(n_samples, n_params)``, columns
                 aligned with ``self.param_names``.
+            backend: ``"local"`` runs the C++ binary on this host via
+                :class:`CppBatchRunner`. ``"hpc"`` submits the theta as a
+                dedicated HPC pool (named after the suffix-pool) with
+                chained test-stat derivation on the cluster, then
+                downloads and reshapes the result to match the local
+                output format. HPC mode requires ``job_manager`` set at
+                construction and is incompatible with ``prediction_targets``
+                for now (the merged CSV isn't yet shipped to the cluster).
             prediction_targets: Optional directory of PredictionTarget
                 YAMLs (``prediction_target_id`` schema). When given, the
                 prediction rows are concatenated with calibration rows
                 before derivation and contribute extra ``ts:*`` columns.
+                Local backend only.
             pool_suffix: Label combined with the theta hash to build the
                 suffix-pool directory name. Only change this when you want
                 two logically distinct posterior-predictive runs to stay
@@ -950,6 +952,8 @@ class CppSimulator:
                 - ``param:<name>``         — one per sampled param
                 - ``ts:<target_id>``       — one per test-stat, NaN on fail
         """
+        if backend not in ("local", "hpc"):
+            raise ValueError(f"backend must be 'local' or 'hpc'; got {backend!r}")
         if self.test_stats_csv is None and self._calibration_targets_dir is None:
             raise RuntimeError(
                 "simulate_with_parameters() requires test_stats_csv or "
@@ -963,6 +967,16 @@ class CppSimulator:
                 f"theta has {theta.shape[1]} columns but priors CSV has "
                 f"{len(self.param_names)} parameters"
             )
+        if backend == "hpc" and prediction_targets is not None:
+            raise NotImplementedError(
+                "simulate_with_parameters(backend='hpc', prediction_targets=...) "
+                "is not yet supported; the merged calibration+prediction CSV is "
+                "not shipped to the cluster. Run locally or split the call."
+            )
+        if backend == "hpc" and self.job_manager is None:
+            raise RuntimeError(
+                "simulate_with_parameters(backend='hpc') requires job_manager " "at construction."
+            )
 
         theta = np.ascontiguousarray(theta, dtype=np.float64)
         n_samples = theta.shape[0]
@@ -971,15 +985,17 @@ class CppSimulator:
             Path(prediction_targets).resolve() if prediction_targets is not None else None
         )
 
-        # Cache key: theta + calibration targets + prediction targets.
-        # Without the target hashes, editing a YAML silently hits a stale
+        # Cache key: theta + calibration targets + prediction targets + backend
+        # tag. Without the target hashes, editing a YAML silently hits a stale
         # pool and the caller sees endpoint columns derived from the old
-        # observable code.
+        # observable code. The backend tag keeps local and HPC caches for the
+        # same theta distinct — they should agree, but leaving them isolated
+        # lets a local smoke reproduce against an HPC reference run.
         theta_hash = hashlib.sha256(theta.tobytes()).hexdigest()
         cal_hash = self._calibration_targets_hash()
         pred_hash = self._prediction_targets_hash(pred_dir)
         key_hash = hashlib.sha256(
-            (theta_hash + "|" + cal_hash + "|" + pred_hash).encode()
+            (theta_hash + "|" + cal_hash + "|" + pred_hash + f"|backend={backend}").encode()
         ).hexdigest()[:HASH_PREFIX_LENGTH]
 
         suffix_pool_dir = self.pool_dir.parent / f"{self.pool_dir.name}_{pool_suffix}_{key_hash}"
@@ -987,7 +1003,7 @@ class CppSimulator:
         cache_path = suffix_pool_dir / "test_stats.parquet"
 
         self.logger.info(
-            f"simulate_with_parameters: n={n_samples}, "
+            f"simulate_with_parameters: n={n_samples}, backend={backend}, "
             f"theta_hash={theta_hash[:8]}, "
             f"cal_hash={cal_hash[:8]}, pred_hash={pred_hash[:8]}"
         )
@@ -1009,10 +1025,55 @@ class CppSimulator:
         # only runs when the caller didn't pre-flatten via test_stats_csv.
         test_stats_df = self._load_test_stats_df(pred_dir)
 
-        # Run the sweep at the user's thetas. Sample indices are local
-        # (arange) — the suffix pool is isolated by theta_hash so there's
-        # no cross-scenario alignment to worry about.
+        # Sample indices are local (arange) — the suffix pool is isolated by
+        # theta_hash so there's no cross-scenario alignment to worry about.
         sample_indices = np.arange(n_samples, dtype=np.int64)
+
+        if backend == "local":
+            table = self._simulate_with_parameters_local(
+                theta=theta,
+                sample_indices=sample_indices,
+                test_stats_df=test_stats_df,
+                suffix_pool_dir=suffix_pool_dir,
+                pool_suffix=pool_suffix,
+            )
+        else:
+            table = self._simulate_with_parameters_hpc(
+                theta=theta,
+                sample_indices=sample_indices,
+                test_stats_df=test_stats_df,
+                suffix_pool_dir=suffix_pool_dir,
+                pool_suffix=pool_suffix,
+            )
+
+        pq.write_table(table, str(cache_path))
+        self.logger.info(
+            f"simulate_with_parameters complete: {table.num_rows} rows × "
+            f"{len(test_stats_df)} test stats → {cache_path.name}"
+        )
+        theta_out = self._theta_from_table(table)
+        return theta_out, table
+
+    # ------------------------------------------------------------------
+    # Backend-specific execution helpers
+    # ------------------------------------------------------------------
+
+    def _simulate_with_parameters_local(
+        self,
+        *,
+        theta: np.ndarray,
+        sample_indices: np.ndarray,
+        test_stats_df: pd.DataFrame,
+        suffix_pool_dir: Path,
+        pool_suffix: str,
+    ) -> pa.Table:
+        """Local backend for :meth:`simulate_with_parameters`.
+
+        Runs the C++ binary via :class:`CppBatchRunner` and derives test
+        stats in-process. All file I/O lands under ``suffix_pool_dir``;
+        the caller handles the final cache write.
+        """
+        n_samples = theta.shape[0]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         species_parquet = (
             suffix_pool_dir / f"species_{ts}_{pool_suffix}_{n_samples}sims_seed{self.seed}.parquet"
@@ -1037,14 +1098,168 @@ class CppSimulator:
         )
 
         species_df = pd.read_parquet(species_parquet)
-        table = self._derive_test_stats_table(species_df, test_stats_df, theta, sample_indices)
-        pq.write_table(table, str(cache_path))
-        self.logger.info(
-            f"simulate_with_parameters complete: {table.num_rows} rows × "
-            f"{len(test_stats_df)} test stats → {cache_path.name}"
-        )
-        theta_out = self._theta_from_table(table)
-        return theta_out, table
+        return self._derive_test_stats_table(species_df, test_stats_df, theta, sample_indices)
+
+    def _simulate_with_parameters_hpc(
+        self,
+        *,
+        theta: np.ndarray,
+        sample_indices: np.ndarray,
+        test_stats_df: pd.DataFrame,
+        suffix_pool_dir: Path,
+        pool_suffix: str,
+    ) -> pa.Table:
+        """HPC backend for :meth:`simulate_with_parameters`.
+
+        Submits the user theta as its own HPC pool — named after the
+        local suffix-pool dir so both sides share a path convention — with
+        chained test-stat derivation (``derive_test_stats=True``), waits,
+        and downloads. The returned table is reshaped to exactly match
+        :meth:`_derive_test_stats_table`'s schema so callers cannot tell
+        local from HPC results apart.
+        """
+        if self.job_manager is None:
+            raise RuntimeError("HPC backend requires job_manager")
+        if self.test_stats_csv is None:
+            raise RuntimeError(
+                "HPC backend requires test_stats_csv (the flat CSV that "
+                "``submit_cpp_jobs`` ships to the cluster)."
+            )
+
+        # Pre-flight: same guard run_hpc does, so priors/template mismatches
+        # surface before any SSH.
+        self.validate()
+
+        remote_binary_path = self.remote_binary_path or self.job_manager.config.cpp_binary_path
+        remote_template_xml = self.remote_template_xml or self.job_manager.config.cpp_template_path
+        if not remote_binary_path:
+            raise RuntimeError(
+                "HPC binary path unset — pass remote_binary_path to CppSimulator "
+                "or set cpp.binary_path in credentials.yaml"
+            )
+        if not remote_template_xml:
+            raise RuntimeError(
+                "HPC template path unset — pass remote_template_xml to CppSimulator "
+                "or set cpp.template_path in credentials.yaml"
+            )
+        if self.model_structure_file is None:
+            raise RuntimeError(
+                "HPC backend requires model_structure_file — without it the "
+                "derivation worker treats every species as dimensionless."
+            )
+
+        n_samples = theta.shape[0]
+        test_stats_hash = self._compute_test_stats_hash()
+
+        # The HPC pool id is the suffix-pool dir name — so local and HPC
+        # layouts share the name, and concurrent callers with distinct
+        # theta hashes never collide on a shared remote path.
+        hpc_pool_id = suffix_pool_dir.name
+        hpc_pool_path = f"{self.job_manager.config.simulation_pool_path}/{hpc_pool_id}"
+
+        self.logger.info(f"HPC simulate_with_parameters: pool={hpc_pool_id}")
+        self.logger.info(f"  test_stats_hash={test_stats_hash[:8]}")
+
+        # Fast path: HPC already has derived test stats for this exact
+        # theta+targets combo (e.g. a previous round). download_test_stats_full
+        # also populates the local cache under the main pool dir but we
+        # don't rely on that — the caller caches via suffix-pool-dir/test_stats.parquet.
+        if self.job_manager.check_hpc_test_stats(
+            hpc_pool_path, test_stats_hash, expected_n_sims=n_samples
+        ):
+            self.logger.info("✓ HPC test stats already present — downloading")
+        else:
+            # Write the user theta as a params CSV and submit. sample_index
+            # rides in the first column so the downloaded parquet can
+            # round-trip back to caller order.
+            df = pd.DataFrame(theta, columns=self.param_names)
+            df.insert(0, "sample_index", sample_indices.astype(np.int64))
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".csv", delete=False, prefix="cpp_hpc_params_"
+            )
+            df.to_csv(tmp.name, index=False)
+            tmp.close()
+            params_csv = Path(tmp.name)
+
+            try:
+                info = self.job_manager.submit_cpp_jobs(
+                    samples_csv=str(params_csv),
+                    num_simulations=n_samples,
+                    simulation_pool_id=hpc_pool_id,
+                    t_end_days=self.t_end_days,
+                    dt_days=self.dt_days,
+                    scenario=self.scenario,
+                    seed=self.seed,
+                    binary_path=remote_binary_path,
+                    template_path=remote_template_xml,
+                    subtree=self.subtree,
+                    scenario_yaml=(str(self.scenario_yaml) if self.scenario_yaml else None),
+                    drug_metadata_yaml=(
+                        str(self.drug_metadata_yaml) if self.drug_metadata_yaml else None
+                    ),
+                    healthy_state_yaml=(
+                        str(self.healthy_state_yaml) if self.healthy_state_yaml else None
+                    ),
+                    derive_test_stats=True,
+                    test_stats_csv=str(self.test_stats_csv),
+                    test_stats_hash=test_stats_hash,
+                    model_structure_file=(
+                        str(self.model_structure_file) if self.model_structure_file else None
+                    ),
+                    evolve_cache=self.evolve_cache_root is not None,
+                )
+            finally:
+                params_csv.unlink(missing_ok=True)
+
+            self.logger.info(f"Submitted jobs: {info.job_ids}")
+            self._wait_for_jobs(info.job_ids)
+
+        # Download + reshape. download_test_stats_full returns positional
+        # ts:0..ts:K columns; remap to ts:<test_statistic_id> so the output
+        # schema matches _derive_test_stats_table exactly.
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.job_manager.download_test_stats_full(
+                hpc_pool_path, test_stats_hash, Path(tmp)
+            )
+        if result.params is None:
+            raise RuntimeError(
+                "HPC submission returned no params CSV — derivation likely failed. "
+                f"Check the job output on cluster (pool={hpc_pool_id})."
+            )
+        hpc_test_stats = result.test_stats
+        hpc_sample_index = result.sample_index
+        if hpc_test_stats.shape[1] != len(test_stats_df):
+            raise RuntimeError(
+                f"HPC returned {hpc_test_stats.shape[1]} test stats but "
+                f"test_stats_df expects {len(test_stats_df)}. Pool at {hpc_pool_id} "
+                "may have been derived with a different cal-target CSV."
+            )
+        # Reindex rows so the returned table matches caller's sample order.
+        # submit_cpp_jobs preserves sample_index in the downloaded parquet;
+        # if it's missing (legacy pool) we assume rows arrive in submission order.
+        if hpc_sample_index is not None and len(hpc_sample_index) == n_samples:
+            order = (
+                pd.Series(np.arange(len(hpc_sample_index)), index=hpc_sample_index)
+                .reindex(sample_indices)
+                .to_numpy()
+                .astype(np.int64)
+            )
+            if np.any(np.isnan(order.astype(np.float64))):
+                raise RuntimeError(
+                    "HPC sample_index missing rows expected by caller — " "derivation incomplete?"
+                )
+            hpc_test_stats = hpc_test_stats[order]
+
+        status_np = np.zeros(n_samples, dtype=np.int64)
+        cols: dict[str, pa.Array] = {
+            "sample_index": pa.array(sample_indices.astype(np.int64), type=pa.int64()),
+            "status": pa.array(status_np, type=pa.int64()),
+        }
+        for j, name in enumerate(self.param_names):
+            cols[f"param:{name}"] = pa.array(theta[:, j].astype(np.float64))
+        for j, tsid in enumerate(test_stats_df["test_statistic_id"].tolist()):
+            cols[f"ts:{tsid}"] = pa.array(hpc_test_stats[:, j].astype(np.float64))
+        return pa.table(cols)
 
     # ------------------------------------------------------------------
     # Helpers for simulate_with_parameters

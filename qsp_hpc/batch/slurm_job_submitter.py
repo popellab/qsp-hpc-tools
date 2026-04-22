@@ -339,6 +339,38 @@ echo "Job completed at $(date)"
             submit_cmd = f'cd "{self.config.remote_project_path}" && sbatch "{remote_script}"'
             returncode, output = self.transport.exec(submit_cmd, timeout=30)
 
+            # Race recovery: if sbatch rejects the dependency because the
+            # parent already left the queue (typical when small C++ arrays
+            # finish in ~20s, before the laptop submits derivation), and
+            # the parent is in fact COMPLETED, resubmit without the
+            # dependency. SLURM purges in-memory job records once they
+            # leave the queue and refuses afterok: dependencies on them
+            # with "Job dependency problem", even though the parent
+            # succeeded — silently dropping the chain would leave the C++
+            # pool un-derived.
+            if (
+                returncode != 0
+                and dependency
+                and "Job dependency problem" in output
+                and self._dependency_already_completed(dependency)
+            ):
+                self.logger.warning(
+                    "Derivation dependency %s already completed before submit — "
+                    "retrying without dependency.",
+                    dependency,
+                )
+                fallback_script = self._generate_derivation_slurm_script(
+                    pool_path, test_stats_config, derivation_dir, dependency=None
+                )
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f2:
+                    f2.write(fallback_script)
+                    fallback_path = f2.name
+                try:
+                    self.transport.upload(fallback_path, remote_script)
+                    returncode, output = self.transport.exec(submit_cmd, timeout=30)
+                finally:
+                    Path(fallback_path).unlink()
+
             if returncode != 0:
                 raise SubmissionError(f"Derivation job submission failed: {output}")
 
@@ -351,6 +383,45 @@ echo "Job completed at $(date)"
 
         finally:
             Path(temp_script).unlink()
+
+    def _dependency_already_completed(self, dependency: str) -> bool:
+        """Return True iff the parent job(s) in ``dependency`` (e.g.
+        ``afterok:12345`` or ``afterok:12345:67890``) are all already in
+        a COMPLETED state per ``sacct``.
+
+        Used by :meth:`submit_derivation_job` to detect the race where the
+        upstream array finished before the laptop submitted the chained
+        derivation. Only ``afterok:`` is recognized — ``afterany:`` /
+        ``afternotok:`` aren't used by qsp_hpc submitters today and would
+        warrant their own state checks.
+        """
+        if ":" not in dependency:
+            return False
+        kind, _, joblist = dependency.partition(":")
+        if kind != "afterok" or not joblist:
+            return False
+        job_ids = [j for j in joblist.split(":") if j]
+        if not job_ids:
+            return False
+        cmd = (
+            "sacct --noheader --parsable2 -X " f"-j {','.join(job_ids)} -o JobID,State 2>&1 || true"
+        )
+        rc, out = self.transport.exec(cmd, timeout=20)
+        if rc != 0 or not out.strip():
+            return False
+        states_seen: set[str] = set()
+        for line in out.splitlines():
+            if "|" not in line:
+                continue
+            _, state = line.split("|", 1)
+            # State field can be "COMPLETED" or e.g. "CANCELLED by 12345" — keep the verb.
+            states_seen.add(state.strip().split()[0])
+        if not states_seen:
+            return False
+        # Any state other than COMPLETED means the dependency would be
+        # legitimately rejected (FAILED / CANCELLED / TIMEOUT) — let the
+        # caller see the original error rather than retry.
+        return states_seen == {"COMPLETED"}
 
     def _generate_derivation_slurm_script(
         self,

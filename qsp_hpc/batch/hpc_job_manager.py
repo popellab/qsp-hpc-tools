@@ -110,7 +110,7 @@ class BatchConfig:
     cpp_runtime_modules: str = (
         ""  # Space-separated `module load` args run before qsp_sim (runtime deps)
     )
-    cpp_repo_path: str = ""  # SPQSP_PDAC checkout on HPC; if empty, derived from cpp_binary_path
+    cpp_repo_path: str = ""  # SPQSP_PDAC checkout on HPC; required for ensure_cpp_binary
     cpp_branch: str = "cpp-sweep-binary-io"  # Branch to track when auto-rebuilding
     cpp_build_modules: str = (
         ""  # Modules for build-time (cmake, git). Falls back to runtime_modules.
@@ -689,8 +689,7 @@ class HPCJobManager:
                 when running submits with known-fresh source.
             skip_build: Skip the cmake/make step. Only checks that the binary
                 exists. Use when you know the binary is already current.
-            repo_path: Override ``cpp.repo_path`` (or the derived value from
-                ``cpp.binary_path``).
+            repo_path: Override ``cpp.repo_path`` for this call.
             branch: Override ``cpp.branch``.
             binary_path: Override ``cpp.binary_path``. Used by callers that
                 pass a per-submit override (e.g. :meth:`submit_cpp_jobs`'s
@@ -705,20 +704,13 @@ class HPCJobManager:
         if not binary_path:
             raise ValueError("cpp.binary_path must be set in credentials.yaml")
 
-        # Derive repo_path from the binary path if not explicitly configured.
-        # Convention: {repo}/PDAC/qsp/sim/build/qsp_sim — 5 intermediate parts
-        # (build, sim, qsp, PDAC, {repo}) so parents[4] is {repo}.
         if repo_path is None:
             repo_path = self.config.cpp_repo_path
             if not repo_path:
-                parents = Path(binary_path).parents
-                if len(parents) < 5:
-                    raise ValueError(
-                        f"Cannot derive cpp.repo_path from binary_path={binary_path!r}. "
-                        "Expected layout: {repo}/PDAC/qsp/sim/build/qsp_sim. "
-                        "Set cpp.repo_path explicitly in credentials.yaml."
-                    )
-                repo_path = str(parents[4])
+                raise ValueError(
+                    "cpp.repo_path must be set in credentials.yaml "
+                    "(path to the SPQSP_PDAC checkout on the HPC node)."
+                )
         branch = branch or self.config.cpp_branch
 
         build_modules = self.config.cpp_build_modules or self.config.cpp_runtime_modules

@@ -696,12 +696,12 @@ class TestEnsureCppBinary:
         with pytest.raises(RuntimeError, match="not found or not executable"):
             manager.ensure_cpp_binary(skip_git_pull=True, skip_build=True)
 
-    def test_short_binary_path_needs_explicit_repo_path(self):
+    def test_missing_repo_path_raises(self):
         manager, transport = self._make_manager(
             cpp_binary_path="/usr/bin/qsp_sim", cpp_repo_path=""
         )
 
-        with pytest.raises(ValueError, match="Cannot derive cpp.repo_path"):
+        with pytest.raises(ValueError, match="cpp.repo_path must be set"):
             manager.ensure_cpp_binary()
 
     def test_branch_override_reaches_git_commands(self):

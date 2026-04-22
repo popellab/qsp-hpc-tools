@@ -164,6 +164,70 @@ class TestDerivationJobSubmission:
                 derivation_dir="/scratch/derivation",
             )
 
+    def test_submit_derivation_job_retries_when_dependency_already_completed(
+        self, submitter, mock_transport
+    ):
+        """If sbatch rejects ``afterok:`` because the parent already left the
+        queue and ``sacct`` confirms the parent COMPLETED, derivation should
+        resubmit without the dependency. Reproduces the small-N race where
+        a 15-task C++ array finished in ~18s before the laptop submitted
+        derivation."""
+        # Sequence of exec returns:
+        #   1st: initial sbatch  → fails with "Job dependency problem"
+        #   2nd: sacct probe     → says COMPLETED for the parent
+        #   3rd: retried sbatch  → succeeds
+        mock_transport.exec.side_effect = [
+            (1, "sbatch: error: Batch job submission failed: Job dependency problem\n"),
+            (0, "22382779|COMPLETED\n"),
+            (0, "Submitted batch job 22389999\n"),
+        ]
+
+        job_id = submitter.submit_derivation_job(
+            pool_path="/scratch/pool",
+            test_stats_config="/scratch/test_stats.csv",
+            derivation_dir="/scratch/derivation",
+            dependency="afterok:22382779",
+        )
+        assert job_id == "22389999"
+        # Retried sbatch is the 3rd call
+        assert mock_transport.exec.call_count == 3
+        retry_cmd = mock_transport.exec.call_args_list[2][0][0]
+        assert "sbatch" in retry_cmd
+
+    def test_submit_derivation_job_does_not_retry_when_parent_failed(
+        self, submitter, mock_transport
+    ):
+        """If the parent is in any state other than COMPLETED, we surface
+        the original SubmissionError instead of silently retrying."""
+        mock_transport.exec.side_effect = [
+            (1, "sbatch: error: Batch job submission failed: Job dependency problem\n"),
+            (0, "22382779|FAILED\n"),
+        ]
+        with pytest.raises(SubmissionError, match="Derivation job submission failed"):
+            submitter.submit_derivation_job(
+                pool_path="/scratch/pool",
+                test_stats_config="/scratch/test_stats.csv",
+                derivation_dir="/scratch/derivation",
+                dependency="afterok:22382779",
+            )
+        # Initial sbatch + sacct probe; no retry
+        assert mock_transport.exec.call_count == 2
+
+    def test_submit_derivation_job_does_not_retry_other_errors(self, submitter, mock_transport):
+        """Race recovery is scoped to the 'Job dependency problem' message;
+        unrelated sbatch failures (Invalid partition, etc) propagate."""
+        mock_transport.exec.side_effect = [
+            (1, "sbatch: error: Invalid partition\n"),
+        ]
+        with pytest.raises(SubmissionError, match="Invalid partition"):
+            submitter.submit_derivation_job(
+                pool_path="/scratch/pool",
+                test_stats_config="/scratch/test_stats.csv",
+                derivation_dir="/scratch/derivation",
+                dependency="afterok:22382779",
+            )
+        assert mock_transport.exec.call_count == 1
+
     def test_submit_derivation_job_generates_single_task_script(self, submitter, mock_transport):
         """Test that derivation submits single task, not array job.
 

@@ -13,8 +13,13 @@ to a full :class:`QSPSimulator` invocation.
 The hashing identity (pool id + test_stats hash) is computed the same way
 as :class:`QSPSimulator` so the two stay in lockstep:
 
-    pool_id         = f"{model_version}_{sha256(priors+script+version)[:8]}_{scenario}"
+    pool_id         = f"{model_version}_{compute_pool_id_hash(...)[:8]}_{scenario}"
     test_stats_hash = sha256(test_stats_csv content)
+
+``model_version`` is the human-readable directory prefix only — it no
+longer participates in the hash (#56). The hash is derived from the
+priors / submodel priors / model script / seed and, for C++ pools,
+the ``qsp_sim`` binary content.
 
 and the expected on-disk layout is::
 
@@ -62,6 +67,7 @@ class QSPResultLoader:
         calibration_targets: Optional[Union[str, Path]] = None,
         submodel_priors_yaml: Optional[Union[str, Path]] = None,
         seed: Optional[int] = None,
+        binary_path: Optional[Union[str, Path]] = None,
     ) -> None:
         if test_stats_csv is not None and calibration_targets is not None:
             raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
@@ -77,6 +83,7 @@ class QSPResultLoader:
             Path(submodel_priors_yaml) if submodel_priors_yaml is not None else None
         )
         self.seed = seed
+        self.binary_path = Path(binary_path) if binary_path is not None else None
 
         self._temp_csv: Optional[Path] = None
         self._test_stats_df: Optional[pd.DataFrame] = None
@@ -107,9 +114,9 @@ class QSPResultLoader:
         return compute_pool_id_hash(
             priors_csv=self.priors_csv,
             model_script=self.model_script,
-            model_version=self.model_version,
             submodel_priors_yaml=self.submodel_priors_yaml,
             seed=self.seed,
+            binary_path=self.binary_path,
         )
 
     def test_stats_hash(self) -> str:

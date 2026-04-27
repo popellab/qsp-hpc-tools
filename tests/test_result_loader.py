@@ -43,7 +43,6 @@ def _write_pool_layout(
     priors_h = hashlib.sha256()
     priors_h.update(priors_csv_text.encode("utf-8"))
     priors_h.update(model_script.encode("utf-8"))
-    priors_h.update(model_version.encode("utf-8"))
     priors_digest = priors_h.hexdigest()
     stats_digest = hashlib.sha256(test_stats_csv_text.encode("utf-8")).hexdigest()
 

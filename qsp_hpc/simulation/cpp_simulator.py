@@ -241,25 +241,26 @@ class CppSimulator:
     def _compute_config_hash(self) -> str:
         """Hash inputs that affect simulation outputs.
 
-        Extends the standard pool-id hash with the binary's SHA-256 and
-        the template XML content so rebuilding the C++ core or editing
-        the template invalidates the cache. When a restriction classifier
-        is configured, its bytes + threshold are folded in so restricted
-        and unrestricted pools (sharing all other config) get distinct
-        on-disk pool dirs.
+        Extends the standard pool-id hash with the template XML content
+        so editing the template invalidates the cache. The C++ binary's
+        SHA-256 is folded in by :func:`compute_pool_id_hash` directly
+        (#56) so the same hash agrees across CppSimulator,
+        :class:`SimulationPool`, and :class:`QSPResultLoader`. When a
+        restriction classifier is configured, its bytes + threshold are
+        folded in so restricted and unrestricted pools (sharing all
+        other config) get distinct on-disk pool dirs.
         """
         from qsp_hpc.utils.hash_utils import compute_pool_id_hash
 
         base_hash = compute_pool_id_hash(
             priors_csv=self.priors_csv,
             model_script="",
-            model_version=self.model_version,
             submodel_priors_yaml=self.submodel_priors_yaml,
             seed=self.seed,
+            binary_path=self.binary_path,
         )
 
         h = hashlib.sha256(base_hash.encode())
-        h.update(hashlib.sha256(self.binary_path.read_bytes()).hexdigest().encode())
         h.update(self.template_xml.read_text().encode())
         # Scenario/drug-meta/healthy-state YAMLs change sim outputs but live
         # outside the priors-CSV + XML template hashed above, so fold them

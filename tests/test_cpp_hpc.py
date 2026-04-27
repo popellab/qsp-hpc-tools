@@ -715,6 +715,41 @@ class TestEnsureCppBinary:
         assert "my-feature-branch" in pull_cmd
         assert "main" not in pull_cmd
 
+    def test_default_sim_subdir_is_legacy_spqsp_layout(self):
+        """Default ``cpp_sim_subdir`` preserves SPQSP_PDAC's PDAC/qsp/sim layout."""
+        manager, transport = self._make_manager()
+        transport.exec.side_effect = self._exec_side_effect()
+
+        manager.ensure_cpp_binary()
+
+        build_cmd = next(
+            c
+            for c in (call.args[0] for call in transport.exec.call_args_list)
+            if "cmake --build" in c
+        )
+        assert "/home/testuser/SPQSP_PDAC/PDAC/qsp/sim" in build_cmd
+
+    def test_sim_subdir_override_for_pdac_build_in_repo_cpp(self):
+        """``cpp_sim_subdir`` override directs the build at pdac-build's
+        in-repo cpp/sim layout instead of legacy SPQSP_PDAC.
+        """
+        manager, transport = self._make_manager(
+            cpp_repo_path="/home/testuser/pdac-build",
+            cpp_binary_path="/home/testuser/pdac-build/cpp/sim/build/qsp_sim",
+            cpp_sim_subdir="cpp/sim",
+        )
+        transport.exec.side_effect = self._exec_side_effect()
+
+        manager.ensure_cpp_binary()
+
+        build_cmd = next(
+            c
+            for c in (call.args[0] for call in transport.exec.call_args_list)
+            if "cmake --build" in c
+        )
+        assert "/home/testuser/pdac-build/cpp/sim" in build_cmd
+        assert "PDAC/qsp/sim" not in build_cmd
+
 
 # ---------------------------------------------------------------------------
 # M9: chained on-cluster derivation for the C++ path

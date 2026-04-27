@@ -916,7 +916,9 @@ class TestCppSimulatorCalibrationTargets:
         )
         assert sim.test_stats_csv is not None
         assert sim.test_stats_csv.exists()
-        assert sim._calibration_targets_dir == sample_calibration_targets_dir.resolve()
+        # _calibration_targets_dir is normalized to List[Path] so the
+        # multi-dir form (literature + mechanistic) is supported uniformly.
+        assert sim._calibration_targets_dir == [sample_calibration_targets_dir.resolve()]
 
     def test_temp_csv_has_expected_columns(
         self,

@@ -76,7 +76,7 @@ class CppSimulator:
         healthy_state_yaml: Optional[str | Path] = None,
         job_manager: Optional["HPCJobManager"] = None,
         test_stats_csv: Optional[str | Path] = None,
-        calibration_targets: Optional[str | Path] = None,
+        calibration_targets: Optional[str | Path | list] = None,
         model_structure_file: Optional[str | Path] = None,
         poll_interval: float = 30.0,
         max_wait_time: Optional[float] = None,
@@ -123,14 +123,17 @@ class CppSimulator:
         # form is the internal/legacy path. Mirrors QSPSimulator.__init__.
         if calibration_targets is not None and test_stats_csv is not None:
             raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
-        self._calibration_targets_dir: Optional[Path] = None
+        self._calibration_targets_dir: Optional[List[Path]] = None
         self._temp_test_stats_csv: Optional[Path] = None
         if calibration_targets is not None:
             from qsp_hpc.calibration import load_calibration_targets
+            from qsp_hpc.calibration.yaml_loader import _resolve_yaml_dirs
 
-            cal_dir = Path(calibration_targets).resolve()
-            self._calibration_targets_dir = cal_dir
-            df = load_calibration_targets(cal_dir)
+            # Normalize to List[Path] so single-dir and multi-dir
+            # (literature + mechanistic) cases use the same downstream code.
+            cal_dirs = [d.resolve() for d in _resolve_yaml_dirs(calibration_targets)]
+            self._calibration_targets_dir = cal_dirs
+            df = load_calibration_targets(cal_dirs)
             tmp = tempfile.NamedTemporaryFile(
                 mode="w", suffix=".csv", delete=False, prefix="cpp_cal_targets_"
             )

@@ -54,15 +54,67 @@ _CALIBRATION_COLUMNS = [
 _PREDICTION_COLUMNS = [*_CALIBRATION_COLUMNS, "is_prediction_only"]
 
 
-def load_calibration_targets(yaml_dir: Path) -> pd.DataFrame:
+def _resolve_yaml_dirs(yaml_dir: Path | str | List) -> List[Path]:
+    """Normalize the ``yaml_dir`` argument into a list of existing directories.
+
+    Accepts a single Path/str or a list of Path/str entries. Each entry must
+    exist; raises ``FileNotFoundError`` on the first that doesn't, naming the
+    bad path so callers can fix the misconfiguration.
     """
-    Load calibration target YAMLs from a directory into a test-statistics DataFrame.
+    if isinstance(yaml_dir, (str, Path)):
+        dirs = [Path(yaml_dir)]
+    else:
+        dirs = [Path(d) for d in yaml_dir]
+        if not dirs:
+            raise ValueError("yaml_dir must be a Path or a non-empty list of Paths")
+
+    for d in dirs:
+        if not d.exists():
+            raise FileNotFoundError(f"Calibration targets directory not found: {d}")
+    return dirs
+
+
+def _gather_yaml_files(dirs: List[Path]) -> List[Path]:
+    """Return ``*.yaml`` files across all dirs, sorted by basename for
+    deterministic ordering across union sets that mix scenario + mechanistic
+    directories.
+
+    Detects basename collisions across directories — two same-named YAMLs
+    produce ambiguous test_statistic_ids downstream — and raises before
+    silently overriding either.
+    """
+    seen: dict[str, Path] = {}
+    for d in dirs:
+        for f in sorted(d.glob("*.yaml")):
+            if f.name in seen:
+                raise ValueError(
+                    f"Duplicate YAML basename '{f.name}' across calibration "
+                    f"target directories: {seen[f.name]} and {f}. "
+                    "Rename one to disambiguate."
+                )
+            seen[f.name] = f
+    return [seen[name] for name in sorted(seen)]
+
+
+def load_calibration_targets(yaml_dir: Path | str | List) -> pd.DataFrame:
+    """
+    Load calibration target YAMLs from one or more directories into a
+    test-statistics DataFrame.
 
     Reads all ``*.yaml`` files, extracts fields, generates 3-arg wrapper code,
     and returns a DataFrame compatible with ``build_test_stat_registry()``.
 
     Args:
-        yaml_dir: Directory containing calibration target YAML files.
+        yaml_dir: Directory (Path or str) containing calibration target YAML
+            files, OR a list of such directories. When a list is passed, the
+            union of YAML files is loaded; basename collisions across dirs
+            raise ``ValueError`` to prevent ambiguous test_statistic_ids.
+
+            The list form is intended for splitting literature targets and
+            mechanistic-prior targets into parallel directory trees per
+            scenario — e.g.
+            ``["calibration_targets/clinical_progression",
+               "calibration_targets/mechanistic/clinical_progression"]``.
 
     Returns:
         DataFrame with columns:
@@ -75,16 +127,15 @@ def load_calibration_targets(yaml_dir: Path) -> pd.DataFrame:
         matters — and is back-filled by callers (CppSimulator) at concat.
 
     Raises:
-        ValueError: If directory contains no YAML files.
-        FileNotFoundError: If yaml_dir does not exist.
+        ValueError: If no YAML files are found across the provided directories,
+            or if two directories contain a YAML with the same basename.
+        FileNotFoundError: If any provided directory does not exist.
     """
-    yaml_dir = Path(yaml_dir)
-    if not yaml_dir.exists():
-        raise FileNotFoundError(f"Calibration targets directory not found: {yaml_dir}")
-
-    yaml_files = sorted(yaml_dir.glob("*.yaml"))
+    dirs = _resolve_yaml_dirs(yaml_dir)
+    yaml_files = _gather_yaml_files(dirs)
     if not yaml_files:
-        raise ValueError(f"No YAML files found in {yaml_dir}")
+        joined = ", ".join(str(d) for d in dirs)
+        raise ValueError(f"No YAML files found in {joined}")
 
     rows: List[dict] = []
     for yaml_file in yaml_files:
@@ -141,29 +192,30 @@ def load_calibration_targets(yaml_dir: Path) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=_CALIBRATION_COLUMNS)
 
 
-def hash_calibration_targets(yaml_dir: Path) -> str:
+def hash_calibration_targets(yaml_dir: Path | str | List) -> str:
     """
     Compute a deterministic SHA256 hash of calibration target YAML files.
 
     Hash is based on sorted filenames and their contents, ensuring consistent
-    cache invalidation when targets change.
+    cache invalidation when targets change. When ``yaml_dir`` is a list,
+    files are unioned across all dirs and sorted by basename — same as
+    :func:`load_calibration_targets`, so the hash matches the loaded set.
 
     Args:
-        yaml_dir: Directory containing calibration target YAML files.
+        yaml_dir: Directory or list of directories containing calibration
+            target YAML files (see :func:`load_calibration_targets`).
 
     Returns:
         SHA256 hex digest string.
 
     Raises:
-        FileNotFoundError: If yaml_dir does not exist.
+        FileNotFoundError: If any provided directory does not exist.
+        ValueError: If two directories contain a YAML with the same basename.
     """
-    yaml_dir = Path(yaml_dir)
-    if not yaml_dir.exists():
-        raise FileNotFoundError(f"Calibration targets directory not found: {yaml_dir}")
+    dirs = _resolve_yaml_dirs(yaml_dir)
+    yaml_files = _gather_yaml_files(dirs)
 
     hasher = hashlib.sha256()
-    yaml_files = sorted(yaml_dir.glob("*.yaml"))
-
     for yaml_file in yaml_files:
         # Include filename in hash for ordering sensitivity
         hasher.update(yaml_file.name.encode("utf-8"))

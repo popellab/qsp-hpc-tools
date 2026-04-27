@@ -3226,7 +3226,9 @@ class TestCalibrationTargetsIntegration:
 
         assert sim.test_stats_csv is not None
         assert sim.test_stats_csv.exists()
-        assert sim._calibration_targets_dir == sample_calibration_targets_dir
+        # _calibration_targets_dir is normalized to List[Path] so the
+        # multi-dir form (literature + mechanistic) is supported uniformly.
+        assert sim._calibration_targets_dir == [sample_calibration_targets_dir]
 
     def test_both_csv_and_yaml_raises(
         self, sample_calibration_targets_dir, sample_test_stats_csv, sample_priors_csv, temp_dir

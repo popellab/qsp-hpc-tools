@@ -116,7 +116,7 @@ class QSPSimulator:
         self,
         priors_csv: Union[str, Path],
         test_stats_csv: Optional[Union[str, Path]] = None,
-        calibration_targets: Optional[Union[str, Path]] = None,
+        calibration_targets: Optional[Union[str, Path, list]] = None,
         model_structure_file: Optional[Union[str, Path]] = None,
         submodel_priors_yaml: Optional[Union[str, Path]] = None,
         model_script: str = "",
@@ -177,10 +177,17 @@ class QSPSimulator:
         self._temp_csv = None
         if calibration_targets is not None:
             from qsp_hpc.calibration import load_calibration_targets
+            from qsp_hpc.calibration.yaml_loader import _resolve_yaml_dirs
 
-            cal_dir = Path(calibration_targets)
-            self._calibration_targets_dir = cal_dir
-            self._test_stats_df = load_calibration_targets(cal_dir)
+            # ``calibration_targets`` is normalized to a List[Path] so that
+            # downstream pool-key hashing + reload paths handle the
+            # single-dir and multi-dir cases identically. The multi-dir form
+            # is the wiring point for splitting literature targets and
+            # mechanistic-prior targets into parallel directory trees per
+            # scenario.
+            cal_dirs = _resolve_yaml_dirs(calibration_targets)
+            self._calibration_targets_dir = cal_dirs
+            self._test_stats_df = load_calibration_targets(cal_dirs)
             # Serialize to temp CSV for internal use + HPC upload
             tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
             tmp.close()

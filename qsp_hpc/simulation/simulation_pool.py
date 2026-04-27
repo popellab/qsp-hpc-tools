@@ -91,7 +91,7 @@ class SimulationPoolManager:
         model_description: str,
         priors_csv: Union[str, Path],
         test_stats_csv: Optional[Union[str, Path]] = None,
-        calibration_targets: Optional[Union[str, Path]] = None,
+        calibration_targets: Optional[Union[str, Path, list]] = None,
         model_script: str = "",
         scenario: str = "default",
         submodel_priors_yaml: Optional[Union[str, Path]] = None,
@@ -132,11 +132,11 @@ class SimulationPoolManager:
         self._calibration_targets_dir = None
 
         if calibration_targets is not None:
-            self._calibration_targets_dir = Path(calibration_targets)
-            if not self._calibration_targets_dir.exists():
-                raise FileNotFoundError(
-                    f"Calibration targets directory not found: {self._calibration_targets_dir}"
-                )
+            from qsp_hpc.calibration.yaml_loader import _resolve_yaml_dirs
+
+            # Normalized to List[Path] so the multi-dir form (literature +
+            # mechanistic-prior parallel trees) is supported uniformly.
+            self._calibration_targets_dir = _resolve_yaml_dirs(calibration_targets)
             self.test_stats_csv = None  # Not used when calibration_targets provided
         else:
             self.test_stats_csv = Path(test_stats_csv)

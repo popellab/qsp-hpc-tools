@@ -2245,10 +2245,13 @@ class TestEndToEndIntegration:
 class TestHashAndConfigMethods:
     """Test hash computation and configuration methods with real execution."""
 
-    def test_compute_priors_hash_with_different_model_versions(
+    def test_compute_priors_hash_ignores_model_version(
         self, sample_test_stats_csv, sample_priors_csv, temp_dir
     ):
-        """Test that model_version affects priors hash."""
+        """model_version is the human-readable pool-dir prefix only —
+        it was retired from the hash in #56 because it was a manual
+        bump easy to forget. The hash now derives from priors / script
+        / submodel priors / seed (and binary content for C++ pools)."""
         sim1 = QSPSimulator(
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
@@ -2261,12 +2264,13 @@ class TestHashAndConfigMethods:
             test_stats_csv=sample_test_stats_csv,
             priors_csv=sample_priors_csv,
             model_script="script",
-            model_version="v2",  # Different version
+            model_version="v2",  # Different version → same hash, different dir prefix.
             cache_dir=temp_dir / "cache2",
         )
 
-        # Different model versions should produce different hashes
-        assert sim1._compute_priors_hash() != sim2._compute_priors_hash()
+        assert sim1._compute_priors_hash() == sim2._compute_priors_hash()
+        assert sim1.model_version == "v1"
+        assert sim2.model_version == "v2"
 
     def test_compute_test_stats_hash_consistency(
         self, sample_test_stats_csv, sample_priors_csv, temp_dir

@@ -187,16 +187,17 @@ class SimulationPoolManager:
         Compute pool-id hash via shared :func:`compute_pool_id_hash`.
 
         Hash includes only inputs that affect raw simulation outputs:
-        priors CSV, submodel priors YAML, model script, model version.
-        Test statistics live in a per-hash subdir (``test_stats/<hash>/``)
+        priors CSV, submodel priors YAML, model script, seed. Test
+        statistics live in a per-hash subdir (``test_stats/<hash>/``)
         and scenario is the pool dir suffix — neither participates here.
+        ``model_version`` was retired from the hash in #56 (the human-
+        readable directory prefix still uses it).
         """
         from qsp_hpc.utils.hash_utils import compute_pool_id_hash
 
         return compute_pool_id_hash(
             priors_csv=self.priors_csv,
             model_script=self.model_script,
-            model_version=self.model_version,
             submodel_priors_yaml=self.submodel_priors_yaml,
             seed=self.seed,
         )

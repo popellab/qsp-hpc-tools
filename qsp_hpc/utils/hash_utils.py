@@ -16,16 +16,26 @@ from typing import Any, Dict, Optional, Union
 def compute_pool_id_hash(
     priors_csv: Union[str, Path],
     model_script: str,
-    model_version: str,
     submodel_priors_yaml: Optional[Union[str, Path]] = None,
     seed: Optional[int] = None,
+    binary_path: Optional[Union[str, Path]] = None,
 ) -> str:
     """Hash inputs that determine raw simulation outputs (full sha256 hex).
 
-    Used by :class:`SimulationPool` and :class:`QSPResultLoader` to derive
-    the pool directory's 8-hex prefix. Includes only inputs that change the
-    parameter draws or sim trajectories — NOT test_stats (those live in a
-    subdir) and NOT scenario (it's the dir-name suffix).
+    Used by :class:`SimulationPool`, :class:`QSPResultLoader`, and
+    :class:`CppSimulator` to derive the pool directory's 8-hex prefix.
+    Includes only inputs that change the parameter draws or sim
+    trajectories — NOT test_stats (those live in a subdir) and NOT
+    scenario (it's the dir-name suffix).
+
+    ``binary_path``, when provided, is hashed by content (sha256 of
+    bytes). This catches silent staleness after rebuilding the C++
+    ``qsp_sim`` binary with new model semantics — see #56. MATLAB
+    callers omit it. ``model_version`` was removed (#56): it was a
+    manual string the user had to bump whenever simulation outputs
+    changed, and forgetting to bump silently served stale draws. The
+    binary content (or, for MATLAB, the priors / submodel priors /
+    model script) is the source of truth.
 
     ``seed`` is part of the hash because ``theta_pool`` draws are
     seed-dependent: row ``sample_index=i`` points at a different theta
@@ -42,7 +52,9 @@ def compute_pool_id_hash(
         if smp.exists():
             h.update(smp.read_text().encode("utf-8"))
     h.update(model_script.encode("utf-8"))
-    h.update(model_version.encode("utf-8"))
+    if binary_path is not None:
+        h.update(b"|binary|")
+        h.update(Path(binary_path).read_bytes())
     if seed is not None:
         h.update(f"seed={int(seed)}".encode("utf-8"))
     return h.hexdigest()

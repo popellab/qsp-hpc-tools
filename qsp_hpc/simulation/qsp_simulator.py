@@ -1827,7 +1827,6 @@ class QSPSimulator:
         return compute_pool_id_hash(
             priors_csv=self.priors_csv,
             model_script=self.model_script,
-            model_version=self.model_version,
             submodel_priors_yaml=self.submodel_priors_yaml,
             seed=self.seed,
         )

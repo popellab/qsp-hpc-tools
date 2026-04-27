@@ -320,31 +320,61 @@ class TestComputePoolIdHash:
 
     def test_different_seeds_produce_different_hashes(self, tmp_path):
         priors = self._write_priors(tmp_path / "priors.csv")
-        h_a = compute_pool_id_hash(priors, "m", "v1", seed=2025)
-        h_b = compute_pool_id_hash(priors, "m", "v1", seed=2026)
+        h_a = compute_pool_id_hash(priors, "m", seed=2025)
+        h_b = compute_pool_id_hash(priors, "m", seed=2026)
         assert h_a != h_b
 
     def test_same_seed_produces_stable_hash(self, tmp_path):
         priors = self._write_priors(tmp_path / "priors.csv")
-        h1 = compute_pool_id_hash(priors, "m", "v1", seed=2025)
-        h2 = compute_pool_id_hash(priors, "m", "v1", seed=2025)
+        h1 = compute_pool_id_hash(priors, "m", seed=2025)
+        h2 = compute_pool_id_hash(priors, "m", seed=2025)
         assert h1 == h2
 
-    def test_seed_none_matches_legacy_hash(self, tmp_path):
-        """seed=None (default) reproduces the pre-#20 hash so legacy
-        pools remain readable during migration."""
+    def test_seed_none_omits_seed_input(self, tmp_path):
+        """seed=None (default) must equal omitting the seed argument so
+        callers can opt in incrementally."""
         priors = self._write_priors(tmp_path / "priors.csv")
-        with_none = compute_pool_id_hash(priors, "m", "v1", seed=None)
-        without_seed = compute_pool_id_hash(priors, "m", "v1")
+        with_none = compute_pool_id_hash(priors, "m", seed=None)
+        without_seed = compute_pool_id_hash(priors, "m")
         assert with_none == without_seed
 
-    def test_seed_changes_hash_vs_legacy(self, tmp_path):
-        """Passing seed must produce a different hash than omitting it,
-        otherwise the migration is a no-op and the bug isn't fixed."""
+    def test_seed_changes_hash_vs_unseeded(self, tmp_path):
+        """Passing a seed must produce a different hash than omitting it."""
         priors = self._write_priors(tmp_path / "priors.csv")
-        h_legacy = compute_pool_id_hash(priors, "m", "v1")
-        h_seeded = compute_pool_id_hash(priors, "m", "v1", seed=2025)
-        assert h_legacy != h_seeded
+        h_unseeded = compute_pool_id_hash(priors, "m")
+        h_seeded = compute_pool_id_hash(priors, "m", seed=2025)
+        assert h_unseeded != h_seeded
+
+    def test_binary_content_changes_hash(self, tmp_path):
+        """Rebuilding the C++ binary with new model semantics must
+        invalidate the pool (#56). Two binaries with different byte
+        content produce different hashes."""
+        priors = self._write_priors(tmp_path / "priors.csv")
+        bin_a = tmp_path / "qsp_sim_a"
+        bin_b = tmp_path / "qsp_sim_b"
+        bin_a.write_bytes(b"\x7fELF...binary-A")
+        bin_b.write_bytes(b"\x7fELF...binary-B")
+        h_a = compute_pool_id_hash(priors, "m", binary_path=bin_a)
+        h_b = compute_pool_id_hash(priors, "m", binary_path=bin_b)
+        assert h_a != h_b
+
+    def test_binary_path_omitted_matches_no_binary(self, tmp_path):
+        """binary_path=None (default) must equal omitting the argument
+        so MATLAB callers stay on the no-binary code path."""
+        priors = self._write_priors(tmp_path / "priors.csv")
+        h_none = compute_pool_id_hash(priors, "m", binary_path=None)
+        h_omit = compute_pool_id_hash(priors, "m")
+        assert h_none == h_omit
+
+    def test_binary_present_changes_hash_vs_absent(self, tmp_path):
+        """Adding a binary to the hash must change the result; otherwise
+        the binary content is silently ignored."""
+        priors = self._write_priors(tmp_path / "priors.csv")
+        binary = tmp_path / "qsp_sim"
+        binary.write_bytes(b"\x7fELF...binary")
+        h_no_bin = compute_pool_id_hash(priors, "m")
+        h_with_bin = compute_pool_id_hash(priors, "m", binary_path=binary)
+        assert h_no_bin != h_with_bin
 
 
 class TestHashIntegration:

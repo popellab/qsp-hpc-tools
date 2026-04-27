@@ -123,10 +123,12 @@ class TestSimulationPoolManagerInit:
         )
         assert pool1.config_hash == pool2.config_hash
 
-    def test_config_hash_changes_with_model_version(
+    def test_config_hash_unchanged_with_model_version(
         self, temp_dir, sample_priors_csv, sample_test_stats_csv
     ):
-        """Test that config hash changes when model version changes."""
+        """``model_version`` is the human-readable pool-dir prefix only —
+        retired from the hash in #56. Two pools with different versions
+        share a config hash but live at different on-disk paths."""
         pool1 = SimulationPoolManager(
             cache_dir=temp_dir / "cache",
             model_version="v1",
@@ -143,7 +145,10 @@ class TestSimulationPoolManagerInit:
             test_stats_csv=sample_test_stats_csv,
             model_script="test_model",
         )
-        assert pool1.config_hash != pool2.config_hash
+        assert pool1.config_hash == pool2.config_hash
+        assert pool1.pool_dir != pool2.pool_dir
+        assert pool1.pool_dir.name.startswith("v1_")
+        assert pool2.pool_dir.name.startswith("v2_")
 
     def test_config_hash_unchanged_across_scenarios(
         self, temp_dir, sample_priors_csv, sample_test_stats_csv

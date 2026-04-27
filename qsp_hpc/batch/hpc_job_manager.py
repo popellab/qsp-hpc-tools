@@ -110,8 +110,12 @@ class BatchConfig:
     cpp_runtime_modules: str = (
         ""  # Space-separated `module load` args run before qsp_sim (runtime deps)
     )
-    cpp_repo_path: str = ""  # SPQSP_PDAC checkout on HPC; required for ensure_cpp_binary
+    cpp_repo_path: str = ""  # Repo checkout on HPC; required for ensure_cpp_binary
     cpp_branch: str = "cpp-sweep-binary-io"  # Branch to track when auto-rebuilding
+    # Path *relative to* cpp_repo_path where the qsp_sim CMakeLists.txt lives.
+    # Default preserves the legacy SPQSP_PDAC layout. For pdac-build's in-repo
+    # cpp/ tree (post-PR-#46), set this to "cpp/sim" in credentials.yaml.
+    cpp_sim_subdir: str = "PDAC/qsp/sim"
     cpp_build_modules: str = (
         ""  # Modules for build-time (cmake, git). Falls back to runtime_modules.
     )
@@ -610,6 +614,7 @@ class HPCJobManager:
             cpp_runtime_modules=cpp.get("runtime_modules", "").strip(),
             cpp_repo_path=cpp.get("repo_path", "").strip(),
             cpp_branch=cpp.get("branch", "cpp-sweep-binary-io").strip(),
+            cpp_sim_subdir=cpp.get("sim_subdir", "PDAC/qsp/sim").strip(),
             cpp_build_modules=cpp.get("build_modules", "").strip(),
             ssh_retry_max_attempts=int(ssh_retry.get("max_attempts", 3)),
             ssh_retry_base_delay_s=float(ssh_retry.get("base_delay_s", 5.0)),
@@ -720,7 +725,10 @@ class HPCJobManager:
             else "# no build modules configured"
         )
 
-        sim_dir = f"{repo_path}/PDAC/qsp/sim"
+        # cpp_sim_subdir is relative to cpp_repo_path. Default
+        # "PDAC/qsp/sim" preserves the legacy SPQSP_PDAC layout; pdac-build's
+        # in-repo cpp/ tree (post-PR-#46) sets this to "cpp/sim".
+        sim_dir = f"{repo_path}/{self.config.cpp_sim_subdir}"
 
         # #48: flock both the git pull and the cmake build against the
         # same login-node lockfile so parallel run_hpc() invocations

@@ -583,7 +583,9 @@ class TestSimulationPoolCalibrationTargets:
         )
 
         assert pool.pool_dir.exists()
-        assert pool._calibration_targets_dir == sample_calibration_targets_dir
+        # _calibration_targets_dir is normalized to List[Path] so the
+        # multi-dir form (literature + mechanistic) is supported uniformly.
+        assert pool._calibration_targets_dir == [sample_calibration_targets_dir]
         assert pool.test_stats_csv is None
 
     def test_both_csv_and_yaml_raises(

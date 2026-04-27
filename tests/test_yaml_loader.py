@@ -260,6 +260,88 @@ class TestLoadCalibrationTargets:
 
 
 # ============================================================================
+# Tests: multi-directory loading (literature + mechanistic parallel trees)
+# ============================================================================
+
+
+class TestMultiDirCalibrationTargets:
+    """``load_calibration_targets`` accepts a list of directories so callers
+    can split literature targets and mechanistic-prior targets into parallel
+    trees per scenario without flattening or symlinks."""
+
+    @pytest.fixture
+    def two_dirs(self, temp_dir):
+        """One literature dir + one mechanistic-prior dir, disjoint contents."""
+        lit_dir = temp_dir / "literature"
+        mech_dir = temp_dir / "mechanistic"
+        lit_dir.mkdir()
+        mech_dir.mkdir()
+        with open(lit_dir / "cd8_density_baseline.yaml", "w") as f:
+            yaml.dump(CONSTANTS_YAML, f)
+        with open(mech_dir / "m1_m2_ratio.yaml", "w") as f:
+            yaml.dump(BASELINE_YAML, f)
+        return lit_dir, mech_dir
+
+    def test_load_union_across_dirs(self, two_dirs):
+        lit_dir, mech_dir = two_dirs
+        df = load_calibration_targets([lit_dir, mech_dir])
+        ids = sorted(df["test_statistic_id"].tolist())
+        assert ids == ["cd8_density_baseline", "m1_m2_ratio"]
+
+    def test_single_path_still_supported(self, single_baseline_dir):
+        """Back-compat: single Path argument still loads as before."""
+        df_single = load_calibration_targets(single_baseline_dir)
+        df_list = load_calibration_targets([single_baseline_dir])
+        # DataFrames should be identical aside from row order
+        assert sorted(df_single["test_statistic_id"].tolist()) == sorted(
+            df_list["test_statistic_id"].tolist()
+        )
+        assert len(df_single) == len(df_list) == 1
+
+    def test_string_path_accepted(self, single_baseline_dir):
+        """str inputs are normalized to Path uniformly with the list form."""
+        df = load_calibration_targets(str(single_baseline_dir))
+        assert len(df) == 1
+
+    def test_empty_list_rejected(self):
+        with pytest.raises(ValueError, match="non-empty list"):
+            load_calibration_targets([])
+
+    def test_nonexistent_dir_in_list_raises(self, single_baseline_dir, temp_dir):
+        bogus = temp_dir / "does_not_exist"
+        with pytest.raises(FileNotFoundError):
+            load_calibration_targets([single_baseline_dir, bogus])
+
+    def test_basename_collision_rejected(self, temp_dir):
+        """Two directories sharing a YAML basename produce ambiguous
+        test_statistic_ids — fail fast rather than silently overriding."""
+        d1 = temp_dir / "d1"
+        d2 = temp_dir / "d2"
+        d1.mkdir()
+        d2.mkdir()
+        with open(d1 / "m1_m2_ratio.yaml", "w") as f:
+            yaml.dump(BASELINE_YAML, f)
+        with open(d2 / "m1_m2_ratio.yaml", "w") as f:
+            yaml.dump(BASELINE_YAML, f)
+        with pytest.raises(ValueError, match="Duplicate YAML basename"):
+            load_calibration_targets([d1, d2])
+
+    def test_hash_matches_loaded_set(self, two_dirs):
+        """hash_calibration_targets over the multi-dir union is stable and
+        order-insensitive across the dirs argument (basename ordering is
+        canonical)."""
+        lit_dir, mech_dir = two_dirs
+        h1 = hash_calibration_targets([lit_dir, mech_dir])
+        h2 = hash_calibration_targets([mech_dir, lit_dir])
+        assert h1 == h2
+        # Mutating either dir's content changes the hash.
+        with open(mech_dir / "m1_m2_ratio.yaml", "a") as f:
+            f.write("\n# perturbed\n")
+        h3 = hash_calibration_targets([lit_dir, mech_dir])
+        assert h3 != h1
+
+
+# ============================================================================
 # Tests: wrapper code generation (using real Pint)
 # ============================================================================
 

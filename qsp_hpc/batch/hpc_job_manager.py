@@ -123,7 +123,7 @@ class BatchConfig:
     # branch as needed. Empty string skips codegen install + python
     # override — only useful for unusual builds that vendor
     # qsp_sim_core or supply Python3_EXECUTABLE another way.
-    cpp_codegen_source: str = "git+https://github.com/popellab/qsp-codegen.git"
+    cpp_codegen_source: str = "git+ssh://git@github.com/popellab/qsp-codegen.git"
     cpp_build_modules: str = (
         ""  # Modules for build-time (cmake, git). Falls back to runtime_modules.
     )
@@ -624,7 +624,7 @@ class HPCJobManager:
             cpp_branch=cpp.get("branch", "main").strip(),
             cpp_sim_subdir=cpp.get("sim_subdir", "cpp/sim").strip(),
             cpp_codegen_source=cpp.get(
-                "codegen_source", "git+https://github.com/popellab/qsp-codegen.git"
+                "codegen_source", "git+ssh://git@github.com/popellab/qsp-codegen.git"
             ).strip(),
             cpp_build_modules=cpp.get("build_modules", "").strip(),
             ssh_retry_max_attempts=int(ssh_retry.get("max_attempts", 3)),

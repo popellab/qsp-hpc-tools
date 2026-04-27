@@ -758,7 +758,7 @@ class TestEnsureCppBinary:
         cpp/sim/CMakeLists.txt which invokes `python3 -m qsp_codegen.cmake`.
         """
         manager, transport = self._make_manager(
-            cpp_codegen_source="git+https://github.com/popellab/qsp-codegen.git",
+            cpp_codegen_source="git+ssh://git@github.com/popellab/qsp-codegen.git",
         )
         transport.exec.side_effect = self._exec_side_effect()
 

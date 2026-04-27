@@ -615,9 +615,8 @@ class TestEnsureCppBinary:
             simulation_pool_path="/scratch/sims",
             hpc_venv_path="/home/testuser/.venv/qsp",
             remote_project_path="/home/testuser/project",
-            cpp_binary_path="/home/testuser/SPQSP_PDAC/PDAC/qsp/sim/build/qsp_sim",
-            cpp_repo_path="/home/testuser/SPQSP_PDAC",
-            cpp_branch="cpp-sweep-binary-io",
+            cpp_binary_path="/home/testuser/pdac-build/cpp/sim/build/qsp_sim",
+            cpp_repo_path="/home/testuser/pdac-build",
             cpp_build_modules="GCC/13.2.0",
         )
         config_kwargs.update(overrides)
@@ -715,8 +714,9 @@ class TestEnsureCppBinary:
         assert "my-feature-branch" in pull_cmd
         assert "main" not in pull_cmd
 
-    def test_default_sim_subdir_is_legacy_spqsp_layout(self):
-        """Default ``cpp_sim_subdir`` preserves SPQSP_PDAC's PDAC/qsp/sim layout."""
+    def test_default_sim_subdir_is_in_repo_pdac_build_layout(self):
+        """Default ``cpp_sim_subdir`` is the in-repo pdac-build layout
+        (``cpp/sim``)."""
         manager, transport = self._make_manager()
         transport.exec.side_effect = self._exec_side_effect()
 
@@ -727,16 +727,17 @@ class TestEnsureCppBinary:
             for c in (call.args[0] for call in transport.exec.call_args_list)
             if "cmake --build" in c
         )
-        assert "/home/testuser/SPQSP_PDAC/PDAC/qsp/sim" in build_cmd
+        assert "/home/testuser/pdac-build/cpp/sim" in build_cmd
 
-    def test_sim_subdir_override_for_pdac_build_in_repo_cpp(self):
-        """``cpp_sim_subdir`` override directs the build at pdac-build's
-        in-repo cpp/sim layout instead of legacy SPQSP_PDAC.
+    def test_sim_subdir_override_routes_build_to_other_layout(self):
+        """``cpp_sim_subdir`` override redirects the build away from the
+        default cpp/sim — exercised by callers that vendor qsp_sim_core
+        in a non-standard subdir.
         """
         manager, transport = self._make_manager(
-            cpp_repo_path="/home/testuser/pdac-build",
-            cpp_binary_path="/home/testuser/pdac-build/cpp/sim/build/qsp_sim",
-            cpp_sim_subdir="cpp/sim",
+            cpp_repo_path="/home/testuser/custom",
+            cpp_binary_path="/home/testuser/custom/foo/bar/build/qsp_sim",
+            cpp_sim_subdir="foo/bar",
         )
         transport.exec.side_effect = self._exec_side_effect()
 
@@ -747,8 +748,52 @@ class TestEnsureCppBinary:
             for c in (call.args[0] for call in transport.exec.call_args_list)
             if "cmake --build" in c
         )
-        assert "/home/testuser/pdac-build/cpp/sim" in build_cmd
-        assert "PDAC/qsp/sim" not in build_cmd
+        assert "/home/testuser/custom/foo/bar" in build_cmd
+        assert "/home/testuser/custom/cpp/sim" not in build_cmd
+
+    def test_codegen_installed_into_venv_before_cmake(self):
+        """When ``cpp_codegen_source`` is set (default), the build pip-installs
+        qsp-codegen into hpc_venv_path and passes that venv's python to cmake
+        via -DPython3_EXECUTABLE. Required for pdac-build's in-repo
+        cpp/sim/CMakeLists.txt which invokes `python3 -m qsp_codegen.cmake`.
+        """
+        manager, transport = self._make_manager(
+            cpp_codegen_source="git+https://github.com/popellab/qsp-codegen.git",
+        )
+        transport.exec.side_effect = self._exec_side_effect()
+
+        manager.ensure_cpp_binary()
+
+        build_cmd = next(
+            c
+            for c in (call.args[0] for call in transport.exec.call_args_list)
+            if "cmake --build" in c
+        )
+        # qsp-codegen pip-installed into the configured venv.
+        assert "uv pip install" in build_cmd
+        assert "qsp-codegen" in build_cmd
+        assert "/home/testuser/.venv/qsp/bin/python" in build_cmd
+        # cmake configure routed through the same venv's python.
+        assert "-DPython3_EXECUTABLE=" in build_cmd
+
+    def test_empty_codegen_source_skips_install_and_python_override(self):
+        """Empty ``cpp_codegen_source`` preserves the legacy SPQSP_PDAC build
+        (vendored qsp_sim_core, no codegen needed). No pip install, no python
+        override.
+        """
+        manager, transport = self._make_manager(cpp_codegen_source="")
+        transport.exec.side_effect = self._exec_side_effect()
+
+        manager.ensure_cpp_binary()
+
+        build_cmd = next(
+            c
+            for c in (call.args[0] for call in transport.exec.call_args_list)
+            if "cmake --build" in c
+        )
+        assert "uv pip install" not in build_cmd
+        assert "qsp-codegen" not in build_cmd
+        assert "-DPython3_EXECUTABLE=" not in build_cmd
 
 
 # ---------------------------------------------------------------------------

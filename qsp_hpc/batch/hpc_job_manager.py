@@ -111,11 +111,19 @@ class BatchConfig:
         ""  # Space-separated `module load` args run before qsp_sim (runtime deps)
     )
     cpp_repo_path: str = ""  # Repo checkout on HPC; required for ensure_cpp_binary
-    cpp_branch: str = "cpp-sweep-binary-io"  # Branch to track when auto-rebuilding
+    cpp_branch: str = "main"  # Branch to track when auto-rebuilding
     # Path *relative to* cpp_repo_path where the qsp_sim CMakeLists.txt lives.
-    # Default preserves the legacy SPQSP_PDAC layout. For pdac-build's in-repo
-    # cpp/ tree (post-PR-#46), set this to "cpp/sim" in credentials.yaml.
-    cpp_sim_subdir: str = "PDAC/qsp/sim"
+    # pdac-build's in-repo cpp/ tree (post-PR-#46) lives at cpp/sim/.
+    cpp_sim_subdir: str = "cpp/sim"
+    # qsp-codegen is the SBML→C++ generator that the in-repo cpp/sim
+    # CMakeLists.txt invokes via `python3 -m qsp_codegen.cmake` to locate
+    # qsp_sim_core. ensure_cpp_binary pip-installs it into hpc_venv_path
+    # before cmake runs and tells cmake to use that python via
+    # -DPython3_EXECUTABLE. Override to point at a fork or a feature
+    # branch as needed. Empty string skips codegen install + python
+    # override — only useful for unusual builds that vendor
+    # qsp_sim_core or supply Python3_EXECUTABLE another way.
+    cpp_codegen_source: str = "git+https://github.com/popellab/qsp-codegen.git"
     cpp_build_modules: str = (
         ""  # Modules for build-time (cmake, git). Falls back to runtime_modules.
     )
@@ -613,8 +621,11 @@ class HPCJobManager:
             cpp_subtree=cpp.get("subtree", "QSP").strip(),
             cpp_runtime_modules=cpp.get("runtime_modules", "").strip(),
             cpp_repo_path=cpp.get("repo_path", "").strip(),
-            cpp_branch=cpp.get("branch", "cpp-sweep-binary-io").strip(),
-            cpp_sim_subdir=cpp.get("sim_subdir", "PDAC/qsp/sim").strip(),
+            cpp_branch=cpp.get("branch", "main").strip(),
+            cpp_sim_subdir=cpp.get("sim_subdir", "cpp/sim").strip(),
+            cpp_codegen_source=cpp.get(
+                "codegen_source", "git+https://github.com/popellab/qsp-codegen.git"
+            ).strip(),
             cpp_build_modules=cpp.get("build_modules", "").strip(),
             ssh_retry_max_attempts=int(ssh_retry.get("max_attempts", 3)),
             ssh_retry_base_delay_s=float(ssh_retry.get("base_delay_s", 5.0)),
@@ -725,9 +736,8 @@ class HPCJobManager:
             else "# no build modules configured"
         )
 
-        # cpp_sim_subdir is relative to cpp_repo_path. Default
-        # "PDAC/qsp/sim" preserves the legacy SPQSP_PDAC layout; pdac-build's
-        # in-repo cpp/ tree (post-PR-#46) sets this to "cpp/sim".
+        # cpp_sim_subdir is relative to cpp_repo_path. Default "cpp/sim"
+        # matches pdac-build's in-repo cpp/ tree (post-PR-#46).
         sim_dir = f"{repo_path}/{self.config.cpp_sim_subdir}"
 
         # #48: flock both the git pull and the cmake build against the
@@ -790,11 +800,30 @@ class HPCJobManager:
         #    pays the full SUNDIALS+yaml-cpp fetch once.
         if not skip_build:
             with log_operation(self.logger, "cmake --build --target qsp_sim"):
+                # The in-repo cpp/sim/CMakeLists.txt invokes
+                # `python3 -m qsp_codegen.cmake` to locate qsp_sim_core. Pip-
+                # install qsp-codegen into hpc_venv_path and pass the venv's
+                # python to cmake so its find_package(Python3) picks it up.
+                # Empty cpp_codegen_source skips both — only useful for
+                # unusual builds that vendor qsp_sim_core or supply
+                # Python3_EXECUTABLE another way.
+                if self.config.cpp_codegen_source:
+                    venv_python = f"{self.config.hpc_venv_path}/bin/python"
+                    codegen_install = (
+                        f"uv pip install --quiet --upgrade --python {shlex.quote(venv_python)} "
+                        f"{shlex.quote(self.config.cpp_codegen_source)} && "
+                    )
+                    cmake_python_override = f"-DPython3_EXECUTABLE={shlex.quote(venv_python)} "
+                else:
+                    codegen_install = ""
+                    cmake_python_override = ""
+
                 build_inner = (
                     f"set -e && {module_prelude} && "
+                    f"{codegen_install}"
                     f"cd {shlex.quote(sim_dir)} && mkdir -p build && cd build && "
                     "if [ ! -f CMakeCache.txt ]; then "
-                    "  cmake .. -DCMAKE_BUILD_TYPE=Release; "
+                    f"  cmake .. -DCMAKE_BUILD_TYPE=Release {cmake_python_override}; "
                     "fi && "
                     'cmake --build . --target qsp_sim -j "$(nproc)"'
                 )

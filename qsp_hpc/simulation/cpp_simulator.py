@@ -18,7 +18,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -68,6 +68,7 @@ class CppSimulator:
         theta_pool_size: int = 100_000,
         restriction_classifier_dir: Optional[str | Path] = None,
         restriction_threshold: float = 0.5,
+        classifier_feature_fills: Optional[Mapping[str, float]] = None,
         max_workers: int | None = None,
         per_sim_timeout_s: float | None = None,
         submodel_priors_yaml: Optional[str | Path] = None,
@@ -111,6 +112,13 @@ class CppSimulator:
             else None
         )
         self.restriction_threshold = float(restriction_threshold)
+        # Optional fills for classifier features that have been retired from
+        # the live priors CSV (e.g. ``{"IFNg_50": 1000.0}``). Threaded into
+        # the theta pool via accept_named so a drifted prior can still use
+        # the existing classifier without retraining.
+        self.classifier_feature_fills = (
+            dict(classifier_feature_fills) if classifier_feature_fills else None
+        )
         self.max_workers = max_workers
         self.per_sim_timeout_s = per_sim_timeout_s
         self.submodel_priors_yaml = Path(submodel_priors_yaml) if submodel_priors_yaml else None
@@ -281,6 +289,11 @@ class CppSimulator:
             if meta.exists():
                 h.update(meta.read_bytes())
             h.update(f"|tau={self.restriction_threshold:.6f}".encode("utf-8"))
+            if self.classifier_feature_fills:
+                fills_str = ",".join(
+                    f"{k}={float(v):.12g}" for k, v in sorted(self.classifier_feature_fills.items())
+                )
+                h.update(f"|fills={fills_str}".encode("utf-8"))
         return h.hexdigest()
 
     def __del__(self):
@@ -370,6 +383,7 @@ class CppSimulator:
             cache_dir=self.cache_dir / "theta_pools",
             restriction_classifier_dir=self.restriction_classifier_dir,
             restriction_threshold=self.restriction_threshold,
+            classifier_feature_fills=self.classifier_feature_fills,
         )
 
     # ------------------------------------------------------------------

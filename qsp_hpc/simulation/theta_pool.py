@@ -31,15 +31,17 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Optional, Union
+from typing import Mapping, Optional, Union
 
 import numpy as np
 
 
 def _classifier_hash_suffix(
-    restriction_classifier_dir: Optional[Union[str, Path]], restriction_threshold: float
+    restriction_classifier_dir: Optional[Union[str, Path]],
+    restriction_threshold: float,
+    classifier_feature_fills: Optional[Mapping[str, float]] = None,
 ) -> bytes:
-    """Content-hash bytes identifying a classifier dir + threshold, or empty."""
+    """Content-hash bytes identifying a classifier dir + threshold + fills."""
     if restriction_classifier_dir is None:
         return b""
     d = Path(restriction_classifier_dir)
@@ -51,6 +53,12 @@ def _classifier_hash_suffix(
     if meta.exists():
         buf += meta.read_bytes()
     buf += f"|tau={restriction_threshold:.6f}".encode("utf-8")
+    if classifier_feature_fills:
+        # Sort to keep hash insensitive to dict ordering.
+        fills_str = ",".join(
+            f"{k}={float(v):.12g}" for k, v in sorted(classifier_feature_fills.items())
+        )
+        buf += f"|fills={fills_str}".encode("utf-8")
     return buf
 
 
@@ -62,6 +70,7 @@ def theta_pool_cache_path(
     n_total: int,
     restriction_classifier_dir: Optional[Union[str, Path]] = None,
     restriction_threshold: float = 0.5,
+    classifier_feature_fills: Optional[Mapping[str, float]] = None,
 ) -> Path:
     """Deterministic on-disk path for a cached theta pool.
 
@@ -79,7 +88,13 @@ def theta_pool_cache_path(
             h.update(smp.read_text().encode("utf-8"))
     h.update(str(seed).encode("utf-8"))
     h.update(str(n_total).encode("utf-8"))
-    h.update(_classifier_hash_suffix(restriction_classifier_dir, restriction_threshold))
+    h.update(
+        _classifier_hash_suffix(
+            restriction_classifier_dir,
+            restriction_threshold,
+            classifier_feature_fills,
+        )
+    )
     suffix = "_restricted" if restriction_classifier_dir is not None else ""
     return Path(cache_dir) / f"theta_pool_{h.hexdigest()[:16]}_n{n_total}{suffix}.npy"
 
@@ -134,6 +149,7 @@ def get_theta_pool(
     restriction_threshold: float = 0.5,
     restriction_oversample_factor: float = 2.5,
     restriction_max_oversample: int = 8,
+    classifier_feature_fills: Optional[Mapping[str, float]] = None,
 ) -> np.ndarray:
     """Return a deterministic ``(n_total, n_params)`` theta matrix.
 
@@ -161,6 +177,7 @@ def get_theta_pool(
         n_total,
         restriction_classifier_dir=restriction_classifier_dir,
         restriction_threshold=restriction_threshold,
+        classifier_feature_fills=classifier_feature_fills,
     )
     if pool_path.exists():
         return np.load(pool_path)
@@ -174,6 +191,11 @@ def get_theta_pool(
         # Oversample the prior; keep only classifier-accepted rows. If we
         # fall short, bump the oversample factor deterministically via a
         # seed offset and retry.
+        # When the live prior has drifted relative to the classifier
+        # (params added/retired), we project caller-side theta onto the
+        # classifier's feature_order via accept_named, dropping live-only
+        # columns and filling classifier-only columns from
+        # ``classifier_feature_fills``.
         accepted = []
         n_accepted = 0
         factor = float(restriction_oversample_factor)
@@ -189,10 +211,18 @@ def get_theta_pool(
             batch_n = int(factor * n_total)
             # Deterministic offset per attempt so cache is reproducible.
             batch_seed = int(seed) + attempt - 1
-            theta_batch, _ = _sample_prior_batch(
+            theta_batch, batch_names = _sample_prior_batch(
                 priors_csv, submodel_priors_yaml, batch_n, batch_seed
             )
-            keep = clf.accept(theta_batch, threshold=restriction_threshold)
+            if list(batch_names) == list(clf.feature_order):
+                keep = clf.accept(theta_batch, threshold=restriction_threshold)
+            else:
+                keep = clf.accept_named(
+                    theta_batch,
+                    batch_names,
+                    fills=classifier_feature_fills,
+                    threshold=restriction_threshold,
+                )
             accepted.append(theta_batch[keep])
             n_accepted += int(keep.sum())
             factor *= 2.0
@@ -212,6 +242,7 @@ def theta_for_indices(
     cache_dir: Union[str, Path] = "cache/theta_pools",
     restriction_classifier_dir: Optional[Union[str, Path]] = None,
     restriction_threshold: float = 0.5,
+    classifier_feature_fills: Optional[Mapping[str, float]] = None,
 ) -> np.ndarray:
     """Slice the theta pool by integer ``sample_index`` array.
 
@@ -226,6 +257,7 @@ def theta_for_indices(
         cache_dir=cache_dir,
         restriction_classifier_dir=restriction_classifier_dir,
         restriction_threshold=restriction_threshold,
+        classifier_feature_fills=classifier_feature_fills,
     )
     indices = np.asarray(indices, dtype=np.int64)
     if indices.size and (indices.min() < 0 or indices.max() >= n_total):

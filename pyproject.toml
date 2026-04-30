@@ -45,9 +45,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jeliason/qsp-hpc-tools"
-Repository = "https://github.com/jeliason/qsp-hpc-tools"
-Issues = "https://github.com/jeliason/qsp-hpc-tools/issues"
+Homepage = "https://github.com/popellab/qsp-hpc-tools"
+Repository = "https://github.com/popellab/qsp-hpc-tools"
+Issues = "https://github.com/popellab/qsp-hpc-tools/issues"
 
 [project.scripts]
 qsp-hpc = "qsp_hpc.cli:cli"

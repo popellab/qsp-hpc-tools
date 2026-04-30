@@ -612,6 +612,9 @@ class TestCppSimulatorRunHpc:
         ms_file.write_text("{}\n")
         job_manager = MagicMock()
         job_manager.config.simulation_pool_path = "/scratch/sims"
+        # Default to "plenty derived" so Tier 2 hits download by default.
+        # Tests covering the partial top-up path override this explicitly.
+        job_manager.count_hpc_test_stats.return_value = 10**9
         sim = CppSimulator(
             priors_csv=priors_csv,
             binary_path=binary_path,
@@ -719,20 +722,19 @@ class TestCppSimulatorRunHpc:
         ``_download_and_persist`` pulled the 40, ``_sample_first_n``
         returned all 40, and ``run_hpc`` silently returned an undersized
         array. Caught by the N=1000 SBI smoke — user requested 1000,
-        got 40. Fix: after downloading, if count < n, fall through to
-        Tier 3 / 3.5 so the pool gets topped up."""
+        got 40. Fix: when count < n, skip the pre-topup download and
+        fall through to Tier 3 / 3.5 so the pool gets topped up and a
+        single post-topup download covers all rows (issue #63)."""
         from qsp_hpc.batch.hpc_job_manager import DownloadResult, JobInfo
 
         sim, jm = self._make_sim(priors_csv, binary_path, template_path, cache_dir, tmp_path)
 
         # HPC has 40 test stats but we ask for 1000 → partial hit.
         rng = np.random.default_rng(10)
-        partial_params = rng.uniform(size=(40, 2))
-        partial_ts = rng.uniform(size=(40, 3))
         jm.check_hpc_test_stats.return_value = True
+        jm.count_hpc_test_stats.return_value = 40
 
-        # After Tier 2 downloads the 40 partial rows, Tier 3 should
-        # see the pool has 40 sims and fall into Tier 3.5 (top-up).
+        # Tier 3 sees the pool has 40 sims and falls into Tier 3.5 (top-up).
         jm.result_collector.check_pool_directory_exists.return_value = True
         jm.result_collector.count_pool_simulations.return_value = 40
 
@@ -747,22 +749,14 @@ class TestCppSimulatorRunHpc:
         )
         full_params = rng.uniform(size=(1000, 2))
         full_ts = rng.uniform(size=(1000, 3))
-        # First call (Tier 2 partial download) returns 40;
-        # second call (after Tier 3.5 derivation) returns 1000.
-        jm.download_test_stats_full.side_effect = [
-            DownloadResult(
-                params=partial_params,
-                test_stats=partial_ts,
-                sample_index=np.arange(40, dtype=np.int64),
-                param_names=list(sim.param_names),
-            ),
-            DownloadResult(
-                params=full_params,
-                test_stats=full_ts,
-                sample_index=np.arange(1000, dtype=np.int64),
-                param_names=list(sim.param_names),
-            ),
-        ]
+        # Issue #63: partial Tier 2 should NOT pre-download — only the
+        # post-topup download fires, returning the full 1000 rows.
+        jm.download_test_stats_full.return_value = DownloadResult(
+            params=full_params,
+            test_stats=full_ts,
+            sample_index=np.arange(1000, dtype=np.int64),
+            param_names=list(sim.param_names),
+        )
 
         out_params, out_ts = sim.run_hpc(1000)
         assert out_params.shape == (1000, 2)
@@ -773,6 +767,8 @@ class TestCppSimulatorRunHpc:
         # start_index should be 40 (already have those from pool).
         _, kwargs = jm.submit_cpp_jobs.call_args
         assert kwargs["num_simulations"] == 960
+        # Issue #63: only one download — the post-topup one.
+        assert jm.download_test_stats_full.call_count == 1
 
     def test_run_hpc_tier3_derives_when_full_sims_present(
         self, priors_csv, binary_path, template_path, cache_dir, tmp_path
@@ -1459,6 +1455,7 @@ class TestSimulateWithParametersHPC:
         job_manager.config.simulation_pool_path = "/scratch/sims"
         job_manager.config.cpp_binary_path = "/scratch/qsp_sim"
         job_manager.config.cpp_template_path = "/scratch/param_all.xml"
+        job_manager.count_hpc_test_stats.return_value = 10**9
         sim = CppSimulator(
             priors_csv=priors_csv,
             binary_path=binary_path,

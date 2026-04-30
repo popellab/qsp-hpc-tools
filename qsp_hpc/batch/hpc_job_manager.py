@@ -2011,6 +2011,36 @@ class HPCJobManager:
 
         return True
 
+    def count_hpc_test_stats(self, pool_path: str, test_stats_hash: str) -> int:
+        """Return the number of derived test-stat rows on HPC, or 0 if missing.
+
+        Counts rows across ``chunk_*_test_stats.csv`` (and the combined file
+        when present) without downloading any data. Used by the C++ top-up
+        path to decide whether the partial Tier-2 download is worth doing —
+        when the existing derivation is going to be superseded by a fresh
+        post-topup combine, the pre-topup download is pure waste (issue #63).
+        """
+        test_stats_dir = f"{pool_path}/test_stats/{test_stats_hash}"
+        # Prefer combined file when it exists (one stat); otherwise sum the
+        # chunk files. ``wc -l`` over a glob already prints a "total" line —
+        # using ``cat ... | wc -l`` keeps the parsing trivial.
+        cmd = (
+            f'test -d "{test_stats_dir}" || {{ echo 0; exit 0; }}; '
+            f'if [ -f "{test_stats_dir}/combined_test_stats.csv" ]; then '
+            f'  wc -l < "{test_stats_dir}/combined_test_stats.csv"; '
+            f"else "
+            f'  cat "{test_stats_dir}"/chunk_*_test_stats.csv 2>/dev/null | wc -l; '
+            f"fi"
+        )
+        status, output = self.transport.exec(cmd)
+        if status != 0:
+            return 0
+        for line in reversed(output.strip().split("\n")):
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+        return 0
+
     def _calculate_batches_needed(
         self, pool_path: str, num_simulations: Optional[int] = None
     ) -> int:

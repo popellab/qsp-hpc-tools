@@ -814,22 +814,27 @@ class CppSimulator:
         # Tier 2: HPC pre-derived test stats
         self.logger.info("Checking HPC for pre-derived test statistics...")
         if self.job_manager.check_hpc_test_stats(hpc_pool_path, test_stats_hash, expected_n_sims=n):
-            self.logger.info("✓ HPC test stats found — downloading")
-            params, test_stats = self._download_and_persist(hpc_pool_path, test_stats_hash)
-            if params.shape[0] >= n:
+            # Count derived rows over SSH first (cheap wc -l) so we can skip
+            # the full download when we know we're about to top up. Issue
+            # #63: downloading the pre-topup combined CSV is pure waste —
+            # the post-topup combine on HPC (cat chunk_*_test_stats.csv >
+            # combined) supersedes it, and for big pools the redundant
+            # transfer dominates wall-time.
+            n_derived = self.job_manager.count_hpc_test_stats(hpc_pool_path, test_stats_hash)
+            if n_derived >= n:
+                self.logger.info(f"✓ HPC test stats found ({n_derived} rows) — downloading")
+                params, test_stats = self._download_and_persist(hpc_pool_path, test_stats_hash)
                 return self._sample_first_n(params, test_stats, n)
-            # Partial — check_hpc_test_stats returned True because some
-            # stats exist, but we have fewer than n. _download_and_persist
-            # has already cached what's there locally (Tier 1 will pick
-            # it up next run). Fall through to Tier 3 / 3.5 so the pool
-            # can be topped up and a fresh derivation covers all rows.
-            # Without this fall-through, run_hpc(1000) over a 40-sim pool
-            # silently returns (40, ...) — caller sees N-too-small arrays
-            # and the "caller can top up" comment in check_hpc_test_stats
-            # goes unenforced.
+            # Partial — derived stats exist but cover fewer rows than n.
+            # Skip the download entirely and fall through to Tier 3 / 3.5
+            # so the pool gets topped up and a single post-topup download
+            # picks up the full combined file. Without this fall-through,
+            # run_hpc(1000) over a 40-sim pool silently returns (40, ...)
+            # — caller sees N-too-small arrays.
             self.logger.info(
-                "HPC test stats partial (%d/%d) — falling through to Tier 3 for top-up",
-                params.shape[0],
+                "HPC test stats partial (%d/%d) — falling through to Tier 3 "
+                "for top-up (skipping pre-topup download)",
+                n_derived,
                 n,
             )
         else:

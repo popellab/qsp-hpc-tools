@@ -259,7 +259,7 @@ def setup(global_only):
             "mem_per_cpu": mem_per_cpu,
         },
         "package": {
-            "qsp_hpc_tools_source": "git+ssh://git@github.com/jeliason/qsp-hpc-tools.git",
+            "qsp_hpc_tools_source": "git+ssh://git@github.com/popellab/qsp-hpc-tools.git",
         },
     }
 
@@ -363,7 +363,7 @@ def setup(global_only):
 
             # Get package source from config
             qsp_hpc_tools_source = config.get("package", {}).get(
-                "qsp_hpc_tools_source", "git+ssh://git@github.com/jeliason/qsp-hpc-tools.git"
+                "qsp_hpc_tools_source", "git+ssh://git@github.com/popellab/qsp-hpc-tools.git"
             )
 
             setup_cmd = f"""
@@ -419,7 +419,7 @@ echo "Python venv setup complete!"
             click.echo(f"    ssh {ssh_host}")
             click.echo(f"    uv venv --python 3.11 {hpc_venv_path}")
             click.echo(
-                f"    uv pip install --python {hpc_venv_path}/bin/python git+ssh://git@github.com/jeliason/qsp-hpc-tools.git"
+                f"    uv pip install --python {hpc_venv_path}/bin/python git+ssh://git@github.com/popellab/qsp-hpc-tools.git"
             )
 
     # Save configuration

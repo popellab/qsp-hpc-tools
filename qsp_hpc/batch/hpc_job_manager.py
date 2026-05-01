@@ -103,7 +103,7 @@ class BatchConfig:
     matlab_workers: int = 0  # 0 = serial; >0 = open parpool(N) in batch_worker
     max_cpus_per_account: int = 0  # 0 = no cap; >0 = enforce one-wave scheduling
     strict_host_key_checking: bool = True  # Security: verify SSH host keys by default
-    qsp_hpc_tools_source: str = "git+ssh://git@github.com/jeliason/qsp-hpc-tools.git"
+    qsp_hpc_tools_source: str = "git+ssh://git@github.com/popellab/qsp-hpc-tools.git"
     cpp_binary_path: str = ""  # Path to qsp_sim binary on HPC
     cpp_template_path: str = ""  # Path to param_all.xml on HPC
     cpp_subtree: str = "QSP"  # XML subtree for parameter lookup
@@ -614,7 +614,7 @@ class HPCJobManager:
                 "strict_host_key_checking", True
             ),  # Default to True for security
             qsp_hpc_tools_source=package.get(
-                "qsp_hpc_tools_source", "git+ssh://git@github.com/jeliason/qsp-hpc-tools.git"
+                "qsp_hpc_tools_source", "git+ssh://git@github.com/popellab/qsp-hpc-tools.git"
             ).strip(),
             cpp_binary_path=cpp.get("binary_path", "").strip(),
             cpp_template_path=cpp.get("template_path", "").strip(),

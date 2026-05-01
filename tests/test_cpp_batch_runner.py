@@ -36,9 +36,7 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
     the other behaviors; here we need at least `ok` and `flaky` (fails on
     specific sim_ids)."""
     script = tmp_path / f"fake_qsp_sim_{behavior}.sh"
-    script.write_text(
-        textwrap.dedent(
-            f"""\
+    script.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env bash
         set -e
         BEHAVIOR={behavior}
@@ -84,9 +82,7 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
         PY
             ;;
         esac
-    """
-        )
-    )
+    """))
     script.chmod(0o755)
     return script
 

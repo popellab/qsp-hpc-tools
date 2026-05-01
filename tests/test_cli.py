@@ -157,16 +157,14 @@ class TestSetupCommand:
         ssh_dir = tmp_path / ".ssh"
         ssh_dir.mkdir()
         ssh_config = ssh_dir / "config"
-        ssh_config.write_text(
-            """
+        ssh_config.write_text("""
 Host hpc-cluster
     HostName hpc.example.edu
     User myuser
 
 Host other-host
     HostName other.example.com
-"""
-        )
+""")
 
         with patch("qsp_hpc.batch.hpc_job_manager.HPCJobManager") as mock_mgr_cls:
             mock_manager = Mock()

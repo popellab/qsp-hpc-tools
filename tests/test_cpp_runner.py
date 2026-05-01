@@ -116,9 +116,7 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
     """Make an executable that mimics qsp_sim. `behavior` selects one of
     several canned responses — see cases in the script below."""
     script = tmp_path / f"fake_qsp_sim_{behavior}.sh"
-    script.write_text(
-        textwrap.dedent(
-            f"""\
+    script.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env bash
         set -e
         BEHAVIOR={behavior}
@@ -176,9 +174,7 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
         PY
             ;;
         esac
-    """
-        )
-    )
+    """))
     script.chmod(0o755)
     return script
 
@@ -342,9 +338,7 @@ def _make_fake_argv_recorder(tmp_path: Path) -> tuple[Path, Path]:
     + species file so run_one's parser is happy. Returns (script, argv_log)."""
     log = tmp_path / "argv.log"
     script = tmp_path / "fake_record.sh"
-    script.write_text(
-        textwrap.dedent(
-            f"""\
+    script.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env bash
         set -e
         printf '%s\\n' "$@" > "{log}"
@@ -368,9 +362,7 @@ def _make_fake_argv_recorder(tmp_path: Path) -> tuple[Path, Path]:
         open("$COMP_OUT", 'w').write('')
         open("$RULES_OUT", 'w').write('')
         PY
-    """
-        )
-    )
+    """))
     script.chmod(0o755)
     return script, log
 

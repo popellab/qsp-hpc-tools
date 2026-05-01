@@ -16,9 +16,9 @@ repos:
       - id: check-toml
       - id: debug-statements
 
-  # Black - Python code formatter
+  # Black - Python code formatter (matches pyproject dev-dep >=26.3.1)
   - repo: https://github.com/psf/black
-    rev: 24.1.1
+    rev: 26.3.1
     hooks:
       - id: black
         language_version: python3

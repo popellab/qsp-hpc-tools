@@ -35,9 +35,7 @@ B,lognormal,0.5,0.3
 def _make_fake_binary(tmp_path: Path) -> Path:
     """Shell script that mimics qsp_sim (2 time-points, 2 species)."""
     script = tmp_path / "fake_qsp_sim.sh"
-    script.write_text(
-        textwrap.dedent(
-            """\
+    script.write_text(textwrap.dedent("""\
         #!/usr/bin/env bash
         set -e
         while [ $# -gt 0 ]; do
@@ -61,9 +59,7 @@ open("$SP_OUT", 'w').write("spA\\nspB\\n")
 open("$COMP_OUT", 'w').write('')
 open("$RULES_OUT", 'w').write('')
 PY
-    """
-        )
-    )
+    """))
     script.chmod(0o755)
     return script
 

@@ -34,9 +34,7 @@ MINI_TEMPLATE = b"""<Param>
 def _make_fake_binary(tmp_path: Path) -> Path:
     """Shell script mimicking qsp_sim (2 timepoints, 2 species)."""
     script = tmp_path / "fake_qsp_sim.sh"
-    script.write_text(
-        textwrap.dedent(
-            """\
+    script.write_text(textwrap.dedent("""\
         #!/usr/bin/env bash
         set -e
         while [ $# -gt 0 ]; do
@@ -60,9 +58,7 @@ def _make_fake_binary(tmp_path: Path) -> Path:
         open("$COMP_OUT", 'w').write('')
         open("$RULES_OUT", 'w').write('')
         PY
-    """
-        )
-    )
+    """))
     script.chmod(0o755)
     return script
 

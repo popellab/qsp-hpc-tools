@@ -707,7 +707,7 @@ class TestCppSimulatorRunHpc:
         jm.download_test_stats_full.assert_called_once()
         # Pool path passed to check_hpc_test_stats must be
         # {simulation_pool_path}/{simulation_pool_id} so HPC and local agree
-        ((pool_path, _hash), kw) = jm.check_hpc_test_stats.call_args
+        (pool_path, _hash), kw = jm.check_hpc_test_stats.call_args
         assert pool_path.endswith(f"/{sim.simulation_pool_id}")
         assert kw["expected_n_sims"] == 4
 

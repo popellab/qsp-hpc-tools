@@ -132,10 +132,21 @@ def _sample_prior_batch(
     theta = np.zeros((n, n_params))
     for i in range(n_params):
         row = priors_df.iloc[i]
-        if row["distribution"] == "lognormal":
-            theta[:, i] = rng.lognormal(mean=row["dist_param1"], sigma=row["dist_param2"], size=n)
+        dist = row["distribution"]
+        p1 = float(row["dist_param1"])
+        p2 = float(row["dist_param2"])
+        if dist == "lognormal":
+            theta[:, i] = rng.lognormal(mean=p1, sigma=p2, size=n)
+        elif dist == "normal":
+            theta[:, i] = rng.normal(loc=p1, scale=p2, size=n)
+        elif dist == "uniform":
+            theta[:, i] = rng.uniform(low=p1, high=p2, size=n)
+        elif dist == "beta":
+            # dist_param1 = alpha (concentration1), dist_param2 = beta (concentration0)
+            # Matches qsp-inference's load_sbi_priors convention.
+            theta[:, i] = rng.beta(a=p1, b=p2, size=n)
         else:
-            raise ValueError(f"Unsupported distribution: {row['distribution']}")
+            raise ValueError(f"Unsupported distribution: {dist}")
     return theta, priors_df["name"].tolist()
 
 

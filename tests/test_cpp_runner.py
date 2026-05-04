@@ -547,6 +547,72 @@ def test_batch_runner_warns_when_per_call_set_without_healthy_state(
     assert not call_dir.exists()
 
 
+def test_run_one_in_worker_skips_cache_when_traj_dir_set(tmp_path: Path, monkeypatch):
+    """The worker must skip the evolve-cache lookup when the caller asks
+    for burn-in trajectories — cached-state mode (``--initial-state``)
+    bypasses the burn-in phase, which would silently produce zero
+    trajectory binaries."""
+    from qsp_hpc.cpp import batch_runner as br
+
+    # Spy on whether get_or_build is called. Replace _WORKER_EVOLVE_CACHE
+    # with a stub that records calls; replace _WORKER_RUNNER with a stub
+    # whose run_one returns a benign SimResult.
+    cache_calls: list[dict] = []
+
+    class _FakeCache:
+        def get_or_build(self, params, workdir, timeout_s):
+            cache_calls.append({"params": params, "workdir": workdir, "timeout_s": timeout_s})
+            return Path("/tmp/state.bin"), "abcdef"
+
+    runner_calls: list[dict] = []
+
+    class _FakeRunner:
+        def run_one(self, **kwargs):
+            runner_calls.append(kwargs)
+            from qsp_hpc.cpp.runner import SimResult
+
+            return SimResult(
+                trajectory=np.zeros((1, 1)),
+                species_names=["x"],
+                compartment_names=[],
+                rule_names=[],
+                dt_days=1.0,
+                t_end_days=1.0,
+            )
+
+    monkeypatch.setattr(br, "_WORKER_RUNNER", _FakeRunner())
+    monkeypatch.setattr(br, "_WORKER_WORKDIR", tmp_path)
+    monkeypatch.setattr(br, "_WORKER_EVOLVE_CACHE", _FakeCache())
+
+    # 1) traj_dir set → cache MUST NOT be consulted; runner sees no
+    #    evolve_state_path (so qsp_sim runs the burn-in fresh).
+    br._run_one_in_worker(
+        sim_id=0,
+        sample_index=0,
+        params={"A": 1.0},
+        t_end_days=0.1,
+        dt_days=0.1,
+        timeout_s=None,
+        evolve_trajectory_dir=str(tmp_path / "traj"),
+    )
+    assert cache_calls == [], "cache was hit despite evolve_trajectory_dir"
+    assert runner_calls[-1]["evolve_state_path"] is None
+    assert runner_calls[-1]["evolve_trajectory_path"] is not None
+
+    # 2) traj_dir omitted → cache IS consulted; runner sees the cached state.
+    br._run_one_in_worker(
+        sim_id=1,
+        sample_index=1,
+        params={"A": 1.0},
+        t_end_days=0.1,
+        dt_days=0.1,
+        timeout_s=None,
+    )
+    assert len(cache_calls) == 1
+    assert runner_calls[-1]["evolve_state_path"] == Path("/tmp/state.bin")
+    assert runner_calls[-1]["evolve_trajectory_path"] is None
+
+
 def _real_healthy_yaml() -> Path | None:
     here = Path(__file__).resolve().parent.parent
     for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):

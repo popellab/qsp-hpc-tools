@@ -241,9 +241,16 @@ def _run_one_in_worker(
         # for this theta (build-if-missing) and pass it to qsp_sim via
         # --initial-state. Scenarios sharing a theta amortize the evolve
         # across all runs; the first one pays ~0.5s, the rest ~0ms.
+        #
+        # Skip the cache when ``evolve_trajectory_dir`` is set: cached-state
+        # mode loads a post-evolve snapshot, which by design skips the
+        # burn-in phase entirely. Honoring the cache here would silently
+        # produce zero trajectory binaries even when the caller asked for
+        # them (caught locally on a 50-sim smoke; this is the worker-side
+        # half of #69's "trajectories take priority over cache" semantics).
         evolve_state_path: Path | None = None
         params_hash: str | None = None
-        if _WORKER_EVOLVE_CACHE is not None:
+        if _WORKER_EVOLVE_CACHE is not None and evolve_trajectory_dir is None:
             evolve_state_path, params_hash = _WORKER_EVOLVE_CACHE.get_or_build(
                 params,
                 workdir=_WORKER_WORKDIR,

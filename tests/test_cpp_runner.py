@@ -458,6 +458,95 @@ def test_runner_missing_yaml_raises(tmp_path: Path, template_path: Path, fake_ok
         CppRunner(fake_ok, template_path, healthy_state_yaml=tmp_path / "nope.yaml")
 
 
+# --- CppBatchRunner per-call override tests --------------------------------
+
+
+def test_batch_runner_per_call_evolve_traj_creates_call_dir(tmp_path: Path, template_path: Path):
+    """``CppBatchRunner.run(evolve_trajectory_dir=...)`` overrides the
+    ``__init__`` default; the per-call dir is created on first batch."""
+    from qsp_hpc.cpp.batch_runner import CppBatchRunner
+
+    script = _make_fake_binary(tmp_path, "ok")
+    healthy = tmp_path / "healthy.yaml"
+    healthy.write_text("densities: {}\n")
+    init_dir = tmp_path / "init_dir"
+    call_dir = tmp_path / "call_dir"
+
+    batch = CppBatchRunner(
+        binary_path=script,
+        template_path=template_path,
+        healthy_state_yaml=healthy,
+        evolve_trajectory_dir=init_dir,
+        evolve_trajectory_dt_days=14.0,
+    )
+    assert batch.evolve_trajectory_dir == init_dir.resolve()
+    assert batch.evolve_trajectory_dt_days == 14.0
+
+    theta = np.array([[5.0]])
+    batch.run(
+        theta_matrix=theta,
+        param_names=["A"],
+        t_end_days=0.1,
+        dt_days=0.1,
+        output_path=tmp_path / "out.parquet",
+        evolve_trajectory_dir=call_dir,
+    )
+    assert call_dir.exists()
+
+
+def test_batch_runner_init_default_used_when_no_per_call(tmp_path: Path, template_path: Path):
+    """Without per-call args, ``__init__``-supplied defaults engage."""
+    from qsp_hpc.cpp.batch_runner import CppBatchRunner
+
+    script = _make_fake_binary(tmp_path, "ok")
+    healthy = tmp_path / "healthy.yaml"
+    healthy.write_text("densities: {}\n")
+    init_dir = tmp_path / "init_dir"
+
+    batch = CppBatchRunner(
+        binary_path=script,
+        template_path=template_path,
+        healthy_state_yaml=healthy,
+        evolve_trajectory_dir=init_dir,
+    )
+    theta = np.array([[5.0]])
+    batch.run(
+        theta_matrix=theta,
+        param_names=["A"],
+        t_end_days=0.1,
+        dt_days=0.1,
+        output_path=tmp_path / "out.parquet",
+    )
+    assert init_dir.exists()
+
+
+def test_batch_runner_warns_when_per_call_set_without_healthy_state(
+    tmp_path: Path, template_path: Path, caplog
+):
+    """A per-call ``evolve_trajectory_dir`` without ``healthy_state_yaml`` is
+    silently dropped with a warning — there's no burn-in phase to dump."""
+    import logging
+
+    from qsp_hpc.cpp.batch_runner import CppBatchRunner
+
+    script = _make_fake_binary(tmp_path, "ok")
+    batch = CppBatchRunner(binary_path=script, template_path=template_path)
+    assert batch.healthy_state_yaml is None
+    theta = np.array([[5.0]])
+    call_dir = tmp_path / "call_dir"
+    with caplog.at_level(logging.WARNING):
+        batch.run(
+            theta_matrix=theta,
+            param_names=["A"],
+            t_end_days=0.1,
+            dt_days=0.1,
+            output_path=tmp_path / "out.parquet",
+            evolve_trajectory_dir=call_dir,
+        )
+    assert any("ignored" in rec.message for rec in caplog.records)
+    assert not call_dir.exists()
+
+
 def _real_healthy_yaml() -> Path | None:
     here = Path(__file__).resolve().parent.parent
     for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):

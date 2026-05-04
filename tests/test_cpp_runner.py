@@ -411,6 +411,48 @@ def test_runner_scenario_requires_drug_metadata(tmp_path: Path, template_path: P
         CppRunner(fake_ok, template_path, scenario_yaml=scenario)
 
 
+def test_runner_appends_evolve_trajectory_flags(tmp_path: Path, template_path: Path):
+    """``run_one(evolve_trajectory_path=..., evolve_trajectory_dt_days=...)``
+    forwards both as ``--evolve-trajectory-out`` / ``--evolve-trajectory-dt-days``."""
+    script, log = _make_fake_argv_recorder(tmp_path)
+    healthy = tmp_path / "healthy.yaml"
+    healthy.write_text("densities: {}\n")
+
+    runner = CppRunner(script, template_path, healthy_state_yaml=healthy)
+    traj_path = tmp_path / "burn_in.bin"
+    runner.run_one(
+        params={"A": 1.0},
+        t_end_days=0.1,
+        dt_days=0.1,
+        workdir=tmp_path / "w",
+        evolve_trajectory_path=traj_path,
+        evolve_trajectory_dt_days=14.0,
+    )
+
+    argv = log.read_text().splitlines()
+    assert "--evolve-trajectory-out" in argv
+    assert str(traj_path) in argv
+    assert "--evolve-trajectory-dt-days" in argv
+    # Surfaces the float through repr() — accept any string that parses back.
+    dt_arg = argv[argv.index("--evolve-trajectory-dt-days") + 1]
+    assert float(dt_arg) == 14.0
+
+
+def test_runner_evolve_trajectory_omits_when_no_path(tmp_path: Path, template_path: Path):
+    """No ``--evolve-trajectory-*`` flags emitted when ``evolve_trajectory_path``
+    is None (the default)."""
+    script, log = _make_fake_argv_recorder(tmp_path)
+    healthy = tmp_path / "healthy.yaml"
+    healthy.write_text("densities: {}\n")
+
+    runner = CppRunner(script, template_path, healthy_state_yaml=healthy)
+    runner.run_one(params={"A": 1.0}, t_end_days=0.1, dt_days=0.1, workdir=tmp_path / "w")
+
+    argv = log.read_text().splitlines()
+    assert "--evolve-trajectory-out" not in argv
+    assert "--evolve-trajectory-dt-days" not in argv
+
+
 def test_runner_missing_yaml_raises(tmp_path: Path, template_path: Path, fake_ok: Path):
     with pytest.raises(FileNotFoundError, match="YAML not found"):
         CppRunner(fake_ok, template_path, healthy_state_yaml=tmp_path / "nope.yaml")

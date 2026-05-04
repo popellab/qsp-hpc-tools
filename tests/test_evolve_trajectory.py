@@ -209,3 +209,139 @@ def test_assemble_column_count_mismatch_raises(tmp_path: Path) -> None:
             compartment_names=COMPS,
             rule_names=RULES,
         )
+
+
+# --- post-scenario assembler tests ---------------------------------------
+
+
+def test_post_scenario_assembler_happy_path(tmp_path: Path) -> None:
+    """Three sims, two timepoints each — long-form output is sorted and
+    matches the underlying list-typed cells."""
+
+    from qsp_hpc.cpp.evolve_trajectory import assemble_post_scenario_trajectory_long
+
+    # Schema mirrors what CppBatchRunner produces: meta + param:* + list-typed
+    # species columns sharing a per-sim 'time' list.
+    parq = tmp_path / "species.parquet"
+    df = pd.DataFrame(
+        {
+            "sample_index": [0, 1, 2],
+            "simulation_id": [0, 1, 2],
+            "status": [0, 0, 0],
+            "time": [[0.0, 5.0], [0.0, 5.0], [0.0, 5.0]],
+            "param:k_growth": [1.0, 2.0, 3.0],
+            "V_T.CD8": [[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]],
+            "V_T": [[1.0, 1.5], [2.0, 2.5], [3.0, 3.5]],
+        }
+    )
+    df.to_parquet(parq)
+
+    out = assemble_post_scenario_trajectory_long(parq)
+    assert list(out.columns) == ["sample_index", "time_days", "column", "value"]
+    # 3 sims × 2 times × 2 cols (V_T.CD8, V_T) = 12 rows
+    assert len(out) == 12
+    # Last sim's V_T.CD8 at t=5 is 60
+    sim2_cd8_t5 = out[
+        (out["sample_index"] == 2) & (out["time_days"] == 5.0) & (out["column"] == "V_T.CD8")
+    ]["value"].iloc[0]
+    assert sim2_cd8_t5 == 60.0
+    # param:* columns are excluded
+    assert "k_growth" not in set(out["column"])
+
+
+def test_post_scenario_assembler_drops_failed(tmp_path: Path) -> None:
+    """``status != 0`` rows are dropped by default."""
+    from qsp_hpc.cpp.evolve_trajectory import assemble_post_scenario_trajectory_long
+
+    parq = tmp_path / "species.parquet"
+    df = pd.DataFrame(
+        {
+            "sample_index": [0, 1],
+            "status": [0, 1],
+            "time": [[0.0, 5.0], [0.0, 5.0]],
+            "V_T.CD8": [[10.0, 20.0], [float("nan"), float("nan")]],
+        }
+    )
+    df.to_parquet(parq)
+    out = assemble_post_scenario_trajectory_long(parq)
+    assert set(out["sample_index"]) == {0}
+
+
+def test_post_scenario_assembler_columns_subset(tmp_path: Path) -> None:
+    from qsp_hpc.cpp.evolve_trajectory import assemble_post_scenario_trajectory_long
+
+    parq = tmp_path / "species.parquet"
+    df = pd.DataFrame(
+        {
+            "sample_index": [0],
+            "status": [0],
+            "time": [[0.0, 5.0]],
+            "V_T.CD8": [[10.0, 20.0]],
+            "V_T.Treg": [[1.0, 2.0]],
+            "V_T": [[1.0, 1.5]],
+        }
+    )
+    df.to_parquet(parq)
+    out = assemble_post_scenario_trajectory_long(parq, columns=["V_T.CD8"])
+    assert set(out["column"]) == {"V_T.CD8"}
+    assert len(out) == 2  # 1 sim × 2 times × 1 col
+
+
+def test_post_scenario_assembler_columns_unknown_raises(tmp_path: Path) -> None:
+    from qsp_hpc.cpp.evolve_trajectory import assemble_post_scenario_trajectory_long
+
+    parq = tmp_path / "species.parquet"
+    df = pd.DataFrame(
+        {
+            "sample_index": [0],
+            "status": [0],
+            "time": [[0.0, 5.0]],
+            "V_T.CD8": [[10.0, 20.0]],
+        }
+    )
+    df.to_parquet(parq)
+    with pytest.raises(ValueError, match="not in species parquet"):
+        assemble_post_scenario_trajectory_long(parq, columns=["NotAColumn"])
+
+
+def test_post_scenario_assembler_sample_indices_filter(tmp_path: Path) -> None:
+    from qsp_hpc.cpp.evolve_trajectory import assemble_post_scenario_trajectory_long
+
+    parq = tmp_path / "species.parquet"
+    df = pd.DataFrame(
+        {
+            "sample_index": [0, 1, 2],
+            "status": [0, 0, 0],
+            "time": [[0.0], [0.0], [0.0]],
+            "V_T.CD8": [[10.0], [20.0], [30.0]],
+        }
+    )
+    df.to_parquet(parq)
+    out = assemble_post_scenario_trajectory_long(parq, sample_indices=[0, 2])
+    assert set(out["sample_index"]) == {0, 2}
+
+
+def test_post_scenario_assembler_missing_file_raises(tmp_path: Path) -> None:
+    from qsp_hpc.cpp.evolve_trajectory import assemble_post_scenario_trajectory_long
+
+    with pytest.raises(FileNotFoundError):
+        assemble_post_scenario_trajectory_long(tmp_path / "nope.parquet")
+
+
+def test_post_scenario_assembler_time_length_mismatch_raises(tmp_path: Path) -> None:
+    """Sanity: a column whose list length doesn't match ``time`` is a
+    schema bug — refuse to silently truncate or pad."""
+    from qsp_hpc.cpp.evolve_trajectory import assemble_post_scenario_trajectory_long
+
+    parq = tmp_path / "species.parquet"
+    df = pd.DataFrame(
+        {
+            "sample_index": [0],
+            "status": [0],
+            "time": [[0.0, 5.0, 10.0]],
+            "V_T.CD8": [[10.0, 20.0]],  # length 2 ≠ time length 3
+        }
+    )
+    df.to_parquet(parq)
+    with pytest.raises(ValueError, match="entries but time has"):
+        assemble_post_scenario_trajectory_long(parq)

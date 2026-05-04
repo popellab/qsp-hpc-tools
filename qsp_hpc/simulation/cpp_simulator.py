@@ -948,6 +948,8 @@ class CppSimulator:
         backend: str = "local",
         prediction_targets: Optional[str | Path] = None,
         pool_suffix: str = "posterior_predictive",
+        evolve_trajectory_dir: Optional[str | Path] = None,
+        evolve_trajectory_dt_days: Optional[float] = None,
     ) -> Tuple[np.ndarray, pa.Table]:
         """Run C++ simulations at explicit thetas and return derived test stats.
 
@@ -979,6 +981,18 @@ class CppSimulator:
                 suffix-pool directory name. Only change this when you want
                 two logically distinct posterior-predictive runs to stay
                 cache-isolated even when the thetas happen to collide.
+            evolve_trajectory_dir: Per-call override of the simulator's
+                ``evolve_trajectory_dir`` setting. When set, dumps a
+                burn-in trajectory binary per sim under this directory
+                (one ``sim_<sample_index>.bin`` each, format matches
+                ``qsp_sim --evolve-trajectory-out``). The suffix-pool
+                cache is **bypassed** when this is set: the cached
+                test-stat parquet has no trajectory data, so we can't
+                short-circuit. Local backend only — HPC raises
+                ``NotImplementedError``.
+            evolve_trajectory_dt_days: Sampling interval in model-time
+                days for the burn-in dump. ``None`` lets the C++ side
+                use the evolve spec's ``step_days``.
 
         Returns:
             ``(theta_out, table)`` where ``theta_out`` has the same shape
@@ -1010,6 +1024,12 @@ class CppSimulator:
                 "simulate_with_parameters(backend='hpc', prediction_targets=...) "
                 "is not yet supported; the merged calibration+prediction CSV is "
                 "not shipped to the cluster. Run locally or split the call."
+            )
+        if backend == "hpc" and evolve_trajectory_dir is not None:
+            raise NotImplementedError(
+                "simulate_with_parameters(backend='hpc', evolve_trajectory_dir=...) "
+                "is not yet supported; the per-sim trajectory binaries don't yet "
+                "have an HPC-side collection path. Run locally."
             )
         if backend == "hpc" and self.job_manager is None:
             raise RuntimeError(
@@ -1047,7 +1067,16 @@ class CppSimulator:
         )
         self.logger.info(f"  suffix pool: {suffix_pool_dir.name}")
 
-        if cache_path.exists():
+        # Burn-in trajectory dump bypasses the suffix-pool cache: the
+        # cached parquet has only test-stat columns, so a hit can't
+        # surface the per-sim trajectory binaries the caller is asking
+        # for. Force-fresh sims when ``evolve_trajectory_dir`` is set.
+        if evolve_trajectory_dir is not None and cache_path.exists():
+            self.logger.info(
+                "suffix-pool cache present but bypassed: "
+                "evolve_trajectory_dir is set (need fresh sims for burn-in dump)"
+            )
+        elif cache_path.exists():
             cached = pq.read_table(str(cache_path))
             if cached.num_rows >= n_samples:
                 self.logger.info(f"✓ suffix-pool cache hit ({cached.num_rows} rows)")
@@ -1074,6 +1103,8 @@ class CppSimulator:
                 test_stats_df=test_stats_df,
                 suffix_pool_dir=suffix_pool_dir,
                 pool_suffix=pool_suffix,
+                evolve_trajectory_dir=evolve_trajectory_dir,
+                evolve_trajectory_dt_days=evolve_trajectory_dt_days,
             )
         else:
             table = self._simulate_with_parameters_hpc(
@@ -1104,6 +1135,8 @@ class CppSimulator:
         test_stats_df: pd.DataFrame,
         suffix_pool_dir: Path,
         pool_suffix: str,
+        evolve_trajectory_dir: Optional[str | Path] = None,
+        evolve_trajectory_dt_days: Optional[float] = None,
     ) -> pa.Table:
         """Local backend for :meth:`simulate_with_parameters`.
 
@@ -1133,6 +1166,8 @@ class CppSimulator:
             seed=self.seed,
             max_workers=self.max_workers,
             per_sim_timeout_s=self.per_sim_timeout_s,
+            evolve_trajectory_dir=evolve_trajectory_dir,
+            evolve_trajectory_dt_days=evolve_trajectory_dt_days,
         )
 
         species_df = pd.read_parquet(species_parquet)

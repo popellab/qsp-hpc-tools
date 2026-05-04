@@ -150,12 +150,6 @@ _WORKER_WORKDIR: Path | None = None
 # binary. Workers lookup via the cache per-sim; the fcntl lock inside
 # get_or_build serializes builds across workers hitting the same theta.
 _WORKER_EVOLVE_CACHE: CppEvolveCache | None = None
-# Optional: when the batch was constructed with evolve_trajectory_dir,
-# workers dump per-sim burn-in trajectories to this directory at the
-# configured cadence. Only meaningful when healthy_state_yaml is set
-# (no burn-in in cached-state mode).
-_WORKER_EVOLVE_TRAJ_DIR: Path | None = None
-_WORKER_EVOLVE_TRAJ_DT: float | None = None
 
 
 def _worker_init(
@@ -168,11 +162,8 @@ def _worker_init(
     drug_metadata_yaml: str | None,
     healthy_state_yaml: str | None,
     evolve_cache_root: str | None,
-    evolve_trajectory_dir: str | None = None,
-    evolve_trajectory_dt_days: float | None = None,
 ) -> None:
     global _WORKER_RUNNER, _WORKER_WORKDIR, _WORKER_EVOLVE_CACHE
-    global _WORKER_EVOLVE_TRAJ_DIR, _WORKER_EVOLVE_TRAJ_DT
     # Configure the qsp_hpc parent logger inside the worker so descendant
     # loggers (qsp_hpc.cpp.evolve_cache, this module) emit to stdout even
     # when the pool was created with the "spawn" start method (Python 3.14+
@@ -217,20 +208,6 @@ def _worker_init(
             healthy_state_yaml,
         )
 
-    if evolve_trajectory_dir is not None and healthy_state_yaml is not None:
-        _WORKER_EVOLVE_TRAJ_DIR = Path(evolve_trajectory_dir)
-        _WORKER_EVOLVE_TRAJ_DIR.mkdir(parents=True, exist_ok=True)
-        _WORKER_EVOLVE_TRAJ_DT = evolve_trajectory_dt_days
-        logger.info(
-            "worker %d: evolve trajectory dump ENABLED, dir=%s, dt_days=%s",
-            os.getpid(),
-            _WORKER_EVOLVE_TRAJ_DIR,
-            _WORKER_EVOLVE_TRAJ_DT if _WORKER_EVOLVE_TRAJ_DT else "(spec step_days)",
-        )
-    else:
-        _WORKER_EVOLVE_TRAJ_DIR = None
-        _WORKER_EVOLVE_TRAJ_DT = None
-
 
 def _run_one_in_worker(
     sim_id: int,
@@ -239,6 +216,8 @@ def _run_one_in_worker(
     t_end_days: float,
     dt_days: float,
     timeout_s: float | None,
+    evolve_trajectory_dir: str | None = None,
+    evolve_trajectory_dt_days: float | None = None,
 ) -> tuple[
     int,
     int,
@@ -248,7 +227,13 @@ def _run_one_in_worker(
     list[str] | None,
     str | None,
 ]:
-    """Return (sim_id, status, trajectory, species, comps, rules, err)."""
+    """Return (sim_id, status, trajectory, species, comps, rules, err).
+
+    ``evolve_trajectory_dir`` / ``evolve_trajectory_dt_days`` are the
+    *effective* values resolved by the caller (CppBatchRunner.run()) —
+    per-call overrides take priority over __init__ defaults. ``None``
+    here means "no dump for this sim".
+    """
     assert _WORKER_RUNNER is not None, "_worker_init must be called first"
     assert _WORKER_WORKDIR is not None
     try:
@@ -270,9 +255,9 @@ def _run_one_in_worker(
         # path skips burn-in entirely).
         traj_path: Path | None = None
         traj_dt: float | None = None
-        if _WORKER_EVOLVE_TRAJ_DIR is not None and evolve_state_path is None:
-            traj_path = _WORKER_EVOLVE_TRAJ_DIR / f"sim_{sample_index:09d}.bin"
-            traj_dt = _WORKER_EVOLVE_TRAJ_DT
+        if evolve_trajectory_dir is not None and evolve_state_path is None:
+            traj_path = Path(evolve_trajectory_dir) / f"sim_{sample_index:09d}.bin"
+            traj_dt = evolve_trajectory_dt_days
         result: SimResult = _WORKER_RUNNER.run_one(
             params=params,
             t_end_days=t_end_days,
@@ -387,6 +372,8 @@ class CppBatchRunner:
         max_workers: int | None = None,
         per_sim_timeout_s: float | None = None,
         sample_indices: np.ndarray | None = None,
+        evolve_trajectory_dir: str | Path | None = None,
+        evolve_trajectory_dt_days: float | None = None,
     ) -> BatchResult:
         """Execute a batch and write the Parquet.
 
@@ -470,6 +457,35 @@ class CppBatchRunner:
         compartment_names: list[str] | None = None
         rule_names: list[str] | None = None
 
+        # Effective evolve-trajectory dump for this batch: per-call args
+        # (passed to .run()) override the __init__ defaults. ``None`` here
+        # means no dump for any sim in this batch.
+        effective_traj_dir = (
+            evolve_trajectory_dir
+            if evolve_trajectory_dir is not None
+            else self.evolve_trajectory_dir
+        )
+        effective_traj_dt = (
+            evolve_trajectory_dt_days
+            if evolve_trajectory_dt_days is not None
+            else self.evolve_trajectory_dt_days
+        )
+        if effective_traj_dir is not None and self.healthy_state_yaml is None:
+            logger.warning(
+                "evolve_trajectory_dir=%s ignored: no healthy_state_yaml "
+                "(no burn-in phase to dump)",
+                effective_traj_dir,
+            )
+            effective_traj_dir = None
+        if effective_traj_dir is not None:
+            Path(effective_traj_dir).mkdir(parents=True, exist_ok=True)
+            logger.info(
+                "Evolve trajectory dump: ENABLED (dir=%s, dt_days=%s)",
+                effective_traj_dir,
+                effective_traj_dt if effective_traj_dt else "(spec step_days)",
+            )
+        traj_dir_str = str(effective_traj_dir) if effective_traj_dir else None
+
         with ProcessPoolExecutor(
             max_workers=max_workers,
             initializer=_worker_init,
@@ -483,8 +499,6 @@ class CppBatchRunner:
                 str(self.drug_metadata_yaml) if self.drug_metadata_yaml else None,
                 str(self.healthy_state_yaml) if self.healthy_state_yaml else None,
                 str(self.evolve_cache_root) if self.evolve_cache_root else None,
-                str(self.evolve_trajectory_dir) if self.evolve_trajectory_dir else None,
-                self.evolve_trajectory_dt_days,
             ),
         ) as pool:
             # sample_indices is the canonical theta-pool index for each row;
@@ -507,6 +521,8 @@ class CppBatchRunner:
                         t_end_days,
                         dt_days,
                         per_sim_timeout_s,
+                        traj_dir_str,
+                        effective_traj_dt,
                     )
                 )
             for fut in as_completed(futures):

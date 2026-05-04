@@ -212,6 +212,8 @@ class CppRunner:
         keep_files: bool = False,
         evolve_state_path: str | Path | None = None,
         params_hash: str | None = None,
+        evolve_trajectory_path: str | Path | None = None,
+        evolve_trajectory_dt_days: float | None = None,
     ) -> SimResult:
         """Run one simulation end-to-end.
 
@@ -226,7 +228,9 @@ class CppRunner:
             timeout_s: Override for default_timeout_s.
             keep_files: If True, leave XML + binary on disk after parsing
                 (useful for debugging). If False, delete on success;
-                always keep on failure.
+                always keep on failure. Note: ``evolve_trajectory_path``
+                output is preserved regardless — the caller owns that
+                file and decides when to clean it up.
             evolve_state_path: If provided, pass ``--initial-state`` to
                 qsp_sim instead of ``--evolve-to-diagnosis`` — skips the
                 ~857-day healthy-state integration by loading a previously
@@ -239,6 +243,19 @@ class CppRunner:
                 cache-consistency checks. Required when
                 ``evolve_state_path`` is set (without it, qsp_sim cannot
                 verify the cached state matches the current theta).
+            evolve_trajectory_path: If provided, pass
+                ``--evolve-trajectory-out`` to qsp_sim — dumps a binary
+                v2 trajectory of the burn-in phase (healthy → diagnosis)
+                to this path. Same magic / column layout as the
+                post-scenario binary, so :func:`read_binary_trajectory`
+                handles both. Requires that the runner be configured
+                with ``healthy_state_yaml`` (the upstream
+                ``--evolve-to-diagnosis`` flag); silently no-ops when
+                ``evolve_state_path`` is set since burn-in is skipped
+                in cached-state mode.
+            evolve_trajectory_dt_days: Sampling interval (model-time
+                days) for the burn-in dump. ``None`` lets qsp_sim use
+                the evolve spec's ``step_days``.
 
         Returns:
             SimResult with trajectory, species_names, dt, t_end.
@@ -298,6 +315,13 @@ class CppRunner:
             ]
         elif self.healthy_state_yaml is not None:
             cmd += ["--evolve-to-diagnosis", str(self.healthy_state_yaml)]
+            if evolve_trajectory_path is not None:
+                cmd += ["--evolve-trajectory-out", str(evolve_trajectory_path)]
+                if evolve_trajectory_dt_days is not None:
+                    cmd += [
+                        "--evolve-trajectory-dt-days",
+                        repr(float(evolve_trajectory_dt_days)),
+                    ]
 
         try:
             proc = subprocess.run(

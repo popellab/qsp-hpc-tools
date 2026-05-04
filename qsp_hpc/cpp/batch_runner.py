@@ -150,6 +150,12 @@ _WORKER_WORKDIR: Path | None = None
 # binary. Workers lookup via the cache per-sim; the fcntl lock inside
 # get_or_build serializes builds across workers hitting the same theta.
 _WORKER_EVOLVE_CACHE: CppEvolveCache | None = None
+# Optional: when the batch was constructed with evolve_trajectory_dir,
+# workers dump per-sim burn-in trajectories to this directory at the
+# configured cadence. Only meaningful when healthy_state_yaml is set
+# (no burn-in in cached-state mode).
+_WORKER_EVOLVE_TRAJ_DIR: Path | None = None
+_WORKER_EVOLVE_TRAJ_DT: float | None = None
 
 
 def _worker_init(
@@ -162,8 +168,11 @@ def _worker_init(
     drug_metadata_yaml: str | None,
     healthy_state_yaml: str | None,
     evolve_cache_root: str | None,
+    evolve_trajectory_dir: str | None = None,
+    evolve_trajectory_dt_days: float | None = None,
 ) -> None:
     global _WORKER_RUNNER, _WORKER_WORKDIR, _WORKER_EVOLVE_CACHE
+    global _WORKER_EVOLVE_TRAJ_DIR, _WORKER_EVOLVE_TRAJ_DT
     # Configure the qsp_hpc parent logger inside the worker so descendant
     # loggers (qsp_hpc.cpp.evolve_cache, this module) emit to stdout even
     # when the pool was created with the "spawn" start method (Python 3.14+
@@ -208,9 +217,24 @@ def _worker_init(
             healthy_state_yaml,
         )
 
+    if evolve_trajectory_dir is not None and healthy_state_yaml is not None:
+        _WORKER_EVOLVE_TRAJ_DIR = Path(evolve_trajectory_dir)
+        _WORKER_EVOLVE_TRAJ_DIR.mkdir(parents=True, exist_ok=True)
+        _WORKER_EVOLVE_TRAJ_DT = evolve_trajectory_dt_days
+        logger.info(
+            "worker %d: evolve trajectory dump ENABLED, dir=%s, dt_days=%s",
+            os.getpid(),
+            _WORKER_EVOLVE_TRAJ_DIR,
+            _WORKER_EVOLVE_TRAJ_DT if _WORKER_EVOLVE_TRAJ_DT else "(spec step_days)",
+        )
+    else:
+        _WORKER_EVOLVE_TRAJ_DIR = None
+        _WORKER_EVOLVE_TRAJ_DT = None
+
 
 def _run_one_in_worker(
     sim_id: int,
+    sample_index: int,
     params: dict[str, float],
     t_end_days: float,
     dt_days: float,
@@ -240,6 +264,15 @@ def _run_one_in_worker(
                 workdir=_WORKER_WORKDIR,
                 timeout_s=timeout_s,
             )
+        # Burn-in trajectory dump path (per-sim, keyed by sample_index so
+        # the assembler can join back to theta rows). Only set when the
+        # batch enabled it AND we're not in cached-state mode (the cache
+        # path skips burn-in entirely).
+        traj_path: Path | None = None
+        traj_dt: float | None = None
+        if _WORKER_EVOLVE_TRAJ_DIR is not None and evolve_state_path is None:
+            traj_path = _WORKER_EVOLVE_TRAJ_DIR / f"sim_{sample_index:09d}.bin"
+            traj_dt = _WORKER_EVOLVE_TRAJ_DT
         result: SimResult = _WORKER_RUNNER.run_one(
             params=params,
             t_end_days=t_end_days,
@@ -248,6 +281,8 @@ def _run_one_in_worker(
             timeout_s=timeout_s,
             evolve_state_path=evolve_state_path,
             params_hash=params_hash,
+            evolve_trajectory_path=traj_path,
+            evolve_trajectory_dt_days=traj_dt,
         )
         return (
             sim_id,
@@ -278,6 +313,8 @@ class CppBatchRunner:
         drug_metadata_yaml: str | Path | None = None,
         healthy_state_yaml: str | Path | None = None,
         evolve_cache_root: str | Path | None = None,
+        evolve_trajectory_dir: str | Path | None = None,
+        evolve_trajectory_dt_days: float | None = None,
     ):
         # Validate eagerly so callers fail fast, before we fork workers.
         probe = CppRunner(
@@ -312,6 +349,22 @@ class CppBatchRunner:
             )
             evolve_cache_root = None
         self.evolve_cache_root = Path(evolve_cache_root).resolve() if evolve_cache_root else None
+        # Burn-in trajectory dump dir (passed to qsp_sim as
+        # --evolve-trajectory-out per sim). Same caveat as evolve_cache:
+        # only meaningful when healthy_state_yaml is set, and disabled
+        # at the worker layer for sims that go through evolve_cache
+        # (no burn-in to dump in cached-state mode).
+        if evolve_trajectory_dir is not None and probe.healthy_state_yaml is None:
+            logger.warning(
+                "evolve_trajectory_dir=%s ignored: no healthy_state_yaml "
+                "(no burn-in phase to dump)",
+                evolve_trajectory_dir,
+            )
+            evolve_trajectory_dir = None
+        self.evolve_trajectory_dir = (
+            Path(evolve_trajectory_dir).resolve() if evolve_trajectory_dir else None
+        )
+        self.evolve_trajectory_dt_days = evolve_trajectory_dt_days
         # Cache template defaults for the pool manifest (#23): only
         # sampled params land as parquet columns, and non-sampled
         # defaults live in pool_manifest.json alongside the batch
@@ -430,8 +483,18 @@ class CppBatchRunner:
                 str(self.drug_metadata_yaml) if self.drug_metadata_yaml else None,
                 str(self.healthy_state_yaml) if self.healthy_state_yaml else None,
                 str(self.evolve_cache_root) if self.evolve_cache_root else None,
+                str(self.evolve_trajectory_dir) if self.evolve_trajectory_dir else None,
+                self.evolve_trajectory_dt_days,
             ),
         ) as pool:
+            # sample_indices is the canonical theta-pool index for each row;
+            # pass it through to workers so per-sim trajectory dump filenames
+            # use the global index (not the local sim_id) and downstream
+            # assemblers can join back to theta cleanly.
+            if sample_indices is not None:
+                _sample_idx = np.asarray(sample_indices, dtype=np.int64)
+            else:
+                _sample_idx = np.arange(n_sims, dtype=np.int64)
             futures = []
             for i in range(n_sims):
                 params = {name: float(theta_matrix[i, j]) for j, name in enumerate(param_names)}
@@ -439,6 +502,7 @@ class CppBatchRunner:
                     pool.submit(
                         _run_one_in_worker,
                         i,
+                        int(_sample_idx[i]),
                         params,
                         t_end_days,
                         dt_days,

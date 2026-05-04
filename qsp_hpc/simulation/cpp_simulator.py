@@ -86,6 +86,8 @@ class CppSimulator:
         verbose: bool = False,
         evolve_cache: bool = True,
         evolve_cache_root: Optional[str | Path] = None,
+        evolve_trajectory_dir: Optional[str | Path] = None,
+        evolve_trajectory_dt_days: Optional[float] = None,
     ):
         self.priors_csv = Path(priors_csv)
         if not self.priors_csv.exists():
@@ -189,6 +191,17 @@ class CppSimulator:
         else:
             self.evolve_cache_root = None
 
+        # Burn-in trajectory dump dir is a per-simulator setting (typically
+        # used for posterior-predictive runs that want time-resolved
+        # observable trajectories, not the prior-pred / pool path). Plumbed
+        # through to CppBatchRunner; workers honor it only when
+        # healthy_state_yaml is set AND the sim is not in cached-state
+        # mode (cached-state skips burn-in by definition).
+        self.evolve_trajectory_dir = (
+            Path(evolve_trajectory_dir).resolve() if evolve_trajectory_dir else None
+        )
+        self.evolve_trajectory_dt_days = evolve_trajectory_dt_days
+
         self._runner = CppBatchRunner(
             binary_path=binary_path,
             template_path=template_xml,
@@ -198,6 +211,8 @@ class CppSimulator:
             drug_metadata_yaml=self.drug_metadata_yaml,
             healthy_state_yaml=self.healthy_state_yaml,
             evolve_cache_root=self.evolve_cache_root,
+            evolve_trajectory_dir=self.evolve_trajectory_dir,
+            evolve_trajectory_dt_days=self.evolve_trajectory_dt_days,
         )
 
         self.config_hash = self._compute_config_hash()

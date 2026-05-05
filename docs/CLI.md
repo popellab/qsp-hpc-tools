@@ -20,6 +20,11 @@ qsp-hpc setup
 - Tests SLURM and MATLAB availability
 - Saves configuration to `~/.config/qsp-hpc/credentials.yaml`
 
+**The wizard does not configure the C++ backend.** When using
+`CppSimulator` or `submit_cpp_jobs`, edit
+`~/.config/qsp-hpc/credentials.yaml` after `qsp-hpc setup` to add the
+`cpp:` block — see [Configuration Guide](CONFIGURATION.md#c-backend-fields).
+
 ### `qsp-hpc test`
 
 Test HPC connection, verify SLURM and MATLAB availability.

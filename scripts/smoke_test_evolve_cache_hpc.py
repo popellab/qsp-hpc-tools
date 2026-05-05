@@ -133,14 +133,17 @@ def submit_and_wait(
 
 
 def check_evolve_cache(manager, cache_root: str) -> tuple[int, list[str]]:
-    """Return (blob_count, ls_output_lines) from the HPC cache dir."""
-    # The subdir name = "<healthy_state_hash[:8]>_<binary_hash[:8]>";
-    # there may be exactly one such subdir for this run. Use ** so we
-    # don't need to predict the segmentation name.
+    """Return (env_count, ls_output_lines) from the HPC cache dir.
+
+    The packed layout has one LMDB env per (healthy_state, binary) pair,
+    each materialized as a `data.mdb` file under
+    `<cache_root>/<hs_hash>_<bin_hash>/`. Counting those gives the
+    number of distinct (model, config) caches present.
+    """
     find_cmd = (
         f"bash -lc "
         f'\'if [ -d "{cache_root}" ]; then '
-        f'find "{cache_root}" -name "*.state.bin" -type f; '
+        f'find "{cache_root}" -name "data.mdb" -type f; '
         f"fi'"
     )
     status, output = manager.transport.exec(find_cmd, timeout=30)

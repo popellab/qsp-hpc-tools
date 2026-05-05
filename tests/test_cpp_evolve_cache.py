@@ -174,7 +174,12 @@ def real_runner():
 
 @pytest.mark.skipif(_SKIP_INTEGRATION, reason=_SKIP_REASON)
 def test_get_or_build_miss_then_hit(real_runner, tmp_path: Path):
-    """First get_or_build is a miss (builds the blob); second is a hit."""
+    """First get_or_build is a miss (builds the blob); second is a hit.
+
+    Each call materializes a fresh on-disk copy from LMDB, so the
+    returned paths refer to files (not LMDB keys) — both must exist and
+    parse cleanly, but path identity isn't part of the contract.
+    """
     cache = CppEvolveCache(
         cache_root=tmp_path / "evolve_cache",
         renderer=real_runner._renderer,
@@ -187,12 +192,12 @@ def test_get_or_build_miss_then_hit(real_runner, tmp_path: Path):
     assert cache.stats == {"hits": 0, "misses": 1}
 
     path2, th2 = cache.get_or_build({}, workdir=tmp_path)
-    assert path2 == path1
+    assert path2.exists()
     assert th2 == th1
     assert cache.stats == {"hits": 1, "misses": 1}
 
-    # Header sanity check.
-    header = QsthHeader.parse(path1)
+    # Both materializations should parse to the same params_hash.
+    header = QsthHeader.parse(path2)
     assert header.params_hash == wire_hash(th1)
     assert header.n_species_var > 0
     assert header.t_diagnosis_days > 0
@@ -220,24 +225,31 @@ def test_different_thetas_produce_distinct_blobs(real_runner, tmp_path: Path):
 
 @pytest.mark.skipif(_SKIP_INTEGRATION, reason=_SKIP_REASON)
 def test_corrupt_blob_is_rebuilt(real_runner, tmp_path: Path):
+    """A bad-magic blob in LMDB triggers a rebuild on next get_or_build."""
     cache = CppEvolveCache(
         cache_root=tmp_path / "evolve_cache",
         renderer=real_runner._renderer,
         runner=real_runner,
     )
-    path, _ = cache.get_or_build({}, workdir=tmp_path)
-    # Clobber the magic bytes.
-    raw = bytearray(path.read_bytes())
-    raw[:4] = b"\x00\x00\x00\x00"
-    path.write_bytes(bytes(raw))
+    path, th = cache.get_or_build({}, workdir=tmp_path)
+    # Reach into the LMDB env and clobber the stored magic bytes.
+    key = th[:16].encode("ascii")
+    with cache._env.begin(write=True) as txn:
+        blob = bytearray(txn.get(key))
+        assert blob, "blob should have been stored on miss"
+        blob[:4] = b"\x00\x00\x00\x00"
+        txn.put(key, bytes(blob), overwrite=True)
 
     # Next call rebuilds instead of using the corrupt blob.
     misses_before = cache.stats["misses"]
-    path2, _ = cache.get_or_build({}, workdir=tmp_path)
-    assert path2 == path  # same filename
+    path2, th2 = cache.get_or_build({}, workdir=tmp_path)
+    assert th2 == th
     assert cache.stats["misses"] == misses_before + 1
     # Header should parse again now that it's been rebuilt.
     QsthHeader.parse(path2)
+    with cache._env.begin() as txn:
+        rebuilt = txn.get(key)
+    assert rebuilt[:4] == b"HQTS"  # ASCII bytes of _QSTH_MAGIC (LE)
 
 
 @pytest.mark.skipif(_SKIP_INTEGRATION, reason=_SKIP_REASON)
@@ -350,8 +362,25 @@ def test_batch_runner_shares_cache_across_scenarios(tmp_path: Path):
     )
     assert r1.n_failed == 0 and r2.n_failed == 0
 
-    blobs = list(cache_root.rglob("*.state.bin"))
-    assert len(blobs) == 1, f"expected one shared evolve blob, got {len(blobs)}: {blobs}"
+    # Exactly one LMDB env should exist (one model/healthy_state pair),
+    # holding exactly one entry (the single shared theta).
+    import lmdb
+
+    env_dirs = [p.parent for p in cache_root.rglob("data.mdb")]
+    assert len(env_dirs) == 1, f"expected one LMDB env dir, got {env_dirs}"
+    env = lmdb.open(str(env_dirs[0]), readonly=True, subdir=True, lock=False)
+    try:
+        with env.begin() as txn:
+            n_entries = txn.stat()["entries"]
+    finally:
+        env.close()
+    assert n_entries == 1, f"expected one shared evolve blob, got {n_entries}"
+
+    # Per-theta legacy .state.bin files should no longer be created in
+    # the cache root (they may exist transiently in worker workdirs as
+    # materialized copies, but those live elsewhere).
+    legacy = list(cache_root.rglob("*.state.bin"))
+    assert legacy == [], f"unexpected legacy blob files in cache: {legacy}"
 
 
 @pytest.mark.skipif(_SKIP_INTEGRATION, reason=_SKIP_REASON)

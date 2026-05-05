@@ -32,6 +32,7 @@ dependencies = [
     "pyyaml>=5.4",
     "click>=8.0",
     "pint>=0.25",  # For unit-aware test statistic calculations
+    "lmdb>=1.4",  # Packed evolve_cache (one file per model/config subdir)
 ]
 
 [project.optional-dependencies]

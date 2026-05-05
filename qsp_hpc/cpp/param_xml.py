@@ -1,14 +1,16 @@
 """Render per-simulation parameter XMLs for the C++ QSP simulator.
 
-The C++ driver (`qsp_sim` in SPQSP_PDAC) reads a Boost-property-tree XML
-where every numeric leaf element holds one model parameter or initial
-value. A priors CSV gives the subset of those parameters we want to
-vary; everything else inherits the value from the template.
+The C++ driver (`qsp_sim`, built in a consumer repo such as SPQSP_PDAC
+or pdac-build) reads a Boost-property-tree XML where every numeric leaf
+element holds one model parameter or initial value. A priors CSV gives
+the subset of those parameters we want to vary; everything else inherits
+the value from the template.
 
 Why the mapping is simple
 -------------------------
-The codegen in SPQSP_PDAC (qsp_codegen.py → QSPParam.cpp → param_all.xml)
-assigns each QSP parameter a *leaf tag that is unique within the
+The qsp-codegen package (`qsp-codegen` → QSPParam.cpp → param_all.xml,
+merged via `qsp-refresh-param-xml`) assigns each QSP parameter a *leaf
+tag that is unique within the
 `Param/QSP/...` subtree* — e.g. `k_C1_growth` appears exactly once under
 QSP, at `Param/QSP/init_value/Parameter/k_C1_growth`. So a priors-CSV
 column name maps directly to the QSP-subtree leaf with the same tag,
@@ -122,8 +124,8 @@ class ParamXMLRenderer:
                     f"Template has multiple leaves with tag {tag!r} "
                     f"inside subtree {self.subtree!r}; priors-column-name "
                     f"→ leaf mapping is ambiguous. This violates an "
-                    f"invariant normally enforced by SPQSP_PDAC codegen — "
-                    f"investigate qsp_codegen.py."
+                    f"invariant normally enforced by qsp-codegen — "
+                    f"investigate the generator (qsp-codegen package)."
                 )
             self._leaf_map[tag] = leaf
 

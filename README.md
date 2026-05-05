@@ -108,8 +108,11 @@ qsp-hpc logs      # View HPC job logs
 
 - Python ≥3.11
 - SSH access to SLURM HPC cluster
-- MATLAB installed on HPC cluster
-- QSP model implemented in MATLAB
+- One of:
+  - **C++ backend** (preferred): a built `qsp_sim` binary on the HPC (see
+    [docs/CPP_SIMULATION_PLAN.md](docs/CPP_SIMULATION_PLAN.md))
+  - **MATLAB backend**: MATLAB + SimBiology on the HPC, with a QSP model
+    implemented in MATLAB
 
 ## Development
 

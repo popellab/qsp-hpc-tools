@@ -80,100 +80,33 @@ qsp-hpc-tools/
 └── pyproject.toml
 ```
 
-## Recent Changes (2025-01-14)
+## Backend Status
 
-### CLI Addition ✨ NEW
-- **Created `qsp_hpc/cli.py`**: Full-featured CLI with Click framework
-- **Commands**:
-  - `qsp-hpc setup` - Interactive setup wizard
-    - Detects SSH config hosts automatically
-    - Tests connection in real-time
-    - Checks/creates remote directories
-    - Sets up Python venv on HPC (optional)
-    - Tests SLURM and MATLAB
-  - `qsp-hpc test` - Validate HPC connection and SLURM access
-  - `qsp-hpc info` - Display current configuration
-  - `qsp-hpc logs` - View HPC job logs
-- **Entry point**: Installed via `pip install -e .` → `qsp-hpc` command available
+The C++ backend (`qsp_sim`) is the primary path for new work. As of
+2026-04, milestones M1–M7 and M10 are done: binary build, param-XML
+renderer, raw-binary trajectory parser, Parquet parity with MATLAB
+output, on-cluster test-stat derivation via chained SLURM dependency
+(M9), dosing + `evolve_to_diagnosis` in `qsp_sim` (M10). `CppSimulator.run_hpc()`
+walks the 3-tier cache against C++ pools. MATLAB retirement (M8) is
+the queued follow-up. KLU/analytical-Jacobian work is infrastructure-
+landed but deferred (OFF by default) due to 1/x rate-law singularities
+at boundary states.
 
-### Configuration Refactor
-- **Global config**: `~/.config/qsp-hpc/credentials.yaml` (one config for all projects)
-- **Removed**: Project-specific `batch_credentials.yaml` pattern
-- **Simplified structure**: No nested `projects/{project_name}/` directories
-- **Updated template**: `credentials.yaml.template` matches new structure
+See `docs/CPP_SIMULATION_PLAN.md` for milestone history and performance
+numbers.
 
-### File Reorganization
-- Moved `logs_show.py` from root → `qsp_hpc/batch/` (functionality now in CLI)
-- Moved `setup_credentials.py` from root → `scripts/` (functionality now in CLI)
-- Renamed `hpc-setup/` → `scripts/hpc/`
+**Codegen vs build split**: SBML → C++ source generation lives in the
+standalone `qsp-codegen` package (`~/Projects/qsp-codegen`). The
+`qsp_sim` binary itself is built in a consumer repo (SPQSP_PDAC,
+pdac-build, etc.) that owns CMake + third-party deps. `cpp.repo_path`
+in credentials points at that consumer repo, not at qsp-codegen.
 
-### Testing Infrastructure
-- Created comprehensive test suite:
-  - `tests/test_batch_utils.py`: Pure function tests (batch splitting) - 15 tests
-  - `tests/test_hash_utils.py`: Critical caching logic tests - 31 tests
-  - `tests/test_simulation_pool.py`: Pool manager tests - 23 tests
-  - `tests/test_hpc_job_manager.py`: HPC integration tests - 23 tests (ready to run)
-- Added `pytest.ini` configuration with `@pytest.mark.hpc` marker
-- Created shared fixtures in `tests/conftest.py`
-- **Total: 92 tests** (69 passing unit tests, 23 HPC integration tests ready)
+## Logging
 
-### Development Environment
-- Set up uv-based development workflow
-- Updated README with development instructions
-- Added Click dependency for CLI
-
-### Pool Structure Consistency ✨ NEW (2025-01-19)
-- **Scenario included in config hash**: Local and HPC pools now use consistent directory structure
-  - Local: `{model_version}_{config_hash[:8]}_{scenario}/`
-  - HPC: `{model_version}_{priors_hash[:8]}_{scenario}/`
-  - Config hash now includes: priors CSV, test stats CSV, model script, model version, **scenario**
-  - Each scenario gets its own pool directory for clarity and consistency
-  - Eliminates confusion between local and HPC pool structures
-
-### Logging Improvements ✨ NEW (2025-01-19)
-- **Enhanced `qsp_hpc/utils/logging_config.py`**: Added structured logging utilities
-  - `separator()` - Visual section separators
-  - `format_config()` - Format key-value pairs with indentation
-  - `create_child_logger()` - Hierarchical logger names (e.g., `QSPSimulator.baseline_no_treatment`)
-  - `log_section()` - Context manager for sections with separators
-  - `log_operation()` - Context manager for operations with timing
-  - `log_summary_section()` - Summary boxes with metrics
-  - Updated default format to always show timestamps and logger names
-
-- **QSPSimulator logging** (`qsp_hpc/simulation/qsp_simulator.py`)
-  - Hierarchical loggers by scenario (e.g., `QSPSimulator.baseline_no_treatment`)
-  - Initialization logs show: test stats path, priors path, model version, config hash, pool directory, seed
-  - Simulation requests show: requested count, local availability, HPC checks
-  - 3-tier cache checking with explicit status messages:
-    - ✓ marks for cache hits
-    - Clear progression through: local pool → HPC test stats → HPC full sims → new generation
-  - Timing information for downloads and derivations
-  - Summary of simulations returned
-
-- **SimulationPoolManager logging** (`qsp_hpc/simulation/simulation_pool.py`)
-  - Hierarchical loggers by model version
-  - Pool creation/reuse messages
-  - Batch addition details: filename, simulation count, total pool stats
-  - Loading messages show scenario and sampling behavior
-
-- **HPCJobManager logging** (`qsp_hpc/batch/hpc_job_manager.py`)
-  - Job submission shows: project, simulation count, array tasks, sims per task, model, seed
-  - Structured progression through: sync → upload → submit
-  - ✓ marks for successful operations
-  - Timing for codebase sync
-  - Derivation job details: pool path, test stats hash
-
-**Example Log Output**:
-```
-2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO - Initializing QSP simulator for scenario: baseline_no_treatment
-2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Test Stats Csv: scenarios/test_statistics/baseline_no_treatment.csv
-2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Priors Csv: priors.csv
-2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Model Version: test_v1
-2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO -   Config Hash: a3f7b2c8...
-2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO - Simulation request: 500 simulations (seed=42)
-2025-01-19 10:30:15 - QSPSimulator.baseline_no_treatment - INFO - No local simulations - checking HPC
-2025-01-19 10:30:15 - SimulationPool.test_v1 - INFO - Creating new pool: cache/sbi_simulations/test_v1_a3f7b2c8
-```
+`qsp_hpc.utils.logging_config` provides hierarchical loggers per scenario
+(e.g. `QSPSimulator.baseline_no_treatment`, `SimulationPool.v1`) plus
+section/operation context managers. Log messages trace the 3-tier cache
+progression and include timing for downloads and derivations.
 
 ## Testing Strategy
 
@@ -240,7 +173,7 @@ ssh:
   key: "~/.ssh/id_rsa"
 
 cluster:
-  matlab_module: "matlab/R2024a"
+  matlab_module: "matlab/R2024a"          # only needed for MATLAB backend
 
 paths:
   remote_base_dir: "/home/username/qsp-projects"    # Base for all projects
@@ -251,6 +184,15 @@ slurm:
   partition: "normal"
   time_limit: "04:00:00"
   mem_per_cpu: "4G"
+
+cpp:                                       # C++ backend
+  repo_path: "/home/username/SPQSP_PDAC"   # required when using CppSimulator
+  binary_path: "/home/username/SPQSP_PDAC/PDAC/qsp/sim/build/qsp_sim"
+  template_path: "/home/username/SPQSP_PDAC/PDAC/sim/resource/param_all.xml"
+  branch: "cpp-sweep-binary-io"
+  subtree: "QSP"
+  runtime_modules: ""                      # optional: module load lines for runtime
+  build_modules: ""                        # optional: module load lines for build
 ```
 
 ## Common Tasks
@@ -295,24 +237,16 @@ show_logs(array_task_id=3, project='my_project')
 
 ## Known Constraints
 
-1. **MATLAB Dependency**: QSP models must be in MATLAB
+1. **Backend**: MATLAB/SimBiology (legacy) or compiled C++ `qsp_sim` (preferred).
+   The C++ path does not need MATLAB on HPC.
 2. **SLURM Only**: Currently only supports SLURM clusters
 3. **SSH Access Required**: No direct SLURM API integration yet
 4. **Parquet Format**: Uses Parquet for efficient storage (requires Python on HPC)
 
-## Future Enhancements
-
-- [ ] Add HPC job manager tests with SSH mocking
-- [ ] Add mypy type checking
-- [ ] Create CLI commands for common operations
-- [ ] Support for non-SLURM schedulers (PBS, LSF)
-- [ ] Direct SLURM API integration (no SSH)
-- [ ] Web dashboard for monitoring jobs
-
 ## Useful References
 
-- **SLURM Integration Guide**: `docs/SLURM_Integration_Guide.md`
-- **HPC Setup**: `scripts/hpc/README.md`
+- **C++ Backend Plan**: `docs/CPP_SIMULATION_PLAN.md`
+- **Architecture**: `docs/ARCHITECTURE.md`
 - **Package Config**: `pyproject.toml`
 - **Test Fixtures**: `tests/conftest.py`
 

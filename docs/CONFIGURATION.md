@@ -53,7 +53,7 @@ ssh:
   # key: "~/.ssh/id_rsa"
 
 cluster:
-  matlab_module: "matlab/R2024a"
+  matlab_module: "matlab/R2024a"          # only needed for MATLAB backend
 
 paths:
   remote_base_dir: "/home/username/qsp-projects"    # Base for all projects
@@ -64,7 +64,28 @@ slurm:
   partition: "normal"
   time_limit: "04:00:00"
   mem_per_cpu: "4G"
+
+# Required when using the C++ backend (CppSimulator / submit_cpp_jobs)
+cpp:
+  repo_path: "/home/username/SPQSP_PDAC"
+  binary_path: "/home/username/SPQSP_PDAC/PDAC/qsp/sim/build/qsp_sim"
+  template_path: "/home/username/SPQSP_PDAC/PDAC/sim/resource/param_all.xml"
+  branch: "cpp-sweep-binary-io"
+  subtree: "QSP"
+  runtime_modules: ""                     # optional: module load lines at runtime
+  build_modules: ""                       # optional: module load lines for build
 ```
+
+### C++ backend fields
+
+- `cpp.repo_path` — required. Root of the sibling `SPQSP_PDAC` checkout on
+  the HPC. Previously derived from `binary_path` by path-chopping; now
+  must be explicit so layout changes don't silently break.
+- `cpp.binary_path` — authoritative path to the built `qsp_sim` binary.
+- `cpp.template_path` — path to `param_all.xml` used as the parameter
+  template.
+- `cpp.branch` — SPQSP_PDAC branch to build from when the binary is
+  missing or stale.
 
 ## Project-Specific Settings
 

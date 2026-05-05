@@ -265,17 +265,24 @@ def _run_one_in_worker(
         if evolve_trajectory_dir is not None and evolve_state_path is None:
             traj_path = Path(evolve_trajectory_dir) / f"sim_{sample_index:09d}.bin"
             traj_dt = evolve_trajectory_dt_days
-        result: SimResult = _WORKER_RUNNER.run_one(
-            params=params,
-            t_end_days=t_end_days,
-            dt_days=dt_days,
-            workdir=_WORKER_WORKDIR,
-            timeout_s=timeout_s,
-            evolve_state_path=evolve_state_path,
-            params_hash=params_hash,
-            evolve_trajectory_path=traj_path,
-            evolve_trajectory_dt_days=traj_dt,
-        )
+        try:
+            result: SimResult = _WORKER_RUNNER.run_one(
+                params=params,
+                t_end_days=t_end_days,
+                dt_days=dt_days,
+                workdir=_WORKER_WORKDIR,
+                timeout_s=timeout_s,
+                evolve_state_path=evolve_state_path,
+                params_hash=params_hash,
+                evolve_trajectory_path=traj_path,
+                evolve_trajectory_dt_days=traj_dt,
+            )
+        finally:
+            # The blob is materialized fresh per call from LMDB; drop it
+            # so the worker workdir doesn't accumulate one file per
+            # distinct theta this worker has seen.
+            if evolve_state_path is not None:
+                Path(evolve_state_path).unlink(missing_ok=True)
         return (
             sim_id,
             STATUS_OK,

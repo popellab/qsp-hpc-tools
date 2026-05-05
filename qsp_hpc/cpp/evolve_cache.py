@@ -13,8 +13,14 @@ Cache layout
 
     <cache_root>/
       <healthy_state_hash[:8]>_<binary_hash[:8]>/
-        <theta_hash[:16]>.state.bin   # QSTH blob (C++ qsp_sim writes this)
-        <theta_hash[:16]>.lock        # fcntl-locked build coordinator
+        data.mdb     # LMDB env; key=theta_hash[:16] -> QSTH blob bytes
+        lock.mdb     # LMDB writer/reader lock
+
+One LMDB env per (healthy_state, qsp_sim) pair. ~50k blobs occupy two
+files instead of 50k inodes — load-bearing on group-quota HPC
+filesystems. LMDB's mmap + COW commit semantics give lock-free readers
+and a single writer transaction at a time, so the per-theta fcntl dance
+is gone.
 
 Segmentation by ``<healthy_state_hash[:8]>_<binary_hash[:8]>`` makes
 invalidation automatic: edit ``healthy_state.yaml`` or rebuild
@@ -29,13 +35,14 @@ refuses the load on mismatch.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import logging
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
+
+import lmdb
 
 from qsp_hpc.cpp.param_xml import ParamXMLRenderer
 from qsp_hpc.cpp.runner import CppRunner
@@ -91,25 +98,22 @@ class QsthHeader:
     params_hash: str  # hex string, as written by qsp_sim's --params-hash
 
     @classmethod
-    def parse(cls, path: Path) -> "QsthHeader":
-        try:
-            raw = path.read_bytes()
-        except OSError as e:
-            raise QsthHeaderError(f"cannot read QSTH blob {path}: {e}") from e
+    def parse_bytes(cls, raw: bytes, *, source: str = "<bytes>") -> "QsthHeader":
         if len(raw) < _QSTH_HEADER_SIZE:
             raise QsthHeaderError(
-                f"QSTH blob {path} truncated: {len(raw)} bytes "
+                f"QSTH blob {source} truncated: {len(raw)} bytes "
                 f"< {_QSTH_HEADER_SIZE}-byte header"
             )
         magic, version, n_sp, t_diag, vt_diam, hash_bytes = _QSTH_FIELD_STRUCT.unpack_from(raw, 0)
         if magic != _QSTH_MAGIC:
             raise QsthHeaderError(
-                f"{path} bad magic: 0x{magic:08x} != 0x{_QSTH_MAGIC:08x} "
+                f"{source} bad magic: 0x{magic:08x} != 0x{_QSTH_MAGIC:08x} "
                 f"(not a QSTH evolve-state blob?)"
             )
         if version != _QSTH_VERSION:
             raise QsthHeaderError(
-                f"{path} QSTH version {version} unsupported " f"(this code handles {_QSTH_VERSION})"
+                f"{source} QSTH version {version} unsupported "
+                f"(this code handles {_QSTH_VERSION})"
             )
         # Header stores hash null-padded; rebuild to a plain hex string.
         hash_str = hash_bytes.rstrip(b"\x00").decode("ascii", errors="strict")
@@ -120,6 +124,14 @@ class QsthHeader:
             vt_diameter_cm=float(vt_diam),
             params_hash=hash_str,
         )
+
+    @classmethod
+    def parse(cls, path: Path) -> "QsthHeader":
+        try:
+            raw = path.read_bytes()
+        except OSError as e:
+            raise QsthHeaderError(f"cannot read QSTH blob {path}: {e}") from e
+        return cls.parse_bytes(raw, source=str(path))
 
 
 # ---- Hashing helpers ----------------------------------------------------
@@ -146,13 +158,25 @@ def _sha256_of_file(path: Path, *, truncate: int | None = None) -> str:
 # ---- Cache --------------------------------------------------------------
 
 
+# LMDB map_size: virtual address-space cap for the env's mmap. Disk grows
+# lazily, so this is a ceiling rather than an allocation. Sized for the
+# realistic worst case (millions of QSTH blobs at a few KB each) with
+# generous headroom; mostly-cheap on 64-bit hosts.
+_LMDB_MAP_SIZE = 16 * 1024 * 1024 * 1024  # 16 GiB
+
+
 class CppEvolveCache:
     """Per-theta post-evolve ODE state, shared across scenarios.
 
-    Not thread-safe within a process (the underlying ``CppRunner`` isn't).
-    Across processes, concurrent ``get_or_build`` calls for the same theta
-    are serialized by an advisory file lock so only one process pays the
-    evolve cost; others block on the lock and read the resulting blob.
+    Backed by one LMDB env per (healthy_state, qsp_sim_binary) pair, keyed
+    by ``theta_hash[:16]`` with QSTH blob bytes as the value. Across
+    processes, LMDB serializes write transactions internally — the prior
+    per-theta fcntl lockfile dance is unnecessary. Readers are lock-free
+    via the mmap'd snapshot.
+
+    The class is not thread-safe within a process (the underlying
+    ``CppRunner`` isn't), but is safe across processes hitting the same
+    on-disk env.
     """
 
     def __init__(
@@ -163,9 +187,9 @@ class CppEvolveCache:
     ):
         """
         Args:
-            cache_root: Base directory for cached blobs. One sub-directory
-                per (healthy_state_yaml, qsp_sim_binary) pair will be
-                created inside it. Usually somewhere persistent like
+            cache_root: Base directory for cached blobs. One LMDB env
+                sub-directory per (healthy_state_yaml, qsp_sim_binary)
+                pair lives inside it. Usually somewhere persistent like
                 ``cache/cpp_simulations/evolve_cache/`` locally or the
                 HPC scratch pool path.
             renderer: Must match the renderer used for the actual sims —
@@ -192,12 +216,21 @@ class CppEvolveCache:
         self._cache_dir = self.cache_root / self._subdir_name
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
+        self._env = lmdb.open(
+            str(self._cache_dir),
+            map_size=_LMDB_MAP_SIZE,
+            subdir=True,
+            max_readers=512,
+            readahead=False,  # large random-access blobs; readahead just thrashes
+            meminit=False,
+        )
+
         self._stats_hits = 0
         self._stats_misses = 0
 
     @property
     def cache_dir(self) -> Path:
-        """Sub-directory holding blobs for the current
+        """LMDB env directory holding blobs for the current
         (healthy_state, qsp_sim) pair."""
         return self._cache_dir
 
@@ -205,18 +238,44 @@ class CppEvolveCache:
     def stats(self) -> dict[str, int]:
         return {"hits": self._stats_hits, "misses": self._stats_misses}
 
-    def state_path_for_hash(self, theta_hash: str) -> Path:
-        """Blob path for a theta hash — the hash is truncated to 16 chars
-        in the filename (16 hex = 64 bits of collision space, which is
-        plenty at theta-count < 10^9)."""
-        if len(theta_hash) < 16:
-            raise ValueError("theta_hash must be at least 16 hex chars")
-        return self._cache_dir / f"{theta_hash[:16]}.state.bin"
+    def close(self) -> None:
+        env = getattr(self, "_env", None)
+        if env is not None:
+            env.close()
+            self._env = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
     def theta_hash(self, params: Mapping[str, float]) -> tuple[str, bytes]:
         """Render params and return ``(theta_hash_hex, xml_bytes)``."""
         xml = self.renderer.render(params)
         return theta_hash_for_xml(xml), xml
+
+    @staticmethod
+    def _key_for_hash(theta_hash: str) -> bytes:
+        if len(theta_hash) < 16:
+            raise ValueError("theta_hash must be at least 16 hex chars")
+        return theta_hash[:16].encode("ascii")
+
+    def _materialize(self, blob: bytes, theta_hash: str, workdir: Path) -> Path:
+        """Write blob bytes to a per-theta tmp file under workdir and
+        return the path. qsp_sim's ``--initial-state`` consumes a path,
+        so each get/build call needs an on-disk copy. The caller may
+        unlink the path once qsp_sim has finished with it."""
+        workdir.mkdir(parents=True, exist_ok=True)
+        out = workdir / f"{theta_hash[:16]}.evolve_state.bin"
+        out.write_bytes(blob)
+        return out
 
     def get_or_build(
         self,
@@ -226,74 +285,74 @@ class CppEvolveCache:
         timeout_s: float | None = None,
     ) -> tuple[Path, str]:
         """Return ``(state_blob_path, theta_hash)``, building the blob if
-        it's missing or invalid.
+        it's missing.
 
-        The first caller for a given theta runs the evolve phase and
-        writes the blob under an exclusive file lock. Later callers for
-        the same theta block on the lock, then find a valid blob and
-        return without running qsp_sim.
+        On hit: blob bytes are written to a tmp file under ``workdir`` and
+        that path is returned. On miss: qsp_sim's ``--dump-state`` writes
+        the blob to a tmp file under ``workdir``, the bytes are validated
+        and committed to LMDB, and the same tmp path is returned. Across
+        processes LMDB serializes the put — racing builders both write,
+        the loser overwrites with bit-identical bytes.
         """
         th, _xml_bytes = self.theta_hash(params)
-        path = self.state_path_for_hash(th)
+        workdir = Path(workdir)
+        key = self._key_for_hash(th)
+        expected_wire = wire_hash(th)
 
-        if self._is_valid(path, th):
+        # Read path: lock-free txn against the mmap snapshot.
+        with self._env.begin(write=False, buffers=False) as txn:
+            blob = txn.get(key)
+        if blob is not None:
+            try:
+                header = QsthHeader.parse_bytes(blob, source=f"<lmdb:{key.decode()}>")
+            except QsthHeaderError:
+                logger.warning(
+                    "evolve cache: blob for %s has bad header, will rebuild", key.decode()
+                )
+                blob = None
+            else:
+                # Truncated-hash mismatch is the LMDB-side authoritative
+                # check; qsp_sim's --params-hash check on load is the
+                # secondary line of defense.
+                if header.params_hash != expected_wire:
+                    logger.warning(
+                        "evolve cache: blob for %s has params_hash mismatch "
+                        "(stored=%s expected=%s), will rebuild",
+                        key.decode(),
+                        header.params_hash,
+                        expected_wire,
+                    )
+                    blob = None
+
+        if blob is not None:
             self._stats_hits += 1
-            logger.debug("evolve cache HIT: %s", path.name)
+            logger.debug("evolve cache HIT: %s", key.decode())
+            path = self._materialize(bytes(blob), th, workdir)
             return path, th
 
-        # Miss — build under lock. Re-check inside the lock so a racing
-        # process that built the blob while we waited is honored.
-        lock_path = path.with_name(path.stem + ".lock")
-        with open(lock_path, "w") as lf:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-            if self._is_valid(path, th):
-                self._stats_hits += 1
-                logger.debug("evolve cache HIT after waiting on lock: %s", path.name)
-                return path, th
-            logger.info(
-                "evolve cache MISS — building %s (theta_hash=%s)",
-                path.name,
-                th[:16],
-            )
-            self._build(params, th, path, Path(workdir), timeout_s=timeout_s)
-            self._stats_misses += 1
-        return path, th
-
-    # -- internals --------------------------------------------------------
-
-    def _is_valid(self, path: Path, expected_hash: str) -> bool:
-        """Exists + parseable header + params_hash matches."""
-        if not path.exists():
-            return False
-        try:
-            header = QsthHeader.parse(path)
-        except QsthHeaderError:
-            logger.warning("evolve cache: blob %s has bad header, will rebuild", path)
-            return False
-        # QSTH header stores wire_hash(theta_hash) (32 chars). qsp_sim's
-        # --params-hash comparison on load is the authoritative check, so
-        # a stale blob that slips through here still fails safely at
-        # simulation time.
-        return header.params_hash == wire_hash(expected_hash)
-
-    def _build(
-        self,
-        params: Mapping[str, float],
-        theta_hash: str,
-        path: Path,
-        workdir: Path,
-        *,
-        timeout_s: float | None,
-    ) -> None:
-        """Invoke qsp_sim --dump-state to produce the blob at `path`."""
+        logger.info("evolve cache MISS — building (theta_hash=%s)", th[:16])
+        workdir.mkdir(parents=True, exist_ok=True)
+        tmp_out = workdir / f"{th[:16]}.evolve_state.bin"
         # qsp_sim stores wire_hash(theta_hash) in the blob header; use the
         # same truncated form when calling --params-hash so load-side
         # comparisons succeed against the full theta_hash truncated the
         # same way.
         self.runner.dump_evolve_state(
             params=params,
-            params_hash=wire_hash(theta_hash),
-            state_out=path,
+            params_hash=expected_wire,
+            state_out=tmp_out,
             workdir=workdir,
             timeout_s=timeout_s,
         )
+        new_blob = tmp_out.read_bytes()
+        # Sanity-check the bytes qsp_sim just produced before committing.
+        header = QsthHeader.parse_bytes(new_blob, source=str(tmp_out))
+        if header.params_hash != expected_wire:
+            raise QsthHeaderError(
+                f"qsp_sim --dump-state wrote params_hash={header.params_hash} "
+                f"but expected {expected_wire}"
+            )
+        with self._env.begin(write=True) as txn:
+            txn.put(key, new_blob, overwrite=True)
+        self._stats_misses += 1
+        return tmp_out, th

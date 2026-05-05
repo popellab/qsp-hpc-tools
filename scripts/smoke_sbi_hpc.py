@@ -246,12 +246,13 @@ def main() -> int:
         else:
             print("  ✓ test_stats differ across scenarios (as expected)")
 
-    # Evolve-cache blob count on HPC: N_unique_thetas × 1 (shared across scenarios).
+    # Evolve-cache LMDB env count on HPC: one env per (healthy_state, binary)
+    # pair; per-theta blobs live as keys inside each env, not as files.
     cache_root = f"{manager.config.simulation_pool_path}/evolve_cache"
-    find_cmd = f'bash -lc \'find "{cache_root}" -name "*.state.bin" -type f 2>/dev/null | wc -l\''
+    find_cmd = f'bash -lc \'find "{cache_root}" -name "data.mdb" -type f 2>/dev/null | wc -l\''
     status, output = manager.transport.exec(find_cmd, timeout=30)
-    blob_count = int(output.strip()) if status == 0 else -1
-    print(f"  evolve-cache blob count (HPC scratch): {blob_count}")
+    env_count = int(output.strip()) if status == 0 else -1
+    print(f"  evolve-cache LMDB env count (HPC scratch): {env_count}")
 
     if failures:
         print("\nFAIL:")

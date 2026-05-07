@@ -9,7 +9,10 @@ authors:
     email: joel.eliason119@gmail.com
     orcid: "https://orcid.org/0000-0003-2227-8727"
     affiliation: "Johns Hopkins University, Department of Biomedical Engineering"
-repository-code: "https://github.com/jeliason/qsp-hpc-tools"
+  - family-names: Popel
+    given-names: Aleksander S.
+    affiliation: "Johns Hopkins University, Department of Biomedical Engineering"
+repository-code: "https://github.com/popellab/qsp-hpc-tools"
 license: MIT
 version: 0.1.0
 date-released: 2026-04-10

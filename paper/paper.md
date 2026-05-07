@@ -11,10 +11,12 @@ authors:
   - name: Joel Eliason
     orcid: 0000-0003-2227-8727
     affiliation: 1
+  - name: Aleksander S. Popel
+    affiliation: 1
 affiliations:
   - name: Department of Biomedical Engineering, Johns Hopkins University, Baltimore, MD, USA
     index: 1
-date: 10 April 2026
+date: 6 May 2026
 bibliography: paper.bib
 ---
 
@@ -22,7 +24,7 @@ bibliography: paper.bib
 
 Quantitative systems pharmacology (QSP) models are mechanistic, ordinary differential equation (ODE)-based representations of disease biology and drug action used throughout pharmaceutical development [@Gadkar2016]. A critical step in QSP workflows is generating large ensembles of simulations—often called virtual patients—by sampling parameter sets from prior distributions and evaluating model outputs under one or more therapeutic scenarios [@Allen2016; @Rieger2018; @Craig2023]. When these simulations feed into modern inference methods such as simulation-based inference (SBI), the computational cost scales rapidly: thousands to tens of thousands of forward simulations are required, each involving stiff ODE integration in MATLAB over clinically relevant timescales [@Cranmer2020].
 
-`qsp-hpc-tools` is a Python package that automates the submission, caching, and retrieval of MATLAB-based QSP simulations on SLURM high-performance computing (HPC) clusters. It provides a single callable interface—`QSPSimulator`—that abstracts the full simulation lifecycle behind a three-tier caching strategy, so that researchers can iterate on inference workflows without redundant computation.
+`qsp-hpc-tools` is a Python package that automates the submission, caching, and retrieval of QSP simulations on SLURM high-performance computing (HPC) clusters. It exposes two interchangeable callable simulators—`QSPSimulator` for MATLAB/SimBiology models and `CppSimulator` for a faster generated C++ backend—both of which abstract the full simulation lifecycle behind a shared three-tier caching strategy, so that researchers can iterate on inference workflows without redundant computation.
 
 # Statement of need
 
@@ -36,13 +38,15 @@ General-purpose workflow managers such as Snakemake and Nextflow [@Koster2012; @
 
 ## Three-tier caching
 
-When simulations are requested, `QSPSimulator` checks three levels before submitting new HPC jobs:
+When simulations are requested, both simulators check three levels before submitting new HPC jobs:
 
 1. **Local pool**: Previously downloaded simulation results stored in scenario-specific directories.
 2. **HPC test statistics**: Pre-computed summary statistics on the cluster that can be downloaded and used without transferring full simulation timecourses.
 3. **HPC full simulations**: Complete simulation outputs on the cluster available for download.
 
 Only when all three tiers miss does the system submit new SLURM array jobs. This strategy avoids redundant computation during the rapid iteration typical of SBI workflow development.
+
+For models with an expensive pre-treatment burn-in phase, the C++ backend additionally caches the post-evolve ODE state in an LMDB-packed `evolve_cache` keyed by parameter set and model configuration, allowing multiple downstream therapeutic scenarios to skip the shared burn-in integration. On models where burn-in dominates wall time, this delivers near-linear speedups in the number of scenarios sharing a configuration.
 
 ## Content-based cache invalidation
 
@@ -54,14 +58,22 @@ QSP workflows frequently evaluate the same parameter sets under multiple therape
 
 ## HPC integration
 
-`HPCJobManager` handles SSH-based codebase synchronization, SLURM array job submission, progress monitoring, and result collection. MATLAB workers on the cluster execute simulations in parallel and write results in Parquet format via a Python bridge, enabling efficient cross-language data transfer. Configuration is managed through a single global credentials file with an interactive setup wizard accessible via the `qsp-hpc setup` CLI command.
+`HPCJobManager` handles SSH-based codebase synchronization, SLURM array job submission, progress monitoring, and result collection. Workers on the cluster execute simulations in parallel and write results in Parquet format via a Python bridge, enabling efficient cross-language data transfer. Configuration is managed through a single global credentials file with an interactive setup wizard accessible via the `qsp-hpc setup` CLI command.
+
+## Pluggable backends: MATLAB and generated C++
+
+The package supports two interchangeable simulation backends that share the cache, scheduler, and result-loading machinery. `QSPSimulator` wraps existing MATLAB/SimBiology models, requiring only a model script and a structure file describing species, units, and initial conditions. `CppSimulator` instead drives a generated C++ ODE simulator (`qsp_sim`) built from an SBML model description by the companion `qsp-codegen` package [@qsp_codegen], which is pip-installed on the cluster and invoked automatically by `ensure_cpp_binary` to drive the in-repo CMake build. The C++ backend yields roughly 25–87× per-simulation speedups over the MATLAB path on representative pancreatic cancer models while preserving the same calibration target interface, so existing MAPLE-style YAMLs and downstream inference code work unchanged.
+
+## Posterior-predictive simulation and prior restriction
+
+Beyond drawing fresh parameter sets from the prior, both simulators expose `simulate_with_parameters(theta, backend="local"|"hpc")`, which evaluates the model at user-supplied parameter arrays such as posterior draws produced by a downstream inference package. Results are cached under a hash of the input theta array, so repeated posterior-predictive checks against the same posterior samples reuse prior work. To further reduce wasted simulation effort, `get_theta_pool` supports an optional `RestrictionClassifier` from the inference layer that rejection-samples the prior, discarding parameter draws predicted to fail the simulator before they are ever submitted.
 
 # Typical usage
 
 ```python
 from qsp_hpc import QSPSimulator
 
-# Initialize simulator for a treatment scenario
+# Initialize the MATLAB-backed simulator for a treatment scenario
 sim = QSPSimulator(
     priors_csv="priors.csv",
     calibration_targets="calibration_targets/",  # directory of MAPLE YAMLs
@@ -71,11 +83,29 @@ sim = QSPSimulator(
     seed=42,
 )
 
-# Request 2000 simulations — cached results returned if available
+# Request 2000 simulations; cached results are returned when available
 theta, x = sim(2000)
 
-# Re-use simulator for posterior predictive checks
+# Re-use the same simulator for posterior-predictive checks at user-supplied
+# parameter draws (typically posteriors from qsp-inference)
 x_posterior = sim.simulate_with_parameters(posterior_samples)
+```
+
+The C++ backend is a drop-in replacement for the simulation step:
+
+```python
+from qsp_hpc import CppSimulator
+from qsp_hpc.batch.hpc_job_manager import HPCJobManager
+
+sim = CppSimulator(
+    priors_csv="priors.csv",
+    binary_path="/path/to/qsp_sim",
+    template_xml="/path/to/param_all.xml",
+    scenario_yaml="scenarios/treatment.yaml",
+    calibration_targets="calibration_targets/treatment/",
+    job_manager=HPCJobManager(),
+)
+theta, test_stats = sim.run_hpc(2000)
 ```
 
 # Acknowledgements

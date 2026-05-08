@@ -113,36 +113,40 @@ def test_batch_runner_happy_path(tmp_path: Path, template_path: Path, ok_binary:
     )
     assert result.n_sims == 3
     assert result.n_failed == 0
-    assert result.parquet_path == out
+    assert result.trajectory_path == tmp_path / "batch.trajectory.parquet"
+    assert result.params_path == tmp_path / "batch.params.parquet"
+    assert result.parquet_path == result.trajectory_path  # legacy alias
     assert result.species_names == ["spA", "spB", "spC"]
     assert result.n_times == 2
 
-    table = pq.read_table(out)
-    cols = table.column_names
-    # sample_index leads (global theta-pool index — stamped on every row
-    # for cross-scenario alignment), then local simulation_id, status, time.
-    assert cols[:4] == ["sample_index", "simulation_id", "status", "time"]
-    assert "param:A" in cols and "param:B" in cols
-    # Species columns are list<double>.
-    for sp in ("spA", "spB", "spC"):
-        assert sp in cols
-        assert str(table.schema.field(sp).type) == "list<element: double>"
-    # All statuses OK.
-    np.testing.assert_array_equal(table.column("status").to_numpy(), [0, 0, 0])
-    # Simulation ids are zero-indexed and ordered.
-    np.testing.assert_array_equal(table.column("simulation_id").to_numpy(), [0, 1, 2])
-    # Param column values round-trip exactly.
-    np.testing.assert_allclose(table.column("param:A").to_numpy(), [1.1, 1.2, 1.3])
-    np.testing.assert_allclose(table.column("param:B").to_numpy(), [2.1, 2.2, 2.3])
-    # Time axis has n_times entries for each row.
-    for row_time in table.column("time").to_pylist():
-        assert len(row_time) == 2
-        assert row_time == [0.0, 0.1]
-    # Species rows match the fake binary's (2,3) payload: row 0 = [1,2,3],
-    # row 1 = [4,5,6]. So spA = [1, 4], spB = [2, 5], spC = [3, 6].
-    assert table.column("spA").to_pylist()[0] == [1.0, 4.0]
-    assert table.column("spB").to_pylist()[0] == [2.0, 5.0]
-    assert table.column("spC").to_pylist()[0] == [3.0, 6.0]
+    # Params sidecar: one row per sim, sample_index/simulation_id/status + param:*.
+    params = pq.read_table(result.params_path)
+    pcols = params.column_names
+    assert pcols[:3] == ["sample_index", "simulation_id", "status"]
+    assert "param:A" in pcols and "param:B" in pcols
+    np.testing.assert_array_equal(params.column("status").to_numpy(), [0, 0, 0])
+    np.testing.assert_array_equal(params.column("simulation_id").to_numpy(), [0, 1, 2])
+    np.testing.assert_array_equal(params.column("sample_index").to_numpy(), [0, 1, 2])
+    np.testing.assert_allclose(params.column("param:A").to_numpy(), [1.1, 1.2, 1.3])
+    np.testing.assert_allclose(params.column("param:B").to_numpy(), [2.1, 2.2, 2.3])
+
+    # Long-form trajectory: (sample_index, time, species, value).
+    traj = pq.read_table(result.trajectory_path)
+    assert traj.column_names == ["sample_index", "time", "species", "value"]
+    # 3 sims × 2 timepoints × 3 species cols = 18 rows.
+    assert traj.num_rows == 3 * 2 * 3
+    df = traj.to_pandas()
+    # Time axis populated with [0.0, 0.1] per sim.
+    sim0 = df[df["sample_index"] == 0]
+    assert sorted(sim0["time"].unique().tolist()) == [0.0, 0.1]
+    # Species column is dictionary-encoded with the binary order
+    # (species first, then compartments+rules — empty here).
+    assert sorted(sim0["species"].unique().tolist()) == ["spA", "spB", "spC"]
+    # Fake binary payload: row 0 = [1,2,3], row 1 = [4,5,6].
+    spa_t0 = df[(df["sample_index"] == 0) & (df["species"] == "spA") & (df["time"] == 0.0)]
+    assert spa_t0["value"].iloc[0] == 1.0
+    spa_t1 = df[(df["sample_index"] == 0) & (df["species"] == "spA") & (df["time"] == 0.1)]
+    assert spa_t1["value"].iloc[0] == 4.0
 
 
 def test_batch_runner_failed_sim_marked_with_nan(tmp_path: Path, template_path: Path):
@@ -162,20 +166,22 @@ def test_batch_runner_failed_sim_marked_with_nan(tmp_path: Path, template_path: 
     assert result.n_sims == 3
     assert result.n_failed == 1
 
-    table = pq.read_table(out)
-    statuses = table.column("status").to_numpy().tolist()
+    # Status + theta survive in the params sidecar even for the failed row.
+    params = pq.read_table(result.params_path)
+    statuses = params.column("status").to_numpy().tolist()
     assert statuses == [STATUS_OK, STATUS_FAILED, STATUS_OK]
+    np.testing.assert_allclose(params.column("param:A").to_numpy(), [1.0, 999.0, 1.5])
 
-    # Failed row's species column is NaN-filled; successful rows have
-    # numeric payload.
-    spa_rows = table.column("spA").to_pylist()
-    assert not np.isnan(spa_rows[0][0])
-    assert all(np.isnan(v) for v in spa_rows[1])
-    assert not np.isnan(spa_rows[2][0])
-
-    # Param columns are preserved for the failed row — downstream code
-    # that correlates params with outcomes can still filter status==1.
-    np.testing.assert_allclose(table.column("param:A").to_numpy(), [1.0, 999.0, 1.5])
+    # Long-form trajectory: failed sim contributes ZERO rows (no NaN
+    # padding under the new schema; consumers join on sample_index from
+    # the params sidecar to detect failures).
+    traj = pq.read_table(result.trajectory_path)
+    sample_indices_present = set(traj.column("sample_index").to_pylist())
+    assert sample_indices_present == {0, 2}  # sim 1 absent
+    # Successful sims still have full payload.
+    df = traj.to_pandas()
+    assert (df[df["sample_index"] == 0]["value"].notna()).all()
+    assert (df[df["sample_index"] == 2]["value"].notna()).all()
 
 
 def test_batch_runner_rejects_unknown_param_before_forking(
@@ -227,7 +233,7 @@ def test_batch_runner_writes_only_sampled_param_columns(
     # Vary only A; B is in the template but not sampled.
     theta = np.array([[1.1], [1.2], [1.3]])
     out = tmp_path / "batch.parquet"
-    runner.run(
+    result = runner.run(
         theta_matrix=theta,
         param_names=["A"],
         t_end_days=0.2,
@@ -235,13 +241,13 @@ def test_batch_runner_writes_only_sampled_param_columns(
         output_path=out,
         max_workers=2,
     )
-    table = pq.read_table(out)
+    params = pq.read_table(result.params_path)
     # Sampled column present, varying per-sim.
-    np.testing.assert_allclose(table.column("param:A").to_numpy(), [1.1, 1.2, 1.3])
+    np.testing.assert_allclose(params.column("param:A").to_numpy(), [1.1, 1.2, 1.3])
     # Unsampled B is NOT broadcast — template default lives only in
     # pool_manifest.json, accessed by cal-target functions via the
     # manifest fallback in derive_test_stats_worker.
-    assert "param:B" not in table.column_names
+    assert "param:B" not in params.column_names
 
 
 def test_write_pool_manifest_round_trip(tmp_path: Path):

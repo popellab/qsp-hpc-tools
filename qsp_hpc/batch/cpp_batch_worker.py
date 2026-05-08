@@ -203,12 +203,13 @@ def run_chunk(config: dict, array_idx: int) -> None:
 
     elapsed = time.time() - t0
     logger.info(
-        "Task %d complete: %d/%d succeeded in %.1fs, wrote %s",
+        "Task %d complete: %d/%d succeeded in %.1fs, wrote %s + %s",
         array_idx,
         result.n_sims - result.n_failed,
         result.n_sims,
         elapsed,
-        output_path,
+        result.trajectory_path.name,
+        result.params_path.name,
     )
 
 

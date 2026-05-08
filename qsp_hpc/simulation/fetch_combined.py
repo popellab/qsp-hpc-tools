@@ -42,7 +42,7 @@ def fetch_combined_trajectory(
     job_manager: "HPCJobManager",
     remote_pool_path: str,
     *,
-    kind: str = "training",
+    kind: str = "",
     sample_indices: Optional[Sequence[int]] = None,
     traj_columns: Optional[Sequence[str]] = None,
     local_cache_dir: Optional[Path] = None,
@@ -74,7 +74,8 @@ def fetch_combined_trajectory(
             path for inspection; otherwise delete it before returning.
     """
 
-    remote_combined = f"{remote_pool_path}/{kind}/{_COMBINED_NAME}"
+    remote_subdir = f"{remote_pool_path}/{kind}" if kind else remote_pool_path
+    remote_combined = f"{remote_subdir}/{_COMBINED_NAME}"
 
     # Probe for existence cheaply via ssh exec; avoids paying the SCP
     # cost when concat hasn't run.
@@ -97,7 +98,7 @@ def fetch_combined_trajectory(
         from qsp_hpc.cpp.sshfs_reader import sshfs_read_long_form_chunks
 
         return sshfs_read_long_form_chunks(
-            f"{remote_pool_path}/{kind}",
+            remote_subdir,
             sample_indices=sample_indices,
             traj_columns=traj_columns,
             sshfs_host=job_manager.config.ssh_host,

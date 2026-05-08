@@ -34,7 +34,7 @@ def existing_sample_indices(
     job_manager: "HPCJobManager",
     remote_pool_path: str,
     *,
-    kind: str = "training",
+    kind: str = "",
 ) -> set[int]:
     """Return the set of ``sample_index`` values already present in
     ``{remote_pool_path}/{kind}/``.
@@ -52,7 +52,8 @@ def existing_sample_indices(
     file isn't present, or the parquet has no rows. Callers treat that
     as "submit everything."
     """
-    remote_combined = f"{remote_pool_path}/{kind}/{_COMBINED_NAME}"
+    remote_subdir = f"{remote_pool_path}/{kind}" if kind else remote_pool_path
+    remote_combined = f"{remote_subdir}/{_COMBINED_NAME}"
 
     rc, out = job_manager.transport.exec(
         f'test -f "{remote_combined}" && echo y || echo n', timeout=15

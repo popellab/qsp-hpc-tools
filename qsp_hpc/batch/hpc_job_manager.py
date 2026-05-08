@@ -1653,7 +1653,7 @@ class HPCJobManager:
         self,
         simulation_pool_id: str,
         *,
-        kind: str = "training",
+        kind: str = "",
         timeout_s: int = 600,
     ) -> str:
         """Run :mod:`qsp_hpc.cpp.concat_chunks` on HPC against ``{pool}/{kind}/``.

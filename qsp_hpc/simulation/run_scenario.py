@@ -233,14 +233,13 @@ def run_scenario(
         # No-ops gracefully if no chunks were produced (e.g. the array
         # was scancel'd before any task wrote output).
         concat_t0 = time.time()
-        job_manager.concat_trajectory_chunks(pool_id, kind="training")
+        job_manager.concat_trajectory_chunks(pool_id)
         logger.info("run_scenario(%s): concat in %.1fs", scen_name, time.time() - concat_t0)
 
         # 5. SCP combined locally + load it.
         traj_df = fetch_combined_trajectory(
             job_manager,
             remote_pool_path,
-            kind="training",
             traj_columns=list(traj_columns) if traj_columns is not None else None,
             keep_local=fetch_keep_local,
         )

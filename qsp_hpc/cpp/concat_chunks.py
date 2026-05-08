@@ -167,7 +167,7 @@ def concat_trajectory_chunks(pool_dir: Path, kind: str) -> Path:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pool-dir", required=True, type=Path)
-    parser.add_argument("--kind", default="training", choices=["training", "ppc"])
+    parser.add_argument("--kind", default="", choices=["", "training", "ppc"])
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 

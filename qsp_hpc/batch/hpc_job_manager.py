@@ -2069,11 +2069,11 @@ class HPCJobManager:
         Returns:
             Number of batches to process
         """
-        # Count total batches (#43 option A: batch_*/ subdirs; plus any
-        # legacy flat batch_*.parquet files from pre-#43 pools).
+        # 3b.iii: count training-side batch_* subdirs under
+        # {pool_path}/training/. PPC chunks (under ppc/) are tracked
+        # separately by the inference machinery.
         status, output = self.transport.exec(
-            f'( ls -d "{pool_path}"/batch_*/ 2>/dev/null; '
-            f'ls "{pool_path}"/batch_*.parquet 2>/dev/null ) | wc -l'
+            f'ls -d "{pool_path}"/training/batch_*/ 2>/dev/null | wc -l'
         )
         # Extract numeric count robustly (HPC login wrapper may inject error text)
         total_batches = 0

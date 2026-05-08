@@ -149,13 +149,16 @@ def process_pool(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find all batch Parquet files. Walks #43 option A layout
-    # (batch_*/chunk_*.parquet) and legacy flat batch_*.parquet.
-    parquet_files = sorted(pool_dir.glob("batch_*/chunk_*.parquet")) + sorted(
-        pool_dir.glob("batch_*.parquet")
-    )
+    # 3b.iii: training-side chunks live under
+    # {pool_dir}/training/batch_*/chunk_*.parquet (D6 hard cutover —
+    # pre-3b layouts are unreadable).
+    training_dir = pool_dir / "training"
+    parquet_files = sorted(training_dir.glob("batch_*/chunk_*.parquet"))
     if not parquet_files:
-        raise FileNotFoundError(f"No batch_*.parquet files found in {pool_dir}")
+        raise FileNotFoundError(
+            f"No chunk_*.parquet files found under {training_dir} "
+            f"(expected {{pool_id}}/training/batch_*/chunk_*.parquet)"
+        )
 
     logger.info(f"Found {len(parquet_files)} batch files in {pool_dir}")
 

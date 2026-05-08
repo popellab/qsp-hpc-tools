@@ -149,7 +149,7 @@ class TestMaxBatchesInDerivationConfig:
         def mock_exec(cmd, timeout=None):
             if "echo $HOME" in cmd:
                 return (0, "/home/user")
-            elif "batch_*.parquet" in cmd and "wc -l" in cmd:
+            elif "training/batch_" in cmd and "wc -l" in cmd:
                 return (0, "79")
             elif "mkdir" in cmd:
                 return (0, "")
@@ -201,7 +201,7 @@ class TestMaxBatchesInDerivationConfig:
         def mock_exec(cmd, timeout=None):
             if "echo $HOME" in cmd:
                 return (0, "/home/user")
-            elif "batch_*.parquet" in cmd and "wc -l" in cmd:
+            elif "training/batch_" in cmd and "wc -l" in cmd:
                 return (0, "10")
             elif "mkdir" in cmd:
                 return (0, "")

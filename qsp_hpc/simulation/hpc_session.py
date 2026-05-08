@@ -754,6 +754,20 @@ class HPCSession:
             sshfs_host=host,
         )
 
+        # Normalize column names to the qsp-inference canonical schema
+        # ``[sample_index, t_to_diagnosis_days, column, value]`` so
+        # ``evaluate_targets_to_x`` consumes the frame without an extra
+        # rename layer at the call site. The reader emits the writer's
+        # native names (``time``, ``species``); the renames here are
+        # idempotent if those columns are already present.
+        rename_map: dict[str, str] = {}
+        if "time" in traj_df.columns and "t_to_diagnosis_days" not in traj_df.columns:
+            rename_map["time"] = "t_to_diagnosis_days"
+        if "species" in traj_df.columns and "column" not in traj_df.columns:
+            rename_map["species"] = "column"
+        if rename_map:
+            traj_df = traj_df.rename(columns=rename_map)
+
         # 9. Species units from model_structure.json.
         from qsp_hpc.utils.model_structure_units import load_units_from_model_structure
 

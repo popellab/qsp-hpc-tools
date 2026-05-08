@@ -97,6 +97,11 @@ def run_scenario(
     samples_csv_local: Optional[Union[str, Path]] = None,
     evolve_cache: bool = True,
     fetch_keep_local: bool = False,
+    priors_csv: Optional[Union[str, Path]] = None,
+    submodel_priors_yaml: Optional[Union[str, Path]] = None,
+    restriction_classifier_dir: Optional[Union[str, Path]] = None,
+    restriction_threshold: Optional[float] = None,
+    classifier_feature_fills: Optional[Mapping[str, float]] = None,
 ) -> ScenarioRunResult:
     """End-to-end orchestrator for one scenario's HPC run.
 
@@ -169,6 +174,14 @@ def run_scenario(
     pool_id = compute_pool_id_hash(
         binary_path=binary_path_p,
         scenario_yaml=scenario_yaml,
+        priors_csv=priors_csv,
+        submodel_priors_yaml=submodel_priors_yaml,
+        seed=seed,
+        restriction_classifier_dir=restriction_classifier_dir,
+        restriction_threshold=restriction_threshold,
+        classifier_feature_fills=(
+            dict(classifier_feature_fills) if classifier_feature_fills else None
+        ),
     )
     scen_name = scenario_name or scenario_yaml.stem
     remote_pool_path = f"{job_manager.config.simulation_pool_path}/{pool_id}"

@@ -72,11 +72,11 @@ class TestSshfsReadLongFormChunks:
 
         df = sshfs_read_long_form_chunks(str(pool), filesystem=local_fs)
 
-        assert list(df.columns) == ["sample_index", "time", "species", "value"]
+        assert list(df.columns) == ["sample_index", "t_to_diagnosis_days", "column", "value"]
         # 4 sims × 3 species × 3 times = 36 rows.
         assert len(df) == 36
         assert sorted(df["sample_index"].unique()) == [0, 1, 2, 3]
-        assert sorted(df["species"].unique()) == ["spA", "spB", "spC"]
+        assert sorted(df["column"].unique()) == ["spA", "spB", "spC"]
 
     def test_sample_index_filter_pushdown(self, tmp_path, local_fs):
         pool = tmp_path / "pool"
@@ -101,13 +101,13 @@ class TestSshfsReadLongFormChunks:
             traj_columns=["spA", "spC"],
             filesystem=local_fs,
         )
-        assert sorted(df["species"].unique()) == ["spA", "spC"]
+        assert sorted(df["column"].unique()) == ["spA", "spC"]
         # 2 sims × 2 species × 3 times = 12 rows.
         assert len(df) == 12
         # Decoded to plain string, not dictionary-typed (pandas may
         # surface this as ``object`` or ``StringDtype`` depending on
         # version — both indicate dict decoding succeeded).
-        assert not isinstance(df["species"].dtype, pd.CategoricalDtype)
+        assert not isinstance(df["column"].dtype, pd.CategoricalDtype)
 
     def test_combined_filters(self, tmp_path, local_fs):
         pool = tmp_path / "pool"
@@ -121,7 +121,7 @@ class TestSshfsReadLongFormChunks:
             filesystem=local_fs,
         )
         assert sorted(df["sample_index"].unique()) == [1, 4]
-        assert df["species"].unique().tolist() == ["spB"]
+        assert df["column"].unique().tolist() == ["spB"]
         # 2 sims × 1 species × 3 times = 6 rows.
         assert len(df) == 6
 
@@ -131,7 +131,7 @@ class TestSshfsReadLongFormChunks:
 
         df = sshfs_read_long_form_chunks(str(pool), filesystem=local_fs)
         assert len(df) == 0
-        assert list(df.columns) == ["sample_index", "time", "species", "value"]
+        assert list(df.columns) == ["sample_index", "t_to_diagnosis_days", "column", "value"]
         assert df["sample_index"].dtype == np.int64
 
     def test_empty_sample_indices_short_circuits(self, tmp_path, local_fs):
@@ -185,8 +185,8 @@ class TestSshfsReadLongFormChunks:
 
         df = sshfs_read_long_form_chunks(str(pool), filesystem=local_fs)
         for sidx in sample_indices:
-            sub = df[(df["sample_index"] == sidx) & (df["species"] == "spA")]
+            sub = df[(df["sample_index"] == sidx) & (df["column"] == "spA")]
             np.testing.assert_allclose(
-                sorted(sub["time"].tolist()),
+                sorted(sub["t_to_diagnosis_days"].tolist()),
                 [0.0, 0.1, 0.2, 0.3],
             )

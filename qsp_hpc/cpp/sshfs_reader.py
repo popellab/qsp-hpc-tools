@@ -130,9 +130,11 @@ def sshfs_read_long_form_chunks(
 
     Returns:
         A long-form ``pd.DataFrame`` with columns
-        ``[sample_index, time, species, value]``. ``species`` is a plain
-        string column (dictionary decoded). The frame is the
-        concatenation of every chunk under ``remote_pool_path``,
+        ``[sample_index, t_to_diagnosis_days, column, value]`` (the
+        canonical schema consumed by ``qsp_inference.inference.trajectory_eval``;
+        the on-disk parquets carry the writer-side names ``time`` and
+        ``species``, which this helper renames before returning). The
+        frame is the concatenation of every chunk under ``remote_pool_path``,
         post-filter; row order is chunk-stable but not otherwise
         sorted.
 
@@ -170,8 +172,8 @@ def sshfs_read_long_form_chunks(
             return pd.DataFrame(
                 {
                     "sample_index": pd.Series(dtype="int64"),
-                    "time": pd.Series(dtype="float64"),
-                    "species": pd.Series(dtype="object"),
+                    "t_to_diagnosis_days": pd.Series(dtype="float64"),
+                    "column": pd.Series(dtype="object"),
                     "value": pd.Series(dtype="float64"),
                 }
             )
@@ -201,8 +203,8 @@ def sshfs_read_long_form_chunks(
                 return pd.DataFrame(
                     {
                         "sample_index": pd.Series(dtype="int64"),
-                        "time": pd.Series(dtype="float64"),
-                        "species": pd.Series(dtype="object"),
+                        "t_to_diagnosis_days": pd.Series(dtype="float64"),
+                        "column": pd.Series(dtype="object"),
                         "value": pd.Series(dtype="float64"),
                     }
                 )
@@ -229,7 +231,12 @@ def sshfs_read_long_form_chunks(
                 "species",
                 table.column("species").cast(pa.string()),
             )
-        return table.to_pandas()
+        # Normalize to the qsp_inference canonical schema
+        # ``[sample_index, t_to_diagnosis_days, column, value]`` so
+        # downstream observable-evaluation helpers consume the frame
+        # without an extra rename layer at the call site.
+        df = table.to_pandas()
+        return df.rename(columns={"time": "t_to_diagnosis_days", "species": "column"})
     finally:
         if owns_filesystem:
             close = getattr(filesystem, "close", None)

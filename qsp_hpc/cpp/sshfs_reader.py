@@ -38,23 +38,38 @@ logger = logging.getLogger(__name__)
 
 
 _TRAJECTORY_SUFFIX = ".trajectory.parquet"
+_COMBINED_NAME = "combined.trajectory.parquet"
 
 
 def _list_trajectory_chunks(filesystem: Any, remote_pool_path: str) -> list[str]:
     """Return the absolute paths of all ``*.trajectory.parquet`` chunks
     under ``remote_pool_path``.
 
-    The C++ batch worker writes chunks one level deep under per-batch
-    subdirs (``batch_<timestamp>_<scenario>_<seed>/chunk_NNN.trajectory.parquet``),
-    so the lookup walks one level into ``batch_*/`` in addition to
-    matching files at the top level (kept as a fallback for layouts
-    that flatten the batch dir).
+    Resolution order:
+
+    1. If ``combined.trajectory.parquet`` exists at the top level, return
+       that single path. ``concat_chunks`` produces it once on HPC after
+       the SLURM array drains, and reading one big file over sshfs is
+       O(seconds) where N small chunks is O(minutes) due to per-file
+       SSH RTT.
+    2. Otherwise walk one level into ``batch_*/`` subdirs (the writer
+       layout) and fall back to flat-level chunks at the top.
 
     Uses :meth:`fsspec.AbstractFileSystem.ls`; both ``sshfs.SSHFileSystem``
     and ``fsspec.implementations.local.LocalFileSystem`` honor that API.
     """
-    found: list[str] = []
     top = filesystem.ls(remote_pool_path, detail=True)
+
+    # Step 1: prefer the pre-combined file when present.
+    for entry in top:
+        path = entry.get("name") if isinstance(entry, dict) else entry
+        if path is None:
+            continue
+        if Path(str(path)).name == _COMBINED_NAME:
+            return [str(path)]
+
+    # Step 2: walk batch_*/ subdirs + flat-level fallback.
+    found: list[str] = []
     for entry in top:
         path = entry.get("name") if isinstance(entry, dict) else entry
         kind = entry.get("type") if isinstance(entry, dict) else None
@@ -63,7 +78,6 @@ def _list_trajectory_chunks(filesystem: Any, remote_pool_path: str) -> list[str]
         if str(path).endswith(_TRAJECTORY_SUFFIX):
             found.append(str(path))
             continue
-        # Walk one level into batch_*/ subdirs.
         if kind == "directory" and Path(str(path)).name.startswith("batch_"):
             for sub in filesystem.ls(str(path), detail=False):
                 if str(sub).endswith(_TRAJECTORY_SUFFIX):

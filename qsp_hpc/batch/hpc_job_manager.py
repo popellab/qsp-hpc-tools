@@ -1644,6 +1644,44 @@ class HPCJobManager:
             dosing,
         )
 
+    def concat_trajectory_chunks(
+        self,
+        simulation_pool_id: str,
+        *,
+        kind: str = "training",
+        timeout_s: int = 600,
+    ) -> str:
+        """Run :mod:`qsp_hpc.cpp.concat_chunks` on HPC against ``{pool}/{kind}/``.
+
+        Combines per-chunk ``chunk_*.trajectory.parquet`` files into a
+        single ``combined.trajectory.parquet`` so the local sshfs read
+        opens one file instead of N (RTT-dominated when N is large and
+        files are small, which is the baseline_no_treatment 5k×1-day
+        case). Idempotent: concat_chunks no-ops when the combined file
+        is up-to-date.
+
+        Returns the absolute remote path of the combined file. Raises
+        ``RuntimeError`` if the script exits non-zero.
+        """
+        import shlex as _shlex
+
+        venv_python = f"{self.config.hpc_venv_path}/bin/python"
+        pool_dir = f"{self.config.simulation_pool_path}/{simulation_pool_id}"
+        cmd = (
+            f"{_shlex.quote(venv_python)} -m qsp_hpc.cpp.concat_chunks "
+            f"--pool-dir {_shlex.quote(pool_dir)} --kind {_shlex.quote(kind)}"
+        )
+        self.logger.info("concat_trajectory_chunks: %s/%s", pool_dir, kind)
+        rc, out = self.transport.exec(cmd, timeout=timeout_s)
+        if rc != 0:
+            raise RuntimeError(
+                f"concat_trajectory_chunks failed (rc={rc}) on {pool_dir}/{kind}: {out}"
+            )
+        # Script prints the combined path on its last line.
+        last_line = out.strip().splitlines()[-1] if out.strip() else ""
+        self.logger.info("concat_trajectory_chunks: combined → %s", last_line)
+        return last_line or f"{pool_dir}/{kind}/combined.trajectory.parquet"
+
     def upload_shared_samples_csv(self, csv_path: str, remote_filename: str) -> str:
         """Upload a samples CSV to a non-pool-scoped shared remote path.
 

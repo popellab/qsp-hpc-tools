@@ -161,6 +161,43 @@ class MultiScenarioRunner:
         self.job_manager.ensure_cpp_binary()
         self._session_prepared = True
 
+    def _preupload_per_scenario_files(self) -> Dict[str, Dict[str, Optional[str]]]:
+        """Pre-upload each scenario's per-scenario shared files once.
+
+        scenario.yaml, drug_metadata.yaml, and test_statistics.csv differ
+        across scenarios but are session-stable per scenario (the same
+        scenario re-run has byte-identical files). Hash-keyed shared
+        upload + skip-if-exists turns repeat sessions on the same
+        scenario set into one ``test -f`` per file. Within a single
+        session this is a no-op vs the per-pool upload — the win is
+        across iterative re-runs.
+
+        Returns ``{name: {scenario_yaml, drug_metadata_yaml,
+        test_stats_csv}}`` with each value being the absolute remote
+        path or None when the simulator has no such file.
+        """
+        out: Dict[str, Dict[str, Optional[str]]] = {}
+        for name, sim in self.simulators.items():
+            entry: Dict[str, Optional[str]] = {
+                "scenario_yaml": None,
+                "drug_metadata_yaml": None,
+                "test_stats_csv": None,
+            }
+            if getattr(sim, "scenario_yaml", None):
+                entry["scenario_yaml"] = self.job_manager.upload_shared_scenario_yaml(
+                    str(sim.scenario_yaml)
+                )
+            if getattr(sim, "drug_metadata_yaml", None):
+                entry["drug_metadata_yaml"] = self.job_manager.upload_shared_drug_metadata_yaml(
+                    str(sim.drug_metadata_yaml)
+                )
+            if getattr(sim, "test_stats_csv", None):
+                entry["test_stats_csv"] = self.job_manager.upload_shared_test_stats_csv(
+                    str(sim.test_stats_csv)
+                )
+            out[name] = entry
+        return out
+
     def upload_shared_model_structure(self) -> Optional[str]:
         """Upload model_structure.json once and return the remote path.
 
@@ -239,6 +276,7 @@ class MultiScenarioRunner:
         shared_remote = self.upload_shared_samples_csv(n)
         shared_healthy_remote = self.upload_shared_healthy_state()
         shared_model_structure_remote = self.upload_shared_model_structure()
+        per_scen_remotes = self._preupload_per_scenario_files()
 
         results: Dict[str, ScenarioResult] = {}
         for name, sim in self.simulators.items():
@@ -248,6 +286,9 @@ class MultiScenarioRunner:
                 samples_csv_remote=shared_remote,
                 healthy_state_yaml_remote=shared_healthy_remote,
                 model_structure_remote=shared_model_structure_remote,
+                scenario_yaml_remote=per_scen_remotes[name]["scenario_yaml"],
+                drug_metadata_yaml_remote=per_scen_remotes[name]["drug_metadata_yaml"],
+                test_stats_csv_remote=per_scen_remotes[name]["test_stats_csv"],
                 skip_setup=True,
             )
             sample_index_scen = (

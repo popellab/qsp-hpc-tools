@@ -992,6 +992,9 @@ class HPCJobManager:
         samples_csv_remote: Optional[str] = None,
         healthy_state_yaml_remote: Optional[str] = None,
         model_structure_remote: Optional[str] = None,
+        scenario_yaml_remote: Optional[str] = None,
+        drug_metadata_yaml_remote: Optional[str] = None,
+        test_stats_csv_remote: Optional[str] = None,
         samples_start_offset: int = 0,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
@@ -1178,12 +1181,22 @@ class HPCJobManager:
         # their remote paths so cpp_batch_worker can pass them into
         # CppBatchRunner. #48: pool_id scoping prevents parallel
         # scenarios from overwriting each other's YAMLs.
-        remote_scenario = self._upload_scenario_yaml(
-            scenario_yaml, "scenario.yaml", simulation_pool_id
-        )
-        remote_drug_meta = self._upload_scenario_yaml(
-            drug_metadata_yaml, "drug_metadata.yaml", simulation_pool_id
-        )
+        # ``scenario_yaml_remote`` / ``drug_metadata_yaml_remote`` short-
+        # circuit the per-pool upload when MSR (or any caller) has
+        # pre-uploaded these YAMLs to the shared ``batch_jobs/input/``
+        # area. Same idempotent-cache shape as the other shared uploads.
+        if scenario_yaml_remote:
+            remote_scenario = scenario_yaml_remote
+        else:
+            remote_scenario = self._upload_scenario_yaml(
+                scenario_yaml, "scenario.yaml", simulation_pool_id
+            )
+        if drug_metadata_yaml_remote:
+            remote_drug_meta = drug_metadata_yaml_remote
+        else:
+            remote_drug_meta = self._upload_scenario_yaml(
+                drug_metadata_yaml, "drug_metadata.yaml", simulation_pool_id
+            )
         # ``healthy_state_yaml_remote``, when set, references a shared
         # session-level upload (``upload_shared_healthy_state``) so every
         # scenario points at the same remote file instead of re-uploading.
@@ -1328,6 +1341,7 @@ class HPCJobManager:
                 dependency=f"afterok:{derive_dep_id}",
                 skip_setup=skip_setup,
                 model_structure_remote=model_structure_remote,
+                test_stats_csv_remote=test_stats_csv_remote,
             )
             job_ids.append(derive_job_id)
 
@@ -1694,6 +1708,96 @@ class HPCJobManager:
         self.transport.upload(csv_path, remote_path)
         self.logger.debug("Shared samples CSV uploaded: %s", remote_path)
         return remote_path
+
+    def _upload_shared_file(
+        self,
+        local_path: str,
+        prefix: str,
+        suffix: str,
+        remote_filename: Optional[str] = None,
+    ) -> str:
+        """Content-hash-keyed shared upload with skip-if-exists.
+
+        Idempotent across sessions: the remote filename is
+        ``{prefix}_{sha256[:12]}{suffix}``, so byte-identical content
+        produces the same remote path. Probes for existence first and
+        skips the SCP when the remote file is already there — turns
+        repeat sessions on the same inputs into a single ``test -f``
+        round-trip per file.
+
+        Args:
+            local_path: Local file to upload.
+            prefix: Filename prefix (e.g. ``"scenario_shared"``).
+            suffix: Filename suffix (extension), e.g. ``".yaml"``.
+            remote_filename: Override the auto-derived filename. Caller
+                is responsible for uniqueness.
+
+        Returns:
+            Absolute remote path under ``batch_jobs/input/``.
+        """
+        import hashlib
+        import shlex as _shlex
+
+        local = Path(local_path)
+        if not local.exists():
+            raise FileNotFoundError(f"shared upload source not found: {local}")
+        if remote_filename is None:
+            content_hash = hashlib.sha256(local.read_bytes()).hexdigest()[:12]
+            remote_filename = f"{prefix}_{content_hash}{suffix}"
+
+        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
+        self.transport.exec(f"mkdir -p {_shlex.quote(remote_input_dir)}")
+        remote_path = f"{remote_input_dir}/{remote_filename}"
+
+        # Skip-if-exists probe. ``test -f`` returns 0 on hit; we use
+        # echo y/n for transports that always return rc=0 from ``exec``.
+        rc, out = self.transport.exec(
+            f"test -f {_shlex.quote(remote_path)} && echo y || echo n", timeout=15
+        )
+        if rc == 0 and out.strip().endswith("y"):
+            self.logger.debug("Shared upload cache HIT: %s", remote_path)
+            return remote_path
+
+        self.transport.upload(str(local), remote_path)
+        self.logger.debug("Shared upload cache MISS, uploaded: %s", remote_path)
+        return remote_path
+
+    def upload_shared_scenario_yaml(
+        self, scenario_yaml: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload a scenario YAML to the shared ``batch_jobs/input/``.
+
+        Content-hash-keyed + skip-if-exists, so back-to-back sessions
+        with the same scenario YAMLs cost one ``test -f`` per scenario
+        instead of an scp. Caller threads the returned path into
+        :meth:`submit_cpp_jobs` via ``scenario_yaml_remote=``.
+        """
+        return self._upload_shared_file(scenario_yaml, "scenario_shared", ".yaml", remote_filename)
+
+    def upload_shared_drug_metadata_yaml(
+        self, drug_metadata_yaml: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload a drug metadata YAML to the shared ``batch_jobs/input/``.
+
+        Same shape as :meth:`upload_shared_scenario_yaml` —
+        content-hash-keyed, skip-if-exists.
+        """
+        return self._upload_shared_file(
+            drug_metadata_yaml, "drug_metadata_shared", ".yaml", remote_filename
+        )
+
+    def upload_shared_test_stats_csv(
+        self, test_stats_csv: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload a test_statistics CSV to the shared ``batch_jobs/input/``.
+
+        Same shape as :meth:`upload_shared_scenario_yaml`. Caller
+        threads the returned path into :meth:`submit_derivation_job` via
+        ``test_stats_csv_remote=`` to skip the per-pool upload.
+        """
+        return self._upload_shared_file(
+            test_stats_csv, "test_stats_shared", ".csv", remote_filename
+        )
 
     def upload_shared_healthy_state(
         self, healthy_state_yaml: str, remote_filename: Optional[str] = None
@@ -2272,6 +2376,7 @@ class HPCJobManager:
         dependency: Optional[str] = None,
         skip_setup: bool = False,
         model_structure_remote: Optional[str] = None,
+        test_stats_csv_remote: Optional[str] = None,
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -2308,12 +2413,18 @@ class HPCJobManager:
         derivation_dir = f"{self.config.remote_project_path}/batch_jobs/derivation"
         self.transport.exec(f'mkdir -p "{derivation_dir}"')
 
-        # Upload test statistics CSV
-        # The CSV now contains Python function code in the model_output_code column,
-        # eliminating the need for separate test_stat_functions.py files
-        remote_test_stats_csv = f"{derivation_dir}/test_stats_{test_stats_hash[:8]}.csv"
-        self.logger.info("Uploading test statistics CSV to HPC...")
-        self.transport.upload(test_stats_csv, remote_test_stats_csv)
+        # Upload test statistics CSV. Hoisted: when MSR pre-uploaded the
+        # CSV via upload_shared_test_stats_csv, reuse that path instead
+        # of re-uploading per derivation submit.
+        if test_stats_csv_remote:
+            remote_test_stats_csv = test_stats_csv_remote
+        else:
+            # The CSV now contains Python function code in the
+            # model_output_code column, eliminating the need for
+            # separate test_stat_functions.py files.
+            remote_test_stats_csv = f"{derivation_dir}/test_stats_{test_stats_hash[:8]}.csv"
+            self.logger.info("Uploading test statistics CSV to HPC...")
+            self.transport.upload(test_stats_csv, remote_test_stats_csv)
 
         # Upload species units file. Hoisted: if model_structure_remote
         # was uploaded once at session level (via

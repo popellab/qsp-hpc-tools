@@ -767,6 +767,9 @@ class CppSimulator:
         samples_csv_remote: Optional[str] = None,
         healthy_state_yaml_remote: Optional[str] = None,
         model_structure_remote: Optional[str] = None,
+        scenario_yaml_remote: Optional[str] = None,
+        drug_metadata_yaml_remote: Optional[str] = None,
+        test_stats_csv_remote: Optional[str] = None,
         skip_setup: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Run ``n`` simulations through the 3-tier HPC cache.
@@ -894,6 +897,7 @@ class CppSimulator:
                 ),
                 skip_setup=skip_setup,
                 model_structure_remote=model_structure_remote,
+                test_stats_csv_remote=test_stats_csv_remote,
             )
             self.logger.info(f"Derivation job: {derive_id}")
             self._wait_for_jobs([derive_id])
@@ -961,6 +965,9 @@ class CppSimulator:
                 samples_csv_remote=samples_csv_remote,
                 healthy_state_yaml_remote=healthy_state_yaml_remote,
                 model_structure_remote=model_structure_remote,
+                scenario_yaml_remote=scenario_yaml_remote,
+                drug_metadata_yaml_remote=drug_metadata_yaml_remote,
+                test_stats_csv_remote=test_stats_csv_remote,
                 samples_start_offset=samples_start_offset,
                 skip_setup=skip_setup,
             )

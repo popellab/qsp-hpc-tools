@@ -319,7 +319,7 @@ class TestSubmitCppJobs:
             cpp_template_path=cpp_template,
             # Explicit repo_path so submit_cpp_jobs' ensure_cpp_binary call
             # doesn't try to derive from the stub `/usr/bin/qsp_sim`.
-            cpp_repo_path="/home/testuser/SPQSP_PDAC",
+            cpp_repo_path="/home/testuser/cpp-repo",
         )
         transport = MagicMock()
 
@@ -773,9 +773,9 @@ class TestEnsureCppBinary:
         assert "-DPython3_EXECUTABLE=" in build_cmd
 
     def test_empty_codegen_source_skips_install_and_python_override(self):
-        """Empty ``cpp_codegen_source`` preserves the legacy SPQSP_PDAC build
-        (vendored qsp_sim_core, no codegen needed). No pip install, no python
-        override.
+        """Empty ``cpp_codegen_source`` preserves the legacy build flow with
+        a vendored qsp_sim_core (no codegen needed). No pip install, no
+        python override.
         """
         manager, transport = self._make_manager(cpp_codegen_source="")
         transport.exec.side_effect = self._exec_side_effect()
@@ -852,7 +852,7 @@ class TestSubmitCppJobsWithDerivation:
             time_limit="01:00:00",
             cpp_binary_path="/usr/bin/qsp_sim",
             cpp_template_path="/tmp/p.xml",
-            cpp_repo_path="/home/testuser/SPQSP_PDAC",
+            cpp_repo_path="/home/testuser/cpp-repo",
         )
         transport = MagicMock()
 

@@ -110,44 +110,30 @@ def test_qsth_header_truncated(tmp_path: Path):
 
 # --- Integration with the real qsp_sim binary -----------------------------
 #
-# Shared helpers with test_cpp_runner.py. Looks for a prebuilt qsp_sim in
-# sibling SPQSP_PDAC checkouts or via QSP_SIM_BINARY. Tests skip cleanly
-# if nothing is available (keeps CI green when the C++ side isn't built).
+# Opt-in: env vars point at a prebuilt qsp_sim + param template + healthy
+# state YAML. Tests skip cleanly if any are unset (keeps CI green when the
+# C++ side isn't built). The legacy SPQSP_PDAC sibling-path discovery was
+# removed when pdac-build moved cpp/ in-tree (PR #46).
 
 
 def _real_binary_path() -> Path | None:
     env = os.environ.get("QSP_SIM_BINARY")
     if env and Path(env).exists():
         return Path(env)
-    here = Path(__file__).resolve().parent.parent
-    # Prefer the M13 worktree — tests need the --dump-state flag which
-    # hasn't landed on the other branches yet.
-    for sibling in ("SPQSP_PDAC-m13", "SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        c = here.parent / sibling / "PDAC" / "qsp" / "sim" / "build" / "qsp_sim"
-        if c.exists():
-            return c
     return None
 
 
 def _real_template_path() -> Path | None:
-    here = Path(__file__).resolve().parent.parent
-    # Prefer the M13 worktree — tests need the --dump-state flag which
-    # hasn't landed on the other branches yet.
-    for sibling in ("SPQSP_PDAC-m13", "SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        c = here.parent / sibling / "PDAC" / "sim" / "resource" / "param_all.xml"
-        if c.exists():
-            return c
+    env = os.environ.get("QSP_SIM_TEMPLATE")
+    if env and Path(env).exists():
+        return Path(env)
     return None
 
 
 def _real_healthy_yaml() -> Path | None:
-    here = Path(__file__).resolve().parent.parent
-    # Prefer the M13 worktree — tests need the --dump-state flag which
-    # hasn't landed on the other branches yet.
-    for sibling in ("SPQSP_PDAC-m13", "SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        c = here.parent / sibling / "PDAC" / "sim" / "resource" / "healthy_state.yaml"
-        if c.exists():
-            return c
+    env = os.environ.get("QSP_SIM_HEALTHY_YAML")
+    if env and Path(env).exists():
+        return Path(env)
     return None
 
 
@@ -156,7 +142,7 @@ _SKIP_INTEGRATION = (
 )
 _SKIP_REASON = (
     "qsp_sim binary / param template / healthy_state.yaml not found; "
-    "build SPQSP_PDAC first or set QSP_SIM_BINARY"
+    "set QSP_SIM_BINARY, QSP_SIM_TEMPLATE, QSP_SIM_HEALTHY_YAML"
 )
 
 

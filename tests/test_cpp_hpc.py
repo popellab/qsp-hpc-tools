@@ -45,14 +45,14 @@ def _make_fake_binary(tmp_path: Path) -> Path:
             --rules-out) RULES_OUT="$2"; shift 2 ;;
             --param) shift 2 ;;
             --t-end-days) TEND="$2"; shift 2 ;;
-            --dt-days) DT="$2"; shift 2 ;;
+            --min-cadence-hours) DT="$2"; shift 2 ;;
             *) shift ;;
           esac
         done
         python3 - <<PY
         import struct
-        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 2, 0, 0, float("$DT"), float("$TEND"))
-        body = struct.pack('<4d', 10.0, 20.0, 30.0, 40.0)
+        header = struct.pack('<IIQQQQdddQQ', 0x51535042, 3, 2, 2, 0, 0, float("$DT"), float("$TEND"), 0.0, 0, 0)
+        body = struct.pack('<6d', 0.0, 10.0, 20.0, 0.1, 30.0, 40.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("spA\\nspB\\n")
         open("$COMP_OUT", 'w').write('')
@@ -103,7 +103,7 @@ class TestCppBatchWorker:
             "seed": 42,
             "jobs_per_chunk": 2,
             "t_end_days": 0.2,
-            "dt_days": 0.1,
+            "min_cadence_hours": 0.1,
             "simulation_pool_id": "test_pool",
             "simulation_pool_path": str(pool_dir),
             "scenario": "ctrl",
@@ -134,7 +134,7 @@ class TestCppBatchWorker:
             "seed": 42,
             "jobs_per_chunk": 2,
             "t_end_days": 0.2,
-            "dt_days": 0.1,
+            "min_cadence_hours": 0.1,
             "simulation_pool_id": "test_pool",
             "simulation_pool_path": str(pool_dir),
             "scenario": "ctrl",
@@ -172,7 +172,7 @@ class TestCppBatchWorker:
             "seed": 42,
             "jobs_per_chunk": 2,
             "t_end_days": 0.2,
-            "dt_days": 0.1,
+            "min_cadence_hours": 0.1,
             "simulation_pool_id": "test_pool",
             "simulation_pool_path": str(pool_dir),
             "scenario": "ctrl",
@@ -199,7 +199,7 @@ class TestCppBatchWorker:
             "seed": 42,
             "jobs_per_chunk": 2,
             "t_end_days": 0.2,
-            "dt_days": 0.1,
+            "min_cadence_hours": 0.1,
             "simulation_pool_id": "test_pool",
             "simulation_pool_path": str(pool_dir),
             "scenario": "ctrl",
@@ -382,14 +382,14 @@ class TestSubmitCppJobs:
             simulation_pool_id="pool",
             skip_sync=True,
             t_end_days=90.0,
-            dt_days=0.5,
+            min_cadence_hours=0.5,
             scenario="treatment",
         )
 
         assert len(captured_configs) == 1
         uploaded_config = captured_configs[0]
         assert uploaded_config["t_end_days"] == 90.0
-        assert uploaded_config["dt_days"] == 0.5
+        assert uploaded_config["min_cadence_hours"] == 0.5
         assert uploaded_config["scenario"] == "treatment"
         assert uploaded_config["binary_path"] == "/usr/bin/qsp_sim"
 

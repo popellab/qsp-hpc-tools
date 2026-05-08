@@ -46,14 +46,14 @@ def _make_fake_binary(tmp_path: Path) -> Path:
             --rules-out) RULES_OUT="$2"; shift 2 ;;
             --param) PARAM="$2"; shift 2 ;;
             --t-end-days) TEND="$2"; shift 2 ;;
-            --dt-days) DT="$2"; shift 2 ;;
+            --min-cadence-hours) DT="$2"; shift 2 ;;
             *) shift ;;
           esac
         done
         python3 - <<PY
 import struct
-header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 2, 0, 0, float("$DT"), float("$TEND"))
-body = struct.pack('<4d', 10.0, 20.0, 30.0, 40.0)
+header = struct.pack('<IIQQQQdddQQ', 0x51535042, 3, 2, 2, 0, 0, float("$DT"), float("$TEND"), 0.0, 0, 0)
+body = struct.pack('<6d', 0.0, 10.0, 20.0, 0.1, 30.0, 40.0)
 open("$BIN_OUT", 'wb').write(header + body)
 open("$SP_OUT", 'w').write("spA\\nspB\\n")
 open("$COMP_OUT", 'w').write('')
@@ -465,7 +465,7 @@ class TestCall:
             cache_dir=cache_dir,
             scenario="ctrl",
             t_end_days=0.2,
-            dt_days=0.1,
+            min_cadence_hours=0.1,
         )
 
         def fake_run(**kwargs):
@@ -499,7 +499,7 @@ class TestCall:
             cache_dir=cache_dir,
             scenario="ctrl",
             t_end_days=0.2,
-            dt_days=0.1,
+            min_cadence_hours=0.1,
         )
         # Pre-seed pool with 3 sims
         _write_synthetic_parquet(
@@ -559,7 +559,7 @@ class TestCall:
             cache_dir=cache_dir,
             scenario="ctrl",
             t_end_days=0.2,
-            dt_days=0.1,
+            min_cadence_hours=0.1,
         )
 
         def fake_run(**kwargs):
@@ -1238,7 +1238,7 @@ class TestSimulateWithParameters:
             calibration_targets=sample_calibration_targets_dir,
             scenario="ctrl",
             t_end_days=0.2,
-            dt_days=0.1,
+            min_cadence_hours=0.1,
         )
         theta = np.array([[0.5, 1.0], [1.5, 2.0], [3.0, 4.0]])
         with patch.object(sim._runner, "run", side_effect=_fake_run_factory()):
@@ -1275,7 +1275,7 @@ class TestSimulateWithParameters:
             calibration_targets=sample_calibration_targets_dir,
             scenario="ctrl",
             t_end_days=0.2,
-            dt_days=0.1,
+            min_cadence_hours=0.1,
         )
         theta = np.array([[0.5, 1.0], [1.5, 2.0]])
         with patch.object(sim._runner, "run", side_effect=_fake_run_factory()):
@@ -1303,7 +1303,7 @@ class TestSimulateWithParameters:
             calibration_targets=sample_calibration_targets_dir,
             scenario="ctrl",
             t_end_days=0.2,
-            dt_days=0.1,
+            min_cadence_hours=0.1,
         )
         theta = np.array([[0.5, 1.0], [1.5, 2.0]])
         with patch.object(sim._runner, "run", side_effect=_fake_run_factory()) as mock_run:
@@ -1326,7 +1326,7 @@ class TestSimulateWithParameters:
             calibration_targets=sample_calibration_targets_dir,
             scenario="ctrl",
             t_end_days=0.2,
-            dt_days=0.1,
+            min_cadence_hours=0.1,
         )
         theta_a = np.array([[0.5, 1.0], [1.5, 2.0]])
         theta_b = np.array([[0.5, 1.0], [9.0, 9.0]])  # different row 1
@@ -1367,7 +1367,7 @@ class TestSimulateWithParameters:
             calibration_targets=sample_calibration_targets_dir,
             scenario="ctrl",
             t_end_days=0.2,
-            dt_days=0.1,
+            min_cadence_hours=0.1,
         )
         theta = np.array([[0.5, 1.0]])
         with patch.object(sim._runner, "run", side_effect=_fake_run_factory()) as mock_run:

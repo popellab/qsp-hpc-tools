@@ -119,11 +119,12 @@ def assemble_evolve_trajectory_long(
         _validate_header_columns(
             header, len(species_names), len(compartment_names), len(rule_names), ftraj.path
         )
-        # Time axis: t_end_days is the diagnosis time; rows are at
-        # t_model = i * dt_days (i = 0..n_t-1). Convert to time-to-diagnosis
-        # = t_model - t_diagnosis (negative leading up to 0).
-        t_model = np.arange(header.n_times, dtype=np.float64) * header.dt_days
-        t_to_diag = t_model - header.t_end_days
+        # Time axis: under v3, the binary's leading time column is
+        # already the per-row sample time (model-time days from start of
+        # evolve, i.e. healthy-IC = 0). t_end_days is the diagnosis time
+        # at which evolve stopped, so subtracting it pins t=0 at diagnosis
+        # with earlier rows negative.
+        t_to_diag = np.asarray(header.time_days, dtype=np.float64) - header.t_end_days
         sub = arr[:, keep_idx]
         # Long-form: one row per (timepoint, column).
         n_t = header.n_times

@@ -265,7 +265,7 @@ def test_run_one_with_cached_state_matches_fresh_evolve(real_runner, tmp_path: P
     cached = real_runner.run_one(
         params={},
         t_end_days=1.0,
-        dt_days=0.1,
+        min_cadence_hours=0.1,
         workdir=tmp_path,
         evolve_state_path=path,
         params_hash=th,
@@ -273,7 +273,7 @@ def test_run_one_with_cached_state_matches_fresh_evolve(real_runner, tmp_path: P
     fresh = real_runner.run_one(
         params={},
         t_end_days=1.0,
-        dt_days=0.1,
+        min_cadence_hours=0.1,
         workdir=tmp_path,
     )
     np.testing.assert_array_equal(cached.trajectory, fresh.trajectory)
@@ -293,7 +293,7 @@ def test_run_one_requires_params_hash_with_initial_state(real_runner, tmp_path: 
         real_runner.run_one(
             params={},
             t_end_days=1.0,
-            dt_days=0.1,
+            min_cadence_hours=0.1,
             workdir=tmp_path,
             evolve_state_path=path,  # no params_hash
         )
@@ -314,7 +314,7 @@ def test_wrong_params_hash_is_rejected(real_runner, tmp_path: Path):
         real_runner.run_one(
             params={},
             t_end_days=1.0,
-            dt_days=0.1,
+            min_cadence_hours=0.1,
             workdir=tmp_path,
             evolve_state_path=path,
             params_hash="f" * 32,  # definitely not the right hash
@@ -346,7 +346,7 @@ def test_batch_runner_shares_cache_across_scenarios(tmp_path: Path):
         theta_matrix=theta,
         param_names=[],
         t_end_days=1.0,
-        dt_days=0.1,
+        min_cadence_hours=0.1,
         output_path=tmp_path / "batch_baseline.parquet",
         scenario="baseline",
         max_workers=1,
@@ -355,7 +355,7 @@ def test_batch_runner_shares_cache_across_scenarios(tmp_path: Path):
         theta_matrix=theta,
         param_names=[],
         t_end_days=1.0,
-        dt_days=0.1,
+        min_cadence_hours=0.1,
         output_path=tmp_path / "batch_treatment.parquet",
         scenario="treatment",
         max_workers=1,

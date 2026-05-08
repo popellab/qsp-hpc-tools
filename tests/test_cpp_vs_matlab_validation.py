@@ -73,7 +73,7 @@ def test_cpp_matches_matlab_20sims_30days(tmp_path):
         project_root=MATLAB_PROJECT_ROOT,
         model_script="immune_oncology_model_PDAC",
         t_end_days=30.0,
-        dt_days=0.5,
+        min_cadence_hours=0.5,
         seed=42,
         out_dir=tmp_path,
     )
@@ -83,7 +83,7 @@ def test_cpp_matches_matlab_20sims_30days(tmp_path):
         binary_path=CPP_BINARY,
         template_path=CPP_TEMPLATE,
         t_end_days=30.0,
-        dt_days=0.5,
+        min_cadence_hours=0.5,
         seed=42,
         out_dir=tmp_path,
     )

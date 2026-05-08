@@ -1525,6 +1525,10 @@ class HPCJobManager:
         SLURM can take a few seconds to register a freshly-submitted
         array, so we tolerate an initial all-zeros window — the loop
         gives up only once we've SEEN the array live and it's now empty.
+
+        Each poll emits an INFO-level progress line so a tail of the
+        run log shows the array draining in real time (matches the
+        per-iteration cadence the legacy CppSimulator wait loop had).
         """
         start = time.time()
         max_seen = 0
@@ -1534,6 +1538,17 @@ class HPCJobManager:
             max_seen = max(max_seen, total)
             elapsed = time.time() - start
             active = status["running"] + status["pending"]
+            self.logger.info(
+                "  [%dm %02ds] array %s: %d/%d done | running=%d pending=%d failed=%d",
+                int(elapsed // 60),
+                int(elapsed % 60),
+                array_id,
+                status["completed"],
+                max(total, max_seen),
+                status["running"],
+                status["pending"],
+                status["failed"],
+            )
             if total > 0 and active == 0:
                 return status
             # Array is "gone" — either it finished too fast for sacct

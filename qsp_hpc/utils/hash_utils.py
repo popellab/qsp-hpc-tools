@@ -10,40 +10,65 @@ pure syntactic changes (like renaming).
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Union
 
 
 def compute_pool_id_hash(
+    *,
+    binary_path: Union[str, Path],
+    scenario_yaml: Union[str, Path],
+) -> str:
+    """Hash the inputs that genuinely change ``f(theta) -> outputs``.
+
+    Returns the full sha256 hex digest of
+    ``binary_bytes | b"|scenario|" | scenario_yaml_content``.
+
+    Per the local-observable-eval plan (Layer 3 / step 3 of
+    ``notes/architecture/local_observable_eval_plan.md`` in pdac-build):
+    everything else previously folded in is dropped.
+
+    - ``priors_csv`` / ``submodel_priors_yaml`` / ``seed``: theta-pool
+      sampling is determined by ``(prior, seed)`` on the runner. That
+      contract lives in ``HPCSession`` (see D7 guardrail), not in the
+      pool key — same pool serves different priors/seeds, and the
+      runner is responsible for refusing stale draws.
+    - ``model_script``: cosmetic namespace for the MATLAB path; not a
+      real sim input.
+    - ``test_stats``: gone. Test statistics are evaluated locally over
+      trajectory parquets (Layer 3 of the plan); there is no longer a
+      ``{pool_id}/test_stats/<hash>/`` subdir.
+
+    Two real inputs remain:
+
+    - ``binary_path`` bytes — captures sim semantics (qsp-codegen
+      produces byte-deterministic binaries since ``fdd81d5``; #56).
+    - ``scenario_yaml`` content — drug regimen / initial conditions /
+      stop time. Edits change ``f(theta)``.
+    """
+    h = hashlib.sha256()
+    h.update(Path(binary_path).read_bytes())
+    h.update(b"|scenario|")
+    h.update(Path(scenario_yaml).read_text().encode("utf-8"))
+    return h.hexdigest()
+
+
+def compute_pool_id_hash_legacy(
     priors_csv: Union[str, Path],
     model_script: str,
-    submodel_priors_yaml: Optional[Union[str, Path]] = None,
-    seed: Optional[int] = None,
-    binary_path: Optional[Union[str, Path]] = None,
+    submodel_priors_yaml: Union[str, Path, None] = None,
+    seed: Union[int, None] = None,
+    binary_path: Union[str, Path, None] = None,
 ) -> str:
-    """Hash inputs that determine raw simulation outputs (full sha256 hex).
+    """Legacy pool-id hash — MATLAB code path only.
 
-    Used by :class:`SimulationPool`, :class:`QSPResultLoader`, and
-    :class:`CppSimulator` to derive the pool directory's 8-hex prefix.
-    Includes only inputs that change the parameter draws or sim
-    trajectories — NOT test_stats (those live in a subdir) and NOT
-    scenario (it's the dir-name suffix).
-
-    ``binary_path``, when provided, is hashed by content (sha256 of
-    bytes). This catches silent staleness after rebuilding the C++
-    ``qsp_sim`` binary with new model semantics — see #56. MATLAB
-    callers omit it. ``model_version`` was removed (#56): it was a
-    manual string the user had to bump whenever simulation outputs
-    changed, and forgetting to bump silently served stale draws. The
-    binary content (or, for MATLAB, the priors / submodel priors /
-    model script) is the source of truth.
-
-    ``seed`` is part of the hash because ``theta_pool`` draws are
-    seed-dependent: row ``sample_index=i`` points at a different theta
-    under a different seed, so pools from different seeds cannot be
-    mixed. Leaving seed out silently served stale draws when users
-    reran with a new seed (see #20). ``seed=None`` reproduces the
-    pre-fix hash for backward compatibility with legacy pools; new
-    callers should always pass the seed they use for theta sampling.
+    Pre-Layer-3 hash retained for the MATLAB
+    :class:`SimulationPool` / :class:`QSPSimulator` orchestration.
+    pdac-build no longer drives the MATLAB path; this function exists
+    so the existing test suite for those classes keeps passing while
+    the C++ path migrates to the simplified
+    :func:`compute_pool_id_hash`. New callers must use the new
+    function. The MATLAB classes will be retired (or migrated) in a
+    later step and this helper will go with them.
     """
     h = hashlib.sha256()
     h.update(Path(priors_csv).read_text().encode("utf-8"))
@@ -60,11 +85,13 @@ def compute_pool_id_hash(
     return h.hexdigest()
 
 
-def compute_test_stats_hash(test_stats_csv: Union[str, Path]) -> str:
-    """Hash the test_stats CSV content (full sha256 hex).
+def compute_test_stats_hash_legacy(test_stats_csv: Union[str, Path]) -> str:
+    """Legacy test-stats hash — MATLAB code path only.
 
-    Used as the subdirectory name under ``{pool_dir}/test_stats/`` so multiple
-    test_stats variants can share the same raw sim pool.
+    Replaces the deleted ``compute_test_stats_hash`` for the MATLAB
+    classes. The new C++ path evaluates test statistics locally over
+    trajectory parquets (Layer 3 of the plan); there is no longer a
+    ``{pool_id}/test_stats/<hash>/`` subdir on disk for new pools.
     """
     return hashlib.sha256(Path(test_stats_csv).read_text().encode("utf-8")).hexdigest()
 

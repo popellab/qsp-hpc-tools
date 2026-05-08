@@ -264,31 +264,40 @@ class CppSimulator:
     def _compute_config_hash(self) -> str:
         """Hash inputs that affect simulation outputs.
 
-        Extends the standard pool-id hash with the template XML content
-        so editing the template invalidates the cache. The C++ binary's
-        SHA-256 is folded in by :func:`compute_pool_id_hash` directly
-        (#56) so the same hash agrees across CppSimulator,
-        :class:`SimulationPool`, and :class:`QSPResultLoader`. When a
-        restriction classifier is configured, its bytes + threshold are
-        folded in so restricted and unrestricted pools (sharing all
-        other config) get distinct on-disk pool dirs.
+        Base key is :func:`compute_pool_id_hash` over
+        ``(binary_bytes | scenario_yaml_content)`` (Layer 3 of the
+        local-observable-eval plan). On top of that we still fold in
+        sim-affecting inputs not covered by the base key:
+
+        - the template XML the binary ingests,
+        - drug-metadata / healthy-state YAMLs,
+        - restriction-classifier bytes + threshold (rejection-sampled
+          theta-pool subset).
+
+        ``scenario_yaml`` is required by the new base hash and is no
+        longer added a second time here.
         """
         from qsp_hpc.utils.hash_utils import compute_pool_id_hash
 
-        base_hash = compute_pool_id_hash(
-            priors_csv=self.priors_csv,
-            model_script="",
-            submodel_priors_yaml=self.submodel_priors_yaml,
-            seed=self.seed,
-            binary_path=self.binary_path,
-        )
+        if self.scenario_yaml is not None:
+            base_hash = compute_pool_id_hash(
+                binary_path=self.binary_path,
+                scenario_yaml=self.scenario_yaml,
+            )
+        else:
+            # Tests sometimes construct CppSimulator without a scenario YAML
+            # (production code always passes one). Fall back to binary-only
+            # hash so construction succeeds; production paths reach the
+            # full ``compute_pool_id_hash`` branch above.
+            base_h = hashlib.sha256()
+            base_h.update(self.binary_path.read_bytes())
+            base_hash = base_h.hexdigest()
 
         h = hashlib.sha256(base_hash.encode())
         h.update(self.template_xml.read_text().encode())
-        # Scenario/drug-meta/healthy-state YAMLs change sim outputs but live
-        # outside the priors-CSV + XML template hashed above, so fold them
-        # in explicitly — edits to any of these must invalidate the pool.
-        for yml in (self.scenario_yaml, self.drug_metadata_yaml, self.healthy_state_yaml):
+        # Drug-meta / healthy-state YAMLs change sim outputs but live
+        # outside the base key, so fold them in explicitly.
+        for yml in (self.drug_metadata_yaml, self.healthy_state_yaml):
             if yml is not None:
                 h.update(yml.read_bytes())
         # Restriction classifier: when set, the theta pool is a rejection-
@@ -489,7 +498,13 @@ class CppSimulator:
         """SHA-256 of the test-stats CSV (matches QSPSimulator)."""
         if self.test_stats_csv is None:
             raise RuntimeError("test_stats_csv must be set to compute test_stats_hash")
-        from qsp_hpc.utils.hash_utils import compute_test_stats_hash
+        # Test-stats subdir is being retired in Layer 3 of the
+        # local-observable-eval plan. Until step 4 deletes the
+        # derive_test_stats_worker, this method routes through the
+        # legacy hash so existing pools remain readable.
+        from qsp_hpc.utils.hash_utils import (
+            compute_test_stats_hash_legacy as compute_test_stats_hash,
+        )
 
         return compute_test_stats_hash(self.test_stats_csv)
 

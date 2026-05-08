@@ -109,9 +109,16 @@ class QSPResultLoader:
     # Identity (delegates to shared helpers, matches SimulationPool)
     # ------------------------------------------------------------------
     def priors_hash(self) -> str:
-        from qsp_hpc.utils.hash_utils import compute_pool_id_hash
+        # QSPResultLoader sits in front of MATLAB-era combined CSVs
+        # under ``{pool_id}/test_stats/<hash>/``. It uses the legacy
+        # hash so it stays in lockstep with :class:`SimulationPool` and
+        # :class:`QSPSimulator`. The C++ path no longer goes through
+        # this loader (Layer 3 of the local-observable-eval plan
+        # rewrites both layout and identity); a follow-up step will
+        # retire or replace this class.
+        from qsp_hpc.utils.hash_utils import compute_pool_id_hash_legacy
 
-        return compute_pool_id_hash(
+        return compute_pool_id_hash_legacy(
             priors_csv=self.priors_csv,
             model_script=self.model_script,
             submodel_priors_yaml=self.submodel_priors_yaml,
@@ -120,9 +127,9 @@ class QSPResultLoader:
         )
 
     def test_stats_hash(self) -> str:
-        from qsp_hpc.utils.hash_utils import compute_test_stats_hash
+        from qsp_hpc.utils.hash_utils import compute_test_stats_hash_legacy
 
-        return compute_test_stats_hash(self.test_stats_csv)
+        return compute_test_stats_hash_legacy(self.test_stats_csv)
 
     def pool_id(self) -> str:
         return (

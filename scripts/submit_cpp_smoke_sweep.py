@@ -215,7 +215,9 @@ def main() -> None:
     test_stats_hash: str | None = None
     test_stats_csv_for_submit: Path | None = args.test_stats_csv
     if args.derive_test_stats:
-        from qsp_hpc.utils.hash_utils import compute_test_stats_hash
+        from qsp_hpc.utils.hash_utils import (
+            compute_test_stats_hash_legacy as compute_test_stats_hash,
+        )
 
         if args.calibration_targets is not None:
             # Mirror QSPSimulator/CppSimulator: serialize calibration target

@@ -991,7 +991,9 @@ class TestCppSimulatorCalibrationTargets:
         from unittest.mock import MagicMock
 
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
-        from qsp_hpc.utils.hash_utils import compute_test_stats_hash
+        from qsp_hpc.utils.hash_utils import (
+            compute_test_stats_hash_legacy as compute_test_stats_hash,
+        )
 
         job_manager = MagicMock()
         job_manager.config.simulation_pool_path = "/scratch/sims"

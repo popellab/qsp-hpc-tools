@@ -26,12 +26,31 @@ def _pack_binary(
     n_comp: int = 0,
     n_rules: int = 0,
     magic: int = 0x51535042,
-    version: int = 2,
+    version: int = 3,
 ) -> bytes:
-    n_t, n_cols = traj.shape
-    assert n_cols == n_sp + n_comp + n_rules
-    header = struct.pack("<IIQQQQdd", magic, version, n_t, n_sp, n_comp, n_rules, dt, t_end)
-    return header + traj.astype("<f8").tobytes()
+    """Pack a synthetic v3 binary. The synthetic ``time_days`` column is
+    ``arange(n_t) * dt`` — i.e., we keep the legacy uniform-grid semantics
+    these assembler tests were written against by stuffing them into the
+    v3 schema's per-row time column."""
+    n_t, n_state = traj.shape
+    assert n_state == n_sp + n_comp + n_rules
+    time_days = np.arange(n_t, dtype=np.float64) * dt
+    header = struct.pack(
+        "<IIQQQQdddQQ",
+        magic,
+        version,
+        n_t,
+        n_sp,
+        n_comp,
+        n_rules,
+        dt,
+        t_end,
+        0.0,  # t_offset_days
+        0,  # n_cvode_steps
+        0,  # reserved
+    )
+    body = np.column_stack([time_days, traj]).astype("<f8").tobytes()
+    return header + body
 
 
 def _write_fake_sim(

@@ -447,6 +447,21 @@ _PENDING_POOL_REWRITE = pytest.mark.xfail(
     strict=False,
 )
 
+# 3b.iv: the HPC PPC backend now raises NotImplementedError pending the
+# Layer 4 unified rewrite (HPCSession.run_scenario + runner-side eval +
+# {pool_id}/ppc/ sub-pool with kind="ppc" submissions). The pre-flight
+# guard tests (prediction_targets, evolve_trajectory_dir, job_manager
+# missing) keep their original semantics; the four tests that exercise
+# the actual HPC path are marked here. They become regression coverage
+# for the Layer 4 rewrite.
+_PENDING_HPC_PPC_REWRITE = pytest.mark.xfail(
+    reason="HPC PPC backend deferred to Layer 4 of the local-observable-eval "
+    "rollout (notes/architecture/local_observable_eval_plan.md). "
+    "backend='local' is the supported path.",
+    strict=True,
+    raises=NotImplementedError,
+)
+
 
 class TestCall:
     def test_call_uses_cache_when_available(
@@ -1532,6 +1547,7 @@ class TestSimulateWithParametersHPC:
                 prediction_targets=prediction_targets_dir,
             )
 
+    @_PENDING_HPC_PPC_REWRITE
     def test_hpc_backend_fresh_submit_and_download(
         self,
         priors_csv,
@@ -1590,6 +1606,7 @@ class TestSimulateWithParametersHPC:
         assert kw["num_simulations"] == 3
         assert "_posterior_predictive_" in kw["simulation_pool_id"]
 
+    @_PENDING_HPC_PPC_REWRITE
     def test_hpc_backend_prederived_skips_submit(
         self,
         priors_csv,
@@ -1625,6 +1642,7 @@ class TestSimulateWithParametersHPC:
         jm.download_test_stats_full.assert_called_once()
         assert table.column("ts:spA_t0").to_numpy().tolist() == [7.0]
 
+    @_PENDING_HPC_PPC_REWRITE
     def test_hpc_backend_cache_hit_avoids_hpc(
         self,
         priors_csv,
@@ -1664,6 +1682,7 @@ class TestSimulateWithParametersHPC:
         assert jm.download_test_stats_full.call_count == 1
         jm.check_hpc_test_stats.assert_not_called()
 
+    @_PENDING_HPC_PPC_REWRITE
     def test_hpc_backend_reindexes_by_sample_index(
         self,
         priors_csv,

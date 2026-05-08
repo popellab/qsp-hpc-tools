@@ -1074,16 +1074,21 @@ class CppSimulator:
             (theta_hash + "|" + cal_hash + "|" + pred_hash + f"|backend={backend}").encode()
         ).hexdigest()[:HASH_PREFIX_LENGTH]
 
-        suffix_pool_dir = self.pool_dir.parent / f"{self.pool_dir.name}_{pool_suffix}_{key_hash}"
-        suffix_pool_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = suffix_pool_dir / "test_stats.parquet"
+        # 3b.iv: PPC writes land in {pool_id}/ppc/ — same pool_id as
+        # training, separate sub-pool. Cache + per-call artifacts are
+        # keyed by ``key_hash`` in their filenames so multiple PPC calls
+        # against the same pool stay isolated. ``pool_suffix`` stays in
+        # the filename for human-readable provenance.
+        ppc_dir = self.pool_dir / "ppc"
+        ppc_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = ppc_dir / f"test_stats_{pool_suffix}_{key_hash}.parquet"
 
         self.logger.info(
             f"simulate_with_parameters: n={n_samples}, backend={backend}, "
             f"theta_hash={theta_hash[:8]}, "
             f"cal_hash={cal_hash[:8]}, pred_hash={pred_hash[:8]}"
         )
-        self.logger.info(f"  suffix pool: {suffix_pool_dir.name}")
+        self.logger.info(f"  ppc sub-pool: {ppc_dir} (key={key_hash})")
 
         # Burn-in trajectory dump bypasses the suffix-pool cache: the
         # cached parquet has only test-stat columns, so a hit can't
@@ -1119,18 +1124,29 @@ class CppSimulator:
                 theta=theta,
                 sample_indices=sample_indices,
                 test_stats_df=test_stats_df,
-                suffix_pool_dir=suffix_pool_dir,
+                ppc_dir=ppc_dir,
+                key_hash=key_hash,
                 pool_suffix=pool_suffix,
                 evolve_trajectory_dir=evolve_trajectory_dir,
                 evolve_trajectory_dt_days=evolve_trajectory_dt_days,
             )
         else:
-            table = self._simulate_with_parameters_hpc(
-                theta=theta,
-                sample_indices=sample_indices,
-                test_stats_df=test_stats_df,
-                suffix_pool_dir=suffix_pool_dir,
-                pool_suffix=pool_suffix,
+            # 3b.iv: the legacy HPC PPC path used a sibling suffix-pool
+            # dir + derive_test_stats_worker + the test_stats/<hash>/
+            # subdir convention. All three are slated for removal in
+            # Layer 4 (notes/architecture/local_observable_eval_plan.md):
+            # observable evaluation moves to the runner over sshfs and
+            # PPC submissions write into {pool_id}/ppc/batch_*/ via
+            # submit_cpp_jobs(kind="ppc"). The unified rewrite needs
+            # HPCSession + the runner-side eval helper, so the gate
+            # below stays until that lands. The local backend (above)
+            # is the supported path today.
+            raise NotImplementedError(
+                "simulate_with_parameters(backend='hpc') is deferred until "
+                "the Layer 4 unified rewrite lands "
+                "(notes/architecture/local_observable_eval_plan.md). "
+                "Use backend='local' (the default) — production callers "
+                "in pdac-build already do."
             )
 
         pq.write_table(table, str(cache_path))
@@ -1151,7 +1167,8 @@ class CppSimulator:
         theta: np.ndarray,
         sample_indices: np.ndarray,
         test_stats_df: pd.DataFrame,
-        suffix_pool_dir: Path,
+        ppc_dir: Path,
+        key_hash: str,
         pool_suffix: str,
         evolve_trajectory_dir: Optional[str | Path] = None,
         evolve_trajectory_dt_days: Optional[float] = None,
@@ -1159,23 +1176,22 @@ class CppSimulator:
         """Local backend for :meth:`simulate_with_parameters`.
 
         Runs the C++ binary via :class:`CppBatchRunner` and derives test
-        stats in-process. All file I/O lands under ``suffix_pool_dir``;
-        the caller handles the final cache write.
+        stats in-process. Per-call artifacts (species parquet) land
+        under ``{pool_id}/ppc/``; the caller writes the final cache
+        parquet under the same dir. ``key_hash`` namespaces multiple
+        concurrent PPC calls within the same sub-pool.
         """
         n_samples = theta.shape[0]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         species_parquet = (
-            suffix_pool_dir / f"species_{ts}_{pool_suffix}_{n_samples}sims_seed{self.seed}.parquet"
+            ppc_dir
+            / f"species_{ts}_{pool_suffix}_{key_hash}_{n_samples}sims_seed{self.seed}.parquet"
         )
         # #23: the pool manifest is what lets derive look up non-sampled
         # template defaults (e.g. parameters referenced by a calibration
         # target but not varied by the priors CSV). Without it, those
         # targets silently NaN out.
-        # 3b.i: kind="training" here is a placeholder — the legacy suffix-pool
-        # PPC path is wholly replaced by the {pool_id}/ppc/ sub-pool in 3b.iv.
-        write_pool_manifest(
-            suffix_pool_dir, "training", self._runner.template_defaults, self.param_names
-        )
+        write_pool_manifest(self.pool_dir, "ppc", self._runner.template_defaults, self.param_names)
 
         self._runner.run(
             theta_matrix=theta,

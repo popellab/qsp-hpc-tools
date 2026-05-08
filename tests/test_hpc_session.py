@@ -390,7 +390,7 @@ def run_scenario_inputs(session_inputs, tmp_path):
 
     # Mock job_manager: config + submit_cpp_jobs return shape.
     jm.config = MagicMock()
-    jm.config.host = "test-host"
+    jm.config.ssh_host = "test-host"
     jm.config.cpp_binary_path = "/hpc/qsp_sim"
     jm.config.cpp_template_path = "/hpc/param_all.xml"
     jm.config.simulation_pool_path = "/hpc/pools"

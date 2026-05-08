@@ -635,7 +635,7 @@ class HPCSession:
                 Defaults to the session's ``seed``.
             evolve_cache: Forwarded to ``submit_cpp_jobs``.
             sshfs_host: Hostname for the sshfs read connection. Defaults
-                to ``job_manager.config.host``.
+                to ``job_manager.config.ssh_host``.
             filesystem: Optional injected fsspec filesystem (tests).
                 When provided, the helper does not open its own sshfs
                 connection.
@@ -745,7 +745,7 @@ class HPCSession:
         remote_pool_path = f"{self.job_manager.config.simulation_pool_path}/{pool_id}/{kind}"
         host = sshfs_host
         if filesystem is None and host is None:
-            host = getattr(self.job_manager.config, "host", None)
+            host = getattr(self.job_manager.config, "ssh_host", None)
         traj_df = _read_helper(
             remote_pool_path,
             sample_indices=sample_index.tolist(),

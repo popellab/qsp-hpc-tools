@@ -585,32 +585,50 @@ class CppSimulator:
         time.sleep(SLURM_REGISTRATION_DELAY)
         start = time.time()
         max_seen = 0
+        # Track expected total from the first nonzero squeue poll so the
+        # progress log can render "X/Y done" without paying the
+        # ~3–5s/poll sacct DB query during the live window. ``Y`` here
+        # is approximate (retries inflate it slightly) but the user-
+        # facing display is what matters.
+        expected_total = 0
         while True:
             totals = {"completed": 0, "running": 0, "pending": 0, "failed": 0}
             for jid in job_ids:
                 try:
-                    status = self.job_manager.check_job_status(jid)
+                    status = self.job_manager.check_job_status(jid, squeue_only=True)
                     for k in totals:
                         totals[k] += status[k]
                 except Exception as e:
                     self.logger.warning(f"Status check failed for job {jid}: {e}")
-            total = sum(totals.values())
-            max_seen = max(max_seen, total)
+            active = totals["running"] + totals["pending"]
+            expected_total = max(expected_total, active)
+            max_seen = max(max_seen, active)
+            # Approximate completed = (max active ever seen) - (current
+            # active). Off-by-one on retries; the final sacct sweep
+            # below corrects it.
+            completed_approx = max(0, expected_total - active)
             elapsed = time.time() - start
             self.logger.info(
                 f"  [{int(elapsed // 60)}m {int(elapsed % 60)}s] "
-                f"{totals['completed']}/{total} done | "
-                f"running={totals['running']} pending={totals['pending']} "
-                f"failed={totals['failed']}"
+                f"{completed_approx}/{expected_total} done | "
+                f"running={totals['running']} pending={totals['pending']}"
             )
-            active = totals["running"] + totals["pending"]
-            if total > 0 and active == 0:
-                if totals["failed"] > 0:
-                    self.logger.warning(f"{totals['failed']} task(s) failed")
+            if expected_total > 0 and active == 0:
+                # One sacct sweep to confirm the final completed/failed
+                # split — the only call that hits the accounting DB.
+                final = {"completed": 0, "running": 0, "pending": 0, "failed": 0}
+                for jid in job_ids:
+                    s = self.job_manager.check_job_status(jid, squeue_only=False)
+                    for k in final:
+                        final[k] += s[k]
+                if final["failed"] > 0:
+                    self.logger.warning(f"{final['failed']} task(s) failed")
+                self.logger.info(
+                    f"  array done: {final['completed']} completed, "
+                    f"{final['failed']} failed (sacct)"
+                )
                 return
-            if total == 0 and max_seen > 0 and elapsed > 30:
-                return
-            if total == 0 and elapsed > JOB_QUEUE_TIMEOUT:
+            if max_seen == 0 and elapsed > JOB_QUEUE_TIMEOUT:
                 self.logger.warning(f"No jobs visible after {JOB_QUEUE_TIMEOUT}s — proceeding")
                 return
             if self.max_wait_time and elapsed > self.max_wait_time:

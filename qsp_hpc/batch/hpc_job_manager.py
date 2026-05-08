@@ -1643,7 +1643,10 @@ class HPCJobManager:
         start = time.time()
         max_seen = 0
         while True:
-            status = self.check_job_status(array_id)
+            # Live polls: squeue only (sub-second). One final sacct sweep
+            # below once squeue empties, for accurate completed/failed
+            # counts.
+            status = self.check_job_status(array_id, squeue_only=True)
             total = sum(status.values())
             max_seen = max(max_seen, total)
             elapsed = time.time() - start
@@ -1660,19 +1663,22 @@ class HPCJobManager:
                 status["failed"],
             )
             if total > 0 and active == 0:
-                return status
+                # Squeue is empty after seeing the array live — fall back
+                # to one full check (sacct included) for accurate
+                # completed/failed counts.
+                return self.check_job_status(array_id, squeue_only=False)
             # Array is "gone" — either it finished too fast for sacct
             # propagation, or it never registered. Only give up if we've
             # waited past a generous registration window.
             if total == 0 and max_seen > 0 and elapsed > 30:
-                return status
+                return self.check_job_status(array_id, squeue_only=False)
             if total == 0 and elapsed > 120:
                 self.logger.warning(
                     "Array %s not visible after %.0fs — assuming complete",
                     array_id,
                     elapsed,
                 )
-                return status
+                return self.check_job_status(array_id, squeue_only=False)
             if timeout_s is not None and elapsed > timeout_s:
                 raise TimeoutError(
                     f"Array {array_id} incomplete after {timeout_s}s " f"(last status: {status})"
@@ -1762,26 +1768,15 @@ class HPCJobManager:
         :meth:`submit_cpp_jobs` via ``samples_csv_remote=`` so the
         per-scenario upload is skipped.
 
-        Used by the local-eval pattern where every scenario uses
-        byte-identical theta (shared ``theta_pool`` sliced the same way
-        per scenario): one upload at session setup, every per-scenario
-        ``submit_cpp_jobs`` call references the shared path.
-
-        Args:
-            csv_path: Local path to the samples CSV.
-            remote_filename: Filename to use under ``batch_jobs/input/``;
-                callers should keep this stable per session and unique
-                enough to avoid clobbering a sibling session's upload
-                (e.g. include a hash of the theta pool key).
+        Routes through :meth:`_upload_shared_file` so the same
+        skip-if-exists + memoized-mkdir behavior applies. The caller
+        supplies ``remote_filename`` directly (since MSR pre-computes
+        the content hash to derive the shared theta CSV's name) — the
+        helper passes it through verbatim instead of re-computing.
         """
-        import shlex as _shlex
-
-        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
-        self.transport.exec(f"mkdir -p {_shlex.quote(remote_input_dir)}")
-        remote_path = f"{remote_input_dir}/{remote_filename}"
-        self.transport.upload(csv_path, remote_path)
-        self.logger.debug("Shared samples CSV uploaded: %s", remote_path)
-        return remote_path
+        return self._upload_shared_file(
+            csv_path, prefix="", suffix="", remote_filename=remote_filename
+        )
 
     def _upload_shared_file(
         self,
@@ -1820,14 +1815,22 @@ class HPCJobManager:
             remote_filename = f"{prefix}_{content_hash}{suffix}"
 
         remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
-        self.transport.exec(f"mkdir -p {_shlex.quote(remote_input_dir)}")
         remote_path = f"{remote_input_dir}/{remote_filename}"
 
-        # Skip-if-exists probe. ``test -f`` returns 0 on hit; we use
-        # echo y/n for transports that always return rc=0 from ``exec``.
-        rc, out = self.transport.exec(
-            f"test -f {_shlex.quote(remote_path)} && echo y || echo n", timeout=15
-        )
+        # Combined mkdir + skip-if-exists probe in one ssh exec. mkdir
+        # is folded into the && chain on first call per HPCJobManager;
+        # subsequent calls drop it via the _shared_input_dir_ready memo
+        # to halve the round-trip count.
+        if getattr(self, "_shared_input_dir_ready", False):
+            probe = f"test -f {_shlex.quote(remote_path)} && echo y || echo n"
+        else:
+            probe = (
+                f"mkdir -p {_shlex.quote(remote_input_dir)} && "
+                f"test -f {_shlex.quote(remote_path)} && echo y || echo n"
+            )
+        rc, out = self.transport.exec(probe, timeout=15)
+        self._shared_input_dir_ready = True
+
         if rc == 0 and out.strip().endswith("y"):
             self.logger.debug("Shared upload cache HIT: %s", remote_path)
             return remote_path
@@ -1880,32 +1883,12 @@ class HPCJobManager:
 
         Healthy state is the same physiological IC across treatment arms
         in a multi-scenario sweep, so the natural shape is one upload
-        per session. Callers pass the returned remote path to
-        :meth:`submit_cpp_jobs` via ``healthy_state_yaml_remote=`` so the
-        per-pool upload is skipped.
-
-        Args:
-            healthy_state_yaml: Local path to the healthy_state.yaml.
-            remote_filename: Filename under ``batch_jobs/input/``; defaults
-                to a content-hash-stamped name so two runners with
-                byte-identical YAML share the upload, but a different
-                YAML lands in its own file.
+        per session. Routes through :meth:`_upload_shared_file` for the
+        skip-if-exists + memoized-mkdir behavior.
         """
-        import hashlib
-        import shlex as _shlex
-
-        local = Path(healthy_state_yaml)
-        if not local.exists():
-            raise FileNotFoundError(f"healthy_state YAML not found: {local}")
-        if remote_filename is None:
-            content_hash = hashlib.sha256(local.read_bytes()).hexdigest()[:12]
-            remote_filename = f"healthy_state_shared_{content_hash}.yaml"
-        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
-        self.transport.exec(f"mkdir -p {_shlex.quote(remote_input_dir)}")
-        remote_path = f"{remote_input_dir}/{remote_filename}"
-        self.transport.upload(str(local), remote_path)
-        self.logger.debug("Shared healthy_state YAML uploaded: %s", remote_path)
-        return remote_path
+        return self._upload_shared_file(
+            healthy_state_yaml, "healthy_state_shared", ".yaml", remote_filename
+        )
 
     def upload_shared_model_structure(
         self, model_structure_file: str, remote_filename: Optional[str] = None
@@ -1913,33 +1896,13 @@ class HPCJobManager:
         """Upload model_structure.json to a non-pool-scoped shared remote path.
 
         ``model_structure.json`` describes species metadata (names,
-        units, compartments) — the same JSON across every scenario in a
-        multi-scenario sweep. Uploading it once per session and pointing
-        every derivation submit at the shared path saves an upload per
-        scenario. Callers thread the returned path into
-        :meth:`submit_derivation_job` via ``model_structure_remote=``.
-
-        Args:
-            model_structure_file: Local path to model_structure.json.
-            remote_filename: Filename under ``batch_jobs/input/``; defaults
-                to a content-hash-stamped name so two runners with
-                byte-identical JSON share the upload.
+        units, compartments) — same across every scenario. Routes
+        through :meth:`_upload_shared_file` for the skip-if-exists +
+        memoized-mkdir behavior.
         """
-        import hashlib
-        import shlex as _shlex
-
-        local = Path(model_structure_file)
-        if not local.exists():
-            raise FileNotFoundError(f"model_structure.json not found: {local}")
-        if remote_filename is None:
-            content_hash = hashlib.sha256(local.read_bytes()).hexdigest()[:12]
-            remote_filename = f"model_structure_shared_{content_hash}.json"
-        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
-        self.transport.exec(f"mkdir -p {_shlex.quote(remote_input_dir)}")
-        remote_path = f"{remote_input_dir}/{remote_filename}"
-        self.transport.upload(str(local), remote_path)
-        self.logger.debug("Shared model_structure JSON uploaded: %s", remote_path)
-        return remote_path
+        return self._upload_shared_file(
+            model_structure_file, "model_structure_shared", ".json", remote_filename
+        )
 
     def _upload_parameter_csv(
         self, csv_path: str, simulation_pool_id: Optional[str] = None
@@ -2835,12 +2798,20 @@ class HPCJobManager:
 
         return downloaded_files
 
-    def check_job_status(self, job_id: str) -> Dict[str, int]:
+    def check_job_status(self, job_id: str, squeue_only: bool = False) -> Dict[str, int]:
         """
         Check status of SLURM job array.
 
         Args:
             job_id: SLURM job ID
+            squeue_only: When True, skip the ``sacct`` round-trip and
+                return only ``running`` / ``pending`` counts (with
+                ``completed`` / ``failed`` left at 0). On busy SLURM
+                clusters (e.g. Rockfish), ``sacct`` queries the
+                accounting DB and can take 3–5s; ``squeue`` is sub-second.
+                Wait loops use this for the live-poll fast path and only
+                fall back to a full ``sacct`` sweep once the array
+                empties.
 
         Returns:
             Dictionary with counts: {'completed': N, 'running': N, 'pending': N, 'failed': N}
@@ -2861,6 +2832,11 @@ class HPCJobManager:
                         status["running"] += 1
                     elif "PENDING" in state_upper:
                         status["pending"] += 1
+
+        # squeue-only fast path: skip the sacct DB query. Caller
+        # consumes only running/pending; completed/failed stay 0.
+        if squeue_only:
+            return status
 
         # Check sacct for completed/failed jobs
         sacct_cmd = f"sacct -j {job_id} --format=JobID,State --noheader --parsable2"

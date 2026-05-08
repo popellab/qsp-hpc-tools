@@ -82,10 +82,17 @@ def concat_trajectory_chunks(pool_dir: Path, kind: str) -> Path:
     flock to serialize concurrent invocations.
     """
     sub_dir = pool_dir / kind
-    if not sub_dir.is_dir():
-        raise FileNotFoundError(f"sub-pool dir not found: {sub_dir}")
-
     combined = sub_dir / _COMBINED_NAME
+
+    # Tolerate a missing sub-pool dir: a scancel'd or never-started SLURM
+    # array writes nothing to ``{pool}/{kind}/``, and concat is called
+    # unconditionally by the orchestrator. Treat that as "no chunks to
+    # concat, no-op" rather than an error so the caller flow stays
+    # graceful.
+    if not sub_dir.is_dir():
+        logger.info("concat_trajectory_chunks: %s does not exist — skipping", sub_dir)
+        return combined
+
     sub_dir.mkdir(parents=True, exist_ok=True)
     lock_path = sub_dir / ".combined.lock"
     if not lock_path.exists():

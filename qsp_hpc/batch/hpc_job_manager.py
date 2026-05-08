@@ -965,7 +965,7 @@ class HPCJobManager:
         num_simulations: int,
         simulation_pool_id: str,
         t_end_days: float = 180.0,
-        dt_days: float = 1.0,
+        min_cadence_hours: float = 4.0,
         scenario: str = "default",
         seed: int = 2025,
         jobs_per_chunk: Optional[int] = None,
@@ -1002,7 +1002,7 @@ class HPCJobManager:
             simulation_pool_id: Pool directory name on HPC
                 (e.g. ``v1_a3f7b2c8_baseline``).
             t_end_days: Simulation end time (days).
-            dt_days: Output timestep (days).
+            min_cadence_hours: Upper bound on inter-row spacing in qsp_sim output (hours; CV_ONE_STEP cadence floor).
             scenario: Scenario name for Parquet filenames.
             seed: Random seed.
             jobs_per_chunk: Simulations per array task (default from config).
@@ -1128,7 +1128,7 @@ class HPCJobManager:
             "scenario": scenario,
             "seed": seed,
             "t_end_days": t_end_days,
-            "dt_days": dt_days,
+            "min_cadence_hours": min_cadence_hours,
         }
         for line in format_config(job_config):
             self.logger.info(line)
@@ -1200,7 +1200,7 @@ class HPCJobManager:
             seed=seed,
             jobs_per_chunk=jobs_per_chunk,
             t_end_days=t_end_days,
-            dt_days=dt_days,
+            min_cadence_hours=min_cadence_hours,
             simulation_pool_id=simulation_pool_id,
             scenario=scenario,
             max_workers=max_workers,
@@ -1367,7 +1367,7 @@ class HPCJobManager:
         seed: int,
         jobs_per_chunk: int,
         t_end_days: float,
-        dt_days: float,
+        min_cadence_hours: float,
         simulation_pool_id: str,
         scenario: str,
         max_workers: Optional[int],
@@ -1394,7 +1394,7 @@ class HPCJobManager:
             "seed": seed,
             "jobs_per_chunk": jobs_per_chunk,
             "t_end_days": t_end_days,
-            "dt_days": dt_days,
+            "min_cadence_hours": min_cadence_hours,
             "simulation_pool_id": simulation_pool_id,
             "simulation_pool_path": self.config.simulation_pool_path,
             "scenario": scenario,

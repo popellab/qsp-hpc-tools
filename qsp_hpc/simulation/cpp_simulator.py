@@ -62,7 +62,7 @@ class CppSimulator:
         scenario: str = "default",
         subtree: str | None = "QSP",
         t_end_days: float = 180.0,
-        dt_days: float = 1.0,
+        min_cadence_hours: float = 4.0,
         cache_dir: str | Path = "cache/sbi_simulations",
         seed: int = 2025,
         theta_pool_size: int = 100_000,
@@ -99,7 +99,7 @@ class CppSimulator:
         self.scenario = scenario
         self.subtree = subtree
         self.t_end_days = t_end_days
-        self.dt_days = dt_days
+        self.min_cadence_hours = min_cadence_hours
         self.cache_dir = Path(cache_dir)
         self.seed = seed
         self.theta_pool_size = theta_pool_size
@@ -245,7 +245,7 @@ class CppSimulator:
             "config_hash": self.config_hash[:8] + "...",
             "pool_dir": str(self.pool_dir),
             "t_end_days": t_end_days,
-            "dt_days": dt_days,
+            "min_cadence_hours": min_cadence_hours,
             "seed": seed,
             "scenario_yaml": str(self.scenario_yaml) if self.scenario_yaml else "-",
             "drug_metadata_yaml": (
@@ -459,7 +459,7 @@ class CppSimulator:
             param_names=self.param_names,
             sample_indices=indices,
             t_end_days=self.t_end_days,
-            dt_days=self.dt_days,
+            min_cadence_hours=self.min_cadence_hours,
             output_path=output_path,
             scenario=self.scenario,
             seed=self.seed,
@@ -908,7 +908,7 @@ class CppSimulator:
                 num_simulations=n_needed,
                 simulation_pool_id=self.simulation_pool_id,
                 t_end_days=self.t_end_days,
-                dt_days=self.dt_days,
+                min_cadence_hours=self.min_cadence_hours,
                 scenario=self.scenario,
                 seed=self.seed,
                 binary_path=remote_binary_path,
@@ -1160,7 +1160,7 @@ class CppSimulator:
             param_names=self.param_names,
             sample_indices=sample_indices,
             t_end_days=self.t_end_days,
-            dt_days=self.dt_days,
+            min_cadence_hours=self.min_cadence_hours,
             output_path=species_parquet,
             scenario=pool_suffix,
             seed=self.seed,
@@ -1260,7 +1260,7 @@ class CppSimulator:
                     num_simulations=n_samples,
                     simulation_pool_id=hpc_pool_id,
                     t_end_days=self.t_end_days,
-                    dt_days=self.dt_days,
+                    min_cadence_hours=self.min_cadence_hours,
                     scenario=self.scenario,
                     seed=self.seed,
                     binary_path=remote_binary_path,

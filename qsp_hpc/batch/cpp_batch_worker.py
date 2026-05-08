@@ -74,7 +74,7 @@ def run_chunk(config: dict, array_idx: int) -> None:
     seed = config["seed"]
     jobs_per_chunk = config["jobs_per_chunk"]
     t_end_days = config["t_end_days"]
-    dt_days = config["dt_days"]
+    min_cadence_hours = config["min_cadence_hours"]
     pool_id = config["simulation_pool_id"]
     pool_base = config["simulation_pool_path"]
     scenario = config.get("scenario", "default")
@@ -193,7 +193,7 @@ def run_chunk(config: dict, array_idx: int) -> None:
         param_names=param_names,
         sample_indices=sample_indices_chunk,
         t_end_days=t_end_days,
-        dt_days=dt_days,
+        min_cadence_hours=min_cadence_hours,
         output_path=output_path,
         scenario=scenario,
         seed=seed,

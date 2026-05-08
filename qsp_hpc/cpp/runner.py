@@ -18,14 +18,31 @@ import numpy as np
 
 from qsp_hpc.cpp.param_xml import ParamXMLRenderer
 
-# Must match qsp_sim.cpp's binary format. Header layout:
-#   magic | version=2 | n_times | n_species | n_compartments | n_rules | dt | t_end
-# Body: n_times × (n_species + n_compartments + n_rules) doubles, in
-# row-major order with columns laid out as species → compartments → rules.
+# Must match qsp_sim_main.cpp's binary format v3 (qsp-codegen's
+# CV_ONE_STEP cadence-floor scheme). Header layout (80 bytes,
+# little-endian, packed):
+#   uint32 magic = "QSPB"
+#   uint32 version = 3
+#   uint64 n_times
+#   uint64 n_species
+#   uint64 n_compartments
+#   uint64 n_rules
+#   double min_cadence_hours
+#   double t_end_days
+#   double t_offset_days
+#   uint64 n_cvode_steps
+#   uint64 reserved = 0
+# Body: n_times × (1 + n_species + n_compartments + n_rules) doubles in
+# row-major order. The leading column is per-row sample time
+# (user-relative days, i.e. (t_solver - t_offset) / time_factor); the
+# remaining columns are species → compartments → rules. v2 (no time
+# column, fixed dt grid) is no longer supported — qsp-codegen and
+# qsp-hpc-tools cut over together; rebuild qsp_sim if a v2 binary lands
+# here.
 _MAGIC = 0x51535042  # "QSPB" little-endian
-_HEADER_STRUCT = struct.Struct("<IIQQQQdd")
-_HEADER_SIZE = _HEADER_STRUCT.size  # 56 bytes
-_SUPPORTED_VERSION = 2
+_HEADER_STRUCT = struct.Struct("<IIQQQQdddQQ")
+_HEADER_SIZE = _HEADER_STRUCT.size  # 80 bytes
+_SUPPORTED_VERSION = 3
 
 
 class QspSimError(RuntimeError):
@@ -45,11 +62,18 @@ class TrajectoryHeader:
     n_species: int
     n_compartments: int
     n_rules: int
-    dt_days: float
+    min_cadence_hours: float
     t_end_days: float
+    t_offset_days: float
+    n_cvode_steps: int
+    # Per-row sample times (days, user-relative). Lifted out of the body
+    # by read_binary_trajectory so callers see a (n_t, n_state_cols)
+    # state array and a separate (n_t,) time vector.
+    time_days: np.ndarray
 
     @property
     def n_columns(self) -> int:
+        """State column count (species + compartments + rules; excludes time)."""
         return self.n_species + self.n_compartments + self.n_rules
 
 
@@ -59,20 +83,19 @@ class SimResult:
 
     ``trajectory`` columns are laid out as
     ``[species..., compartments..., rules...]`` (matching the binary
-    body order).
+    body order, with the leading time column already stripped — see
+    ``time_days``).
     """
 
     trajectory: np.ndarray  # shape (n_times, n_columns), float64
     species_names: list[str]
     compartment_names: list[str]
     rule_names: list[str]
-    dt_days: float
+    time_days: np.ndarray  # shape (n_times,), float64; sample times
+    min_cadence_hours: float
     t_end_days: float
-
-    @property
-    def time_days(self) -> np.ndarray:
-        """Time axis reconstructed from dt and n_times (t=0 is first row)."""
-        return np.arange(self.trajectory.shape[0]) * self.dt_days
+    t_offset_days: float
+    n_cvode_steps: int
 
     @property
     def column_names(self) -> list[str]:
@@ -81,18 +104,31 @@ class SimResult:
 
 
 def read_binary_trajectory(path: Path) -> tuple[np.ndarray, TrajectoryHeader]:
-    """Parse a qsp_sim --binary-out file (format version 2).
+    """Parse a qsp_sim --binary-out file (format version 3).
 
     Returns ``(trajectory, header)``. Trajectory shape is
     ``(n_times, n_columns)`` with columns laid out as
-    ``[species..., compartments..., rules...]``.
+    ``[species..., compartments..., rules...]``. Per-row sample times
+    are returned as ``header.time_days`` (shape ``(n_times,)``).
     """
     data = path.read_bytes()
     if len(data) < _HEADER_SIZE:
         raise BinaryFormatError(
             f"Binary file truncated: {len(data)} bytes < {_HEADER_SIZE}-byte header"
         )
-    magic, version, n_t, n_sp, n_comp, n_rules, dt, t_end = _HEADER_STRUCT.unpack_from(data, 0)
+    (
+        magic,
+        version,
+        n_t,
+        n_sp,
+        n_comp,
+        n_rules,
+        min_cadence_hours,
+        t_end,
+        t_offset,
+        n_cvode_steps,
+        _reserved,
+    ) = _HEADER_STRUCT.unpack_from(data, 0)
     if magic != _MAGIC:
         raise BinaryFormatError(
             f"Bad magic: got 0x{magic:08x}, expected 0x{_MAGIC:08x} "
@@ -100,25 +136,33 @@ def read_binary_trajectory(path: Path) -> tuple[np.ndarray, TrajectoryHeader]:
         )
     if version != _SUPPORTED_VERSION:
         raise BinaryFormatError(
-            f"Unsupported binary version {version}; this code handles "
-            f"{_SUPPORTED_VERSION} (rebuild qsp_sim if you have an older binary)"
+            f"Unsupported binary version {version}; this reader handles v"
+            f"{_SUPPORTED_VERSION} only. Rebuild qsp_sim from qsp-codegen "
+            f"`feature/min-cadence-hours` or later."
         )
-    n_cols = n_sp + n_comp + n_rules
-    expected = _HEADER_SIZE + n_t * n_cols * 8
+    n_state_cols = n_sp + n_comp + n_rules
+    n_body_cols = 1 + n_state_cols  # leading time column
+    expected = _HEADER_SIZE + n_t * n_body_cols * 8
     if len(data) != expected:
         raise BinaryFormatError(
             f"Binary file size mismatch: got {len(data)} bytes, "
-            f"expected {expected} ({n_t} times × {n_cols} cols × 8 + {_HEADER_SIZE})"
+            f"expected {expected} ({n_t} times × {n_body_cols} cols × 8 + "
+            f"{_HEADER_SIZE})"
         )
-    arr = np.frombuffer(data, dtype="<f8", offset=_HEADER_SIZE).reshape(n_t, n_cols)
+    body = np.frombuffer(data, dtype="<f8", offset=_HEADER_SIZE).reshape(n_t, n_body_cols)
+    time_days = np.ascontiguousarray(body[:, 0])
+    arr = np.ascontiguousarray(body[:, 1:])
     header = TrajectoryHeader(
         version=version,
         n_times=n_t,
         n_species=n_sp,
         n_compartments=n_comp,
         n_rules=n_rules,
-        dt_days=float(dt),
+        min_cadence_hours=float(min_cadence_hours),
         t_end_days=float(t_end),
+        t_offset_days=float(t_offset),
+        n_cvode_steps=int(n_cvode_steps),
+        time_days=time_days,
     )
     return arr, header
 
@@ -206,7 +250,7 @@ class CppRunner:
         self,
         params: Mapping[str, float],
         t_end_days: float,
-        dt_days: float,
+        min_cadence_hours: float,
         workdir: str | Path,
         timeout_s: float | None = None,
         keep_files: bool = False,
@@ -221,7 +265,11 @@ class CppRunner:
             params: Subset of `self.parameter_names` to override in the
                 XML template. Unknown names raise ParamNotFoundError.
             t_end_days: Simulation end time (days).
-            dt_days: Output step (days). qsp_sim writes one row every dt.
+            min_cadence_hours: Upper bound on inter-row spacing in the
+                output trajectory. qsp_sim runs CV_ONE_STEP and emits a
+                row whenever elapsed solver time since the last dump
+                exceeds this floor (plus at every dose boundary and at
+                t_end). Replaces the legacy fixed-dt output grid.
             workdir: Directory for the rendered XML and binary output.
                 Created if missing. Files named with a short UUID so
                 concurrent calls into the same directory don't collide.
@@ -290,8 +338,8 @@ class CppRunner:
             str(rules_path),
             "--t-end-days",
             repr(float(t_end_days)),
-            "--dt-days",
-            repr(float(dt_days)),
+            "--min-cadence-hours",
+            repr(float(min_cadence_hours)),
         ]
         if self.scenario_yaml is not None:
             cmd += [
@@ -402,8 +450,11 @@ class CppRunner:
             species_names=species,
             compartment_names=compartments,
             rule_names=rules,
-            dt_days=header.dt_days,
+            time_days=header.time_days,
+            min_cadence_hours=header.min_cadence_hours,
             t_end_days=header.t_end_days,
+            t_offset_days=header.t_offset_days,
+            n_cvode_steps=header.n_cvode_steps,
         )
 
     def dump_evolve_state(

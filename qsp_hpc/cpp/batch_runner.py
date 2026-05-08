@@ -214,13 +214,14 @@ def _run_one_in_worker(
     sample_index: int,
     params: dict[str, float],
     t_end_days: float,
-    dt_days: float,
+    min_cadence_hours: float,
     timeout_s: float | None,
     evolve_trajectory_dir: str | None = None,
     evolve_trajectory_dt_days: float | None = None,
 ) -> tuple[
     int,
     int,
+    np.ndarray | None,
     np.ndarray | None,
     list[str] | None,
     list[str] | None,
@@ -269,7 +270,7 @@ def _run_one_in_worker(
             result: SimResult = _WORKER_RUNNER.run_one(
                 params=params,
                 t_end_days=t_end_days,
-                dt_days=dt_days,
+                min_cadence_hours=min_cadence_hours,
                 workdir=_WORKER_WORKDIR,
                 timeout_s=timeout_s,
                 evolve_state_path=evolve_state_path,
@@ -287,13 +288,14 @@ def _run_one_in_worker(
             sim_id,
             STATUS_OK,
             result.trajectory,
+            result.time_days,
             result.species_names,
             result.compartment_names,
             result.rule_names,
             None,
         )
     except (QspSimError, ParamNotFoundError) as e:
-        return sim_id, STATUS_FAILED, None, None, None, None, str(e)
+        return sim_id, STATUS_FAILED, None, None, None, None, None, str(e)
 
 
 # --- Public batch runner ----------------------------------------------------
@@ -378,7 +380,7 @@ class CppBatchRunner:
         theta_matrix: np.ndarray,
         param_names: Sequence[str],
         t_end_days: float,
-        dt_days: float,
+        min_cadence_hours: float,
         output_path: str | Path,
         scenario: str = "default",
         seed: int = 0,
@@ -396,7 +398,10 @@ class CppBatchRunner:
                 vector for sim i.
             param_names: length n_params; the priors-CSV column names that
                 line up with theta_matrix's columns.
-            t_end_days, dt_days: passed through to qsp_sim.
+            t_end_days, min_cadence_hours: passed through to qsp_sim
+                (--t-end-days and --min-cadence-hours respectively;
+                under v3 the output cadence is solver-native with the
+                given hours value as a floor on inter-row spacing).
             output_path: Parquet destination. Parent dirs created.
             scenario, seed: metadata embedded in the Parquet filename
                 schema used elsewhere in the codebase. Not written into
@@ -465,6 +470,7 @@ class CppBatchRunner:
                 self.healthy_state_yaml,
             )
         trajectories: list[np.ndarray | None] = [None] * n_sims
+        time_arrays: list[np.ndarray | None] = [None] * n_sims
         statuses: list[int] = [STATUS_FAILED] * n_sims
         errors: list[str | None] = [None] * n_sims
         species_names: list[str] | None = None
@@ -494,7 +500,7 @@ class CppBatchRunner:
         if effective_traj_dir is not None:
             Path(effective_traj_dir).mkdir(parents=True, exist_ok=True)
             logger.info(
-                "Evolve trajectory dump: ENABLED (dir=%s, dt_days=%s)",
+                "Evolve trajectory dump: ENABLED (dir=%s, evolve_dt_days=%s)",
                 effective_traj_dir,
                 effective_traj_dt if effective_traj_dt else "(spec step_days)",
             )
@@ -533,17 +539,18 @@ class CppBatchRunner:
                         int(_sample_idx[i]),
                         params,
                         t_end_days,
-                        dt_days,
+                        min_cadence_hours,
                         per_sim_timeout_s,
                         traj_dir_str,
                         effective_traj_dt,
                     )
                 )
             for fut in as_completed(futures):
-                sim_id, status, traj, sp, comps, rules, err = fut.result()
+                sim_id, status, traj, t_days, sp, comps, rules, err = fut.result()
                 statuses[sim_id] = status
                 if status == STATUS_OK:
                     trajectories[sim_id] = traj
+                    time_arrays[sim_id] = t_days
                     if species_names is None:
                         species_names = sp
                         compartment_names = comps or []
@@ -568,9 +575,12 @@ class CppBatchRunner:
         assert compartment_names is not None
         assert rule_names is not None
 
-        n_times = trajectories[next(i for i, t in enumerate(trajectories) if t is not None)].shape[
-            0
-        ]
+        # Under v3 (CV_ONE_STEP), each sim has its own non-uniform time
+        # vector. n_times reported here is the first successful sim's
+        # row count for backward-compat metadata; the parquet writer
+        # uses each sim's own time array via time_arrays.
+        first_ok = next(i for i, t in enumerate(trajectories) if t is not None)
+        n_times = trajectories[first_ok].shape[0]
 
         parquet_path = _write_batch_parquet(
             output_path=output_path,
@@ -578,12 +588,12 @@ class CppBatchRunner:
             param_names=list(param_names),
             statuses=statuses,
             trajectories=trajectories,
+            time_arrays=time_arrays,
             species_names=species_names,
             compartment_names=compartment_names,
             rule_names=rule_names,
             t_end_days=t_end_days,
-            dt_days=dt_days,
-            n_times=n_times,
+            min_cadence_hours=min_cadence_hours,
             sample_indices=sample_indices,
         )
 
@@ -616,20 +626,25 @@ def _write_batch_parquet(
     param_names: list[str],
     statuses: list[int],
     trajectories: list[np.ndarray | None],
+    time_arrays: list[np.ndarray | None],
     species_names: list[str],
     compartment_names: list[str],
     rule_names: list[str],
     t_end_days: float,
-    dt_days: float,
-    n_times: int,
+    min_cadence_hours: float,
     sample_indices: np.ndarray | None = None,
 ) -> Path:
     """Build one pyarrow Table matching MATLAB's Parquet schema, write it.
 
     Trajectory columns are laid out in the order
-    ``[species..., compartments..., rules...]`` (matching the v2 binary
-    layout). Each is emitted as a bare column name so downstream code
-    reads them via ``species_dict[name]`` uniformly.
+    ``[species..., compartments..., rules...]`` (matching the binary
+    body layout). Each is emitted as a bare column name so downstream
+    code reads them via ``species_dict[name]`` uniformly.
+
+    Under qsp-codegen v3 (CV_ONE_STEP), each successful sim has its own
+    non-uniform time vector — the writer threads these through as
+    ``time_arrays`` rather than reconstructing one shared axis from a
+    fixed dt. Failed sims get a NaN-padded single-row time/state.
 
     Only **sampled** model parameters land as ``param:<name>`` columns
     (one per entry in ``param_names``). Non-sampled template defaults
@@ -642,12 +657,17 @@ def _write_batch_parquet(
     """
     n_sims = len(statuses)
 
-    # Time column is the same for every row; reconstruct from dt × i.
-    time_axis = (np.arange(n_times) * dt_days).tolist()
-    time_lists = [time_axis for _ in range(n_sims)]
-
-    # Failed rows get NaN arrays so downstream can filter on status==0.
-    nan_row = np.full(n_times, np.nan, dtype=np.float64)
+    # Per-sim time vectors (variable length under v3). Failed sims get
+    # a single-NaN placeholder so the parquet column shape is well-defined.
+    time_lists: list[list[float]] = []
+    nan_rows: list[np.ndarray] = []
+    for traj, t_days in zip(trajectories, time_arrays):
+        if traj is None or t_days is None:
+            time_lists.append([float("nan")])
+            nan_rows.append(np.array([np.nan], dtype=np.float64))
+        else:
+            time_lists.append(np.asarray(t_days, dtype=np.float64).tolist())
+            nan_rows.append(np.full(traj.shape[0], np.nan, dtype=np.float64))
 
     # sample_index is the GLOBAL theta-pool position (same across all
     # scenarios for a given patient/draw); simulation_id is the LOCAL
@@ -674,9 +694,9 @@ def _write_batch_parquet(
     all_trajectory_names = list(species_names) + list(compartment_names) + list(rule_names)
     for k, name in enumerate(all_trajectory_names):
         per_sim_series: list[list[float]] = []
-        for traj in trajectories:
+        for sim_idx, traj in enumerate(trajectories):
             if traj is None:
-                per_sim_series.append(nan_row.tolist())
+                per_sim_series.append(nan_rows[sim_idx].tolist())
             else:
                 per_sim_series.append(traj[:, k].tolist())
         columns[name] = pa.array(per_sim_series, type=pa.list_(pa.float64()))

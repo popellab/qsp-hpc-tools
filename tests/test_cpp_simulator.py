@@ -293,157 +293,30 @@ class TestCppSimulatorInit:
         assert len(hashes) == 4
 
 
-class TestPoolCaching:
-    def test_scan_empty_pool(self, priors_csv, binary_path, template_path, cache_dir):
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-        )
-        assert sim.get_available_simulations() == 0
-
-    def test_scan_detects_parquet(self, priors_csv, binary_path, template_path, cache_dir):
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            scenario="ctrl",
-        )
-        _write_synthetic_parquet(
-            sim.pool_dir / "batch_20260415_120000_ctrl_10sims_seed42.parquet",
-            n_sims=10,
-        )
-        assert sim.get_available_simulations() == 10
-
-    def test_scan_ignores_wrong_scenario(self, priors_csv, binary_path, template_path, cache_dir):
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            scenario="ctrl",
-        )
-        _write_synthetic_parquet(
-            sim.pool_dir / "batch_20260415_120000_treatment_10sims_seed42.parquet",
-            n_sims=10,
-        )
-        assert sim.get_available_simulations() == 0
-
-    def test_load_from_pool_filters_failed(self, priors_csv, binary_path, template_path, cache_dir):
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            scenario="ctrl",
-        )
-        # Write a parquet with one failed row
-        n = 5
-        cols: dict[str, pa.Array] = {
-            "simulation_id": pa.array(np.arange(n, dtype=np.int64)),
-            "status": pa.array([0, 0, 1, 0, 0], type=pa.int64()),
-            "time": pa.array([[0.0, 0.1]] * n, type=pa.list_(pa.float64())),
-            "param:A": pa.array([1.0, 2.0, 3.0, 4.0, 5.0]),
-            "param:B": pa.array([10.0, 20.0, 30.0, 40.0, 50.0]),
-            "spA": pa.array(
-                [[1.0, 2.0], [3.0, 4.0], [float("nan"), float("nan")], [7.0, 8.0], [9.0, 10.0]],
-                type=pa.list_(pa.float64()),
-            ),
-        }
-        pq.write_table(
-            pa.table(cols),
-            str(sim.pool_dir / "batch_20260415_120000_ctrl_5sims_seed42.parquet"),
-        )
-        theta, table = sim._load_from_pool(10)
-        assert table.num_rows == 4  # one failed row filtered
-        assert theta.shape[0] == 4
-
-    def test_load_samples_when_pool_exceeds_request(
-        self, priors_csv, binary_path, template_path, cache_dir
-    ):
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            scenario="ctrl",
-        )
-        _write_synthetic_parquet(
-            sim.pool_dir / "batch_20260415_120000_ctrl_20sims_seed42.parquet",
-            n_sims=20,
-        )
-        theta, table = sim._load_from_pool(5)
-        assert theta.shape[0] == 5
-        assert table.num_rows == 5
-
-    def test_scan_reads_count_from_parquet_metadata_not_filename(
-        self, priors_csv, binary_path, template_path, cache_dir
-    ):
-        """Regression for #21: filename-based row counts overreported when
-        array-task chunks dropped. _scan_pool now reads num_rows from the
-        parquet footer, so a legacy file claiming '1000sims' but holding
-        only 620 rows reports 620 — the truth.
-        """
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            scenario="ctrl",
-        )
-        # Filename lies about the count; metadata holds the truth.
-        _write_synthetic_parquet(
-            sim.pool_dir / "batch_20260415_120000_ctrl_1000sims_seed42.parquet",
-            n_sims=620,
-        )
-        assert sim.get_available_simulations() == 620
-
-    def test_scan_accepts_new_filename_without_nsims_token(
-        self, priors_csv, binary_path, template_path, cache_dir
-    ):
-        """New combine-worker filenames omit the _{N}sims_ segment (#21).
-        _scan_pool must still match them and pull the count from metadata."""
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            scenario="ctrl",
-        )
-        _write_synthetic_parquet(
-            sim.pool_dir / "batch_20260415_120000_ctrl_seed42.parquet",
-            n_sims=15,
-        )
-        assert sim.get_available_simulations() == 15
-
-
-# The local-pool reader path (CppSimulator._load_from_pool / _scan_pool)
-# expects wide-form parquets with ``param:*`` and per-species list columns.
-# Step 1 of the local-observable-eval rollout (long-form parquet) breaks
-# that reader; steps 2-3 (HPCSession factor-out + content-addressed pool
-# layout with training/ppc sub-pools, plus sshfs read path) replace the
-# local-pool concept entirely. See
-# notes/architecture/local_observable_eval_plan.md §"Layer 2" and the
-# 2026-05-07 handoff at /tmp/handoff_local-eval-rollout-task3-task4*.md.
-_PENDING_POOL_REWRITE = pytest.mark.xfail(
-    reason="local pool reader replaced by sshfs + content-addressed sub-pools "
-    "(steps 2-3 of the local-observable-eval rollout)",
+# 3b.v: TestPoolCaching + TestCall classes deleted alongside the local-pool
+# path (CppSimulator.__call__ / _scan_pool / _load_from_pool /
+# get_available_simulations / _generate_parameters / _batch_pattern).
+# The on-disk pool reader is gone; SBI flows go through run_hpc() (HPC
+# pool over the existing 3-tier walk) and simulate_with_parameters()
+# (PPC into {pool_id}/ppc/, 3b.iv). pdac-build production callers all
+# use QSPSimulator (MATLAB-era) or run_hpc().
+#
+# The local PPC path's `_simulate_with_parameters_local` reads the
+# per-call species parquet via pd.read_parquet — but CppBatchRunner
+# now writes long-form (trajectory + params sidecar; commit 35d2703).
+# Until that read is rewritten to load the long-form pair and pivot to
+# the wide-form species_dict that _derive_test_stats_table expects, the
+# 5 TestSimulateWithParameters tests below stay xfailed under the
+# rename below.
+_PENDING_LONG_FORM_FIXTURE = pytest.mark.xfail(
+    reason="_simulate_with_parameters_local reads species_parquet via "
+    "pd.read_parquet but CppBatchRunner writes long-form trajectory + "
+    "params sidecar (commit 35d2703). Resolving this needs the local "
+    "PPC path rewritten to load both parquets and pivot to wide-form, "
+    "or moved onto the runner-side eval helper landing in Layer 4 of "
+    "the local-observable-eval rollout. The fake_run fixture also "
+    "still passes BatchResult(parquet_path=...) on the pre-long-form "
+    "schema and would need updating in lockstep.",
     strict=False,
 )
 
@@ -461,159 +334,6 @@ _PENDING_HPC_PPC_REWRITE = pytest.mark.xfail(
     strict=True,
     raises=NotImplementedError,
 )
-
-
-class TestCall:
-    def test_call_uses_cache_when_available(
-        self, priors_csv, binary_path, template_path, cache_dir
-    ):
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            scenario="ctrl",
-        )
-        _write_synthetic_parquet(
-            sim.pool_dir / "batch_20260415_120000_ctrl_20sims_seed42.parquet",
-            n_sims=20,
-        )
-        with patch.object(sim, "_runner") as mock_runner:
-            theta, table = sim(10)
-            mock_runner.run.assert_not_called()
-        assert theta.shape[0] == 10
-
-    @_PENDING_POOL_REWRITE
-    def test_call_runs_batch_when_no_cache(self, priors_csv, binary_path, template_path, cache_dir):
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            scenario="ctrl",
-            t_end_days=0.2,
-            min_cadence_hours=0.1,
-        )
-
-        def fake_run(**kwargs):
-            _write_synthetic_parquet(
-                kwargs["output_path"],
-                n_sims=kwargs["theta_matrix"].shape[0],
-                param_names=list(kwargs["param_names"]),
-            )
-            return BatchResult(
-                parquet_path=kwargs["output_path"],
-                n_sims=kwargs["theta_matrix"].shape[0],
-                n_failed=0,
-                species_names=["spA", "spB"],
-                n_times=2,
-            )
-
-        with patch.object(sim._runner, "run", side_effect=fake_run):
-            theta, table = sim(5)
-
-        assert theta.shape == (5, 2)
-        assert table.num_rows == 5
-        assert sim.get_available_simulations() == 5
-
-    @_PENDING_POOL_REWRITE
-    def test_call_tops_up_partial_cache(self, priors_csv, binary_path, template_path, cache_dir):
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            scenario="ctrl",
-            t_end_days=0.2,
-            min_cadence_hours=0.1,
-        )
-        # Pre-seed pool with 3 sims
-        _write_synthetic_parquet(
-            sim.pool_dir / "batch_20260415_120000_ctrl_3sims_seed42.parquet",
-            n_sims=3,
-        )
-
-        run_calls = []
-
-        def fake_run(**kwargs):
-            run_calls.append(kwargs["theta_matrix"].shape[0])
-            _write_synthetic_parquet(
-                kwargs["output_path"],
-                n_sims=kwargs["theta_matrix"].shape[0],
-                param_names=list(kwargs["param_names"]),
-            )
-            return BatchResult(
-                parquet_path=kwargs["output_path"],
-                n_sims=kwargs["theta_matrix"].shape[0],
-                n_failed=0,
-                species_names=["spA", "spB"],
-                n_times=2,
-            )
-
-        with patch.object(sim._runner, "run", side_effect=fake_run):
-            theta, table = sim(10)
-
-        assert run_calls == [7]  # 10 - 3 = 7 new sims
-        assert theta.shape[0] == 10
-
-    def test_call_tuple_batch_size(self, priors_csv, binary_path, template_path, cache_dir):
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            scenario="ctrl",
-        )
-        _write_synthetic_parquet(
-            sim.pool_dir / "batch_20260415_120000_ctrl_20sims_seed42.parquet",
-            n_sims=20,
-        )
-        with patch.object(sim, "_runner"):
-            theta, table = sim((5,))
-        assert theta.shape[0] == 5
-
-    @_PENDING_POOL_REWRITE
-    def test_second_call_uses_cache(self, priors_csv, binary_path, template_path, cache_dir):
-        """After running once, second call with same size hits cache."""
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            scenario="ctrl",
-            t_end_days=0.2,
-            min_cadence_hours=0.1,
-        )
-
-        def fake_run(**kwargs):
-            _write_synthetic_parquet(
-                kwargs["output_path"],
-                n_sims=kwargs["theta_matrix"].shape[0],
-                param_names=list(kwargs["param_names"]),
-            )
-            return BatchResult(
-                parquet_path=kwargs["output_path"],
-                n_sims=kwargs["theta_matrix"].shape[0],
-                n_failed=0,
-                species_names=["spA", "spB"],
-                n_times=2,
-            )
-
-        with patch.object(sim._runner, "run", side_effect=fake_run) as mock_run:
-            sim(5)
-            assert mock_run.call_count == 1
-            sim(5)
-            assert mock_run.call_count == 1  # no additional run
 
 
 # ---------------------------------------------------------------------------
@@ -1260,7 +980,7 @@ class TestSimulateWithParameters:
         with pytest.raises(ValueError, match="priors CSV has"):
             sim.simulate_with_parameters(np.zeros((3, 7)))
 
-    @_PENDING_POOL_REWRITE
+    @_PENDING_LONG_FORM_FIXTURE
     def test_returns_table_with_named_ts_columns(
         self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
     ):
@@ -1290,7 +1010,7 @@ class TestSimulateWithParameters:
         ts_col = table.column("ts:spA_t0").to_numpy()
         np.testing.assert_allclose(ts_col, [1.0, 2.0, 3.0])
 
-    @_PENDING_POOL_REWRITE
+    @_PENDING_LONG_FORM_FIXTURE
     def test_prediction_columns_appear(
         self,
         priors_csv,
@@ -1327,7 +1047,7 @@ class TestSimulateWithParameters:
             table.column("ts:spA_t0").to_numpy(),
         )
 
-    @_PENDING_POOL_REWRITE
+    @_PENDING_LONG_FORM_FIXTURE
     def test_second_call_hits_cache_without_rerunning_sim(
         self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
     ):
@@ -1351,7 +1071,7 @@ class TestSimulateWithParameters:
             sim.simulate_with_parameters(theta)
             assert mock_run.call_count == 1
 
-    @_PENDING_POOL_REWRITE
+    @_PENDING_LONG_FORM_FIXTURE
     def test_different_theta_produces_different_cache_dir(
         self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
     ):
@@ -1383,7 +1103,7 @@ class TestSimulateWithParameters:
         ]
         assert len(siblings) == 2
 
-    @_PENDING_POOL_REWRITE
+    @_PENDING_LONG_FORM_FIXTURE
     def test_prediction_targets_edit_invalidates_cache(
         self,
         priors_csv,

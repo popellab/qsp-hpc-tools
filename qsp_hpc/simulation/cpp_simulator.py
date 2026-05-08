@@ -13,12 +13,11 @@ from __future__ import annotations
 import csv
 import hashlib
 import logging
-import re
 import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -221,17 +220,6 @@ class CppSimulator:
         self.pool_dir = self.cache_dir / pool_name
         self.pool_dir.mkdir(parents=True, exist_ok=True)
 
-        # LOCAL pool only — CppSimulator writes one batch_*.parquet per
-        # top-up directly (no combine step; #43 option A applies only to
-        # HPC pools where array tasks shard into batch_*/chunk_*.parquet
-        # subdirs).  `_task{N}` and `_{N}sims` segments are optional for
-        # backward compatibility with pre-#21 pools; new runs don't emit
-        # them and read row counts from parquet metadata instead.
-        self._batch_pattern = re.compile(
-            r"batch_(\d{8}_\d{6}(?:_\d{6})?)(?:_task\d+)?_(.+?)"
-            r"(?:_(\d+)sims)?_seed(\d+)\.parquet"
-        )
-
         base_logger = setup_logger(__name__, verbose=verbose)
         self.logger = create_child_logger(base_logger, scenario)
 
@@ -330,72 +318,18 @@ class CppSimulator:
                 pass
 
     # ------------------------------------------------------------------
-    # Pool scanning / loading
-    # ------------------------------------------------------------------
-
-    def _scan_pool(self) -> list[dict]:
-        """Scan pool directory for cached Parquet batch files.
-
-        Row counts come from parquet metadata (footer-only read) rather
-        than the filename's ``_{N}sims`` token — the token was unreliable
-        once array-task chunk drops started producing batches with fewer
-        rows than originally requested (see #21). The token is still
-        accepted by the regex for back-compat but ignored when present.
-        """
-        batches = []
-        for f in sorted(self.pool_dir.glob("batch_*.parquet")):
-            m = self._batch_pattern.match(f.name)
-            if not m:
-                continue
-            ts, file_scenario, _legacy_n_sims, file_seed = m.groups()
-            if file_scenario != self.scenario:
-                continue
-            n_sims = pq.read_metadata(str(f)).num_rows
-            batches.append(
-                {
-                    "filepath": f,
-                    "timestamp": ts,
-                    "n_sims": int(n_sims),
-                    "seed": int(file_seed),
-                }
-            )
-        return batches
-
-    def get_available_simulations(self) -> int:
-        """Total successful simulations cached in the pool."""
-        return sum(b["n_sims"] for b in self._scan_pool())
-
-    def _load_from_pool(self, n_requested: int) -> tuple[np.ndarray, pa.Table]:
-        """Load cached simulations, filtering failed rows and sampling
-        if the pool is larger than needed."""
-        batches = self._scan_pool()
-        if not batches:
-            raise ValueError(f"No cached simulations for scenario '{self.scenario}'")
-
-        tables = [pq.read_table(str(b["filepath"])) for b in batches]
-        combined = pa.concat_tables(tables)
-
-        status_col = combined.column("status").to_numpy()
-        ok_mask = status_col == 0
-        combined = combined.filter(pa.array(ok_mask))
-        n_available = combined.num_rows
-
-        if n_available > n_requested:
-            rng = np.random.default_rng(self.seed)
-            indices = rng.choice(n_available, size=n_requested, replace=False)
-            indices.sort()
-            combined = combined.take(indices)
-
-        param_cols = sorted(c for c in combined.column_names if c.startswith("param:"))
-        theta = np.column_stack([combined.column(c).to_numpy() for c in param_cols])
-
-        return theta, combined
-
-    # ------------------------------------------------------------------
-    # Parameter generation (reuses the deterministic theta pool)
+    # Theta pool draw (used by run_hpc / _write_params_csv)
     # ------------------------------------------------------------------
 
     def _generate_parameters(self, indices: np.ndarray) -> np.ndarray:
+        """Draw thetas for the given sample_indices from the deterministic pool.
+
+        Used by :meth:`_write_params_csv` (the run_hpc path) to produce
+        a params CSV the cpp_batch_worker ships through SLURM. Theta
+        rows are deterministic in ``(priors_csv, submodel_priors_yaml,
+        seed, n_total)`` so cross-scenario alignment can intersect pools
+        on ``sample_index`` (D1 of the local-observable-eval plan).
+        """
         from qsp_hpc.simulation.theta_pool import theta_for_indices
 
         return theta_for_indices(
@@ -409,78 +343,6 @@ class CppSimulator:
             restriction_threshold=self.restriction_threshold,
             classifier_feature_fills=self.classifier_feature_fills,
         )
-
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
-
-    def __call__(self, batch_size: Union[int, Tuple[int, ...]]) -> tuple[np.ndarray, pa.Table]:
-        """Run simulations, returning cached results when available.
-
-        Args:
-            batch_size: Number of simulations (int or tuple — product
-                is taken for tuple inputs like BayesFlow's ``(N,)``).
-
-        Returns:
-            ``(theta, table)`` where *theta* is ``(n_sims, n_params)``
-            and *table* is a pyarrow Table with columns
-            ``simulation_id``, ``status``, ``time``, ``param:*``, and
-            one list-of-float column per species.
-        """
-        if isinstance(batch_size, tuple):
-            n = int(np.prod(batch_size))
-        else:
-            n = int(batch_size)
-
-        self.logger.info(f"Simulation request: {n} simulations (seed={self.seed})")
-
-        n_available = self.get_available_simulations()
-
-        if n_available >= n:
-            self.logger.info(f"Using pool cache: {n_available} available")
-            return self._load_from_pool(n)
-
-        n_needed = n - n_available
-        if n_available > 0:
-            self.logger.info(f"Pool has {n_available}/{n} — running {n_needed} more")
-        else:
-            self.logger.info(f"No cached simulations — running {n}")
-
-        start_idx = n_available
-        indices = np.arange(start_idx, start_idx + n_needed, dtype=np.int64)
-        theta_new = self._generate_parameters(indices)
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # No `_{N}sims_` segment — actual row count comes from parquet
-        # metadata at scan time (#21). Filename stays stable even if
-        # some sims fail and the on-disk row count diverges from n_needed.
-        filename = f"batch_{ts}_{self.scenario}_seed{self.seed}.parquet"
-        output_path = self.pool_dir / filename
-
-        # #23: sidecar manifest at the pool dir so downstream consumers
-        # can resolve non-sampled template defaults without each parquet
-        # carrying every one as a broadcast column. Idempotent — reused
-        # across every batch into this pool.
-        # Sub-pool layout (3b.i): training rows live under {pool_id}/training/.
-        write_pool_manifest(
-            self.pool_dir, "training", self._runner.template_defaults, self.param_names
-        )
-
-        self._runner.run(
-            theta_matrix=theta_new,
-            param_names=self.param_names,
-            sample_indices=indices,
-            t_end_days=self.t_end_days,
-            min_cadence_hours=self.min_cadence_hours,
-            output_path=output_path,
-            scenario=self.scenario,
-            seed=self.seed,
-            max_workers=self.max_workers,
-            per_sim_timeout_s=self.per_sim_timeout_s,
-        )
-
-        self.logger.info(f"Batch complete, loading {n} from pool")
-        return self._load_from_pool(n)
 
     # ------------------------------------------------------------------
     # HPC tier (M9) — 3-tier cache walk against an HPC pool

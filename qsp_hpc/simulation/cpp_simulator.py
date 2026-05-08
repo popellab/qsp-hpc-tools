@@ -79,7 +79,7 @@ class CppSimulator:
         test_stats_csv: Optional[str | Path] = None,
         calibration_targets: Optional[str | Path | list] = None,
         model_structure_file: Optional[str | Path] = None,
-        poll_interval: float = 30.0,
+        poll_interval: float = 5.0,
         max_wait_time: Optional[float] = None,
         remote_binary_path: Optional[str] = None,
         remote_template_xml: Optional[str] = None,

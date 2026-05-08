@@ -46,12 +46,16 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal, Mapping, Optional, Sequence, Union
 
 import numpy as np
+import pandas as pd
 
+from qsp_hpc.constants import JOB_QUEUE_TIMEOUT, SLURM_REGISTRATION_DELAY
 from qsp_hpc.cpp.batch_runner import (
     POOL_MANIFEST_FILENAME as SUBPOOL_MANIFEST_FILENAME,
 )
@@ -64,7 +68,10 @@ from qsp_hpc.cpp.batch_runner import (
 from qsp_hpc.cpp.batch_runner import (
     subpool_dir,
 )
+from qsp_hpc.cpp.sshfs_reader import sshfs_read_long_form_chunks
+from qsp_hpc.simulation.simulation_batch import SimulationBatch
 from qsp_hpc.simulation.theta_pool import get_theta_pool
+from qsp_hpc.utils.hash_utils import compute_pool_id_hash
 
 if TYPE_CHECKING:
     from qsp_hpc.batch.hpc_job_manager import HPCJobManager
@@ -128,6 +135,12 @@ class HPCSession:
         restriction_threshold: float = 0.5,
         classifier_feature_fills: Optional[Mapping[str, float]] = None,
         remote_binary_path: Optional[str] = None,
+        remote_template_xml: Optional[str] = None,
+        model_structure_file: Optional[Union[str, Path]] = None,
+        local_pool_root: Union[str, Path] = "cache/scenario_pools",
+        t_end_days: float = 180.0,
+        poll_interval: float = 30.0,
+        max_wait_time: Optional[float] = None,
     ):
         self.binary_path = Path(binary_path).resolve()
         if not self.binary_path.exists():
@@ -150,6 +163,19 @@ class HPCSession:
             dict(classifier_feature_fills) if classifier_feature_fills else None
         )
         self.remote_binary_path = remote_binary_path
+        self.remote_template_xml = remote_template_xml
+        self.model_structure_file = (
+            Path(model_structure_file).resolve() if model_structure_file else None
+        )
+        self.local_pool_root = Path(local_pool_root)
+        self.t_end_days = float(t_end_days)
+        self.poll_interval = float(poll_interval)
+        self.max_wait_time = max_wait_time
+        self.logger = logger
+        # Cache of priors-CSV "name" column, lazily loaded under the
+        # ensure_remote priors-hash snapshot. Used by run_scenario to thread
+        # ``param_names`` into SimulationBatch in priors-CSV order.
+        self._param_names_cache: Optional[list[str]] = None
 
         # Populated by ensure_remote(); used by sample_theta_pool to refuse
         # drawing if the priors CSV has shifted on disk since setup.
@@ -499,41 +525,245 @@ class HPCSession:
     # Per-scenario run: scaffold only, plan steps 3-5 fill this in
     # --------------------------------------------------------------
 
+    def _load_param_names(self) -> list[str]:
+        """Read the ``name`` column of the priors CSV, cached on first use.
+
+        This is the canonical theta column order used by both
+        :meth:`sample_theta_pool` (via the composite prior or the
+        per-row lognormal sampler) and the samples CSV uploaded to HPC.
+        ensure_remote() must have run so the D7 priors-hash guardrail
+        catches a mid-session edit.
+        """
+        if self._param_names_cache is None:
+            self._param_names_cache = pd.read_csv(self.priors_csv)["name"].tolist()
+        return self._param_names_cache
+
+    def _wait_for_jobs(self, job_ids: list[str]) -> None:
+        """Poll ``check_job_status`` until all jobs leave the queue.
+
+        Mirrors :meth:`CppSimulator._wait_for_jobs` — same SLURM
+        registration delay, post-empty grace window, and timeout
+        semantics. Kept private so the polling cadence stays consistent
+        across the two run paths.
+        """
+        time.sleep(SLURM_REGISTRATION_DELAY)
+        start = time.time()
+        max_seen = 0
+        while True:
+            totals = {"completed": 0, "running": 0, "pending": 0, "failed": 0}
+            for jid in job_ids:
+                try:
+                    status = self.job_manager.check_job_status(jid)
+                    for k in totals:
+                        totals[k] += status[k]
+                except Exception as e:  # pragma: no cover — best-effort
+                    self.logger.warning(f"Status check failed for job {jid}: {e}")
+            total = sum(totals.values())
+            max_seen = max(max_seen, total)
+            elapsed = time.time() - start
+            self.logger.info(
+                "  [%dm %ds] %d/%d done | running=%d pending=%d failed=%d",
+                int(elapsed // 60),
+                int(elapsed % 60),
+                totals["completed"],
+                total,
+                totals["running"],
+                totals["pending"],
+                totals["failed"],
+            )
+            active = totals["running"] + totals["pending"]
+            if total > 0 and active == 0:
+                if totals["failed"] > 0:
+                    self.logger.warning(f"{totals['failed']} task(s) failed")
+                return
+            if total == 0 and max_seen > 0 and elapsed > 30:
+                return
+            if total == 0 and elapsed > JOB_QUEUE_TIMEOUT:
+                self.logger.warning(f"No jobs visible after {JOB_QUEUE_TIMEOUT}s — proceeding")
+                return
+            if self.max_wait_time and elapsed > self.max_wait_time:
+                raise TimeoutError(f"Job wait exceeded {self.max_wait_time}s for {job_ids}")
+            time.sleep(self.poll_interval)
+
     def run_scenario(
         self,
         *,
         scenario_yaml: Union[str, Path],
         n_simulations: int,
-        traj_columns: Optional[list[str]] = None,
-        kind: str = "training",
+        traj_columns: Optional[Sequence[str]] = None,
+        kind: SUBPOOL_KIND = "training",
         min_cadence_hours: Optional[float] = None,
-    ):
+        drug_metadata_yaml: Optional[Union[str, Path]] = None,
+        healthy_state_yaml: Optional[Union[str, Path]] = None,
+        scenario_name: Optional[str] = None,
+        seed_override: Optional[int] = None,
+        evolve_cache: bool = True,
+        sshfs_host: Optional[str] = None,
+        filesystem: Any = None,
+        _read_helper=sshfs_read_long_form_chunks,
+    ) -> SimulationBatch:
         """Submit + collect one scenario's simulations against this session.
 
-        **Not yet implemented.** This is the Layer 4 contract from
-        ``notes/architecture/local_observable_eval_plan.md``; landing it
-        requires plan steps 3 (content-addressed pool layout with
-        ``training/`` + ``ppc/`` sub-pools), 4 (SLURM job script writes
-        long-form parquet directly, no ``derive_test_stats_worker``),
-        and 5 (sshfs read path). Until those land, callers continue to
-        use :class:`CppSimulator` directly.
+        Implements the Layer 4 contract from
+        ``notes/architecture/local_observable_eval_plan.md``: compute the
+        content-addressed ``pool_id``, register the local manifest dir,
+        reserve a sample-index range, write the samples CSV with
+        sample_index-keyed theta from the session pool, submit a
+        ``submit_cpp_jobs(kind=...)`` array (no test-stats derivation —
+        SLURM writes long-form trajectory parquets directly), wait for
+        completion, then read the chunks back from
+        ``{simulation_pool_path}/{pool_id}/{kind}`` over sshfs.
 
-        Expected signature when complete::
+        Args:
+            scenario_yaml: pdac-build scenario YAML driving the run.
+                Folded into ``pool_id`` (alongside the binary bytes) so
+                edits invalidate the cache.
+            n_simulations: Range size to reserve and submit. Mapped to
+                theta-pool indices ``[start, start + n_simulations)``.
+            traj_columns: Optional species filter pushed down to the
+                parquet read. Defaults to ``None`` (every species).
+            kind: ``"training"`` or ``"ppc"``. Selects the sub-pool
+                dir on disk and on HPC.
+            min_cadence_hours: Per-scenario override of the qsp_sim
+                output-cadence cap. ``None`` lets the CLI default win.
+            drug_metadata_yaml / healthy_state_yaml: Optional companions
+                forwarded to ``submit_cpp_jobs`` — same path resolution
+                as :class:`CppSimulator`.
+            scenario_name: Cosmetic name for parquet filenames. Defaults
+                to the YAML stem.
+            seed_override: Forwarded to ``submit_cpp_jobs`` as ``seed``.
+                Defaults to the session's ``seed``.
+            evolve_cache: Forwarded to ``submit_cpp_jobs``.
+            sshfs_host: Hostname for the sshfs read connection. Defaults
+                to ``job_manager.config.host``.
+            filesystem: Optional injected fsspec filesystem (tests).
+                When provided, the helper does not open its own sshfs
+                connection.
+            _read_helper: Test seam — pass a stand-in for
+                :func:`sshfs_read_long_form_chunks` to bypass the live
+                sshfs path. Kept private to discourage production use.
 
-            batch = session.run_scenario(
-                scenario_yaml=scen_yaml,
-                n_simulations=N,
-                traj_columns=cols,                 # species the cal targets need
-                kind="training",                    # or "ppc"
-                min_cadence_hours=4.0,             # per-scenario override
-            )
-            # returns a SimulationBatch (theta + traj_df, sample_index-keyed,
-            # written to {pool_id}/{kind}/ over sshfs).
+        Returns:
+            :class:`SimulationBatch` with theta sliced to
+            ``[start, end)``, ``sample_index`` matching the reservation,
+            ``traj_df`` from the SLURM-written long-form parquets, and
+            ``species_units`` from ``model_structure.json``.
         """
-        raise NotImplementedError(
-            "HPCSession.run_scenario is the Layer 4 contract from "
-            "notes/architecture/local_observable_eval_plan.md; plan steps "
-            "3-5 (content-addressed pool layout, SLURM-direct parquet, "
-            "sshfs read path) must land first. Today's callers should "
-            "continue to use CppSimulator.run_hpc() directly."
+        if not self._ensured:
+            raise RuntimeError(
+                "HPCSession.run_scenario: call ensure_remote() first "
+                "(needed for the D7 priors-hash guardrail and "
+                "sample_theta_pool determinism)."
+            )
+        if kind not in _VALID_KINDS:
+            raise ValueError(f"run_scenario: kind must be one of {_VALID_KINDS}; got {kind!r}")
+        if not isinstance(n_simulations, int) or n_simulations <= 0:
+            raise ValueError(
+                f"run_scenario: n_simulations must be a positive int; got {n_simulations!r}"
+            )
+        scenario_yaml = Path(scenario_yaml).resolve()
+        if not scenario_yaml.exists():
+            raise FileNotFoundError(f"scenario_yaml not found: {scenario_yaml}")
+        if self.model_structure_file is None or not self.model_structure_file.exists():
+            raise RuntimeError(
+                "HPCSession.run_scenario: model_structure_file is required so "
+                "SimulationBatch.species_units is populated. Pass "
+                "model_structure_file=... to HPCSession()."
+            )
+
+        # 1. Pool key — content-addressed by binary bytes + scenario YAML.
+        pool_id = compute_pool_id_hash(
+            binary_path=self.binary_path,
+            scenario_yaml=scenario_yaml,
+        )
+        self.logger.info(
+            "HPCSession.run_scenario: pool_id=%s... kind=%s n=%d",
+            pool_id[:8],
+            kind,
+            n_simulations,
+        )
+
+        # 2. Register local manifest dir + 3. reserve sample-index range.
+        local_pool_dir = self.local_pool_root / pool_id
+        self.register_scenario_pool(local_pool_dir)
+        start, end = self.reserve_sample_index_range(n_simulations, kind=kind)
+
+        # 4. Pull theta slice from the deterministic pool.
+        theta_pool = self.sample_theta_pool(end)
+        theta = theta_pool[start:end]
+        sample_index = np.arange(start, end, dtype=np.int64)
+        param_names = self._load_param_names()
+        if theta.shape[1] != len(param_names):
+            raise RuntimeError(
+                f"run_scenario: theta has {theta.shape[1]} cols but "
+                f"priors CSV has {len(param_names)} param names — "
+                f"composite-prior / CSV drift."
+            )
+
+        # 5. Write samples CSV (sample_index + param cols, mirrors
+        # CppSimulator._write_params_csv).
+        samples_df = pd.DataFrame(theta, columns=param_names)
+        samples_df.insert(0, "sample_index", sample_index)
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, prefix="hpc_session_params_"
+        )
+        samples_csv = Path(tmp.name)
+        samples_df.to_csv(tmp.name, index=False)
+        tmp.close()
+
+        # 6. Submit. derive_test_stats=False per plan §D4: SLURM writes
+        # long-form parquet directly, observable evaluation runs locally
+        # off the read path.
+        remote_binary = self.remote_binary_path or self.job_manager.config.cpp_binary_path
+        remote_template = self.remote_template_xml or self.job_manager.config.cpp_template_path
+        scen_name = scenario_name or scenario_yaml.stem
+        try:
+            info = self.job_manager.submit_cpp_jobs(
+                samples_csv=str(samples_csv),
+                num_simulations=n_simulations,
+                simulation_pool_id=pool_id,
+                t_end_days=self.t_end_days,
+                min_cadence_hours=(min_cadence_hours if min_cadence_hours is not None else 4.0),
+                scenario=scen_name,
+                seed=int(seed_override if seed_override is not None else self.seed),
+                binary_path=remote_binary,
+                template_path=remote_template,
+                scenario_yaml=str(scenario_yaml),
+                drug_metadata_yaml=(str(drug_metadata_yaml) if drug_metadata_yaml else None),
+                healthy_state_yaml=(str(healthy_state_yaml) if healthy_state_yaml else None),
+                derive_test_stats=False,
+                evolve_cache=evolve_cache,
+                kind=kind,
+            )
+        finally:
+            samples_csv.unlink(missing_ok=True)
+
+        # 7. Wait for the array to drain.
+        self._wait_for_jobs(list(info.job_ids))
+
+        # 8. Read long-form parquets back over sshfs.
+        remote_pool_path = f"{self.job_manager.config.simulation_pool_path}/{pool_id}/{kind}"
+        host = sshfs_host
+        if filesystem is None and host is None:
+            host = getattr(self.job_manager.config, "host", None)
+        traj_df = _read_helper(
+            remote_pool_path,
+            sample_indices=sample_index.tolist(),
+            traj_columns=list(traj_columns) if traj_columns is not None else None,
+            filesystem=filesystem,
+            sshfs_host=host,
+        )
+
+        # 9. Species units from model_structure.json.
+        from qsp_hpc.utils.model_structure_units import load_units_from_model_structure
+
+        species_units = load_units_from_model_structure(self.model_structure_file)
+
+        return SimulationBatch(
+            theta=np.asarray(theta),
+            sample_index=sample_index,
+            traj_df=traj_df,
+            species_units=species_units,
+            param_names=list(param_names),
+            pool_id=pool_id,
         )

@@ -367,13 +367,202 @@ def test_reserve_flock_serializes_concurrent_writers(session_inputs, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_run_scenario_not_implemented(session_inputs, tmp_path):
-    binary, priors, jm = session_inputs
-    s = _make_session(binary, priors, jm)
-    s.ensure_remote()
+_MODEL_STRUCTURE_JSON = json.dumps(
+    {
+        "species": [
+            {"name": "C1", "units": "cell"},
+            {"name": "Teff", "units": "cell"},
+        ],
+        "compartments": [{"name": "V_T", "volume_units": "milliliter"}],
+        "parameters": [],
+    }
+)
 
-    with pytest.raises(NotImplementedError, match="Layer 4 contract"):
-        s.run_scenario(
-            scenario_yaml=tmp_path / "scen.yaml",
-            n_simulations=10,
+
+@pytest.fixture
+def run_scenario_inputs(session_inputs, tmp_path):
+    """Augment session_inputs with a scenario YAML + model_structure.json."""
+    binary, priors, jm = session_inputs
+    scen = tmp_path / "scenario.yaml"
+    scen.write_text("scenario:\n  name: test\n")
+    model_struct = tmp_path / "model_structure.json"
+    model_struct.write_text(_MODEL_STRUCTURE_JSON)
+
+    # Mock job_manager: config + submit_cpp_jobs return shape.
+    jm.config = MagicMock()
+    jm.config.host = "test-host"
+    jm.config.cpp_binary_path = "/hpc/qsp_sim"
+    jm.config.cpp_template_path = "/hpc/param_all.xml"
+    jm.config.simulation_pool_path = "/hpc/pools"
+    job_info = MagicMock()
+    job_info.job_ids = ["12345"]
+    jm.submit_cpp_jobs.return_value = job_info
+    jm.check_job_status.return_value = {
+        "completed": 1,
+        "running": 0,
+        "pending": 0,
+        "failed": 0,
+    }
+
+    return binary, priors, jm, scen, model_struct
+
+
+def test_run_scenario_requires_ensure_remote(run_scenario_inputs):
+    binary, priors, jm, scen, ms = run_scenario_inputs
+    s = _make_session(binary, priors, jm, model_structure_file=ms)
+    with pytest.raises(RuntimeError, match="ensure_remote"):
+        s.run_scenario(scenario_yaml=scen, n_simulations=4)
+
+
+def test_run_scenario_rejects_bad_kind(run_scenario_inputs, monkeypatch):
+    binary, priors, jm, scen, ms = run_scenario_inputs
+    s = _make_session(binary, priors, jm, model_structure_file=ms)
+    s.ensure_remote()
+    with pytest.raises(ValueError, match="kind must be"):
+        s.run_scenario(scenario_yaml=scen, n_simulations=4, kind="bogus")
+
+
+def test_run_scenario_rejects_bad_n(run_scenario_inputs):
+    binary, priors, jm, scen, ms = run_scenario_inputs
+    s = _make_session(binary, priors, jm, model_structure_file=ms)
+    s.ensure_remote()
+    with pytest.raises(ValueError, match="positive int"):
+        s.run_scenario(scenario_yaml=scen, n_simulations=0)
+
+
+def test_run_scenario_requires_model_structure(run_scenario_inputs):
+    binary, priors, jm, scen, _ms = run_scenario_inputs
+    s = _make_session(binary, priors, jm)  # no model_structure_file
+    s.ensure_remote()
+    with pytest.raises(RuntimeError, match="model_structure_file"):
+        s.run_scenario(scenario_yaml=scen, n_simulations=4)
+
+
+def test_run_scenario_happy_path(run_scenario_inputs, tmp_path, monkeypatch):
+    """End-to-end shape: pool_id is computed, register/reserve runs, theta
+    slice matches [start, end), traj_columns + sshfs_host are forwarded,
+    and the result is a SimulationBatch with the expected fields."""
+    import pandas as pd
+
+    binary, priors, jm, scen, ms = run_scenario_inputs
+    s = _make_session(
+        binary,
+        priors,
+        jm,
+        model_structure_file=ms,
+        local_pool_root=tmp_path / "scenario_pools",
+    )
+    s.ensure_remote()
+    s.poll_interval = 0.0  # don't sleep in tests
+
+    # Stub the read helper — capture kwargs and return a synthetic long-form
+    # frame. The frame just needs the schema; SimulationBatch doesn't validate
+    # cell-by-cell.
+    captured: dict = {}
+
+    def fake_read(remote_pool_path, *, sample_indices, traj_columns, filesystem, sshfs_host):
+        captured["remote_pool_path"] = remote_pool_path
+        captured["sample_indices"] = sample_indices
+        captured["traj_columns"] = traj_columns
+        captured["sshfs_host"] = sshfs_host
+        return pd.DataFrame(
+            {
+                "sample_index": pd.Series([], dtype="int64"),
+                "time": pd.Series([], dtype="float64"),
+                "species": pd.Series([], dtype="object"),
+                "value": pd.Series([], dtype="float64"),
+            }
         )
+
+    batch = s.run_scenario(
+        scenario_yaml=scen,
+        n_simulations=5,
+        traj_columns=["C1", "Teff"],
+        kind="training",
+        _read_helper=fake_read,
+    )
+
+    # 1. pool_id is sha256 hex of binary | scenario YAML.
+    from qsp_hpc.utils.hash_utils import compute_pool_id_hash
+
+    expected_pool_id = compute_pool_id_hash(binary_path=binary, scenario_yaml=scen)
+    assert batch.pool_id == expected_pool_id
+
+    # 2. submit_cpp_jobs got pool_id, kind, scenario_yaml, derive_test_stats=False.
+    jm.submit_cpp_jobs.assert_called_once()
+    submit_kwargs = jm.submit_cpp_jobs.call_args.kwargs
+    assert submit_kwargs["simulation_pool_id"] == expected_pool_id
+    assert submit_kwargs["kind"] == "training"
+    assert submit_kwargs["scenario_yaml"] == str(scen.resolve())
+    assert submit_kwargs["derive_test_stats"] is False
+    assert submit_kwargs["num_simulations"] == 5
+
+    # 3. samples_csv was sample_index + param-name columns.
+    # The temp file is unlinked post-submit, but we can re-read the args
+    # by intercepting at submit time. Easier: assert samples_csv path
+    # was passed and num_simulations matches.
+    assert "samples_csv" in submit_kwargs
+
+    # 4. read helper got the right shape.
+    assert captured["remote_pool_path"] == f"/hpc/pools/{expected_pool_id}/training"
+    assert captured["sample_indices"] == [0, 1, 2, 3, 4]
+    assert captured["traj_columns"] == ["C1", "Teff"]
+    assert captured["sshfs_host"] == "test-host"
+
+    # 5. SimulationBatch fields.
+    assert batch.theta.shape == (5, 2)
+    np.testing.assert_array_equal(batch.sample_index, np.arange(5))
+    assert batch.param_names == ["A", "B"]
+    assert batch.species_units == {
+        "V_T": "milliliter",
+        "C1": "cell",
+        "Teff": "cell",
+    }
+
+    # 6. Local pool manifest was written.
+    manifest = _read_manifest(tmp_path / "scenario_pools" / expected_pool_id, "training")
+    assert manifest["reservations"] == [
+        {"start": 0, "end": 5, "ts": manifest["reservations"][0]["ts"]}
+    ]
+
+
+def test_run_scenario_theta_slice_matches_reservation(run_scenario_inputs, tmp_path):
+    """A second run_scenario after a prior reservation must hand back the
+    matching theta slice (so cross-scenario sample_index alignment holds)."""
+    import pandas as pd
+
+    binary, priors, jm, scen, ms = run_scenario_inputs
+    s = _make_session(
+        binary,
+        priors,
+        jm,
+        model_structure_file=ms,
+        local_pool_root=tmp_path / "scenario_pools",
+    )
+    s.ensure_remote()
+    s.poll_interval = 0.0
+
+    # Pre-consume a range so the second run_scenario reservation starts at 3.
+    s.register_scenario_pool(tmp_path / "scenario_pools" / "warmup")
+    s.reserve_sample_index_range(3, kind="training")
+
+    def fake_read(remote_pool_path, *, sample_indices, traj_columns, filesystem, sshfs_host):
+        return pd.DataFrame(
+            {
+                "sample_index": pd.Series([], dtype="int64"),
+                "time": pd.Series([], dtype="float64"),
+                "species": pd.Series([], dtype="object"),
+                "value": pd.Series([], dtype="float64"),
+            }
+        )
+
+    batch = s.run_scenario(
+        scenario_yaml=scen,
+        n_simulations=4,
+        _read_helper=fake_read,
+    )
+
+    np.testing.assert_array_equal(batch.sample_index, np.arange(3, 7))
+    # theta rows for [3, 7) must match a fresh draw of the same pool sliced.
+    full_pool = s.sample_theta_pool(7)
+    np.testing.assert_array_equal(batch.theta, full_pool[3:7])

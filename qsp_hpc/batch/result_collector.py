@@ -55,8 +55,8 @@ class ResultCollector:
 
         return "not_found" not in output
 
-    def count_pool_simulations(self, pool_path: str) -> int:
-        """Count simulations in a remote pool.
+    def count_pool_simulations(self, pool_path: str, kind: str = "training") -> int:
+        """Count simulations in a remote pool's ``{kind}/`` sub-pool.
 
         Prefers parquet footer metadata (cheap O(1) per file) over the
         legacy ``_{N}sims_`` filename token, which silently overreported
@@ -64,22 +64,21 @@ class ResultCollector:
         than the requested N (#21). Manifest.json takes precedence when
         present (MATLAB pools historically wrote one).
 
-        Pool layouts recognised:
-          - Current (#43 option A): ``{pool}/batch_*/chunk_*.parquet`` —
-            array tasks write chunks straight into per-submission subdirs.
-          - Legacy (pre-#43): flat ``{pool}/batch_*.parquet`` produced
-            by the retired combine worker.
-          - MATLAB: ``{pool}/batch_*_{N}sims_*.mat``.
+        Pool layouts recognised (3b.ii sub-pool layout — D6 hard cutover
+        means pre-3b layouts are unreadable and must be re-simulated):
+          - ``{pool}/{kind}/batch_*/chunk_*.parquet`` (current).
+          - ``{pool}/manifest.json`` (MATLAB-era; pool-root manifest).
+          - ``{pool}/batch_*_{N}sims_*.mat`` (MATLAB-era; pool-root flat).
         """
-        # The python one-liner walks batch_*/chunk_*.parquet AND flat
-        # batch_*.parquet, sums num_rows from each file's footer, and
-        # prints ``N_SIMS:<sum>``. Footer reads don't materialise rows,
-        # so this stays O(num_files), not O(rows).
+        if kind not in ("training", "ppc"):
+            raise ValueError(f"count_pool_simulations: kind must be training|ppc; got {kind!r}")
+        # Walks {kind}/batch_*/chunk_*.parquet, sums num_rows from each
+        # file's footer, and prints ``N_SIMS:<sum>``. Footer reads don't
+        # materialise rows, so this stays O(num_files), not O(rows).
         py_count = (
             "import sys, glob; "
             "import pyarrow.parquet as pq; "
-            "files = sorted(glob.glob('batch_*/chunk_*.parquet')) "
-            "+ sorted(glob.glob('batch_*.parquet')); "
+            f"files = sorted(glob.glob('{kind}/batch_*/chunk_*.parquet')); "
             "total = sum(pq.read_metadata(f).num_rows for f in files); "
             "print(f'N_FILES:{len(files)}'); "
             "print(f'N_SIMS:{total}')"
@@ -91,7 +90,7 @@ class ResultCollector:
             if [ -f manifest.json ]; then
                 echo "MANIFEST_FOUND"
                 cat manifest.json
-            elif ls batch_*/chunk_*.parquet >/dev/null 2>&1 || ls batch_*.parquet >/dev/null 2>&1; then
+            elif ls "{kind}"/batch_*/chunk_*.parquet >/dev/null 2>&1; then
                 echo "COUNTING_PARQUET_METADATA"
                 "{venv_python}" -c "{py_count}"
             else

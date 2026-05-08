@@ -145,6 +145,15 @@ def run_chunk(config: dict, array_idx: int) -> None:
     pool_dir = Path(pool_base) / pool_id
     pool_dir.mkdir(parents=True, exist_ok=True)
 
+    # 3b.ii: training/ + ppc/ sub-pool layout. Chunks live under
+    # ``{pool_id}/{kind}/batch_*/chunk_*.parquet``. Default to "training"
+    # for backcompat with configs predating the kind field.
+    kind = config.get("kind", "training")
+    if kind not in ("training", "ppc"):
+        raise ValueError(f"cpp_batch_worker: unknown kind={kind!r} in config")
+    sub_pool_dir = pool_dir / kind
+    sub_pool_dir.mkdir(parents=True, exist_ok=True)
+
     # Write to a per-submission batch subdir (issue #43 option A: no
     # combine step). Each submission deposits one
     # ``batch_{ts}_{scenario}_seed{S}/`` subdir containing one
@@ -159,10 +168,10 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # keeps unit tests + ad-hoc runs working without the orchestrator.
     batch_subdir_override = config.get("batch_subdir")
     if batch_subdir_override:
-        batch_dir = pool_dir / batch_subdir_override
+        batch_dir = sub_pool_dir / batch_subdir_override
     else:
         array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID", "local")
-        batch_dir = pool_dir / f"batch_{array_job_id}_{scenario}_seed{seed}"
+        batch_dir = sub_pool_dir / f"batch_{array_job_id}_{scenario}_seed{seed}"
     batch_dir.mkdir(parents=True, exist_ok=True)
     filename = f"chunk_{array_idx:03d}.parquet"
     output_path = batch_dir / filename
@@ -186,9 +195,9 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # the second+ writers no-op. Defaults come from the XML template the
     # CppBatchRunner probed at init time, so the snapshot always matches
     # the binary this submission ran against.
-    # 3b.i: training-side SLURM workers write into {pool_id}/training/.
-    # The PPC path (kind="ppc") lands in 3b.iv via simulate_with_parameters.
-    write_pool_manifest(pool_dir, "training", runner.template_defaults, param_names)
+    # 3b.i + 3b.ii: SLURM workers write the manifest into the same
+    # sub-pool as the chunks ({pool_id}/{kind}/pool_manifest.json).
+    write_pool_manifest(pool_dir, kind, runner.template_defaults, param_names)
 
     result = runner.run(
         theta_matrix=theta_chunk,

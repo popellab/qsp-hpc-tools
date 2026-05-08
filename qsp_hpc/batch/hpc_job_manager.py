@@ -46,6 +46,7 @@ import yaml
 from qsp_hpc.batch.hpc_file_transfer import HPCFileTransfer
 from qsp_hpc.batch.result_collector import MissingOutputError, ResultCollector
 from qsp_hpc.batch.slurm_job_submitter import SLURMJobSubmitter, SubmissionError  # noqa: F401
+from qsp_hpc.cpp.batch_runner import SUBPOOL_KINDS
 from qsp_hpc.utils.logging_config import format_config, log_operation, setup_logger
 from qsp_hpc.utils.security import build_safe_ssh_command
 
@@ -988,6 +989,7 @@ class HPCJobManager:
         model_structure_file: Optional[str] = None,
         evolve_cache: bool = True,
         retry_missing_chunks: int = 0,
+        kind: str = "training",
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
 
@@ -1114,6 +1116,9 @@ class HPCJobManager:
         if jobs_per_chunk is None:
             jobs_per_chunk = self.config.jobs_per_chunk
 
+        if kind not in SUBPOOL_KINDS:
+            raise ValueError(f"submit_cpp_jobs: kind must be one of {SUBPOOL_KINDS}; got {kind!r}")
+
         from qsp_hpc.batch.batch_utils import calculate_num_tasks
 
         n_jobs = calculate_num_tasks(num_simulations, jobs_per_chunk)
@@ -1210,6 +1215,7 @@ class HPCJobManager:
             healthy_state_yaml=remote_healthy,
             evolve_cache_root=evolve_cache_root,
             batch_subdir=batch_subdir,
+            kind=kind,
         )
         self._upload_parameter_csv(samples_csv, simulation_pool_id=simulation_pool_id)
 
@@ -1236,7 +1242,9 @@ class HPCJobManager:
         # the config) lands its chunk in this directory.
         _, home_dir = self.transport.exec("echo $HOME")
         expanded_pool_base = self.config.simulation_pool_path.replace("$HOME", home_dir.strip())
-        batch_dir = f"{expanded_pool_base}/{simulation_pool_id}/{batch_subdir}"
+        # 3b.ii: training/ + ppc/ sub-pool layout — chunks live under
+        # {pool_id}/{kind}/batch_*/chunk_*.parquet.
+        batch_dir = f"{expanded_pool_base}/{simulation_pool_id}/{kind}/{batch_subdir}"
         base_config_remote = (
             f"{self.config.remote_project_path}/{pool_input_dir_rel}/cpp_job_config.json"
         )
@@ -1377,6 +1385,7 @@ class HPCJobManager:
         healthy_state_yaml: Optional[str] = None,
         evolve_cache_root: Optional[str] = None,
         batch_subdir: Optional[str] = None,
+        kind: str = "training",
     ) -> None:
         """Create and upload C++ job configuration JSON."""
         import json
@@ -1408,9 +1417,12 @@ class HPCJobManager:
             "evolve_cache_root": evolve_cache_root,
             # Per-submission batch subdir name (issue #43 option A).
             # Every task in the array writes chunks into
-            # ``{pool}/{batch_subdir}/chunk_NNN.parquet``. None falls back
-            # to a SLURM_ARRAY_JOB_ID-derived default in the worker.
+            # ``{pool}/{kind}/{batch_subdir}/chunk_NNN.parquet``. None falls
+            # back to a SLURM_ARRAY_JOB_ID-derived default in the worker.
             "batch_subdir": batch_subdir,
+            # 3b.ii sub-pool layout: "training" or "ppc" — selects the
+            # sub-pool dir the worker writes chunks into.
+            "kind": kind,
         }
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -1738,29 +1750,30 @@ class HPCJobManager:
         """Check if simulation pool directory exists on HPC."""
         return self.result_collector.check_pool_directory_exists(pool_path)
 
-    def _count_pool_simulations(self, pool_path: str) -> int:
+    def _count_pool_simulations(self, pool_path: str, kind: str = "training") -> int:
         """Count number of simulations in pool from manifest or filenames."""
-        return self.result_collector.count_pool_simulations(pool_path)
+        return self.result_collector.count_pool_simulations(pool_path, kind=kind)
 
-    def get_max_sample_index(self, hpc_pool_path: str) -> Optional[int]:
-        """Return the largest ``sample_index`` already present in the HPC pool.
+    def get_max_sample_index(self, hpc_pool_path: str, kind: str = "training") -> Optional[int]:
+        """Return the largest ``sample_index`` already present in the
+        HPC pool's ``{kind}/`` sub-pool.
 
-        Scans ``batch_*/chunk_*.parquet`` (#43 option A layout) AND flat
-        ``batch_*.parquet`` (legacy combine-era layout) in
-        ``hpc_pool_path`` and reads only the ``sample_index`` column
-        metadata (cheap). Returns ``None`` when the dir doesn't exist,
-        has no parquets, or the parquets predate the sample_index
-        schema. Used to assign contiguous index ranges to new batches
-        without re-using sample_indices already simulated.
+        Scans ``{kind}/batch_*/chunk_*.parquet`` (3b.ii sub-pool layout)
+        in ``hpc_pool_path`` and reads only the ``sample_index`` column
+        metadata (cheap). Returns ``None`` when the sub-pool dir doesn't
+        exist, has no parquets, or the parquets predate the
+        sample_index schema. Used to assign contiguous index ranges to
+        new batches without re-using sample_indices already simulated.
         """
+        if kind not in ("training", "ppc"):
+            raise ValueError(f"get_max_sample_index: kind must be training|ppc; got {kind!r}")
         py = self.config.hpc_venv_path + "/bin/python"
         cmd = (
-            f'test -d "{hpc_pool_path}" || exit 0; '
+            f'test -d "{hpc_pool_path}/{kind}" || exit 0; '
             f'{py} -c "'
             f"import glob, sys; "
             f"import pyarrow.parquet as pq; "
-            f"files = sorted(glob.glob('{hpc_pool_path}/batch_*/chunk_*.parquet')) "
-            f"+ sorted(glob.glob('{hpc_pool_path}/batch_*.parquet')); "
+            f"files = sorted(glob.glob('{hpc_pool_path}/{kind}/batch_*/chunk_*.parquet')); "
             f"max_i = -1; "
             f"missing = False\n"
             f"for f in files:\n"
@@ -2447,12 +2460,13 @@ class HPCJobManager:
         self.logger.info(f"   Pool path: {pool_path}")
 
         # List Parquet files sorted by modification time (most recent first).
-        # Walks both #43 option A subdirs (batch_*/chunk_*.parquet) and legacy
-        # flat batch_*.parquet — used only for diagnostic downloads (e.g.
-        # `qsp-hpc inspect`), so returning chunk files directly is fine.
+        # 3b.ii: scans both training/ and ppc/ sub-pool layouts — used only
+        # for diagnostic downloads (e.g. `qsp-hpc inspect`), so returning
+        # chunk files directly is fine.
         list_cmd = (
-            f'( ls -t "{pool_path}"/batch_*/chunk_*.parquet 2>/dev/null; '
-            f'ls -t "{pool_path}"/batch_*.parquet 2>/dev/null ) | head -{n_files}'
+            f'( ls -t "{pool_path}"/training/batch_*/chunk_*.parquet 2>/dev/null; '
+            f'ls -t "{pool_path}"/ppc/batch_*/chunk_*.parquet 2>/dev/null ) '
+            f"| head -{n_files}"
         )
         status, output = self.transport.exec(list_cmd)
 

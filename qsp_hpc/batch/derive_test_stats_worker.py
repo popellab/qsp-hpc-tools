@@ -516,21 +516,15 @@ def main():
     else:
         logger.info("No pool_manifest.json found — assuming wide parquets (pre-#23 layout)")
 
-    # Find all batches in the pool. Supports two layouts:
-    #   - Legacy (pre-#43): flat batch_*.parquet files (one per submission,
-    #     produced by the retired cpp_combine_batch_worker).
-    #   - Current (#43 option A): batch_*/ subdirs containing
-    #     chunk_NNN.parquet shards written directly by array tasks.
-    # Both are enumerated and merged so derive works across mixed pools
-    # (e.g. an old pool topped up with a fresh submission).
+    # 3b.ii: training-side chunks live under
+    # {pool_id}/training/batch_*/chunk_*.parquet. Per D6 (hard cutover),
+    # legacy {pool_id}/batch_*/* layouts are unreadable.
+    training_pool_dir = simulation_pool_dir / "training"
     batch_sources: list[Path] = []
-    for entry in sorted(simulation_pool_dir.iterdir()):
-        if not entry.name.startswith("batch_"):
-            continue
-        if entry.is_dir():
-            batch_sources.append(entry)
-        elif entry.is_file() and entry.suffix == ".parquet":
-            batch_sources.append(entry)
+    if training_pool_dir.is_dir():
+        for entry in sorted(training_pool_dir.iterdir()):
+            if entry.is_dir() and entry.name.startswith("batch_"):
+                batch_sources.append(entry)
 
     if not batch_sources:
         logger.error(f"No simulation batches found in {simulation_pool_dir}")

@@ -166,7 +166,8 @@ class TestCppBatchWorker:
 
         pool_dir = tmp_path / "pool"
         batch_subdir = "batch_20260418_120000_000000_ctrl_seed42"
-        original_batch_dir = pool_dir / "test_pool" / batch_subdir
+        # 3b.ii: chunks land under {pool_id}/training/{batch_subdir}/.
+        original_batch_dir = pool_dir / "test_pool" / "training" / batch_subdir
         config = {
             "binary_path": str(fake_binary),
             "template_path": str(template_path),
@@ -189,7 +190,7 @@ class TestCppBatchWorker:
         assert len(traj_files) == 1 and len(params_files) == 1
         assert traj_files[0].name == "chunk_002.trajectory.parquet"
         # Must NOT have fallen back to the SLURM_ARRAY_JOB_ID-derived dir.
-        assert not (pool_dir / "test_pool" / "batch_local_ctrl_seed42").exists()
+        assert not (pool_dir / "test_pool" / "training" / "batch_local_ctrl_seed42").exists()
 
     def test_run_chunk_past_end_is_noop(self, tmp_path, fake_binary, template_path, params_csv):
         from qsp_hpc.batch.cpp_batch_worker import run_chunk

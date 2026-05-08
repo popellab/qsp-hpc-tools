@@ -112,14 +112,17 @@ class TestCppBatchWorker:
         # Task 0 processes sims [0, 2). Writes its chunk directly into a
         # per-submission batch subdir (#43 option A: no combine step).
         run_chunk(config, array_idx=0)
-        parquets = list((pool_dir / "test_pool").rglob("*.parquet"))
-        assert len(parquets) == 1
+        # Long-form schema: each chunk emits {trajectory,params}.parquet pair.
+        traj_files = list((pool_dir / "test_pool").rglob("*.trajectory.parquet"))
+        params_files = list((pool_dir / "test_pool").rglob("*.params.parquet"))
+        assert len(traj_files) == 1 and len(params_files) == 1
         # SLURM_ARRAY_JOB_ID fallback -> "local" in dir name
-        assert parquets[0].parent.name == "batch_local_ctrl_seed42"
-        assert parquets[0].name == "chunk_000.parquet"
-        table = pq.read_table(str(parquets[0]))
-        assert table.num_rows == 2
-        np.testing.assert_allclose(table.column("param:A").to_numpy(), [1.0, 1.1])
+        assert traj_files[0].parent.name == "batch_local_ctrl_seed42"
+        assert traj_files[0].name == "chunk_000.trajectory.parquet"
+        assert params_files[0].name == "chunk_000.params.parquet"
+        params_tbl = pq.read_table(str(params_files[0]))
+        assert params_tbl.num_rows == 2
+        np.testing.assert_allclose(params_tbl.column("param:A").to_numpy(), [1.0, 1.1])
 
     def test_run_chunk_last_task_partial(self, tmp_path, fake_binary, template_path, params_csv):
         from qsp_hpc.batch.cpp_batch_worker import run_chunk
@@ -143,12 +146,13 @@ class TestCppBatchWorker:
         # Task 2 processes sims [4, 5) — only 1 sim. Chunk lands in the
         # per-submission batch subdir (#43 option A).
         run_chunk(config, array_idx=2)
-        parquets = list((pool_dir / "test_pool").rglob("*.parquet"))
-        assert len(parquets) == 1
-        assert parquets[0].name == "chunk_002.parquet"
-        table = pq.read_table(str(parquets[0]))
-        assert table.num_rows == 1
-        np.testing.assert_allclose(table.column("param:A").to_numpy(), [1.4])
+        traj_files = list((pool_dir / "test_pool").rglob("*.trajectory.parquet"))
+        params_files = list((pool_dir / "test_pool").rglob("*.params.parquet"))
+        assert len(traj_files) == 1 and len(params_files) == 1
+        assert params_files[0].name == "chunk_002.params.parquet"
+        params_tbl = pq.read_table(str(params_files[0]))
+        assert params_tbl.num_rows == 1
+        np.testing.assert_allclose(params_tbl.column("param:A").to_numpy(), [1.4])
 
     def test_run_chunk_honors_batch_subdir_override(
         self, tmp_path, fake_binary, template_path, params_csv
@@ -180,9 +184,10 @@ class TestCppBatchWorker:
         }
 
         run_chunk(config, array_idx=2)
-        parquets = list(original_batch_dir.glob("*.parquet"))
-        assert len(parquets) == 1
-        assert parquets[0].name == "chunk_002.parquet"
+        traj_files = list(original_batch_dir.glob("*.trajectory.parquet"))
+        params_files = list(original_batch_dir.glob("*.params.parquet"))
+        assert len(traj_files) == 1 and len(params_files) == 1
+        assert traj_files[0].name == "chunk_002.trajectory.parquet"
         # Must NOT have fallen back to the SLURM_ARRAY_JOB_ID-derived dir.
         assert not (pool_dir / "test_pool" / "batch_local_ctrl_seed42").exists()
 

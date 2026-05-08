@@ -1,24 +1,33 @@
-"""Run a batch of C++ QSP simulations and write one MATLAB-compatible Parquet.
+"""Run a batch of C++ QSP simulations and write long-form Parquet.
 
 This layer sits between the single-sim CppRunner (M3) and the top-level
 CppSimulator (M5). Given a `theta_matrix` of parameter samples plus the
 priors column names, it fans out over a ProcessPoolExecutor, collects
-trajectories, and writes a Parquet whose schema matches what the MATLAB
-pipeline has been emitting — so downstream caching / test-stat
-derivation code keeps working without edits.
+trajectories, and writes two Parquet files per chunk:
 
-Schema (one row per simulation):
-    simulation_id:  int64     # zero-indexed within this batch
-    status:         int64     # 0 = success, 1 = qsp_sim failure
-    time:           list<float64>   # length n_times (same for all rows)
-    param:<name>:   float64   # one column per priors-CSV param
-    <species>:      list<float64>   # one column per qsp_sim species
-    <compartment>:  list<float64>   # v2 binaries: one per compartment
-    <rule>:         list<float64>   # v2 binaries: one per assignment rule
+  ``{stem}.trajectory.parquet`` — long-form trajectory rows::
+      sample_index:  int64
+      time:          float64
+      species:       dictionary<string>   # categorical, includes
+                                          # species + compartments + rules
+      value:         float64
 
-The compartment and rule columns are emitted as bare names (no prefix)
-so calibration-target functions can read them via ``species_dict[name]``
-just like the MATLAB SimBiology output.
+  ``{stem}.params.parquet`` — sidecar with one row per sample_index::
+      sample_index:  int64
+      simulation_id: int64    # zero-indexed within this batch
+      status:        int64    # 0 = success, 1 = qsp_sim failure
+      param:<name>:  float64  # one column per priors-CSV param
+
+The compartment and rule entries appear in the ``species`` dict alongside
+true species so calibration-target functions can read them via
+``species_dict[name]`` uniformly. Failed sims contribute zero trajectory
+rows; their status survives in the params sidecar.
+
+The long-form layout halves on-disk size vs the prior wide-form
+list-typed schema (zstd-compressed categorical species column) and
+enables column projection at read time via predicate pushdown on
+``species`` — see ``notes/architecture/local_observable_eval_plan.md``
+Open Q5 for the 2026-05-07 benchmark.
 """
 
 from __future__ import annotations
@@ -126,15 +135,27 @@ def load_pool_manifest(pool_dir: Path | str) -> dict | None:
 
 @dataclass
 class BatchResult:
-    """Summary returned after a batch completes."""
+    """Summary returned after a batch completes.
 
-    parquet_path: Path
+    The two paths point at the long-form trajectory parquet and the
+    params sidecar respectively. ``parquet_path`` is retained as an
+    alias for ``trajectory_path`` to keep test scaffolding migrating
+    one piece at a time, but new callers should prefer the explicit
+    field names.
+    """
+
+    trajectory_path: Path
+    params_path: Path
     n_sims: int
     n_failed: int
     species_names: list[str]
     n_times: int
     compartment_names: list[str] | None = None
     rule_names: list[str] | None = None
+
+    @property
+    def parquet_path(self) -> Path:  # legacy alias — prefer trajectory_path
+        return self.trajectory_path
 
 
 # --- Worker (module-level so ProcessPoolExecutor can pickle it) -------------
@@ -582,7 +603,7 @@ class CppBatchRunner:
         first_ok = next(i for i, t in enumerate(trajectories) if t is not None)
         n_times = trajectories[first_ok].shape[0]
 
-        parquet_path = _write_batch_parquet(
+        trajectory_path, params_path = _write_batch_parquet(
             output_path=output_path,
             theta_matrix=theta_matrix,
             param_names=list(param_names),
@@ -598,16 +619,19 @@ class CppBatchRunner:
         )
 
         logger.info(
-            "Batch complete: %d/%d succeeded, wrote %s (cols: %d species + %d comps + %d rules)",
+            "Batch complete: %d/%d succeeded, wrote %s + %s "
+            "(species in dict: %d sp + %d comps + %d rules)",
             n_sims - n_failed,
             n_sims,
-            parquet_path,
+            trajectory_path.name,
+            params_path.name,
             len(species_names),
             len(compartment_names),
             len(rule_names),
         )
         return BatchResult(
-            parquet_path=parquet_path,
+            trajectory_path=trajectory_path,
+            params_path=params_path,
             n_sims=n_sims,
             n_failed=n_failed,
             species_names=species_names,
@@ -618,6 +642,22 @@ class CppBatchRunner:
 
 
 # --- Parquet writer ---------------------------------------------------------
+
+
+def _derive_chunk_paths(output_path: Path) -> tuple[Path, Path]:
+    """Map a legacy single-parquet ``output_path`` to the long-form pair.
+
+    ``chunk_NNN.parquet`` → (``chunk_NNN.trajectory.parquet``,
+    ``chunk_NNN.params.parquet``). A path without a ``.parquet`` suffix
+    is treated as the stem.
+    """
+    stem = output_path.name
+    if stem.endswith(".parquet"):
+        stem = stem[: -len(".parquet")]
+    return (
+        output_path.parent / f"{stem}.trajectory.parquet",
+        output_path.parent / f"{stem}.params.parquet",
+    )
 
 
 def _write_batch_parquet(
@@ -633,41 +673,31 @@ def _write_batch_parquet(
     t_end_days: float,
     min_cadence_hours: float,
     sample_indices: np.ndarray | None = None,
-) -> Path:
-    """Build one pyarrow Table matching MATLAB's Parquet schema, write it.
+) -> tuple[Path, Path]:
+    """Emit the long-form trajectory + params sidecar pair for this batch.
 
-    Trajectory columns are laid out in the order
-    ``[species..., compartments..., rules...]`` (matching the binary
-    body layout). Each is emitted as a bare column name so downstream
-    code reads them via ``species_dict[name]`` uniformly.
+    Returns ``(trajectory_path, params_path)``. Trajectory rows are
+    keyed by ``sample_index``; the species column is dictionary-encoded
+    and combines true species, compartments, and assignment rules
+    (positionally aligned with the binary body layout's column order:
+    species first, then compartments, then rules). Failed sims
+    contribute zero trajectory rows; the params sidecar always carries
+    one row per sim so consumers can look up ``status`` / ``param:*``
+    by ``sample_index``.
 
     Under qsp-codegen v3 (CV_ONE_STEP), each successful sim has its own
-    non-uniform time vector — the writer threads these through as
-    ``time_arrays`` rather than reconstructing one shared axis from a
-    fixed dt. Failed sims get a NaN-padded single-row time/state.
+    non-uniform time vector. The long-form layout absorbs heterogeneous
+    per-sim time grids natively — no NaN padding needed — and carries
+    the per-sim time vector verbatim into the ``time`` column.
 
-    Only **sampled** model parameters land as ``param:<name>`` columns
-    (one per entry in ``param_names``). Non-sampled template defaults
-    live in the pool's sidecar ``pool_manifest.json`` and are injected
-    by readers when a calibration-target function asks for a parameter
-    that isn't in the sampled set. See #23 — the prior behavior
-    broadcast every template default into every row, tripling parquet
-    width and creating a recurring source of "which set do I want?"
-    ambiguity between callers.
+    Only **sampled** model parameters appear as ``param:<name>`` columns
+    in the params sidecar. Non-sampled template defaults live in the
+    pool's ``pool_manifest.json`` and are injected by readers when a
+    calibration-target function asks for a parameter outside the
+    sampled set (issue #23 convention, preserved).
     """
     n_sims = len(statuses)
-
-    # Per-sim time vectors (variable length under v3). Failed sims get
-    # a single-NaN placeholder so the parquet column shape is well-defined.
-    time_lists: list[list[float]] = []
-    nan_rows: list[np.ndarray] = []
-    for traj, t_days in zip(trajectories, time_arrays):
-        if traj is None or t_days is None:
-            time_lists.append([float("nan")])
-            nan_rows.append(np.array([np.nan], dtype=np.float64))
-        else:
-            time_lists.append(np.asarray(t_days, dtype=np.float64).tolist())
-            nan_rows.append(np.full(traj.shape[0], np.nan, dtype=np.float64))
+    trajectory_path, params_path = _derive_chunk_paths(output_path)
 
     # sample_index is the GLOBAL theta-pool position (same across all
     # scenarios for a given patient/draw); simulation_id is the LOCAL
@@ -679,31 +709,76 @@ def _write_batch_parquet(
         sample_indices_arr = np.arange(n_sims, dtype=np.int64)
     else:
         sample_indices_arr = np.asarray(sample_indices, dtype=np.int64)
-    columns: dict[str, pa.Array] = {
+
+    # --- Params sidecar -----------------------------------------------------
+    params_columns: dict[str, pa.Array] = {
         "sample_index": pa.array(sample_indices_arr),
         "simulation_id": pa.array(np.arange(n_sims, dtype=np.int64)),
         "status": pa.array(np.asarray(statuses, dtype=np.int64)),
-        "time": pa.array(time_lists, type=pa.list_(pa.float64())),
     }
     for j, name in enumerate(param_names):
-        columns[f"param:{name}"] = pa.array(theta_matrix[:, j].astype(np.float64))
+        params_columns[f"param:{name}"] = pa.array(theta_matrix[:, j].astype(np.float64))
+    params_table = pa.Table.from_pydict(params_columns)
+    pq.write_table(params_table, str(params_path), compression="zstd")
 
-    # Trajectory columns in the same order they appear in the v2 binary:
-    # species first, then compartments, then assignment rules. Indexing
-    # is positional — column k corresponds to trajectory[:, k].
+    # --- Long-form trajectory ----------------------------------------------
+    # Column dictionary order matches the binary body layout.
     all_trajectory_names = list(species_names) + list(compartment_names) + list(rule_names)
-    for k, name in enumerate(all_trajectory_names):
-        per_sim_series: list[list[float]] = []
-        for sim_idx, traj in enumerate(trajectories):
-            if traj is None:
-                per_sim_series.append(nan_rows[sim_idx].tolist())
-            else:
-                per_sim_series.append(traj[:, k].tolist())
-        columns[name] = pa.array(per_sim_series, type=pa.list_(pa.float64()))
+    n_cols = len(all_trajectory_names)
 
-    table = pa.Table.from_pydict(columns)
-    pq.write_table(table, str(output_path), compression="snappy")
-    return output_path
+    # Allocate one block per (sim, species_col) pair, then concatenate.
+    # Failed sims contribute nothing here — their status is in the sidecar.
+    sample_idx_blocks: list[np.ndarray] = []
+    time_blocks: list[np.ndarray] = []
+    species_idx_blocks: list[np.ndarray] = []
+    value_blocks: list[np.ndarray] = []
+
+    for i in range(n_sims):
+        traj = trajectories[i]
+        t_days = time_arrays[i]
+        if traj is None or t_days is None or statuses[i] != STATUS_OK:
+            continue
+        n_t = traj.shape[0]
+        if n_t == 0:
+            continue
+        sidx = int(sample_indices_arr[i])
+        t_arr = np.asarray(t_days, dtype=np.float64)
+        for k in range(n_cols):
+            sample_idx_blocks.append(np.full(n_t, sidx, dtype=np.int64))
+            time_blocks.append(t_arr)
+            species_idx_blocks.append(np.full(n_t, k, dtype=np.int32))
+            value_blocks.append(traj[:, k].astype(np.float64, copy=False))
+
+    if sample_idx_blocks:
+        sample_idx_flat = np.concatenate(sample_idx_blocks)
+        time_flat = np.concatenate(time_blocks)
+        species_idx_flat = np.concatenate(species_idx_blocks)
+        value_flat = np.concatenate(value_blocks)
+    else:
+        # All-failed batch — emit an empty trajectory parquet with the
+        # right schema. Consumers must tolerate this (it's already the
+        # "raise QspSimError" path above for fully-failed batches).
+        sample_idx_flat = np.empty(0, dtype=np.int64)
+        time_flat = np.empty(0, dtype=np.float64)
+        species_idx_flat = np.empty(0, dtype=np.int32)
+        value_flat = np.empty(0, dtype=np.float64)
+
+    species_dict = pa.DictionaryArray.from_arrays(
+        pa.array(species_idx_flat, type=pa.int32()),
+        pa.array(all_trajectory_names, type=pa.string()),
+    )
+
+    trajectory_table = pa.table(
+        {
+            "sample_index": pa.array(sample_idx_flat, type=pa.int64()),
+            "time": pa.array(time_flat, type=pa.float64()),
+            "species": species_dict,
+            "value": pa.array(value_flat, type=pa.float64()),
+        }
+    )
+    pq.write_table(trajectory_table, str(trajectory_path), compression="zstd")
+
+    return trajectory_path, params_path
 
 
 def batch_filename(

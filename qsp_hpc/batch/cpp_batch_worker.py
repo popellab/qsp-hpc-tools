@@ -89,6 +89,13 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # fcntl lock; every other task (including future scenario arrays) for
     # the same theta skips evolve via --initial-state. None disables.
     evolve_cache_root = config.get("evolve_cache_root")
+    # samples_start_offset: when the caller hoisted the FULL theta pool to
+    # a shared remote CSV (samples_csv_remote=...) but this submit is a
+    # top-up needing only rows ``[existing : N)``, the offset shifts the
+    # per-chunk slice into the right region. ``n_simulations`` here is
+    # the deficit count, not the pool size; the absolute slice each task
+    # reads is ``[offset + start : offset + end]``.
+    samples_start_offset = int(config.get("samples_start_offset", 0))
 
     # #34: announce the cache-wiring inputs at INFO in the parent process.
     # These are also implicitly checked by CppBatchRunner/_worker_init, but
@@ -124,16 +131,19 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # integer-valued "param" and fail the XML template lookup. The index
     # is forwarded to runner.run so the written parquet carries it, which
     # downstream multi-scenario alignment relies on.
+    abs_lo = samples_start_offset + start
+    abs_hi = samples_start_offset + end
     if "sample_index" in params_df.columns:
         sample_index_all = params_df["sample_index"].astype(np.int64).values
-        sample_indices_chunk = sample_index_all[start:end]
+        sample_indices_chunk = sample_index_all[abs_lo:abs_hi]
         params_df = params_df.drop(columns=["sample_index"])
     else:
         # Legacy / test CSVs that predate the sample_index convention —
-        # fall back to positional global index (task_offset + local idx).
-        sample_indices_chunk = np.arange(start, end, dtype=np.int64)
+        # fall back to positional global index (samples_start_offset +
+        # task_offset + local idx).
+        sample_indices_chunk = np.arange(abs_lo, abs_hi, dtype=np.int64)
     param_names = list(params_df.columns)
-    theta_chunk = params_df.iloc[start:end].values.astype(np.float64)
+    theta_chunk = params_df.iloc[abs_lo:abs_hi].values.astype(np.float64)
 
     logger.info(
         "Loaded %d parameters: %s%s",

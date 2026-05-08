@@ -161,6 +161,35 @@ class MultiScenarioRunner:
         self.job_manager.ensure_cpp_binary()
         self._session_prepared = True
 
+    def upload_shared_healthy_state(self) -> Optional[str]:
+        """Upload the healthy_state YAML once and return the remote path.
+
+        Returns None when no simulator carries a healthy_state_yaml.
+        Validation in :meth:`_validate_alignment` does NOT enforce that
+        every simulator's healthy_state matches — typical shared usage
+        does match, but legacy mixed-IC sweeps would silently break if
+        we forced a single upload. So: only hoist when *every*
+        simulator agrees on the same local path. Mismatches fall back
+        to the per-pool upload (no shared remote).
+        """
+        if getattr(self, "_shared_healthy_remote", None) is not None:
+            return self._shared_healthy_remote
+
+        local_paths = {getattr(sim, "healthy_state_yaml", None) for sim in self.simulators.values()}
+        local_paths.discard(None)
+        if len(local_paths) != 1:
+            logger.info(
+                "MSR.upload_shared_healthy_state: simulators don't agree on a single "
+                "healthy_state YAML (%s) — falling back to per-pool upload",
+                local_paths,
+            )
+            self._shared_healthy_remote = None
+            return None
+
+        local = next(iter(local_paths))
+        self._shared_healthy_remote = self.job_manager.upload_shared_healthy_state(str(local))
+        return self._shared_healthy_remote
+
     def run_all(self, n: int) -> Dict[str, ScenarioResult]:
         """Submit each scenario for ``n`` simulations against the shared
         theta pool, wait, return per-scenario ``(theta, x, sample_index)``.
@@ -178,6 +207,7 @@ class MultiScenarioRunner:
         """
         self.prepare_session()
         shared_remote = self.upload_shared_samples_csv(n)
+        shared_healthy_remote = self.upload_shared_healthy_state()
 
         results: Dict[str, ScenarioResult] = {}
         for name, sim in self.simulators.items():
@@ -185,6 +215,7 @@ class MultiScenarioRunner:
             theta_scen, x_scen = sim.run_hpc(
                 n,
                 samples_csv_remote=shared_remote,
+                healthy_state_yaml_remote=shared_healthy_remote,
                 skip_setup=True,
             )
             sample_index_scen = (

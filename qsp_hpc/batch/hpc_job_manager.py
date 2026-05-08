@@ -990,6 +990,8 @@ class HPCJobManager:
         retry_missing_chunks: int = 0,
         skip_setup: bool = False,
         samples_csv_remote: Optional[str] = None,
+        healthy_state_yaml_remote: Optional[str] = None,
+        samples_start_offset: int = 0,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
 
@@ -1181,9 +1183,17 @@ class HPCJobManager:
         remote_drug_meta = self._upload_scenario_yaml(
             drug_metadata_yaml, "drug_metadata.yaml", simulation_pool_id
         )
-        remote_healthy = self._upload_scenario_yaml(
-            healthy_state_yaml, "healthy_state.yaml", simulation_pool_id
-        )
+        # ``healthy_state_yaml_remote``, when set, references a shared
+        # session-level upload (``upload_shared_healthy_state``) so every
+        # scenario points at the same remote file instead of re-uploading.
+        # Healthy state is the same physiological IC across treatment
+        # arms — uploading it once per session is the natural shape.
+        if healthy_state_yaml_remote:
+            remote_healthy = healthy_state_yaml_remote
+        else:
+            remote_healthy = self._upload_scenario_yaml(
+                healthy_state_yaml, "healthy_state.yaml", simulation_pool_id
+            )
 
         # Evolve-cache root lives on scratch alongside the per-scenario
         # sim pools so every scenario job hitting the same theta shares
@@ -1221,6 +1231,7 @@ class HPCJobManager:
             evolve_cache_root=evolve_cache_root,
             batch_subdir=batch_subdir,
             samples_csv_remote=samples_csv_remote,
+            samples_start_offset=samples_start_offset,
         )
         # ``samples_csv_remote`` lets the caller hoist the upload above
         # the per-scenario loop when every scenario uses byte-identical
@@ -1395,6 +1406,7 @@ class HPCJobManager:
         evolve_cache_root: Optional[str] = None,
         batch_subdir: Optional[str] = None,
         samples_csv_remote: Optional[str] = None,
+        samples_start_offset: int = 0,
     ) -> None:
         """Create and upload C++ job configuration JSON."""
         import json
@@ -1414,6 +1426,13 @@ class HPCJobManager:
                 samples_csv_remote if samples_csv_remote else f"{pool_input_dir}/params.csv"
             ),
             "n_simulations": num_simulations,
+            # Worker slices ``samples_csv[start_offset + chunk_lo : start_offset + chunk_hi]``.
+            # Lets the caller hoist the full theta CSV to a shared remote
+            # path even for top-up submits (where only rows
+            # ``[existing : N)`` are needed): the worker reads the full
+            # CSV but skips the first ``existing`` rows. Default 0
+            # preserves legacy behavior.
+            "samples_start_offset": int(samples_start_offset),
             "seed": seed,
             "jobs_per_chunk": jobs_per_chunk,
             "t_end_days": t_end_days,
@@ -1672,6 +1691,40 @@ class HPCJobManager:
         remote_path = f"{remote_input_dir}/{remote_filename}"
         self.transport.upload(csv_path, remote_path)
         self.logger.debug("Shared samples CSV uploaded: %s", remote_path)
+        return remote_path
+
+    def upload_shared_healthy_state(
+        self, healthy_state_yaml: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload a healthy_state.yaml to a non-pool-scoped shared remote path.
+
+        Healthy state is the same physiological IC across treatment arms
+        in a multi-scenario sweep, so the natural shape is one upload
+        per session. Callers pass the returned remote path to
+        :meth:`submit_cpp_jobs` via ``healthy_state_yaml_remote=`` so the
+        per-pool upload is skipped.
+
+        Args:
+            healthy_state_yaml: Local path to the healthy_state.yaml.
+            remote_filename: Filename under ``batch_jobs/input/``; defaults
+                to a content-hash-stamped name so two runners with
+                byte-identical YAML share the upload, but a different
+                YAML lands in its own file.
+        """
+        import hashlib
+        import shlex as _shlex
+
+        local = Path(healthy_state_yaml)
+        if not local.exists():
+            raise FileNotFoundError(f"healthy_state YAML not found: {local}")
+        if remote_filename is None:
+            content_hash = hashlib.sha256(local.read_bytes()).hexdigest()[:12]
+            remote_filename = f"healthy_state_shared_{content_hash}.yaml"
+        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
+        self.transport.exec(f"mkdir -p {_shlex.quote(remote_input_dir)}")
+        remote_path = f"{remote_input_dir}/{remote_filename}"
+        self.transport.upload(str(local), remote_path)
+        self.logger.debug("Shared healthy_state YAML uploaded: %s", remote_path)
         return remote_path
 
     def _upload_parameter_csv(

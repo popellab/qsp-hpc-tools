@@ -765,6 +765,7 @@ class CppSimulator:
         n: int,
         *,
         samples_csv_remote: Optional[str] = None,
+        healthy_state_yaml_remote: Optional[str] = None,
         skip_setup: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Run ``n`` simulations through the 3-tier HPC cache.
@@ -921,20 +922,14 @@ class CppSimulator:
             start_index = 0
             self.logger.info("HPC pool empty — submitting fresh sweep of %d sims", n_needed)
 
+        # When a shared full-pool CSV is hoisted via samples_csv_remote,
+        # the worker honors ``samples_start_offset=start_index`` and
+        # slices the right rows out of the shared CSV. Without
+        # samples_csv_remote we fall back to a per-pool deficit CSV
+        # upload (rows [start_index : n) of the deterministic theta
+        # pool); workers read from row 0 of that smaller file.
         params_csv = self._write_params_csv(n_needed, start_index=start_index)
-        # samples_csv_remote points at a CSV with the full theta pool
-        # (rows [0..n-1]) — only usable when this submit covers indices
-        # starting at 0. For top-up (start_index > 0) the worker slices
-        # [0:n_needed] of whatever CSV it reads, which would pull the
-        # wrong theta rows. Drop the shared remote in that case and let
-        # submit_cpp_jobs upload the deficit CSV per-pool.
-        if samples_csv_remote is not None and start_index != 0:
-            self.logger.info(
-                "samples_csv_remote ignored: top-up with start_index=%d cannot "
-                "use the shared full-pool CSV. Uploading deficit per-pool.",
-                start_index,
-            )
-            samples_csv_remote = None
+        samples_start_offset = start_index if samples_csv_remote is not None else 0
         try:
             info = self.job_manager.submit_cpp_jobs(
                 samples_csv=str(params_csv),
@@ -962,6 +957,8 @@ class CppSimulator:
                 ),
                 evolve_cache=self.evolve_cache_root is not None,
                 samples_csv_remote=samples_csv_remote,
+                healthy_state_yaml_remote=healthy_state_yaml_remote,
+                samples_start_offset=samples_start_offset,
                 skip_setup=skip_setup,
             )
         finally:

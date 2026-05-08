@@ -28,6 +28,7 @@ def _fake_sim(
     binary_path="qsp_sim",
     pool_id="poolXYZ",
     job_manager=None,
+    healthy_state_yaml="healthy.yaml",
 ):
     """A MagicMock-backed CppSimulator surrogate carrying just the attrs
     the runner reads off it."""
@@ -38,6 +39,7 @@ def _fake_sim(
     sim.binary_path = binary_path
     sim.simulation_pool_id = pool_id
     sim.job_manager = job_manager
+    sim.healthy_state_yaml = healthy_state_yaml
     sim.last_sample_index = None
     return sim
 
@@ -160,6 +162,45 @@ class TestRunAll:
         for name, res in results.items():
             assert isinstance(res, ScenarioResult)
             assert res.pool_id == f"pool_{name}"
+
+    def test_shared_healthy_state_uploaded_once_and_threaded(self, tmp_path):
+        jm = _fake_jm()
+        a = _fake_sim(job_manager=jm, pool_id="pool_a", healthy_state_yaml="hs.yaml")
+        b = _fake_sim(job_manager=jm, pool_id="pool_b", healthy_state_yaml="hs.yaml")
+        csv = tmp_path / "samples.csv"
+        csv.write_text("sample_index,k\n0,1\n")
+        a._write_params_csv.return_value = csv
+        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        jm.upload_shared_healthy_state.return_value = "/remote/healthy.yaml"
+        a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+        b.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+
+        r = MultiScenarioRunner({"a": a, "b": b})
+        r.run_all(1)
+
+        # Healthy state uploaded once, shared remote threaded into both run_hpc calls.
+        assert jm.upload_shared_healthy_state.call_count == 1
+        assert a.run_hpc.call_args.kwargs["healthy_state_yaml_remote"] == "/remote/healthy.yaml"
+        assert b.run_hpc.call_args.kwargs["healthy_state_yaml_remote"] == "/remote/healthy.yaml"
+
+    def test_mixed_healthy_state_falls_back_to_per_pool_upload(self, tmp_path):
+        jm = _fake_jm()
+        a = _fake_sim(job_manager=jm, pool_id="pool_a", healthy_state_yaml="hs_a.yaml")
+        b = _fake_sim(job_manager=jm, pool_id="pool_b", healthy_state_yaml="hs_b.yaml")
+        csv = tmp_path / "samples.csv"
+        csv.write_text("sample_index,k\n0,1\n")
+        a._write_params_csv.return_value = csv
+        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+        b.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+
+        r = MultiScenarioRunner({"a": a, "b": b})
+        r.run_all(1)
+
+        # Shared upload skipped because YAMLs disagree.
+        assert jm.upload_shared_healthy_state.call_count == 0
+        assert a.run_hpc.call_args.kwargs["healthy_state_yaml_remote"] is None
+        assert b.run_hpc.call_args.kwargs["healthy_state_yaml_remote"] is None
 
     def test_prepare_session_idempotent(self, tmp_path):
         jm = _fake_jm()

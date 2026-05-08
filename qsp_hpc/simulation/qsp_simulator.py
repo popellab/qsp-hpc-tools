@@ -1822,9 +1822,12 @@ class QSPSimulator:
         expected another — silently writing new simulations to a pool that
         downstream loaders couldn't find.
         """
-        from qsp_hpc.utils.hash_utils import compute_pool_id_hash
+        # MATLAB QSPSimulator predates the Layer-3 simplified pool-id
+        # hash; uses the legacy hash so its tests + downstream MATLAB
+        # SimulationPool / QSPResultLoader stay in lockstep.
+        from qsp_hpc.utils.hash_utils import compute_pool_id_hash_legacy
 
-        return compute_pool_id_hash(
+        return compute_pool_id_hash_legacy(
             priors_csv=self.priors_csv,
             model_script=self.model_script,
             submodel_priors_yaml=self.submodel_priors_yaml,
@@ -1832,11 +1835,10 @@ class QSPSimulator:
         )
 
     def _compute_test_stats_hash(self) -> str:
-        """Delegate to the shared test-stats hash (matches
-        :class:`QSPResultLoader.test_stats_hash`)."""
-        from qsp_hpc.utils.hash_utils import compute_test_stats_hash
+        """Legacy test-stats hash for the MATLAB code path."""
+        from qsp_hpc.utils.hash_utils import compute_test_stats_hash_legacy
 
-        return compute_test_stats_hash(self.test_stats_csv)
+        return compute_test_stats_hash_legacy(self.test_stats_csv)
 
     def _compute_hpc_pool_id(self, scenario_override: Optional[str] = None) -> str:
         """

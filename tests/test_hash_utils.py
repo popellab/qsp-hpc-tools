@@ -305,76 +305,69 @@ class TestGenerateFilename:
 
 
 class TestComputePoolIdHash:
-    """Regression tests for compute_pool_id_hash seed behaviour (#20).
+    """Tests for the simplified pool-id hash (Layer 3 of the
+    local-observable-eval plan).
 
-    Theta-pool draws are seed-dependent (qsp_hpc/simulation/theta_pool.py
-    keys on seed), so row sample_index=i points at a different theta
-    under a different seed. Before #20, the sim-pool dir was seed-blind,
-    so Run 2 at seed=B silently served cached sims from Run 1 at seed=A.
+    Inputs collapsed to ``sha256(binary_bytes | scenario_yaml_content)`` —
+    everything else is either upstream sampling machinery (priors / seed,
+    enforced at the runner) or a read-time decision (test stats, traj
+    columns, cadence). See ``compute_pool_id_hash`` docstring.
     """
 
     @staticmethod
-    def _write_priors(path, content="a,b\n1,2\n"):
-        path.write_text(content)
-        return path
+    def _write_inputs(tmp_path, *, binary_bytes=b"\x7fELF binary v1", scenario="a: 1\n"):
+        binary = tmp_path / "qsp_sim"
+        binary.write_bytes(binary_bytes)
+        scenario_yaml = tmp_path / "scenario.yaml"
+        scenario_yaml.write_text(scenario)
+        return binary, scenario_yaml
 
-    def test_different_seeds_produce_different_hashes(self, tmp_path):
-        priors = self._write_priors(tmp_path / "priors.csv")
-        h_a = compute_pool_id_hash(priors, "m", seed=2025)
-        h_b = compute_pool_id_hash(priors, "m", seed=2026)
-        assert h_a != h_b
-
-    def test_same_seed_produces_stable_hash(self, tmp_path):
-        priors = self._write_priors(tmp_path / "priors.csv")
-        h1 = compute_pool_id_hash(priors, "m", seed=2025)
-        h2 = compute_pool_id_hash(priors, "m", seed=2025)
+    def test_hash_is_deterministic(self, tmp_path):
+        binary, scenario_yaml = self._write_inputs(tmp_path)
+        h1 = compute_pool_id_hash(binary_path=binary, scenario_yaml=scenario_yaml)
+        h2 = compute_pool_id_hash(binary_path=binary, scenario_yaml=scenario_yaml)
         assert h1 == h2
 
-    def test_seed_none_omits_seed_input(self, tmp_path):
-        """seed=None (default) must equal omitting the seed argument so
-        callers can opt in incrementally."""
-        priors = self._write_priors(tmp_path / "priors.csv")
-        with_none = compute_pool_id_hash(priors, "m", seed=None)
-        without_seed = compute_pool_id_hash(priors, "m")
-        assert with_none == without_seed
+    def test_hash_is_full_sha256_hex(self, tmp_path):
+        binary, scenario_yaml = self._write_inputs(tmp_path)
+        h = compute_pool_id_hash(binary_path=binary, scenario_yaml=scenario_yaml)
+        assert len(h) == 64
+        assert all(c in "0123456789abcdef" for c in h)
 
-    def test_seed_changes_hash_vs_unseeded(self, tmp_path):
-        """Passing a seed must produce a different hash than omitting it."""
-        priors = self._write_priors(tmp_path / "priors.csv")
-        h_unseeded = compute_pool_id_hash(priors, "m")
-        h_seeded = compute_pool_id_hash(priors, "m", seed=2025)
-        assert h_unseeded != h_seeded
-
-    def test_binary_content_changes_hash(self, tmp_path):
-        """Rebuilding the C++ binary with new model semantics must
-        invalidate the pool (#56). Two binaries with different byte
-        content produce different hashes."""
-        priors = self._write_priors(tmp_path / "priors.csv")
-        bin_a = tmp_path / "qsp_sim_a"
+    def test_binary_bytes_change_hash(self, tmp_path):
+        """Rebuilding qsp_sim with new model semantics must invalidate
+        the pool (#56). Two binaries with different bytes produce
+        different hashes."""
+        bin_a, scen = self._write_inputs(tmp_path, binary_bytes=b"\x7fELF binary A")
         bin_b = tmp_path / "qsp_sim_b"
-        bin_a.write_bytes(b"\x7fELF...binary-A")
-        bin_b.write_bytes(b"\x7fELF...binary-B")
-        h_a = compute_pool_id_hash(priors, "m", binary_path=bin_a)
-        h_b = compute_pool_id_hash(priors, "m", binary_path=bin_b)
+        bin_b.write_bytes(b"\x7fELF binary B")
+        h_a = compute_pool_id_hash(binary_path=bin_a, scenario_yaml=scen)
+        h_b = compute_pool_id_hash(binary_path=bin_b, scenario_yaml=scen)
         assert h_a != h_b
 
-    def test_binary_path_omitted_matches_no_binary(self, tmp_path):
-        """binary_path=None (default) must equal omitting the argument
-        so MATLAB callers stay on the no-binary code path."""
-        priors = self._write_priors(tmp_path / "priors.csv")
-        h_none = compute_pool_id_hash(priors, "m", binary_path=None)
-        h_omit = compute_pool_id_hash(priors, "m")
-        assert h_none == h_omit
+    def test_scenario_content_changes_hash(self, tmp_path):
+        """Edits to scenario YAML (drug regimen, IC, stop_time) must
+        invalidate the pool — they change ``f(theta)``."""
+        binary, scen_a = self._write_inputs(tmp_path, scenario="stop_time: 21\n")
+        scen_b = tmp_path / "scenario_b.yaml"
+        scen_b.write_text("stop_time: 90\n")
+        h_a = compute_pool_id_hash(binary_path=binary, scenario_yaml=scen_a)
+        h_b = compute_pool_id_hash(binary_path=binary, scenario_yaml=scen_b)
+        assert h_a != h_b
 
-    def test_binary_present_changes_hash_vs_absent(self, tmp_path):
-        """Adding a binary to the hash must change the result; otherwise
-        the binary content is silently ignored."""
-        priors = self._write_priors(tmp_path / "priors.csv")
-        binary = tmp_path / "qsp_sim"
-        binary.write_bytes(b"\x7fELF...binary")
-        h_no_bin = compute_pool_id_hash(priors, "m")
-        h_with_bin = compute_pool_id_hash(priors, "m", binary_path=binary)
-        assert h_no_bin != h_with_bin
+    def test_keyword_only_signature(self, tmp_path):
+        """Args are keyword-only — positional calls must fail. Guards
+        against silent breakage if someone reorders the parameters."""
+        binary, scenario_yaml = self._write_inputs(tmp_path)
+        with pytest.raises(TypeError):
+            compute_pool_id_hash(binary, scenario_yaml)  # type: ignore[misc]
+
+    def test_str_and_path_inputs_equivalent(self, tmp_path):
+        """str-paths and Path objects produce the same hash."""
+        binary, scenario_yaml = self._write_inputs(tmp_path)
+        h_path = compute_pool_id_hash(binary_path=binary, scenario_yaml=scenario_yaml)
+        h_str = compute_pool_id_hash(binary_path=str(binary), scenario_yaml=str(scenario_yaml))
+        assert h_path == h_str
 
 
 class TestHashIntegration:

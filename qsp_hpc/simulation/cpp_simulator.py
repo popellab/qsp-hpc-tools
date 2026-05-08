@@ -760,7 +760,13 @@ class CppSimulator:
                 "template before submitting."
             )
 
-    def run_hpc(self, n: int) -> Tuple[np.ndarray, np.ndarray]:
+    def run_hpc(
+        self,
+        n: int,
+        *,
+        samples_csv_remote: Optional[str] = None,
+        skip_setup: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Run ``n`` simulations through the 3-tier HPC cache.
 
         Returns ``(theta, test_stats)`` arrays — *not* full trajectories.
@@ -775,6 +781,19 @@ class CppSimulator:
 
         Requires ``job_manager`` and ``test_stats_csv`` set in the
         constructor.
+
+        Args:
+            n: Number of simulations requested.
+            samples_csv_remote: When set, ``submit_cpp_jobs`` references
+                this remote samples CSV instead of uploading a
+                per-pool copy. Used by :class:`MultiScenarioRunner` to
+                hoist the upload above the per-scenario loop when every
+                scenario shares theta. Caller must have uploaded the
+                CSV via :meth:`HPCJobManager.upload_shared_samples_csv`
+                first.
+            skip_setup: When True, ``submit_cpp_jobs`` skips the
+                venv-refresh / git pull / cmake setup phase. Used for
+                scenarios 2..N when scenario 1 already did the setup.
         """
         if self.job_manager is None:
             raise RuntimeError("run_hpc() requires job_manager")
@@ -902,6 +921,19 @@ class CppSimulator:
             self.logger.info("HPC pool empty — submitting fresh sweep of %d sims", n_needed)
 
         params_csv = self._write_params_csv(n_needed, start_index=start_index)
+        # samples_csv_remote points at a CSV with the full theta pool
+        # (rows [0..n-1]) — only usable when this submit covers indices
+        # starting at 0. For top-up (start_index > 0) the worker slices
+        # [0:n_needed] of whatever CSV it reads, which would pull the
+        # wrong theta rows. Drop the shared remote in that case and let
+        # submit_cpp_jobs upload the deficit CSV per-pool.
+        if samples_csv_remote is not None and start_index != 0:
+            self.logger.info(
+                "samples_csv_remote ignored: top-up with start_index=%d cannot "
+                "use the shared full-pool CSV. Uploading deficit per-pool.",
+                start_index,
+            )
+            samples_csv_remote = None
         try:
             info = self.job_manager.submit_cpp_jobs(
                 samples_csv=str(params_csv),
@@ -928,6 +960,8 @@ class CppSimulator:
                     str(self.model_structure_file) if self.model_structure_file else None
                 ),
                 evolve_cache=self.evolve_cache_root is not None,
+                samples_csv_remote=samples_csv_remote,
+                skip_setup=skip_setup,
             )
         finally:
             params_csv.unlink(missing_ok=True)

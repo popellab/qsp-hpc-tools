@@ -57,76 +57,106 @@ STATUS_FAILED = 1
 
 
 POOL_MANIFEST_FILENAME = "pool_manifest.json"
-POOL_MANIFEST_SCHEMA = "thin-v1"
+POOL_MANIFEST_SCHEMA = "subpool-v2"
+SUBPOOL_KINDS: tuple[str, ...] = ("training", "ppc")
+
+
+def subpool_dir(pool_dir: Path | str, kind: str) -> Path:
+    """Return ``{pool_dir}/{kind}`` after validating ``kind``.
+
+    Layer-3 sub-pool layout (D1 in
+    ``notes/architecture/local_observable_eval_plan.md``): each
+    ``pool_id`` carries a ``training/`` and a ``ppc/`` sub-pool, each
+    with its own manifest.
+    """
+    if kind not in SUBPOOL_KINDS:
+        raise ValueError(f"subpool kind must be one of {SUBPOOL_KINDS}; got {kind!r}")
+    return Path(pool_dir) / kind
 
 
 def write_pool_manifest(
     pool_dir: Path | str,
+    kind: str,
     template_defaults: dict[str, float],
     sampled_params: Sequence[str],
 ) -> Path:
-    """Write ``pool_manifest.json`` with template defaults + sampled set.
+    """Write ``{pool_dir}/{kind}/pool_manifest.json`` (subpool-v2).
 
-    One manifest per pool dir, written once (idempotent — existing
-    manifests are left alone). Downstream consumers (derive_test_stats
-    worker, CppSimulator local cache loader) fall back to these defaults
-    when a parameter's ``param:{name}`` column is missing from the thin
-    parquet — see #23.
+    The sub-pool manifest is the single source of truth for both
+    ``HPCSession.reserve_sample_index_range``-allocated ``reservations``
+    and the SLURM-side ``template_defaults`` + ``sampled_params`` snapshot
+    a downstream reader needs to resolve unsampled ``param:*`` columns.
+    Concurrent SLURM array tasks all race to write this on first run of
+    a fresh pool; the merge below is idempotent so second+ writers no-op.
 
     Layout::
 
         {
-            "schema_version": "thin-v1",
+            "schema_version": "subpool-v2",
+            "kind": "training",                              # or "ppc"
+            "reservations": [{"start": 0, "end": N, "ts": ...}, ...],
             "template_defaults": {"A": 1.5, "B": 2.0, ...},  # EVERY model param
             "sampled_params": ["A", "C", ...]                # subset varied
         }
 
-    The ``sampled_params`` list is informational — writers put those
-    columns into the parquet; readers can trust the parquet columns for
-    sampled values and the manifest for everything else.
+    Merge semantics: if the manifest already exists with
+    ``reservations`` populated by ``HPCSession`` (training-side
+    SLURM-tasks land *after* reservation broadcast), this call adds the
+    ``template_defaults`` and ``sampled_params`` keys without touching
+    ``reservations``. If ``template_defaults`` is already present, the
+    call is a no-op (first writer wins; content is identical across
+    SLURM array tasks).
     """
-    pool_dir = Path(pool_dir)
-    pool_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = pool_dir / POOL_MANIFEST_FILENAME
+    sub_dir = subpool_dir(pool_dir, kind)
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = sub_dir / POOL_MANIFEST_FILENAME
+
     if manifest_path.exists():
-        return manifest_path
-    payload = {
-        "schema_version": POOL_MANIFEST_SCHEMA,
-        "template_defaults": {str(k): float(v) for k, v in template_defaults.items()},
-        "sampled_params": list(sampled_params),
-    }
+        try:
+            with open(manifest_path) as fh:
+                payload = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if "template_defaults" in payload:
+            return manifest_path
+    else:
+        payload = {}
+
+    payload.setdefault("schema_version", POOL_MANIFEST_SCHEMA)
+    payload.setdefault("kind", kind)
+    payload.setdefault("reservations", [])
+    payload["template_defaults"] = {str(k): float(v) for k, v in template_defaults.items()}
+    payload["sampled_params"] = list(sampled_params)
+
     # Atomic write so a partial read never happens: a parallel cal-target
     # evaluator could race a first-run write otherwise. Every SLURM array
     # task races to write this on first run of a fresh pool, so the tmp
     # filename MUST be unique per-process — a single shared
     # "pool_manifest.json.tmp" lets task 0 rename its tmp to the final
     # path and leaves task 1 without a tmp to rename (FileNotFoundError,
-    # #hit on SBI smoke 2026-04-17). os.getpid() is enough even across
+    # hit on SBI smoke 2026-04-17). os.getpid() is enough even across
     # different hosts because two tasks writing simultaneously into the
     # same scratch dir with the same PID would need the same PID to be
-    # reused within milliseconds — negligible. Content is identical
-    # across writers so "last writer wins" is safe.
+    # reused within milliseconds — negligible.
     tmp_path = manifest_path.with_suffix(f".json.tmp.{os.getpid()}")
     try:
         with open(tmp_path, "w") as fh:
             json.dump(payload, fh, indent=2, sort_keys=True)
         tmp_path.replace(manifest_path)
     finally:
-        # If replace() succeeded the tmp file no longer exists (renamed);
-        # on failure we want to clean up to avoid littering the pool dir.
         if tmp_path.exists():
             tmp_path.unlink()
     return manifest_path
 
 
-def load_pool_manifest(pool_dir: Path | str) -> dict | None:
-    """Load ``pool_manifest.json`` from a pool dir, or None if absent.
+def load_pool_manifest(pool_dir: Path | str, kind: str) -> dict | None:
+    """Load ``{pool_dir}/{kind}/pool_manifest.json``, or None if absent.
 
-    Pre-#23 pools have no manifest — parquets carry the full param set
-    inline, so callers treat None as "no fallback needed".
+    Pre-subpool-v2 pools (legacy ``{pool_dir}/pool_manifest.json`` at the
+    pool root, schema ``thin-v1``) are not migrated — the local-eval
+    rollout (D6) is a hard cutover; older pools must be re-simulated.
     """
-    pool_dir = Path(pool_dir)
-    manifest_path = pool_dir / POOL_MANIFEST_FILENAME
+    manifest_path = subpool_dir(pool_dir, kind) / POOL_MANIFEST_FILENAME
     if not manifest_path.exists():
         return None
     with open(manifest_path) as fh:

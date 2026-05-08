@@ -52,6 +52,18 @@ from typing import TYPE_CHECKING, Literal, Mapping, Optional, Union
 
 import numpy as np
 
+from qsp_hpc.cpp.batch_runner import (
+    POOL_MANIFEST_FILENAME as SUBPOOL_MANIFEST_FILENAME,
+)
+from qsp_hpc.cpp.batch_runner import (
+    POOL_MANIFEST_SCHEMA as SUBPOOL_MANIFEST_SCHEMA,
+)
+from qsp_hpc.cpp.batch_runner import (
+    SUBPOOL_KINDS as _VALID_KINDS,
+)
+from qsp_hpc.cpp.batch_runner import (
+    subpool_dir,
+)
 from qsp_hpc.simulation.theta_pool import get_theta_pool
 
 if TYPE_CHECKING:
@@ -61,9 +73,6 @@ logger = logging.getLogger(__name__)
 
 
 SUBPOOL_KIND = Literal["training", "ppc"]
-SUBPOOL_MANIFEST_FILENAME = "pool_manifest.json"
-SUBPOOL_MANIFEST_SCHEMA = "subpool-v1"
-_VALID_KINDS: tuple[str, ...] = ("training", "ppc")
 
 
 class _HoldFlocks:
@@ -372,8 +381,8 @@ class HPCSession:
         # against the same pool set.
         lock_paths: list[Path] = []
         for pool_dir in self._scenario_pool_dirs:
-            for sub in _VALID_KINDS:
-                sub_dir = pool_dir / sub
+            for kind_name in _VALID_KINDS:
+                sub_dir = subpool_dir(pool_dir, kind_name)
                 sub_dir.mkdir(parents=True, exist_ok=True)
                 lock_path = sub_dir / ".pool_manifest.lock"
                 if not lock_path.exists():
@@ -415,8 +424,8 @@ class HPCSession:
         """Scan registered pools' training/+ppc/ manifests for max end."""
         max_end = 0
         for pool_dir in self._scenario_pool_dirs:
-            for sub in _VALID_KINDS:
-                manifest_path = pool_dir / sub / SUBPOOL_MANIFEST_FILENAME
+            for kind_name in _VALID_KINDS:
+                manifest_path = subpool_dir(pool_dir, kind_name) / SUBPOOL_MANIFEST_FILENAME
                 if not manifest_path.exists():
                     continue
                 try:
@@ -452,7 +461,7 @@ class HPCSession:
         across all registered pools. Atomic rename keeps any concurrent
         lock-free reader from observing a partial JSON.
         """
-        sub_dir = pool_dir / kind
+        sub_dir = subpool_dir(pool_dir, kind)
         sub_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = sub_dir / SUBPOOL_MANIFEST_FILENAME
 

@@ -461,7 +461,10 @@ class CppSimulator:
         # can resolve non-sampled template defaults without each parquet
         # carrying every one as a broadcast column. Idempotent — reused
         # across every batch into this pool.
-        write_pool_manifest(self.pool_dir, self._runner.template_defaults, self.param_names)
+        # Sub-pool layout (3b.i): training rows live under {pool_id}/training/.
+        write_pool_manifest(
+            self.pool_dir, "training", self._runner.template_defaults, self.param_names
+        )
 
         self._runner.run(
             theta_matrix=theta_new,
@@ -1168,7 +1171,11 @@ class CppSimulator:
         # template defaults (e.g. parameters referenced by a calibration
         # target but not varied by the priors CSV). Without it, those
         # targets silently NaN out.
-        write_pool_manifest(suffix_pool_dir, self._runner.template_defaults, self.param_names)
+        # 3b.i: kind="training" here is a placeholder — the legacy suffix-pool
+        # PPC path is wholly replaced by the {pool_id}/ppc/ sub-pool in 3b.iv.
+        write_pool_manifest(
+            suffix_pool_dir, "training", self._runner.template_defaults, self.param_names
+        )
 
         self._runner.run(
             theta_matrix=theta,

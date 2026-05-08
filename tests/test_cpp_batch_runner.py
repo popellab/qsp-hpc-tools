@@ -252,7 +252,8 @@ def test_batch_runner_writes_only_sampled_param_columns(
 
 def test_write_pool_manifest_round_trip(tmp_path: Path):
     """write_pool_manifest is idempotent (concurrent array tasks safe);
-    load_pool_manifest round-trips the content."""
+    load_pool_manifest round-trips the content under the kind sub-pool
+    (subpool-v2)."""
     from qsp_hpc.cpp.batch_runner import (
         POOL_MANIFEST_FILENAME,
         POOL_MANIFEST_SCHEMA,
@@ -262,18 +263,62 @@ def test_write_pool_manifest_round_trip(tmp_path: Path):
 
     defaults = {"A": 1.5, "B": 2.0, "C": 3.14}
     sampled = ["A"]
-    path = write_pool_manifest(tmp_path / "pool", defaults, sampled)
+    path = write_pool_manifest(tmp_path / "pool", "training", defaults, sampled)
     assert path.name == POOL_MANIFEST_FILENAME
-    loaded = load_pool_manifest(tmp_path / "pool")
+    assert path.parent.name == "training"
+    loaded = load_pool_manifest(tmp_path / "pool", "training")
     assert loaded["schema_version"] == POOL_MANIFEST_SCHEMA
+    assert loaded["kind"] == "training"
     assert loaded["template_defaults"] == defaults
     assert loaded["sampled_params"] == sampled
+    assert loaded["reservations"] == []
+    # ppc sub-pool is independent — round-trip there is unaffected.
+    assert load_pool_manifest(tmp_path / "pool", "ppc") is None
 
     # Idempotent: second call doesn't overwrite. Concurrent array tasks
     # all racing to write the manifest produce one consistent file.
-    write_pool_manifest(tmp_path / "pool", {"A": 999.0}, [])
-    loaded2 = load_pool_manifest(tmp_path / "pool")
+    write_pool_manifest(tmp_path / "pool", "training", {"A": 999.0}, [])
+    loaded2 = load_pool_manifest(tmp_path / "pool", "training")
     assert loaded2["template_defaults"] == defaults
+
+
+def test_write_pool_manifest_preserves_reservations(tmp_path: Path):
+    """When HPCSession.reserve_sample_index_range has already written the
+    sub-pool manifest with a reservations array, the SLURM-side
+    write_pool_manifest call must merge in template_defaults +
+    sampled_params without clobbering reservations (3b.i merge contract)."""
+    import json
+
+    from qsp_hpc.cpp.batch_runner import (
+        POOL_MANIFEST_FILENAME,
+        load_pool_manifest,
+        subpool_dir,
+        write_pool_manifest,
+    )
+
+    pool_dir = tmp_path / "pool"
+    sub = subpool_dir(pool_dir, "training")
+    sub.mkdir(parents=True)
+    seeded = {
+        "schema_version": "subpool-v2",
+        "kind": "training",
+        "reservations": [{"start": 0, "end": 100, "ts": "2026-05-07T00:00:00+00:00"}],
+    }
+    (sub / POOL_MANIFEST_FILENAME).write_text(json.dumps(seeded))
+
+    write_pool_manifest(pool_dir, "training", {"A": 1.5, "B": 2.0}, ["A"])
+
+    loaded = load_pool_manifest(pool_dir, "training")
+    assert loaded["reservations"] == seeded["reservations"]
+    assert loaded["template_defaults"] == {"A": 1.5, "B": 2.0}
+    assert loaded["sampled_params"] == ["A"]
+
+
+def test_write_pool_manifest_rejects_unknown_kind(tmp_path: Path):
+    from qsp_hpc.cpp.batch_runner import write_pool_manifest
+
+    with pytest.raises(ValueError):
+        write_pool_manifest(tmp_path / "pool", "bogus", {"A": 1.0}, ["A"])
 
 
 def _manifest_race_writer(args: tuple) -> int:
@@ -291,7 +336,7 @@ def _manifest_race_writer(args: tuple) -> int:
     defaults = {f"k_{i}": float(seed + i) for i in range(200)}
     sampled = [f"k_{i}" for i in range(10)]
     try:
-        write_pool_manifest(pool_dir, defaults, sampled)
+        write_pool_manifest(pool_dir, "training", defaults, sampled)
         return 0
     except Exception as e:
         print(f"writer {seed} failed: {type(e).__name__}: {e}")
@@ -321,25 +366,25 @@ def test_write_pool_manifest_concurrent_writers(tmp_path: Path):
 
     assert all(rc == 0 for rc in rcs), f"some writers failed: {rcs}"
 
-    # Exactly one manifest; no tmp residue.
-    assert (pool_dir / "pool_manifest.json").exists()
-    residue = sorted(pool_dir.glob("pool_manifest.json.tmp*"))
+    # Exactly one manifest under the training/ sub-pool; no tmp residue.
+    sub_dir = pool_dir / "training"
+    assert (sub_dir / "pool_manifest.json").exists()
+    residue = sorted(sub_dir.glob("pool_manifest.json.tmp*"))
     assert residue == [], f"tmp files not cleaned up: {residue}"
 
-    loaded = load_pool_manifest(pool_dir)
+    loaded = load_pool_manifest(pool_dir, "training")
     assert "template_defaults" in loaded
     assert len(loaded["template_defaults"]) == 200
 
 
 def test_load_pool_manifest_missing_returns_none(tmp_path: Path):
-    """Pre-#23 pools have no manifest; readers treat None as 'no
-    fallback needed' and look only at parquet columns (which carry
-    the full param set in the wide layout)."""
+    """Empty / unwritten sub-pools return None (subpool-v2; D6 hard cutover
+    means legacy {pool_dir}/pool_manifest.json is not migrated)."""
     from qsp_hpc.cpp.batch_runner import load_pool_manifest
 
-    assert load_pool_manifest(tmp_path / "nonexistent") is None
+    assert load_pool_manifest(tmp_path / "nonexistent", "training") is None
     (tmp_path / "empty").mkdir()
-    assert load_pool_manifest(tmp_path / "empty") is None
+    assert load_pool_manifest(tmp_path / "empty", "training") is None
 
 
 def test_batch_runner_all_fail_raises(tmp_path: Path, template_path: Path):

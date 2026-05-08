@@ -499,7 +499,10 @@ def main():
     # manifest is what cal-target functions fall back to when they ask
     # for one. Pre-#23 pools have no manifest — the parquet columns
     # still cover everything, so None is a safe default.
-    pool_manifest = load_pool_manifest(simulation_pool_dir)
+    # 3b.i: training-side manifest moved into the {pool_id}/training/
+    # sub-pool. derive_test_stats_worker is queued for removal once the
+    # local observable-eval rollout (steps 3b.ii / 3b.v) lands.
+    pool_manifest = load_pool_manifest(simulation_pool_dir, "training")
     template_defaults: dict[str, float] | None = None
     if pool_manifest is not None:
         template_defaults = {

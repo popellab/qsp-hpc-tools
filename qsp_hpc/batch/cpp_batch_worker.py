@@ -186,7 +186,9 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # the second+ writers no-op. Defaults come from the XML template the
     # CppBatchRunner probed at init time, so the snapshot always matches
     # the binary this submission ran against.
-    write_pool_manifest(pool_dir, runner.template_defaults, param_names)
+    # 3b.i: training-side SLURM workers write into {pool_id}/training/.
+    # The PPC path (kind="ppc") lands in 3b.iv via simulate_with_parameters.
+    write_pool_manifest(pool_dir, "training", runner.template_defaults, param_names)
 
     result = runner.run(
         theta_matrix=theta_chunk,

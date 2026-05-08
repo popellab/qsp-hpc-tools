@@ -161,6 +161,36 @@ class MultiScenarioRunner:
         self.job_manager.ensure_cpp_binary()
         self._session_prepared = True
 
+    def upload_shared_model_structure(self) -> Optional[str]:
+        """Upload model_structure.json once and return the remote path.
+
+        Returns None when no simulator carries a model_structure_file.
+        Same fall-back semantics as :meth:`upload_shared_healthy_state`:
+        only hoist when every simulator agrees on the same local path;
+        otherwise let the per-pool upload happen.
+        """
+        if getattr(self, "_shared_model_structure_remote", None) is not None:
+            return self._shared_model_structure_remote
+
+        local_paths = {
+            getattr(sim, "model_structure_file", None) for sim in self.simulators.values()
+        }
+        local_paths.discard(None)
+        if len(local_paths) != 1:
+            logger.info(
+                "MSR.upload_shared_model_structure: simulators don't agree on a single "
+                "model_structure.json (%s) — falling back to per-pool upload",
+                local_paths,
+            )
+            self._shared_model_structure_remote = None
+            return None
+
+        local = next(iter(local_paths))
+        self._shared_model_structure_remote = self.job_manager.upload_shared_model_structure(
+            str(local)
+        )
+        return self._shared_model_structure_remote
+
     def upload_shared_healthy_state(self) -> Optional[str]:
         """Upload the healthy_state YAML once and return the remote path.
 
@@ -208,6 +238,7 @@ class MultiScenarioRunner:
         self.prepare_session()
         shared_remote = self.upload_shared_samples_csv(n)
         shared_healthy_remote = self.upload_shared_healthy_state()
+        shared_model_structure_remote = self.upload_shared_model_structure()
 
         results: Dict[str, ScenarioResult] = {}
         for name, sim in self.simulators.items():
@@ -216,6 +247,7 @@ class MultiScenarioRunner:
                 n,
                 samples_csv_remote=shared_remote,
                 healthy_state_yaml_remote=shared_healthy_remote,
+                model_structure_remote=shared_model_structure_remote,
                 skip_setup=True,
             )
             sample_index_scen = (

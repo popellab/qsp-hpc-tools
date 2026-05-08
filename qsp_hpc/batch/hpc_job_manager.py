@@ -991,6 +991,7 @@ class HPCJobManager:
         skip_setup: bool = False,
         samples_csv_remote: Optional[str] = None,
         healthy_state_yaml_remote: Optional[str] = None,
+        model_structure_remote: Optional[str] = None,
         samples_start_offset: int = 0,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
@@ -1326,6 +1327,7 @@ class HPCJobManager:
                 model_structure_file=model_structure_file,
                 dependency=f"afterok:{derive_dep_id}",
                 skip_setup=skip_setup,
+                model_structure_remote=model_structure_remote,
             )
             job_ids.append(derive_job_id)
 
@@ -1725,6 +1727,40 @@ class HPCJobManager:
         remote_path = f"{remote_input_dir}/{remote_filename}"
         self.transport.upload(str(local), remote_path)
         self.logger.debug("Shared healthy_state YAML uploaded: %s", remote_path)
+        return remote_path
+
+    def upload_shared_model_structure(
+        self, model_structure_file: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload model_structure.json to a non-pool-scoped shared remote path.
+
+        ``model_structure.json`` describes species metadata (names,
+        units, compartments) — the same JSON across every scenario in a
+        multi-scenario sweep. Uploading it once per session and pointing
+        every derivation submit at the shared path saves an upload per
+        scenario. Callers thread the returned path into
+        :meth:`submit_derivation_job` via ``model_structure_remote=``.
+
+        Args:
+            model_structure_file: Local path to model_structure.json.
+            remote_filename: Filename under ``batch_jobs/input/``; defaults
+                to a content-hash-stamped name so two runners with
+                byte-identical JSON share the upload.
+        """
+        import hashlib
+        import shlex as _shlex
+
+        local = Path(model_structure_file)
+        if not local.exists():
+            raise FileNotFoundError(f"model_structure.json not found: {local}")
+        if remote_filename is None:
+            content_hash = hashlib.sha256(local.read_bytes()).hexdigest()[:12]
+            remote_filename = f"model_structure_shared_{content_hash}.json"
+        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
+        self.transport.exec(f"mkdir -p {_shlex.quote(remote_input_dir)}")
+        remote_path = f"{remote_input_dir}/{remote_filename}"
+        self.transport.upload(str(local), remote_path)
+        self.logger.debug("Shared model_structure JSON uploaded: %s", remote_path)
         return remote_path
 
     def _upload_parameter_csv(
@@ -2235,6 +2271,7 @@ class HPCJobManager:
         num_simulations: Optional[int] = None,
         dependency: Optional[str] = None,
         skip_setup: bool = False,
+        model_structure_remote: Optional[str] = None,
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -2278,9 +2315,15 @@ class HPCJobManager:
         self.logger.info("Uploading test statistics CSV to HPC...")
         self.transport.upload(test_stats_csv, remote_test_stats_csv)
 
-        # Upload species units file if provided
-        remote_model_structure_file = None
-        if model_structure_file:
+        # Upload species units file. Hoisted: if model_structure_remote
+        # was uploaded once at session level (via
+        # upload_shared_model_structure), reference that path instead of
+        # re-uploading per scenario. model_structure.json describes
+        # species (units, compartments) — same across scenarios.
+        remote_model_structure_file: Optional[str] = None
+        if model_structure_remote:
+            remote_model_structure_file = model_structure_remote
+        elif model_structure_file:
             remote_model_structure_file = f"{derivation_dir}/model_structure.json"
             self.logger.info("Uploading model structure file to HPC...")
             self.transport.upload(model_structure_file, remote_model_structure_file)

@@ -475,6 +475,47 @@ class TestSubmitCppJobs:
         # params.csv now also lives under the per-pool input dir.
         assert cfg["param_csv"].endswith("/batch_jobs/input/pool/params.csv")
 
+    def test_samples_csv_remote_skips_upload_and_overrides_param_csv(self, tmp_path):
+        """``samples_csv_remote=`` lets a caller hoist the upload above
+        the per-scenario loop. With it set, submit_cpp_jobs must:
+          (a) skip the per-pool params.csv upload,
+          (b) write the supplied remote path into cpp_job_config.json's
+              param_csv field instead of the per-pool default.
+        Used by the local-eval pattern (every scenario gets the same
+        theta slice, one upload at session setup).
+        """
+        import json as _json
+
+        manager, transport = self._make_manager()
+
+        csv = tmp_path / "params.csv"
+        csv.write_text("sample_index,A\n0,1.0\n1,2.0\n")
+
+        captured: dict = {}
+
+        def capture(local, remote):
+            if "cpp_job_config.json" in remote:
+                with open(local) as f:
+                    captured["config"] = _json.load(f)
+
+        transport.upload.side_effect = capture
+
+        shared_remote = "/hpc/batch_jobs/input/_shared_samples_abc.csv"
+        manager.submit_cpp_jobs(
+            samples_csv=str(csv),
+            num_simulations=2,
+            simulation_pool_id="pool",
+            skip_sync=True,
+            samples_csv_remote=shared_remote,
+        )
+
+        # Per-pool params.csv upload is skipped.
+        upload_dests = [call.args[1] for call in transport.upload.call_args_list]
+        assert not any(d.endswith("/batch_jobs/input/pool/params.csv") for d in upload_dests)
+
+        # Worker config points at the shared remote samples path.
+        assert captured["config"]["param_csv"] == shared_remote
+
     def test_submit_cpp_jobs_concurrent_pool_scoped_uploads(self, tmp_path):
         """#48 regression: parallel submit_cpp_jobs() calls for different
         simulation_pool_ids must land in distinct remote dirs, so an

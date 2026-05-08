@@ -273,7 +273,7 @@ class CppSimulator:
         folded in so restricted and unrestricted pools (sharing all
         other config) get distinct on-disk pool dirs.
         """
-        from qsp_hpc.utils.hash_utils import compute_pool_id_hash
+        from qsp_hpc.utils.hash_utils import compute_pool_id_hash_legacy as compute_pool_id_hash
 
         base_hash = compute_pool_id_hash(
             priors_csv=self.priors_csv,

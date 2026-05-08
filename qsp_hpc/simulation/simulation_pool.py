@@ -193,7 +193,7 @@ class SimulationPoolManager:
         ``model_version`` was retired from the hash in #56 (the human-
         readable directory prefix still uses it).
         """
-        from qsp_hpc.utils.hash_utils import compute_pool_id_hash
+        from qsp_hpc.utils.hash_utils import compute_pool_id_hash_legacy as compute_pool_id_hash
 
         return compute_pool_id_hash(
             priors_csv=self.priors_csv,

@@ -1822,7 +1822,7 @@ class QSPSimulator:
         expected another — silently writing new simulations to a pool that
         downstream loaders couldn't find.
         """
-        from qsp_hpc.utils.hash_utils import compute_pool_id_hash
+        from qsp_hpc.utils.hash_utils import compute_pool_id_hash_legacy as compute_pool_id_hash
 
         return compute_pool_id_hash(
             priors_csv=self.priors_csv,

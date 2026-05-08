@@ -14,6 +14,79 @@ from typing import Any, Dict, Optional, Union
 
 
 def compute_pool_id_hash(
+    *,
+    binary_path: Union[str, Path],
+    scenario_yaml: Union[str, Path],
+    priors_csv: Union[str, Path, None] = None,
+    submodel_priors_yaml: Union[str, Path, None] = None,
+    seed: Union[int, None] = None,
+    restriction_classifier_dir: Union[str, Path, None] = None,
+    restriction_threshold: Union[float, None] = None,
+    classifier_feature_fills: Union[Dict[str, float], None] = None,
+) -> str:
+    """Hash the inputs that genuinely change ``f(theta) -> outputs``,
+    including everything that determines which θ ends up at each
+    ``sample_index`` row of the theta pool.
+
+    Returns the full sha256 hex digest. Components folded in (each
+    separated by a labeled tag so insertion order changes don't quietly
+    collide):
+
+    - ``binary_path`` bytes — captures sim semantics (qsp-codegen
+      produces byte-deterministic binaries since ``fdd81d5``; #56).
+    - ``scenario_yaml`` content — drug regimen / initial conditions /
+      stop time. Edits change ``f(theta)``.
+    - ``priors_csv`` content — distributions + parameter ordering.
+    - ``submodel_priors_yaml`` content — composite copula prior.
+    - ``seed`` — theta-pool RNG seed.
+    - ``restriction_classifier_dir`` (path bytes), ``restriction_threshold``,
+      ``classifier_feature_fills`` — rejection-sampling configuration.
+      Different filter settings produce different θ at the same
+      sample_index, so they belong in the pool key.
+
+    Top-up safety: the previous (binary, scenario_yaml) only hash
+    silently mixed θ rows from incompatible runs when the priors / seed
+    / classifier changed. The widened hash forces a fresh pool dir
+    whenever any θ-pool determinant changes, so
+    :func:`existing_sample_indices` can never see a sample_index that
+    was simulated under a different θ than the current run's
+    theta_pool[sample_index].
+
+    The ``priors_*`` / ``seed`` / ``restriction_*`` args are optional
+    so legacy MATLAB-side callers (which don't carry that context)
+    still get a stable hash. New C++ callers should pass them all.
+    """
+    h = hashlib.sha256()
+    h.update(b"|binary|")
+    h.update(Path(binary_path).read_bytes())
+    h.update(b"|scenario|")
+    h.update(Path(scenario_yaml).read_text().encode("utf-8"))
+    if priors_csv is not None:
+        h.update(b"|priors|")
+        h.update(Path(priors_csv).read_text().encode("utf-8"))
+    if submodel_priors_yaml is not None:
+        smp = Path(submodel_priors_yaml)
+        if smp.exists():
+            h.update(b"|submodel_priors|")
+            h.update(smp.read_text().encode("utf-8"))
+    if seed is not None:
+        h.update(b"|seed|")
+        h.update(f"{int(seed)}".encode("utf-8"))
+    if restriction_classifier_dir is not None:
+        h.update(b"|restriction_dir|")
+        h.update(str(Path(restriction_classifier_dir).resolve()).encode("utf-8"))
+    if restriction_threshold is not None:
+        h.update(b"|restriction_threshold|")
+        h.update(f"{float(restriction_threshold):.6f}".encode("utf-8"))
+    if classifier_feature_fills:
+        # Sort so dict-insertion-order doesn't perturb the hash.
+        h.update(b"|classifier_feature_fills|")
+        for name in sorted(classifier_feature_fills):
+            h.update(f"{name}={float(classifier_feature_fills[name]):.10g};".encode("utf-8"))
+    return h.hexdigest()
+
+
+def compute_pool_id_hash_legacy(
     priors_csv: Union[str, Path],
     model_script: str,
     submodel_priors_yaml: Optional[Union[str, Path]] = None,

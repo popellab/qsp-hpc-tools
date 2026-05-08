@@ -890,6 +890,7 @@ class CppSimulator:
                 model_structure_file=(
                     str(self.model_structure_file) if self.model_structure_file else None
                 ),
+                skip_setup=skip_setup,
             )
             self.logger.info(f"Derivation job: {derive_id}")
             self._wait_for_jobs([derive_id])

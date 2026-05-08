@@ -1314,6 +1314,7 @@ class HPCJobManager:
                 test_stats_hash=test_stats_hash,
                 model_structure_file=model_structure_file,
                 dependency=f"afterok:{derive_dep_id}",
+                skip_setup=skip_setup,
             )
             job_ids.append(derive_job_id)
 
@@ -2180,6 +2181,7 @@ class HPCJobManager:
         model_structure_file: Optional[str] = None,
         num_simulations: Optional[int] = None,
         dependency: Optional[str] = None,
+        skip_setup: bool = False,
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -2206,8 +2208,11 @@ class HPCJobManager:
         self.logger.info(f"  Pool: {pool_path}")
         self.logger.info(f"  Test stats hash: {test_stats_hash[:8]}...")
 
-        # Ensure Python venv is set up
-        self.ensure_hpc_venv()
+        # Ensure Python venv is set up. Skipped when caller (e.g.
+        # MultiScenarioRunner.prepare_session) already configured the
+        # session venv — re-running pip install is ~10s of pure waste.
+        if not skip_setup:
+            self.ensure_hpc_venv()
 
         # Create persistent directory for derivation inputs (in batch_jobs)
         derivation_dir = f"{self.config.remote_project_path}/batch_jobs/derivation"

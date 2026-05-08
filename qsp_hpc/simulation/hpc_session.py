@@ -41,10 +41,14 @@ contract that cross-scenario alignment relies on.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import json
 import logging
+import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Literal, Mapping, Optional, Union
 
 import numpy as np
 
@@ -54,6 +58,43 @@ if TYPE_CHECKING:
     from qsp_hpc.batch.hpc_job_manager import HPCJobManager
 
 logger = logging.getLogger(__name__)
+
+
+SUBPOOL_KIND = Literal["training", "ppc"]
+SUBPOOL_MANIFEST_FILENAME = "pool_manifest.json"
+SUBPOOL_MANIFEST_SCHEMA = "subpool-v1"
+_VALID_KINDS: tuple[str, ...] = ("training", "ppc")
+
+
+class _HoldFlocks:
+    """Context manager: acquire ``LOCK_EX`` on a list of paths, sorted.
+
+    Used by :meth:`HPCSession.reserve_sample_index_range` to make the
+    session-global scan+allocate+broadcast cycle atomic across every
+    registered pool's training/ + ppc/ sub-pool. Sorted-path acquisition
+    order prevents deadlock between concurrent sessions touching
+    overlapping pool sets.
+    """
+
+    def __init__(self, paths: list[Path]):
+        self._paths = list(paths)
+        self._fhs: list = []
+
+    def __enter__(self):
+        for p in self._paths:
+            fh = open(p, "r+")
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            self._fhs.append(fh)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for fh in reversed(self._fhs):
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                fh.close()
+        self._fhs.clear()
+        return False
 
 
 class HPCSession:
@@ -111,6 +152,22 @@ class HPCSession:
         # array, larger n triggers a fresh draw (which the underlying
         # get_theta_pool will load from on-disk cache when available).
         self._theta_pool_cache: Optional[tuple[int, np.ndarray]] = None
+
+        # Registered scenario pool dirs (D1: one pool per scenario). Each
+        # call to ``reserve_sample_index_range`` broadcasts the allocated
+        # range into every registered pool's ``{kind}/pool_manifest.json``.
+        # Insertion-ordered for deterministic test output.
+        self._scenario_pool_dirs: dict[Path, None] = {}
+
+        # Session-global high-watermark for sample_index allocation. None
+        # until first reservation, when we scan all registered pools'
+        # training/ + ppc/ manifests for the max end_exclusive seen and
+        # cache it. Subsequent reservations bump it locally without
+        # rescanning (D1: per-pool flock guarantees that concurrent
+        # sessions can't drift below their own cached watermark; if a
+        # sibling session writes a higher value while we hold the lock,
+        # the next reservation in that session re-derives from disk).
+        self._sample_index_watermark: Optional[int] = None
 
     # --------------------------------------------------------------
     # Setup: idempotent, runs once per session
@@ -223,6 +280,211 @@ class HPCSession:
         )
         self._theta_pool_cache = (n, theta)
         return theta
+
+    # --------------------------------------------------------------
+    # Sample-index range allocator (D1)
+    # --------------------------------------------------------------
+
+    def register_scenario_pool(self, pool_dir: Union[str, Path]) -> Path:
+        """Track a scenario pool dir for sample-index reservation broadcasts.
+
+        :meth:`reserve_sample_index_range` writes the allocated range
+        into ``{pool_dir}/{kind}/pool_manifest.json`` for every
+        registered pool. Idempotent: re-registering the same path is a
+        no-op. Pool dir is created if absent (sub-pool dirs are
+        materialized lazily on first reservation).
+
+        Once :meth:`reserve_sample_index_range` has run, the in-memory
+        watermark is locked in. Registering a *new* pool after that
+        invalidates the watermark — the next reservation rescans, since
+        the new pool's existing reservations may sit above the old
+        max.
+        """
+        pd = Path(pool_dir).resolve()
+        pd.mkdir(parents=True, exist_ok=True)
+        if pd not in self._scenario_pool_dirs:
+            self._scenario_pool_dirs[pd] = None
+            # Force a rescan on next reservation — the new pool may carry
+            # reservations from a previous session that we haven't
+            # accounted for in our cached watermark.
+            self._sample_index_watermark = None
+            logger.debug("HPCSession: registered scenario pool %s", pd)
+        return pd
+
+    @property
+    def registered_pool_dirs(self) -> tuple[Path, ...]:
+        return tuple(self._scenario_pool_dirs)
+
+    def reserve_sample_index_range(
+        self,
+        n: int,
+        *,
+        kind: SUBPOOL_KIND,
+    ) -> tuple[int, int]:
+        """Allocate ``[start, end)`` and broadcast to registered pools.
+
+        Session-global allocator (D1, Option A). The same range is
+        written into every registered scenario pool's
+        ``{kind}/pool_manifest.json`` so cross-scenario alignment can
+        rely on ``sample_index`` ≡ theta-index. Concurrent sessions
+        colliding on the same pool serialize on a per-pool fcntl flock
+        during the reservation-append.
+
+        Args:
+            n: Range size. Must be > 0.
+            kind: ``"training"`` or ``"ppc"``. Selects the sub-pool
+                manifest file to write into. The watermark is shared
+                across kinds (a sample_index allocated to ``training``
+                is consumed for the whole session — PPC won't reuse
+                it).
+
+        Returns:
+            ``(start, end_exclusive)`` with ``end_exclusive == start + n``.
+
+        Raises:
+            RuntimeError: If :meth:`ensure_remote` hasn't run, or no
+                scenario pools are registered.
+            ValueError: For non-positive ``n`` or unknown ``kind``.
+        """
+        if not self._ensured:
+            raise RuntimeError(
+                "HPCSession.reserve_sample_index_range: call ensure_remote() "
+                "first (the (prior, seed) -> theta_at_sample_index "
+                "determinism contract is set up there)."
+            )
+        if kind not in _VALID_KINDS:
+            raise ValueError(
+                f"reserve_sample_index_range: kind must be one of " f"{_VALID_KINDS}; got {kind!r}"
+            )
+        if not isinstance(n, int) or n <= 0:
+            raise ValueError(f"reserve_sample_index_range: n must be a positive int; got {n!r}")
+        if not self._scenario_pool_dirs:
+            raise RuntimeError(
+                "HPCSession.reserve_sample_index_range: no scenario pools "
+                "registered. Call register_scenario_pool(pool_dir) for each "
+                "scenario before reserving a range."
+            )
+
+        # Materialize sub-pool dirs + lockfiles for both kinds (the scan
+        # needs to read both kinds; the append writes only the requested
+        # one). Holding all locks atomically across scan+write is what
+        # makes session-global allocation safe under concurrent writers
+        # against the same pool set.
+        lock_paths: list[Path] = []
+        for pool_dir in self._scenario_pool_dirs:
+            for sub in _VALID_KINDS:
+                sub_dir = pool_dir / sub
+                sub_dir.mkdir(parents=True, exist_ok=True)
+                lock_path = sub_dir / ".pool_manifest.lock"
+                if not lock_path.exists():
+                    lock_path.touch()
+                lock_paths.append(lock_path)
+        # Sorted path order prevents deadlock between concurrent
+        # broadcasters touching overlapping pool sets.
+        lock_paths.sort()
+
+        with _HoldFlocks(lock_paths):
+            # Rescan under the lock — the cached watermark is best-effort
+            # for the no-contention case, but a sibling session may have
+            # written between our last scan and this reservation. Trust
+            # disk inside the lock.
+            disk_watermark = self._scan_high_watermark()
+            cached = self._sample_index_watermark or 0
+            start = int(max(disk_watermark, cached))
+            end = start + int(n)
+            ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            for pool_dir in self._scenario_pool_dirs:
+                self._append_reservation(
+                    pool_dir=pool_dir,
+                    kind=kind,
+                    start=start,
+                    end=end,
+                    ts=ts,
+                )
+            self._sample_index_watermark = end
+        logger.info(
+            "HPCSession: reserved sample_index [%d, %d) kind=%s across %d pool(s)",
+            start,
+            end,
+            kind,
+            len(self._scenario_pool_dirs),
+        )
+        return start, end
+
+    def _scan_high_watermark(self) -> int:
+        """Scan registered pools' training/+ppc/ manifests for max end."""
+        max_end = 0
+        for pool_dir in self._scenario_pool_dirs:
+            for sub in _VALID_KINDS:
+                manifest_path = pool_dir / sub / SUBPOOL_MANIFEST_FILENAME
+                if not manifest_path.exists():
+                    continue
+                try:
+                    with open(manifest_path) as fh:
+                        payload = json.load(fh)
+                except (OSError, json.JSONDecodeError) as exc:
+                    logger.warning(
+                        "HPCSession: skipping unreadable manifest %s (%s)",
+                        manifest_path,
+                        exc,
+                    )
+                    continue
+                for r in payload.get("reservations", []):
+                    end = int(r.get("end", 0))
+                    if end > max_end:
+                        max_end = end
+        return max_end
+
+    @staticmethod
+    def _append_reservation(
+        *,
+        pool_dir: Path,
+        kind: str,
+        start: int,
+        end: int,
+        ts: str,
+    ) -> None:
+        """Append a reservation entry to ``{pool_dir}/{kind}/pool_manifest.json``.
+
+        Caller is responsible for holding the per-sub-pool flock during
+        this write — :meth:`reserve_sample_index_range` does so via
+        :func:`_HoldFlocks` so the scan+broadcast cycle is atomic
+        across all registered pools. Atomic rename keeps any concurrent
+        lock-free reader from observing a partial JSON.
+        """
+        sub_dir = pool_dir / kind
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = sub_dir / SUBPOOL_MANIFEST_FILENAME
+
+        if manifest_path.exists():
+            with open(manifest_path) as fh:
+                payload = json.load(fh)
+        else:
+            payload = {
+                "schema_version": SUBPOOL_MANIFEST_SCHEMA,
+                "kind": kind,
+                "reservations": [],
+            }
+        if payload.get("kind", kind) != kind:
+            raise RuntimeError(
+                f"HPCSession: manifest at {manifest_path} declares "
+                f"kind={payload.get('kind')!r} but reservation "
+                f"requested kind={kind!r}"
+            )
+        payload.setdefault("reservations", []).append(
+            {"start": int(start), "end": int(end), "ts": ts}
+        )
+        payload.setdefault("schema_version", SUBPOOL_MANIFEST_SCHEMA)
+        payload.setdefault("kind", kind)
+
+        tmp_path = manifest_path.with_suffix(f".json.tmp.{os.getpid()}")
+        try:
+            with open(tmp_path, "w") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+            tmp_path.replace(manifest_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     # --------------------------------------------------------------
     # Per-scenario run: scaffold only, plan steps 3-5 fill this in

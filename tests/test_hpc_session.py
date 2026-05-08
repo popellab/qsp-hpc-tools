@@ -9,13 +9,19 @@ on ``sample_theta_pool``, and the run_scenario sentinel.
 
 from __future__ import annotations
 
+import json
+import multiprocessing as mp
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
-from qsp_hpc.simulation.hpc_session import HPCSession
+from qsp_hpc.simulation.hpc_session import (
+    SUBPOOL_MANIFEST_FILENAME,
+    SUBPOOL_MANIFEST_SCHEMA,
+    HPCSession,
+)
 
 PRIORS_CSV = """\
 name,distribution,dist_param1,dist_param2
@@ -149,6 +155,211 @@ def test_sample_theta_pool_detects_priors_drift(session_inputs):
 
     with pytest.raises(RuntimeError, match="priors_csv .* has changed"):
         s.sample_theta_pool(4)
+
+
+# ---------------------------------------------------------------------------
+# run_scenario: scaffold sentinel
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# reserve_sample_index_range: session-global allocator (D1)
+# ---------------------------------------------------------------------------
+
+
+def _read_manifest(pool_dir: Path, kind: str) -> dict:
+    return json.loads((pool_dir / kind / SUBPOOL_MANIFEST_FILENAME).read_text())
+
+
+def test_reserve_requires_ensure_remote(session_inputs, tmp_path):
+    binary, priors, jm = session_inputs
+    s = _make_session(binary, priors, jm)
+    s.register_scenario_pool(tmp_path / "pool_A")
+    with pytest.raises(RuntimeError, match="ensure_remote"):
+        s.reserve_sample_index_range(10, kind="training")
+
+
+def test_reserve_requires_registered_pool(session_inputs):
+    binary, priors, jm = session_inputs
+    s = _make_session(binary, priors, jm)
+    s.ensure_remote()
+    with pytest.raises(RuntimeError, match="no scenario pools"):
+        s.reserve_sample_index_range(10, kind="training")
+
+
+def test_reserve_rejects_bad_kind(session_inputs, tmp_path):
+    binary, priors, jm = session_inputs
+    s = _make_session(binary, priors, jm)
+    s.ensure_remote()
+    s.register_scenario_pool(tmp_path / "pool_A")
+    with pytest.raises(ValueError, match="kind must be"):
+        s.reserve_sample_index_range(10, kind="bogus")
+
+
+def test_reserve_rejects_bad_n(session_inputs, tmp_path):
+    binary, priors, jm = session_inputs
+    s = _make_session(binary, priors, jm)
+    s.ensure_remote()
+    s.register_scenario_pool(tmp_path / "pool_A")
+    with pytest.raises(ValueError, match="positive int"):
+        s.reserve_sample_index_range(0, kind="training")
+    with pytest.raises(ValueError, match="positive int"):
+        s.reserve_sample_index_range(-5, kind="training")
+
+
+def test_reserve_writes_manifest_for_single_scenario(session_inputs, tmp_path):
+    binary, priors, jm = session_inputs
+    s = _make_session(binary, priors, jm)
+    s.ensure_remote()
+    pool = s.register_scenario_pool(tmp_path / "pool_A")
+
+    start, end = s.reserve_sample_index_range(100, kind="training")
+
+    assert (start, end) == (0, 100)
+    manifest = _read_manifest(pool, "training")
+    assert manifest["schema_version"] == SUBPOOL_MANIFEST_SCHEMA
+    assert manifest["kind"] == "training"
+    assert manifest["reservations"] == [
+        {"start": 0, "end": 100, "ts": manifest["reservations"][0]["ts"]}
+    ]
+    # PPC sub-pool is untouched.
+    assert not (pool / "ppc" / SUBPOOL_MANIFEST_FILENAME).exists()
+
+
+def test_reserve_consecutive_calls_are_non_overlapping(session_inputs, tmp_path):
+    binary, priors, jm = session_inputs
+    s = _make_session(binary, priors, jm)
+    s.ensure_remote()
+    pool = s.register_scenario_pool(tmp_path / "pool_A")
+
+    r1 = s.reserve_sample_index_range(50, kind="training")
+    r2 = s.reserve_sample_index_range(75, kind="training")
+    r3 = s.reserve_sample_index_range(20, kind="ppc")
+
+    assert r1 == (0, 50)
+    assert r2 == (50, 125)
+    assert r3 == (125, 145)
+
+    training = _read_manifest(pool, "training")
+    ppc = _read_manifest(pool, "ppc")
+    assert [(r["start"], r["end"]) for r in training["reservations"]] == [(0, 50), (50, 125)]
+    assert [(r["start"], r["end"]) for r in ppc["reservations"]] == [(125, 145)]
+
+
+def test_reserve_broadcasts_to_all_registered_pools(session_inputs, tmp_path):
+    binary, priors, jm = session_inputs
+    s = _make_session(binary, priors, jm)
+    s.ensure_remote()
+    pool_a = s.register_scenario_pool(tmp_path / "pool_A")
+    pool_b = s.register_scenario_pool(tmp_path / "pool_B")
+
+    start, end = s.reserve_sample_index_range(40, kind="training")
+
+    assert (start, end) == (0, 40)
+    for pool in (pool_a, pool_b):
+        m = _read_manifest(pool, "training")
+        assert [(r["start"], r["end"]) for r in m["reservations"]] == [(0, 40)]
+
+
+def test_reserve_rescans_when_new_pool_registered(session_inputs, tmp_path):
+    binary, priors, jm = session_inputs
+    s = _make_session(binary, priors, jm)
+    s.ensure_remote()
+
+    # Pre-existing pool with reservations from a previous session.
+    pool_b = tmp_path / "pool_B"
+    (pool_b / "training").mkdir(parents=True)
+    (pool_b / "training" / SUBPOOL_MANIFEST_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": SUBPOOL_MANIFEST_SCHEMA,
+                "kind": "training",
+                "reservations": [{"start": 0, "end": 1000, "ts": "2026-05-01T00:00:00+00:00"}],
+            }
+        )
+    )
+
+    s.register_scenario_pool(tmp_path / "pool_A")
+    r1 = s.reserve_sample_index_range(10, kind="training")
+    assert r1 == (0, 10)  # only pool_A registered, no prior reservations
+
+    # Registering pool_B should invalidate the cached watermark and force
+    # a rescan that picks up the 1000-end reservation.
+    s.register_scenario_pool(pool_b)
+    r2 = s.reserve_sample_index_range(20, kind="training")
+    assert r2 == (1000, 1020)
+
+
+def test_reserve_picks_up_disk_watermark_from_ppc(session_inputs, tmp_path):
+    binary, priors, jm = session_inputs
+    s = _make_session(binary, priors, jm)
+    s.ensure_remote()
+
+    pool = tmp_path / "pool_A"
+    (pool / "ppc").mkdir(parents=True)
+    (pool / "ppc" / SUBPOOL_MANIFEST_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": SUBPOOL_MANIFEST_SCHEMA,
+                "kind": "ppc",
+                "reservations": [{"start": 0, "end": 500, "ts": "x"}],
+            }
+        )
+    )
+    s.register_scenario_pool(pool)
+
+    # Watermark spans both kinds — training reservation must start at 500.
+    start, end = s.reserve_sample_index_range(50, kind="training")
+    assert (start, end) == (500, 550)
+
+
+def _worker_reserve(args):
+    binary_str, priors_str, pool_str, n = args
+    s = HPCSession(
+        binary_path=Path(binary_str),
+        priors_csv=Path(priors_str),
+        job_manager=MagicMock(),
+        seed=42,
+        theta_pool_size=8,
+        theta_pool_cache_dir=Path(binary_str).parent / "theta_cache",
+    )
+    s.ensure_remote()
+    s.register_scenario_pool(Path(pool_str))
+    return s.reserve_sample_index_range(n, kind="training")
+
+
+def test_reserve_flock_serializes_concurrent_writers(session_inputs, tmp_path):
+    """Two processes hitting the same pool dir produce non-overlapping ranges.
+
+    Each process scans the high-watermark before its own append, so under
+    flock the second writer sees the first's manifest and starts past it.
+    Without flock, both would see watermark=0 and write overlapping ranges.
+    """
+    binary, priors, jm = session_inputs
+    pool = tmp_path / "pool_A"
+
+    # Run two writers in parallel against the same pool dir.
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(2) as pp:
+        results = pp.map(
+            _worker_reserve,
+            [
+                (str(binary), str(priors), str(pool), 100),
+                (str(binary), str(priors), str(pool), 200),
+            ],
+        )
+
+    # The two ranges must be disjoint and cover [0, 300) in some order.
+    ranges = sorted(results)
+    assert len(ranges) == 2
+    sizes = sorted([end - start for start, end in ranges])
+    assert sizes == [100, 200]
+    assert ranges[0][0] == 0
+    assert ranges[0][1] == ranges[1][0]
+    assert ranges[1][1] == 300
+
+    manifest = _read_manifest(pool, "training")
+    assert len(manifest["reservations"]) == 2
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ read returns" — applies only when the helper opens its own
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import pyarrow as pa
@@ -41,13 +42,33 @@ _TRAJECTORY_SUFFIX = ".trajectory.parquet"
 
 def _list_trajectory_chunks(filesystem: Any, remote_pool_path: str) -> list[str]:
     """Return the absolute paths of all ``*.trajectory.parquet`` chunks
-    directly under ``remote_pool_path`` (non-recursive).
+    under ``remote_pool_path``.
+
+    The C++ batch worker writes chunks one level deep under per-batch
+    subdirs (``batch_<timestamp>_<scenario>_<seed>/chunk_NNN.trajectory.parquet``),
+    so the lookup walks one level into ``batch_*/`` in addition to
+    matching files at the top level (kept as a fallback for layouts
+    that flatten the batch dir).
 
     Uses :meth:`fsspec.AbstractFileSystem.ls`; both ``sshfs.SSHFileSystem``
     and ``fsspec.implementations.local.LocalFileSystem`` honor that API.
     """
-    entries = filesystem.ls(remote_pool_path, detail=False)
-    return sorted(p for p in entries if str(p).endswith(_TRAJECTORY_SUFFIX))
+    found: list[str] = []
+    top = filesystem.ls(remote_pool_path, detail=True)
+    for entry in top:
+        path = entry.get("name") if isinstance(entry, dict) else entry
+        kind = entry.get("type") if isinstance(entry, dict) else None
+        if path is None:
+            continue
+        if str(path).endswith(_TRAJECTORY_SUFFIX):
+            found.append(str(path))
+            continue
+        # Walk one level into batch_*/ subdirs.
+        if kind == "directory" and Path(str(path)).name.startswith("batch_"):
+            for sub in filesystem.ls(str(path), detail=False):
+                if str(sub).endswith(_TRAJECTORY_SUFFIX):
+                    found.append(str(sub))
+    return sorted(found)
 
 
 def _open_default_sshfs(host: str, **sshfs_kwargs: Any) -> Any:

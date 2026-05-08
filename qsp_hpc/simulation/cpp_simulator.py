@@ -84,7 +84,7 @@ class CppSimulator:
         remote_binary_path: Optional[str] = None,
         remote_template_xml: Optional[str] = None,
         verbose: bool = False,
-        evolve_cache: bool = True,
+        evolve_cache: bool = False,
         evolve_cache_root: Optional[str | Path] = None,
         evolve_trajectory_dir: Optional[str | Path] = None,
         evolve_trajectory_dt_days: Optional[float] = None,

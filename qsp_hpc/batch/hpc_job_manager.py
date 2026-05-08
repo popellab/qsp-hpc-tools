@@ -986,7 +986,7 @@ class HPCJobManager:
         test_stats_csv: Optional[str] = None,
         test_stats_hash: Optional[str] = None,
         model_structure_file: Optional[str] = None,
-        evolve_cache: bool = True,
+        evolve_cache: bool = False,
         retry_missing_chunks: int = 0,
         skip_setup: bool = False,
         samples_csv_remote: Optional[str] = None,
@@ -1055,14 +1055,19 @@ class HPCJobManager:
                 ``derive_test_stats=True`` — without it the worker tags
                 every species as dimensionless and most calibration-target
                 ``.to('cell/mm**2')``-style conversions silently NaN out.
-            evolve_cache: When True (default) and ``healthy_state_yaml`` is
+            evolve_cache: When True and ``healthy_state_yaml`` is
                 set, each array task reuses a post-``evolve_to_diagnosis``
                 ODE state cache at
                 ``{simulation_pool_path}/evolve_cache/`` on scratch (M13).
-                Multi-scenario sweeps over the same theta amortize the
-                ~857-day evolve across scenarios: the first task builds
-                the QSTH blob under an ``fcntl`` lock, later tasks skip
-                evolve via ``--initial-state``. No effect when
+                Defaults to False — opt-in only. The LMDB-on-NFS path
+                has been a recurring source of SLURM-task hangs on the
+                MISS branch; production sweeps run the full evolve
+                inline (~10-15% wall-time hit at 50-task fan-out).
+                When enabled, multi-scenario sweeps over the same theta
+                amortize the ~857-day evolve across scenarios: the
+                first task builds the QSTH blob under an ``fcntl``
+                lock, later tasks skip evolve via ``--initial-state``.
+                No effect when
                 ``healthy_state_yaml`` is None (no evolve phase to cache).
             retry_missing_chunks: Max rounds of laptop-side sparse retry
                 (#29). 0 (default) fires array → derive and tolerates a

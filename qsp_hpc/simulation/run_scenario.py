@@ -95,7 +95,7 @@ def run_scenario(
     healthy_state_yaml: Optional[Union[str, Path]] = None,
     samples_csv_remote: Optional[str] = None,
     samples_csv_local: Optional[Union[str, Path]] = None,
-    evolve_cache: bool = True,
+    evolve_cache: bool = False,
     fetch_keep_local: bool = False,
     priors_csv: Optional[Union[str, Path]] = None,
     submodel_priors_yaml: Optional[Union[str, Path]] = None,
@@ -136,7 +136,8 @@ def run_scenario(
             returned remote path here.
         samples_csv_local: Optional local path for the samples CSV.
             Defaults to a tempfile that's deleted on return.
-        evolve_cache: Forward to ``submit_cpp_jobs``.
+        evolve_cache: Forward to ``submit_cpp_jobs``. Defaults to
+            False — see job manager docstring for rationale.
         fetch_keep_local: Pass-through to fetch_combined_trajectory.
 
     Returns:

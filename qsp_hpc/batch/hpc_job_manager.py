@@ -1618,7 +1618,7 @@ class HPCJobManager:
     def _wait_for_array_completion(
         self,
         array_id: str,
-        poll_s: float = 20.0,
+        poll_s: float = 5.0,
         timeout_s: Optional[float] = None,
     ) -> Dict[str, int]:
         """Block until ``array_id`` has no running/pending tasks.
@@ -1634,6 +1634,11 @@ class HPCJobManager:
         Each poll emits an INFO-level progress line so a tail of the
         run log shows the array draining in real time (matches the
         per-iteration cadence the legacy CppSimulator wait loop had).
+
+        Default ``poll_s=5`` assumes ControlMaster connection reuse
+        (each ``squeue`` round-trip ~0.1s rather than the ~2s of a
+        fresh ssh handshake). Without CM, raise to 20–30s to avoid
+        login-node load.
         """
         start = time.time()
         max_seen = 0

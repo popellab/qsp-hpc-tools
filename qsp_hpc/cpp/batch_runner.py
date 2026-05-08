@@ -35,7 +35,15 @@ from __future__ import annotations
 import json
 import logging
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+from concurrent.futures import (
+    BrokenExecutor,
+    ProcessPoolExecutor,
+    as_completed,
+)
+from concurrent.futures import (
+    TimeoutError as FuturesTimeoutError,
+)
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 STATUS_OK = 0
 STATUS_FAILED = 1
+STATUS_FUTURE_TIMEOUT = 2  # worker future never completed (pool broken / hung worker)
 
 
 POOL_MANIFEST_FILENAME = "pool_manifest.json"
@@ -258,6 +267,13 @@ def _run_one_in_worker(
     """
     assert _WORKER_RUNNER is not None, "_worker_init must be called first"
     assert _WORKER_WORKDIR is not None
+    _worker_t0 = time.time()
+    logging.getLogger(__name__).info(
+        "worker pid=%d start sim_id=%d sample_index=%d",
+        os.getpid(),
+        sim_id,
+        sample_index,
+    )
     try:
         # If the evolve cache is active, materialize the post-evolve state
         # for this theta (build-if-missing) and pass it to qsp_sim via
@@ -305,6 +321,14 @@ def _run_one_in_worker(
             # distinct theta this worker has seen.
             if evolve_state_path is not None:
                 Path(evolve_state_path).unlink(missing_ok=True)
+        logging.getLogger(__name__).info(
+            "worker pid=%d done  sim_id=%d sample_index=%d (%.2fs, n_times=%d)",
+            os.getpid(),
+            sim_id,
+            sample_index,
+            time.time() - _worker_t0,
+            int(result.trajectory.shape[0]) if result.trajectory is not None else 0,
+        )
         return (
             sim_id,
             STATUS_OK,
@@ -316,6 +340,14 @@ def _run_one_in_worker(
             None,
         )
     except (QspSimError, ParamNotFoundError) as e:
+        logging.getLogger(__name__).info(
+            "worker pid=%d FAIL sim_id=%d sample_index=%d (%.2fs): %s",
+            os.getpid(),
+            sim_id,
+            sample_index,
+            time.time() - _worker_t0,
+            str(e)[:120],
+        )
         return sim_id, STATUS_FAILED, None, None, None, None, None, str(e)
 
 
@@ -551,34 +583,128 @@ class CppBatchRunner:
             else:
                 _sample_idx = np.arange(n_sims, dtype=np.int64)
             futures = []
+            sim_id_to_sample_idx: dict = {}
             for i in range(n_sims):
                 params = {name: float(theta_matrix[i, j]) for j, name in enumerate(param_names)}
-                futures.append(
-                    pool.submit(
-                        _run_one_in_worker,
-                        i,
-                        int(_sample_idx[i]),
-                        params,
-                        t_end_days,
-                        min_cadence_hours,
-                        per_sim_timeout_s,
-                        traj_dir_str,
-                        effective_traj_dt,
-                    )
+                fut = pool.submit(
+                    _run_one_in_worker,
+                    i,
+                    int(_sample_idx[i]),
+                    params,
+                    t_end_days,
+                    min_cadence_hours,
+                    per_sim_timeout_s,
+                    traj_dir_str,
+                    effective_traj_dt,
                 )
-            for fut in as_completed(futures):
-                sim_id, status, traj, t_days, sp, comps, rules, err = fut.result()
-                statuses[sim_id] = status
-                if status == STATUS_OK:
-                    trajectories[sim_id] = traj
-                    time_arrays[sim_id] = t_days
-                    if species_names is None:
-                        species_names = sp
-                        compartment_names = comps or []
-                        rule_names = rules or []
-                else:
-                    errors[sim_id] = err
-                    logger.warning("sim %d failed: %s", sim_id, err)
+                futures.append(fut)
+                sim_id_to_sample_idx[id(fut)] = (i, int(_sample_idx[i]))
+
+            # Per-future wait timeout. Bound on top of per_sim_timeout_s
+            # so a worker process death (broken pool) doesn't hang
+            # as_completed forever — without this, a SIGSEGV-killed worker
+            # leaves its future unfulfilled and the main process waits on
+            # the SLURM time_limit. Slack added to absorb pickling /
+            # post-sim parquet-write time inside _run_one_in_worker.
+            future_wait_s = float(per_sim_timeout_s or 300.0) + 60.0
+            n_completed = 0
+            n_timeouts = 0
+            n_pool_broken = 0
+            broken_pool = False
+            try:
+                for fut in as_completed(futures, timeout=future_wait_s * (n_sims + 1)):
+                    try:
+                        sim_id, status, traj, t_days, sp, comps, rules, err = fut.result(
+                            timeout=future_wait_s,
+                        )
+                    except FuturesTimeoutError:
+                        # Future never completed within future_wait_s.
+                        # Worker may be hung in a kernel call (e.g.
+                        # blocked I/O on apopel1) or in C-level qsp_sim
+                        # that ignored its own timeout_s. Mark the sim
+                        # failed and continue.
+                        sid_pair = sim_id_to_sample_idx.get(id(fut))
+                        sid_str = (
+                            f"sim_id={sid_pair[0]} sample_index={sid_pair[1]}"
+                            if sid_pair
+                            else "(unknown sim)"
+                        )
+                        logger.warning(
+                            "Future-level timeout (%.0fs) on %s — worker may be hung; "
+                            "marking failed and continuing.",
+                            future_wait_s,
+                            sid_str,
+                        )
+                        n_timeouts += 1
+                        if sid_pair is not None:
+                            statuses[sid_pair[0]] = STATUS_FUTURE_TIMEOUT
+                            errors[sid_pair[0]] = f"future-level timeout after {future_wait_s:.0f}s"
+                        continue
+                    except BrokenExecutor as e:
+                        # Worker died (SIGSEGV / OOM / unhandled C++ abort). The
+                        # ProcessPoolExecutor flips to broken state; every other
+                        # future is now unfulfillable. Log + bail out so the
+                        # remaining futures don't sit in as_completed forever.
+                        logger.error(
+                            "ProcessPool broken: %s. %d/%d sims completed before "
+                            "the worker died. Remaining futures will not resolve; "
+                            "exiting the collection loop.",
+                            e,
+                            n_completed,
+                            n_sims,
+                        )
+                        n_pool_broken = 1
+                        broken_pool = True
+                        break
+
+                    n_completed += 1
+                    statuses[sim_id] = status
+                    if status == STATUS_OK:
+                        trajectories[sim_id] = traj
+                        time_arrays[sim_id] = t_days
+                        if species_names is None:
+                            species_names = sp
+                            compartment_names = comps or []
+                            rule_names = rules or []
+                    else:
+                        errors[sim_id] = err
+                        logger.warning("sim %d failed: %s", sim_id, err)
+
+                    # Heartbeat: log every 10% of n_sims so a hang
+                    # post-sim shows up as "stopped at 80%" not silence.
+                    every = max(1, n_sims // 10)
+                    if n_completed % every == 0 or n_completed == n_sims:
+                        logger.info(
+                            "Collected %d/%d sims (%d ok, %d failed, %d future-timeout)",
+                            n_completed,
+                            n_sims,
+                            sum(1 for s in statuses if s == STATUS_OK),
+                            sum(
+                                1
+                                for s in statuses
+                                if s not in (STATUS_OK, STATUS_FUTURE_TIMEOUT, None)
+                            ),
+                            n_timeouts,
+                        )
+            except FuturesTimeoutError:
+                logger.error(
+                    "as_completed-level timeout: %d/%d sims completed before the "
+                    "outer collector wait expired. Bailing out of the collection "
+                    "loop and proceeding with what we have.",
+                    n_completed,
+                    n_sims,
+                )
+                broken_pool = True
+
+            if broken_pool or n_timeouts:
+                logger.warning(
+                    "Collection loop summary: completed=%d, future_timeouts=%d, "
+                    "pool_broken=%d (out of %d sims).",
+                    n_completed,
+                    n_timeouts,
+                    n_pool_broken,
+                    n_sims,
+                )
 
         n_failed = sum(1 for s in statuses if s != STATUS_OK)
         if species_names is None:
@@ -603,6 +729,15 @@ class CppBatchRunner:
         first_ok = next(i for i, t in enumerate(trajectories) if t is not None)
         n_times = trajectories[first_ok].shape[0]
 
+        n_ok = sum(1 for s in statuses if s == STATUS_OK)
+        logger.info(
+            "Collection loop done: %d/%d ok. Writing batch parquet (this is the "
+            "step that lights up shared filesystem I/O — if the task hangs after "
+            "this log line, the parquet write is the suspect).",
+            n_ok,
+            n_sims,
+        )
+        _write_t0 = time.time()
         trajectory_path, params_path = _write_batch_parquet(
             output_path=output_path,
             theta_matrix=theta_matrix,
@@ -616,6 +751,10 @@ class CppBatchRunner:
             t_end_days=t_end_days,
             min_cadence_hours=min_cadence_hours,
             sample_indices=sample_indices,
+        )
+        logger.info(
+            "Batch parquet write done in %.1fs",
+            time.time() - _write_t0,
         )
 
         logger.info(

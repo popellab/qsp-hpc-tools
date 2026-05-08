@@ -811,6 +811,90 @@ def _write_batch_parquet(
     return trajectory_path, params_path
 
 
+def load_long_form_chunk_as_wide(
+    trajectory_path: Path,
+    params_path: Path,
+) -> "pd.DataFrame":  # noqa: F821 — pandas imported lazily
+    """Inverse of :func:`_write_batch_parquet`: read the long-form pair and
+    return the wide-form ``sim_df`` schema that
+    :func:`qsp_hpc.batch.derive_test_stats_worker.compute_test_statistics_batch`
+    expects.
+
+    Output columns: ``sample_index``, ``simulation_id``, ``status``, ``time``
+    (list[float] per row), one column per species/compartment/rule (also
+    list[float] per row), and ``param:<name>`` columns from the sidecar.
+
+    Bridge code: this exists so the local PPC path
+    (``CppSimulator._simulate_with_parameters_local``) and any other
+    consumer that hasn't been migrated to the long-form view can keep
+    working through the Layer 4 transition. Once observable evaluation
+    moves onto the runner via ``evaluate_targets_to_x``, this helper
+    can be deleted alongside ``derive_test_stats_worker``.
+
+    Failed sims (status != 0) keep their sidecar row but appear with empty
+    ``time`` and per-species lists, matching the legacy convention.
+    """
+    import pandas as pd
+
+    params_df = pd.read_parquet(params_path)
+    traj_table = pq.read_table(trajectory_path)
+
+    # Decode the dictionary-encoded `species` column once. The value
+    # column is plain float64; sample_index/time too.
+    species_arr = traj_table.column("species").to_pylist()
+    sample_idx_arr = traj_table.column("sample_index").to_numpy()
+    time_arr = traj_table.column("time").to_numpy()
+    value_arr = traj_table.column("value").to_numpy()
+
+    species_names = [s for s in dict.fromkeys(species_arr).keys()]
+
+    # Group rows by sample_index → species → ordered (time, value).
+    # Within a chunk all (sample, species) entries share the same
+    # per-sim time vector (the writer iterates n_cols against one
+    # t_arr per sim), so we extract one time vector per sample_index.
+    per_sample: dict[int, dict[str, list[float]]] = {}
+    per_sample_time: dict[int, list[float]] = {}
+
+    # Single pass: bucket into per-sample dicts. This is O(N) and
+    # avoids the O(N²) sort-then-groupby pandas path.
+    for sidx_raw, sp, t, v in zip(sample_idx_arr, species_arr, time_arr, value_arr):
+        sidx = int(sidx_raw)
+        bucket = per_sample.setdefault(sidx, {})
+        lst = bucket.setdefault(sp, [])
+        lst.append(float(v))
+        if sp == species_names[0]:
+            per_sample_time.setdefault(sidx, []).append(float(t))
+
+    # Build wide-form rows in params_df order.
+    out: dict[str, list] = {
+        "sample_index": [],
+        "simulation_id": [],
+        "status": [],
+        "time": [],
+    }
+    for sp in species_names:
+        out[sp] = []
+    param_cols = [c for c in params_df.columns if c.startswith("param:")]
+    for c in param_cols:
+        out[c] = []
+
+    for _, prow in params_df.iterrows():
+        sidx = int(prow["sample_index"])
+        out["sample_index"].append(sidx)
+        out["simulation_id"].append(
+            int(prow["simulation_id"]) if "simulation_id" in params_df.columns else sidx
+        )
+        out["status"].append(int(prow["status"]) if "status" in params_df.columns else 0)
+        sp_data = per_sample.get(sidx, {})
+        out["time"].append(per_sample_time.get(sidx, []))
+        for sp in species_names:
+            out[sp].append(sp_data.get(sp, []))
+        for c in param_cols:
+            out[c].append(float(prow[c]))
+
+    return pd.DataFrame(out)
+
+
 def batch_filename(
     batch_index: int,
     n_sims: int,

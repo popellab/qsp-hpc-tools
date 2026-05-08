@@ -1055,7 +1055,7 @@ class CppSimulator:
         # targets silently NaN out.
         write_pool_manifest(self.pool_dir, "ppc", self._runner.template_defaults, self.param_names)
 
-        self._runner.run(
+        result = self._runner.run(
             theta_matrix=theta,
             param_names=self.param_names,
             sample_indices=sample_indices,
@@ -1070,7 +1070,20 @@ class CppSimulator:
             evolve_trajectory_dt_days=evolve_trajectory_dt_days,
         )
 
-        species_df = pd.read_parquet(species_parquet)
+        # Long-form pair → wide-form for the legacy derive worker. This
+        # bridge stays until Layer 4 retires derive_test_stats_worker; see
+        # notes/architecture/local_observable_eval_plan.md.
+        from qsp_hpc.cpp.batch_runner import (
+            _derive_chunk_paths,
+            load_long_form_chunk_as_wide,
+        )
+
+        if result is not None and getattr(result, "trajectory_path", None) is not None:
+            trajectory_path = Path(result.trajectory_path)
+            params_path = Path(result.params_path)
+        else:
+            trajectory_path, params_path = _derive_chunk_paths(species_parquet)
+        species_df = load_long_form_chunk_as_wide(trajectory_path, params_path)
         return self._derive_test_stats_table(species_df, test_stats_df, theta, sample_indices)
 
     def _simulate_with_parameters_hpc(

@@ -899,44 +899,57 @@ def prediction_targets_dir(tmp_path: Path) -> Path:
 
 
 def _fake_run_factory(species=("spA", "spB")):
-    """Build a fake ``_runner.run`` that writes a synthetic parquet matching
-    the requested theta/param layout. Mirrors the helper the other
-    TestCall tests use but preserves the exact sample_indices handed in
-    (posterior-predictive needs row-level alignment)."""
+    """Build a fake ``_runner.run`` that writes the long-form parquet pair
+    (trajectory + params sidecar) matching CppBatchRunner's post-35d2703
+    schema. Preserves the exact sample_indices handed in (posterior-
+    predictive needs row-level alignment)."""
 
     def fake_run(**kwargs):
+        from qsp_hpc.cpp.batch_runner import _write_batch_parquet
+
         theta_matrix = kwargs["theta_matrix"]
         param_names = list(kwargs["param_names"])
-        output_path = kwargs["output_path"]
+        output_path = Path(kwargs["output_path"])
         sample_indices = kwargs.get("sample_indices")
 
         n_sims = theta_matrix.shape[0]
         n_times = 2
         dt = 0.1
-        time_rows = [(np.arange(n_times) * dt).tolist()] * n_sims
-        cols = {
-            "sample_index": pa.array(
-                np.asarray(sample_indices, dtype=np.int64)
-                if sample_indices is not None
-                else np.arange(n_sims, dtype=np.int64)
-            ),
-            "simulation_id": pa.array(np.arange(n_sims, dtype=np.int64)),
-            "status": pa.array(np.zeros(n_sims, dtype=np.int64)),
-            "time": pa.array(time_rows, type=pa.list_(pa.float64())),
-        }
-        for j, name in enumerate(param_names):
-            cols[f"param:{name}"] = pa.array(theta_matrix[:, j])
-        # Deterministic species: spA = row index, spB = 2 * row index
-        # so test stats can identify which row they came from.
-        for sp_idx, sp in enumerate(species):
-            trajectories = []
-            for i in range(n_sims):
+        # Per-sim trajectory: rows = timesteps, cols = species.
+        # Deterministic per-row values so test stats can identify the source row:
+        # spA[i] = i+1, spB[i] = 2*(i+1), with a +0.1 bump at t=dt.
+        trajectories: list[np.ndarray] = []
+        time_arrays: list[np.ndarray] = []
+        n_cols = len(species)
+        for i in range(n_sims):
+            traj = np.zeros((n_times, n_cols), dtype=np.float64)
+            for sp_idx, _sp in enumerate(species):
                 base = float(i + 1) * (1.0 if sp_idx == 0 else 2.0)
-                trajectories.append([base, base + 0.1])
-            cols[sp] = pa.array(trajectories, type=pa.list_(pa.float64()))
-        pq.write_table(pa.table(cols), str(output_path))
+                traj[0, sp_idx] = base
+                traj[1, sp_idx] = base + 0.1
+            trajectories.append(traj)
+            time_arrays.append(np.arange(n_times) * dt)
+
+        statuses = [0] * n_sims
+        trajectory_path, params_path = _write_batch_parquet(
+            output_path=output_path,
+            theta_matrix=theta_matrix,
+            param_names=param_names,
+            statuses=statuses,
+            trajectories=trajectories,
+            time_arrays=time_arrays,
+            species_names=list(species),
+            compartment_names=[],
+            rule_names=[],
+            t_end_days=float(n_times * dt),
+            min_cadence_hours=24.0 * dt,
+            sample_indices=(
+                np.asarray(sample_indices, dtype=np.int64) if sample_indices is not None else None
+            ),
+        )
         return BatchResult(
-            parquet_path=output_path,
+            trajectory_path=trajectory_path,
+            params_path=params_path,
             n_sims=n_sims,
             n_failed=0,
             species_names=list(species),
@@ -980,7 +993,6 @@ class TestSimulateWithParameters:
         with pytest.raises(ValueError, match="priors CSV has"):
             sim.simulate_with_parameters(np.zeros((3, 7)))
 
-    @_PENDING_LONG_FORM_FIXTURE
     def test_returns_table_with_named_ts_columns(
         self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
     ):
@@ -1010,7 +1022,6 @@ class TestSimulateWithParameters:
         ts_col = table.column("ts:spA_t0").to_numpy()
         np.testing.assert_allclose(ts_col, [1.0, 2.0, 3.0])
 
-    @_PENDING_LONG_FORM_FIXTURE
     def test_prediction_columns_appear(
         self,
         priors_csv,
@@ -1047,7 +1058,6 @@ class TestSimulateWithParameters:
             table.column("ts:spA_t0").to_numpy(),
         )
 
-    @_PENDING_LONG_FORM_FIXTURE
     def test_second_call_hits_cache_without_rerunning_sim(
         self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
     ):
@@ -1071,7 +1081,6 @@ class TestSimulateWithParameters:
             sim.simulate_with_parameters(theta)
             assert mock_run.call_count == 1
 
-    @_PENDING_LONG_FORM_FIXTURE
     def test_different_theta_produces_different_cache_dir(
         self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
     ):
@@ -1093,17 +1102,13 @@ class TestSimulateWithParameters:
             sim.simulate_with_parameters(theta_a)
             sim.simulate_with_parameters(theta_b)
             assert mock_run.call_count == 2
-        # Two suffix-pool dirs: the sibling pools carry the hashes.
-        siblings = [
-            p
-            for p in sim.pool_dir.parent.iterdir()
-            if p.is_dir()
-            and p.name.startswith(sim.pool_dir.name)
-            and "_posterior_predictive_" in p.name
-        ]
-        assert len(siblings) == 2
+        # 3b.iv: PPC writes land under {pool_id}/ppc/ with the per-call
+        # key_hash baked into the filename. Two distinct theta matrices →
+        # two distinct cache parquets.
+        ppc_dir = sim.pool_dir / "ppc"
+        cache_files = sorted(ppc_dir.glob("test_stats_posterior_predictive_*.parquet"))
+        assert len(cache_files) == 2
 
-    @_PENDING_LONG_FORM_FIXTURE
     def test_prediction_targets_edit_invalidates_cache(
         self,
         priors_csv,

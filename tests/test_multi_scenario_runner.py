@@ -129,7 +129,7 @@ class TestUploadSharedSamplesCsv:
 
 
 class TestRunAll:
-    def test_first_no_skip_setup_rest_skip(self, tmp_path):
+    def test_prepare_session_runs_once_then_all_scenarios_skip_setup(self, tmp_path):
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a")
         b = _fake_sim(job_manager=jm, pool_id="pool_b")
@@ -144,19 +144,39 @@ class TestRunAll:
         r = MultiScenarioRunner({"a": a, "b": b})
         results = r.run_all(1)
 
-        # First sim: skip_setup=False
+        # Session setup runs exactly once before any scenario.
+        assert jm.ensure_hpc_venv.call_count == 1
+        assert jm.ensure_cpp_binary.call_count == 1
+
+        # Both scenarios get skip_setup=True (setup already done above).
         a_kw = a.run_hpc.call_args.kwargs
-        assert a_kw["skip_setup"] is False
-        assert a_kw["samples_csv_remote"] == "/remote/shared.csv"
-        # Second sim: skip_setup=True
         b_kw = b.run_hpc.call_args.kwargs
+        assert a_kw["skip_setup"] is True
         assert b_kw["skip_setup"] is True
+        assert a_kw["samples_csv_remote"] == "/remote/shared.csv"
         assert b_kw["samples_csv_remote"] == "/remote/shared.csv"
 
         assert set(results) == {"a", "b"}
         for name, res in results.items():
             assert isinstance(res, ScenarioResult)
             assert res.pool_id == f"pool_{name}"
+
+    def test_prepare_session_idempotent(self, tmp_path):
+        jm = _fake_jm()
+        a = _fake_sim(job_manager=jm, pool_id="pool_a")
+        csv = tmp_path / "samples.csv"
+        csv.write_text("sample_index,k\n0,1\n")
+        a._write_params_csv.return_value = csv
+        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+
+        r = MultiScenarioRunner({"a": a})
+        r.prepare_session()
+        r.prepare_session()
+        r.run_all(1)
+        # ensure_* should still be called exactly once total.
+        assert jm.ensure_hpc_venv.call_count == 1
+        assert jm.ensure_cpp_binary.call_count == 1
 
     def test_sample_index_pulled_from_simulator(self, tmp_path):
         jm = _fake_jm()

@@ -144,34 +144,48 @@ class MultiScenarioRunner:
 
     # ---- core run_all ---------------------------------------------------
 
+    def prepare_session(self) -> None:
+        """Run the per-session HPC setup once: venv refresh + qsp-hpc-tools
+        upgrade + git fetch + cmake build. Decoupled from any scenario's
+        cache-tier resolution so scenarios that hit a local cache (and
+        never call submit_cpp_jobs) still leave the session in a state
+        where downstream skip_setup=True is safe.
+
+        Idempotent within a runner instance — re-running is a near-no-op
+        (incremental cmake on unchanged source).
+        """
+        if getattr(self, "_session_prepared", False):
+            return
+        logger.info("MSR: prepare_session — ensure_hpc_venv + ensure_cpp_binary")
+        self.job_manager.ensure_hpc_venv()
+        self.job_manager.ensure_cpp_binary()
+        self._session_prepared = True
+
     def run_all(self, n: int) -> Dict[str, ScenarioResult]:
         """Submit each scenario for ``n`` simulations against the shared
         theta pool, wait, return per-scenario ``(theta, x, sample_index)``.
 
         Strategy:
+        - Hoist :meth:`prepare_session` (venv + binary setup) before the
+          loop, then submit every scenario with ``skip_setup=True``.
+          Decouples HPC setup from any scenario's cache-tier resolution.
         - Hoist one ``upload_shared_samples_csv``.
-        - First scenario: full setup; rest: ``skip_setup=True``.
         - Each scenario internally tier-checks (local cache → HPC cache
           → derive → submit), so re-runs hit local cache and the runner
           is safely re-callable.
 
         Returns ``{name: ScenarioResult}`` in scenario-insertion order.
         """
+        self.prepare_session()
         shared_remote = self.upload_shared_samples_csv(n)
 
         results: Dict[str, ScenarioResult] = {}
-        first_done = False
         for name, sim in self.simulators.items():
-            logger.info(
-                "MSR: %s run_hpc(n=%d) (skip_setup=%s)",
-                name,
-                n,
-                first_done,
-            )
+            logger.info("MSR: %s run_hpc(n=%d, skip_setup=True)", name, n)
             theta_scen, x_scen = sim.run_hpc(
                 n,
                 samples_csv_remote=shared_remote,
-                skip_setup=first_done,
+                skip_setup=True,
             )
             sample_index_scen = (
                 np.asarray(sim.last_sample_index, dtype=np.int64)
@@ -187,7 +201,6 @@ class MultiScenarioRunner:
                     f"{self.job_manager.config.simulation_pool_path}/{sim.simulation_pool_id}"
                 ),
             )
-            first_done = True
         return results
 
     # ---- joint NaN filter (static) ---------------------------------------

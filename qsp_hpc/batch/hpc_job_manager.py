@@ -990,6 +990,7 @@ class HPCJobManager:
         evolve_cache: bool = True,
         retry_missing_chunks: int = 0,
         kind: str = "training",
+        skip_setup: bool = False,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
 
@@ -1141,12 +1142,20 @@ class HPCJobManager:
         with log_operation(self.logger, "Syncing codebase to HPC", log_start=not skip_sync):
             self.sync_codebase(skip_sync=skip_sync)
 
-        self.ensure_hpc_venv()
-        self.ensure_cpp_binary(
-            skip_git_pull=skip_git_pull,
-            skip_build=skip_build,
-            binary_path=binary_path,
-        )
+        # ``skip_setup`` is the HPCSession path's escape hatch:
+        # ``HPCSession.ensure_remote()`` already ran ensure_hpc_venv +
+        # ensure_cpp_binary once for the whole session, and re-running
+        # them per scenario costs ~30s of SSH round-trips that the
+        # local-eval rollout's Layer 2.5 was meant to factor out. Legacy
+        # CppSimulator callers leave skip_setup=False and pay the
+        # per-submit cost as before.
+        if not skip_setup:
+            self.ensure_hpc_venv()
+            self.ensure_cpp_binary(
+                skip_git_pull=skip_git_pull,
+                skip_build=skip_build,
+                binary_path=binary_path,
+            )
         # #48 follow-up: we deliberately do NOT call
         # _setup_remote_directories() here. Its historical behavior —
         # ``rm -rf`` then ``mkdir -p`` of batch_jobs/{input,output,scripts}

@@ -734,6 +734,10 @@ class HPCSession:
                 derive_test_stats=False,
                 evolve_cache=evolve_cache,
                 kind=kind,
+                # Layer 2.5: ensure_remote() already ran ensure_hpc_venv
+                # + ensure_cpp_binary once per session, so submit_cpp_jobs
+                # skips the redundant per-scenario re-ensure.
+                skip_setup=True,
             )
         finally:
             samples_csv.unlink(missing_ok=True)

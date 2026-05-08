@@ -137,6 +137,12 @@ class BatchConfig:
     # scp has no built-in timeout; a stale control socket can hang indefinitely.
     # Fail fast at 10 minutes so the retry loop can kick in instead.
     scp_timeout_s: int = 600
+    # SSH ControlMaster connection multiplexing. First ssh/scp call sets up
+    # a master socket under ~/.qsp_hpc_cm/cm-%C; subsequent calls reuse it
+    # and skip the ~1.5–2s handshake. ControlPersist=60s keeps the master
+    # alive between back-to-back commands. Disable for environments that
+    # ban multiplexing.
+    ssh_control_master: bool = True
 
 
 # Substrings observed in transient SSH/SCP failures against Rockfish login
@@ -275,6 +281,37 @@ class SSHTransport:
             return f"{self.config.ssh_user}@{self.config.ssh_host}"
         return self.config.ssh_host
 
+    def _control_master_opts(self) -> list[str]:
+        """OpenSSH ControlMaster options for connection multiplexing.
+
+        ControlMaster=auto opens a master socket on the first ssh/scp
+        call and routes subsequent calls through it, skipping the
+        ~1.5–2s TCP+TLS+key handshake. ControlPersist=60s keeps the
+        master alive a minute past the last child exit so back-to-back
+        commands within a session reuse the connection.
+
+        ``%C`` in ControlPath expands to a hash of (l,r,h,p,u) so
+        concurrent sessions to different hosts (or as different users)
+        don't fight over the same socket. A dedicated socket directory
+        under ``~/.qsp_hpc_cm/`` avoids colliding with the user's
+        global ssh config.
+
+        ``ssh_control_master=False`` in the BatchConfig disables this
+        for environments that ban multiplexing (rare).
+        """
+        if not getattr(self.config, "ssh_control_master", True):
+            return []
+        cm_dir = Path("~/.qsp_hpc_cm").expanduser()
+        cm_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return [
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPath={cm_dir}/cm-%C",
+            "-o",
+            "ControlPersist=60s",
+        ]
+
     def _warn_insecure_ssh(self):
         """Warn user once about disabled host key checking."""
         if not self._warned_about_host_key_checking and not self.config.strict_host_key_checking:
@@ -333,6 +370,7 @@ class SSHTransport:
                 "BatchMode=yes",
             ]
         )
+        ssh_cmd.extend(self._control_master_opts())
 
         ssh_cmd.append(self._build_ssh_target())
         ssh_cmd.append(command)
@@ -376,6 +414,7 @@ class SSHTransport:
                 f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
                 "-o",
                 "BatchMode=yes",
+                *self._control_master_opts(),
                 local_path,
                 remote_target,
             ]
@@ -417,6 +456,7 @@ class SSHTransport:
             [
                 "-o",
                 f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
+                *self._control_master_opts(),
                 remote_source,
                 local_dir,
             ]
@@ -674,14 +714,24 @@ class HPCJobManager:
         except Exception as exc:
             raise RuntimeError(f"SSH connection error: {exc}") from exc
 
-    def ensure_hpc_venv(self) -> None:
+    def ensure_hpc_venv(self, force: bool = False) -> None:
         """
         Ensure Python virtual environment is set up on HPC.
 
         Creates venv at configured hpc_venv_path if it doesn't exist and installs
         required packages for Parquet I/O and test statistics derivation.
+
+        Session memo: a successful call sets ``_session_venv_ready`` on
+        the manager; subsequent calls within the same instance no-op
+        unless ``force=True``. Saves the ~7s SSH-bound venv-check round
+        trip on every chained derivation submit / repeat caller. Defeat
+        with ``force=True`` (e.g. when a session may have wiped the
+        venv).
         """
-        return self.file_transfer.ensure_hpc_venv()
+        if not force and getattr(self, "_session_venv_ready", False):
+            return
+        self.file_transfer.ensure_hpc_venv()
+        self._session_venv_ready = True
 
     def ensure_cpp_binary(
         self,
@@ -690,6 +740,7 @@ class HPCJobManager:
         repo_path: Optional[str] = None,
         branch: Optional[str] = None,
         binary_path: Optional[str] = None,
+        force: bool = False,
     ) -> None:
         """Ensure the C++ qsp_sim binary on HPC is up-to-date with source.
 
@@ -698,6 +749,13 @@ class HPCJobManager:
         qsp_sim`` in the existing build directory. Incremental makes are
         near-zero cost when source is unchanged; a first build (or one after
         qsp_sim.cpp edits) pays the compile cost once.
+
+        Session memo: a successful call sets ``_session_cpp_binary_ready``
+        on the manager keyed by ``(repo_path, branch, binary_path)``;
+        subsequent calls with the same triple no-op unless ``force=True``.
+        Saves the 17–30s git-fetch + cmake step on every chained
+        derivation submit / repeat caller. Defeat with ``force=True``
+        when a session may have left source in a stale state.
 
         Args:
             skip_git_pull: Skip ``git fetch + checkout + pull``. Use when
@@ -728,6 +786,12 @@ class HPCJobManager:
                     "(path to the SPQSP_PDAC checkout on the HPC node)."
                 )
         branch = branch or self.config.cpp_branch
+
+        # Session memo: same (repo, branch, binary) triple already verified.
+        memo_key = (repo_path, branch, binary_path)
+        memo: Optional[set] = getattr(self, "_session_cpp_binary_ready", None)
+        if not force and memo is not None and memo_key in memo:
+            return
 
         build_modules = self.config.cpp_build_modules or self.config.cpp_runtime_modules
         module_prelude = (
@@ -847,6 +911,11 @@ class HPCJobManager:
                 f"Check cpp.binary_path / cpp.repo_path in credentials.yaml."
             )
         self.logger.info(f"  ✓ qsp_sim binary ready at {binary_path}")
+
+        if memo is None:
+            self._session_cpp_binary_ready = {memo_key}
+        else:
+            memo.add(memo_key)
 
     def sync_codebase(self, skip_sync: bool = False) -> None:
         """

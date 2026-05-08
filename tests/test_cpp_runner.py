@@ -1,8 +1,9 @@
 """Tests for qsp_hpc.cpp.runner.
 
 Unit tests use a synthetic binary file and a fake qsp_sim (shell script)
-so the suite runs without SPQSP_PDAC compiled. The integration test at
-the bottom runs the real qsp_sim if available.
+so the suite runs without a real qsp_sim build. The integration test at
+the bottom runs the real qsp_sim when QSP_SIM_BINARY +
+QSP_SIM_TEMPLATE + QSP_SIM_HEALTHY_YAML env vars are set.
 """
 
 from __future__ import annotations
@@ -330,24 +331,13 @@ def _real_binary_path() -> Path | None:
     env = os.environ.get("QSP_SIM_BINARY")
     if env and Path(env).exists():
         return Path(env)
-    here = Path(__file__).resolve().parent.parent
-    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        candidate = here.parent / sibling / "PDAC" / "qsp" / "sim" / "build" / "qsp_sim"
-        if candidate.exists():
-            return candidate
     return None
 
 
 def _real_template_path() -> Path | None:
-    env = os.environ.get("SPQSP_PDAC_ROOT")
-    if env:
-        c = Path(env) / "PDAC" / "sim" / "resource" / "param_all_test.xml"
-        return c if c.exists() else None
-    here = Path(__file__).resolve().parent.parent
-    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        c = here.parent / sibling / "PDAC" / "sim" / "resource" / "param_all_test.xml"
-        if c.exists():
-            return c
+    env = os.environ.get("QSP_SIM_TEMPLATE")
+    if env and Path(env).exists():
+        return Path(env)
     return None
 
 
@@ -662,11 +652,9 @@ def test_run_one_in_worker_skips_cache_when_traj_dir_set(tmp_path: Path, monkeyp
 
 
 def _real_healthy_yaml() -> Path | None:
-    here = Path(__file__).resolve().parent.parent
-    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        c = here.parent / sibling / "PDAC" / "sim" / "resource" / "healthy_state.yaml"
-        if c.exists():
-            return c
+    env = os.environ.get("QSP_SIM_HEALTHY_YAML")
+    if env and Path(env).exists():
+        return Path(env)
     return None
 
 

@@ -366,24 +366,13 @@ def _real_binary_path() -> Path | None:
     env = os.environ.get("QSP_SIM_BINARY")
     if env and Path(env).exists():
         return Path(env)
-    here = Path(__file__).resolve().parent.parent
-    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        candidate = here.parent / sibling / "PDAC" / "qsp" / "sim" / "build" / "qsp_sim"
-        if candidate.exists():
-            return candidate
     return None
 
 
 def _real_template_path() -> Path | None:
-    env = os.environ.get("SPQSP_PDAC_ROOT")
-    if env:
-        c = Path(env) / "PDAC" / "sim" / "resource" / "param_all_test.xml"
-        return c if c.exists() else None
-    here = Path(__file__).resolve().parent.parent
-    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        c = here.parent / sibling / "PDAC" / "sim" / "resource" / "param_all_test.xml"
-        if c.exists():
-            return c
+    env = os.environ.get("QSP_SIM_TEMPLATE")
+    if env and Path(env).exists():
+        return Path(env)
     return None
 
 

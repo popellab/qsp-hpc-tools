@@ -989,6 +989,7 @@ class HPCJobManager:
         evolve_cache: bool = True,
         retry_missing_chunks: int = 0,
         skip_setup: bool = False,
+        samples_csv_remote: Optional[str] = None,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
 
@@ -1219,8 +1220,14 @@ class HPCJobManager:
             healthy_state_yaml=remote_healthy,
             evolve_cache_root=evolve_cache_root,
             batch_subdir=batch_subdir,
+            samples_csv_remote=samples_csv_remote,
         )
-        self._upload_parameter_csv(samples_csv, simulation_pool_id=simulation_pool_id)
+        # ``samples_csv_remote`` lets the caller hoist the upload above
+        # the per-scenario loop when every scenario uses byte-identical
+        # theta (e.g. the local-eval pattern: shared theta_pool sliced
+        # the same way per scenario).
+        if not samples_csv_remote:
+            self._upload_parameter_csv(samples_csv, simulation_pool_id=simulation_pool_id)
 
         # #48: pool-scoped sbatch script + worker config so parallel
         # submissions for different scenarios don't overwrite each
@@ -1386,6 +1393,7 @@ class HPCJobManager:
         healthy_state_yaml: Optional[str] = None,
         evolve_cache_root: Optional[str] = None,
         batch_subdir: Optional[str] = None,
+        samples_csv_remote: Optional[str] = None,
     ) -> None:
         """Create and upload C++ job configuration JSON."""
         import json
@@ -1397,8 +1405,13 @@ class HPCJobManager:
             "template_path": template_path,
             "subtree": subtree,
             # #48: pool-scoped params path so concurrent scenarios don't
-            # overwrite each other's params.csv upload.
-            "param_csv": f"{pool_input_dir}/params.csv",
+            # overwrite each other's params.csv upload. Callers can
+            # override with a shared remote samples_csv (e.g. the local-eval
+            # rollout where every scenario uses byte-identical theta) by
+            # passing ``samples_csv_remote=<remote_path>``.
+            "param_csv": (
+                samples_csv_remote if samples_csv_remote else f"{pool_input_dir}/params.csv"
+            ),
             "n_simulations": num_simulations,
             "seed": seed,
             "jobs_per_chunk": jobs_per_chunk,
@@ -1615,6 +1628,35 @@ class HPCJobManager:
             sim_config,
             dosing,
         )
+
+    def upload_shared_samples_csv(self, csv_path: str, remote_filename: str) -> str:
+        """Upload a samples CSV to a non-pool-scoped shared remote path.
+
+        Writes to ``{remote_project_path}/batch_jobs/input/{remote_filename}``.
+        Returns the absolute remote path. Callers pass that path to
+        :meth:`submit_cpp_jobs` via ``samples_csv_remote=`` so the
+        per-scenario upload is skipped.
+
+        Used by the local-eval pattern where every scenario uses
+        byte-identical theta (shared ``theta_pool`` sliced the same way
+        per scenario): one upload at session setup, every per-scenario
+        ``submit_cpp_jobs`` call references the shared path.
+
+        Args:
+            csv_path: Local path to the samples CSV.
+            remote_filename: Filename to use under ``batch_jobs/input/``;
+                callers should keep this stable per session and unique
+                enough to avoid clobbering a sibling session's upload
+                (e.g. include a hash of the theta pool key).
+        """
+        import shlex as _shlex
+
+        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
+        self.transport.exec(f"mkdir -p {_shlex.quote(remote_input_dir)}")
+        remote_path = f"{remote_input_dir}/{remote_filename}"
+        self.transport.upload(csv_path, remote_path)
+        self.logger.debug("Shared samples CSV uploaded: %s", remote_path)
+        return remote_path
 
     def _upload_parameter_csv(
         self, csv_path: str, simulation_pool_id: Optional[str] = None

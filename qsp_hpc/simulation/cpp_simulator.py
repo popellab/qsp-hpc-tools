@@ -485,13 +485,19 @@ class CppSimulator:
         """
         return self.pool_dir.name
 
-    def _compute_test_stats_hash(self) -> str:
-        """SHA-256 of the test-stats CSV (matches QSPSimulator)."""
+    def _compute_test_stats_hash(self, aux_samples_csv: Optional[str] = None) -> str:
+        """SHA-256 of the test-stats CSV (+ aux samples CSV when present).
+
+        ``aux_samples_csv`` is folded in so two runs that share the
+        trajectory pool but disagree on aux draws (different RNG seed,
+        different aux declarations) get distinct derive-stage cache
+        keys. Sim pool key is unaffected; aux is purely derive-stage.
+        """
         if self.test_stats_csv is None:
             raise RuntimeError("test_stats_csv must be set to compute test_stats_hash")
         from qsp_hpc.utils.hash_utils import compute_test_stats_hash
 
-        return compute_test_stats_hash(self.test_stats_csv)
+        return compute_test_stats_hash(self.test_stats_csv, aux_samples_csv)
 
     def _local_test_stats_path(self, test_stats_hash: str) -> Path:
         """Where downloaded HPC test stats land locally.
@@ -788,6 +794,9 @@ class CppSimulator:
         scenario_yaml_remote: Optional[str] = None,
         drug_metadata_yaml_remote: Optional[str] = None,
         test_stats_csv_remote: Optional[str] = None,
+        aux_samples_csv: Optional[str] = None,
+        aux_samples_csv_remote: Optional[str] = None,
+        auxiliary_units: Optional[dict] = None,
         skip_setup: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Run ``n`` simulations through the 3-tier HPC cache.
@@ -850,7 +859,7 @@ class CppSimulator:
                 "and most cal-target unit conversions silently NaN out."
             )
 
-        test_stats_hash = self._compute_test_stats_hash()
+        test_stats_hash = self._compute_test_stats_hash(aux_samples_csv=aux_samples_csv)
         local_cache = self._local_test_stats_path(test_stats_hash)
 
         self.logger.info(f"HPC request: {n} simulations (scenario={self.scenario})")
@@ -916,6 +925,9 @@ class CppSimulator:
                 skip_setup=skip_setup,
                 model_structure_remote=model_structure_remote,
                 test_stats_csv_remote=test_stats_csv_remote,
+                aux_samples_csv=aux_samples_csv,
+                aux_samples_csv_remote=aux_samples_csv_remote,
+                auxiliary_units=auxiliary_units,
             )
             self.logger.info(f"Derivation job: {derive_id}")
             self._wait_for_jobs([derive_id])
@@ -986,6 +998,9 @@ class CppSimulator:
                 scenario_yaml_remote=scenario_yaml_remote,
                 drug_metadata_yaml_remote=drug_metadata_yaml_remote,
                 test_stats_csv_remote=test_stats_csv_remote,
+                aux_samples_csv=aux_samples_csv,
+                aux_samples_csv_remote=aux_samples_csv_remote,
+                auxiliary_units=auxiliary_units,
                 samples_start_offset=samples_start_offset,
                 skip_setup=skip_setup,
             )

@@ -1064,6 +1064,9 @@ class HPCJobManager:
         scenario_yaml_remote: Optional[str] = None,
         drug_metadata_yaml_remote: Optional[str] = None,
         test_stats_csv_remote: Optional[str] = None,
+        aux_samples_csv: Optional[str] = None,
+        aux_samples_csv_remote: Optional[str] = None,
+        auxiliary_units: Optional[dict] = None,
         samples_start_offset: int = 0,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
@@ -1411,6 +1414,9 @@ class HPCJobManager:
                 skip_setup=skip_setup,
                 model_structure_remote=model_structure_remote,
                 test_stats_csv_remote=test_stats_csv_remote,
+                aux_samples_csv=aux_samples_csv,
+                aux_samples_csv_remote=aux_samples_csv_remote,
+                auxiliary_units=auxiliary_units,
             )
             job_ids.append(derive_job_id)
 
@@ -1902,6 +1908,22 @@ class HPCJobManager:
         """
         return self._upload_shared_file(
             model_structure_file, "model_structure_shared", ".json", remote_filename
+        )
+
+    def upload_shared_aux_samples_csv(
+        self, aux_samples_csv: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload an auxiliary parameter samples CSV to a session-shared path.
+
+        Aux draws are sampled once by the inference orchestrator,
+        keyed on ``sample_index``, and shared across every scenario in
+        a sweep (since aux is a measurement-bridge concept, not a
+        scenario-specific perturbation). Skip-if-exists is content-keyed
+        via :meth:`_upload_shared_file`, so re-runs with identical aux
+        CSVs are one ``test -f`` round-trip per session.
+        """
+        return self._upload_shared_file(
+            aux_samples_csv, "aux_samples_shared", ".csv", remote_filename
         )
 
     def _upload_parameter_csv(
@@ -2414,6 +2436,9 @@ class HPCJobManager:
         skip_setup: bool = False,
         model_structure_remote: Optional[str] = None,
         test_stats_csv_remote: Optional[str] = None,
+        aux_samples_csv: Optional[str] = None,
+        aux_samples_csv_remote: Optional[str] = None,
+        auxiliary_units: Optional[dict] = None,
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -2490,6 +2515,19 @@ class HPCJobManager:
         else:
             n_batches = self._calculate_batches_needed(pool_path, num_simulations=None)
 
+        # Auxiliary samples sidecar: if a local path was provided and no
+        # session-shared remote was hoisted, upload per-derivation alongside
+        # the test_stats CSV. Otherwise reuse the hoisted remote path. The
+        # CSV is keyed on sample_index and joined into species_dict by the
+        # derive worker.
+        remote_aux_samples_csv: Optional[str] = None
+        if aux_samples_csv_remote:
+            remote_aux_samples_csv = aux_samples_csv_remote
+        elif aux_samples_csv:
+            remote_aux_samples_csv = f"{derivation_dir}/aux_samples_{test_stats_hash[:8]}.csv"
+            self.logger.info("Uploading aux samples CSV to HPC...")
+            self.transport.upload(aux_samples_csv, remote_aux_samples_csv)
+
         # Create derivation config JSON
         # Always derive ALL batches to handle incremental pool growth correctly.
         # Trying to derive only "first N batches" breaks when new batches are added
@@ -2501,6 +2539,8 @@ class HPCJobManager:
             "test_stats_hash": test_stats_hash,
             "model_structure_file": remote_model_structure_file,
             "max_batches": None,  # Always derive all batches
+            "aux_samples_csv": remote_aux_samples_csv,
+            "auxiliary_units": auxiliary_units or {},
         }
 
         # Write config locally then upload

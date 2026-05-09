@@ -133,13 +133,27 @@ def compute_pool_id_hash_legacy(
     return h.hexdigest()
 
 
-def compute_test_stats_hash(test_stats_csv: Union[str, Path]) -> str:
+def compute_test_stats_hash(
+    test_stats_csv: Union[str, Path],
+    aux_samples_csv: Union[str, Path, None] = None,
+) -> str:
     """Hash the test_stats CSV content (full sha256 hex).
 
     Used as the subdirectory name under ``{pool_dir}/test_stats/`` so multiple
     test_stats variants can share the same raw sim pool.
+
+    When ``aux_samples_csv`` is provided, its bytes are folded into the hash
+    so two runs that share trajectories but disagree on auxiliary draws
+    (different RNG seed, different aux declarations) get distinct
+    derive-stage cache keys. The trajectory pool is unchanged either way —
+    aux is a pure derive-stage concern.
     """
-    return hashlib.sha256(Path(test_stats_csv).read_text().encode("utf-8")).hexdigest()
+    hasher = hashlib.sha256()
+    hasher.update(Path(test_stats_csv).read_bytes())
+    if aux_samples_csv is not None:
+        hasher.update(b"\x00aux\x00")  # domain separator
+        hasher.update(Path(aux_samples_csv).read_bytes())
+    return hasher.hexdigest()
 
 
 def _safe_sort_key(entry: Dict[str, Any]) -> tuple:

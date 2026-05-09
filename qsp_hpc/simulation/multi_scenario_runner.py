@@ -85,6 +85,9 @@ class MultiScenarioRunner:
 
         self._shared_samples_remote: Optional[str] = None
         self._shared_samples_local: Optional[Path] = None
+        self._aux_samples_local: Optional[Path] = None
+        self._aux_samples_remote: Optional[str] = None
+        self._auxiliary_units: Optional[dict] = None
 
     def _validate_alignment(self) -> None:
         """Fail fast if simulators disagree on joint-inference invariants.
@@ -141,6 +144,50 @@ class MultiScenarioRunner:
             # mostly belt-and-braces).
             self._shared_samples_local = local_path
         return self._shared_samples_remote
+
+    def attach_auxiliary_samples(
+        self,
+        aux_samples_csv: str | Path,
+        auxiliary_units: dict,
+    ) -> None:
+        """Register a per-sim auxiliary-samples CSV for the session.
+
+        Aux draws are sampled once by the inference orchestrator, keyed
+        on ``sample_index``, and shared across every scenario in a
+        sweep (since aux is a measurement-bridge concept, not a
+        scenario-specific perturbation). When called before
+        :meth:`run_all`, the runner uploads the CSV via the
+        skip-if-exists shared-upload rail and threads its remote path
+        + ``auxiliary_units`` map into each scenario's
+        :meth:`CppSimulator.run_hpc` call.
+
+        Args:
+            aux_samples_csv: Local path to a CSV with one row per
+                ``sample_index``. Required columns: ``sample_index`` plus
+                one float column per auxiliary parameter.
+            auxiliary_units: ``{aux_name: pint-parseable units string}``.
+                The derive worker uses this to attach Pint units when
+                merging aux values into ``species_dict``.
+        """
+        self._aux_samples_local = Path(aux_samples_csv)
+        self._auxiliary_units = dict(auxiliary_units)
+
+    def upload_shared_aux_samples_csv(self) -> Optional[str]:
+        """Upload the registered aux samples CSV once and return remote path.
+
+        Returns None when no aux samples were attached. Idempotent within
+        a runner instance.
+        """
+        if self._aux_samples_local is None:
+            return None
+        if self._aux_samples_remote is not None:
+            return self._aux_samples_remote
+        content_hash = hashlib.sha256(self._aux_samples_local.read_bytes()).hexdigest()[:12]
+        remote_filename = f"aux_samples_shared_{content_hash}.csv"
+        self._aux_samples_remote = self.job_manager.upload_shared_aux_samples_csv(
+            str(self._aux_samples_local), remote_filename
+        )
+        return self._aux_samples_remote
 
     # ---- core run_all ---------------------------------------------------
 
@@ -276,6 +323,7 @@ class MultiScenarioRunner:
         shared_remote = self.upload_shared_samples_csv(n)
         shared_healthy_remote = self.upload_shared_healthy_state()
         shared_model_structure_remote = self.upload_shared_model_structure()
+        shared_aux_remote = self.upload_shared_aux_samples_csv()
         per_scen_remotes = self._preupload_per_scenario_files()
 
         results: Dict[str, ScenarioResult] = {}
@@ -289,6 +337,9 @@ class MultiScenarioRunner:
                 scenario_yaml_remote=per_scen_remotes[name]["scenario_yaml"],
                 drug_metadata_yaml_remote=per_scen_remotes[name]["drug_metadata_yaml"],
                 test_stats_csv_remote=per_scen_remotes[name]["test_stats_csv"],
+                aux_samples_csv=(str(self._aux_samples_local) if self._aux_samples_local else None),
+                aux_samples_csv_remote=shared_aux_remote,
+                auxiliary_units=self._auxiliary_units,
                 skip_setup=True,
             )
             sample_index_scen = (

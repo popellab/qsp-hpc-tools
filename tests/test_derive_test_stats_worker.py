@@ -496,6 +496,84 @@ class TestComputeTestStatisticsBatch:
         assert np.isnan(result[0, 0])
 
 
+class TestAuxiliaryParameterMerge:
+    """Per-sim auxiliary parameter draws merged into species_dict by sample_index."""
+
+    def test_aux_value_attached_with_units_and_consumed_by_wrapper(self):
+        # Wrapper that asks for an aux name in species_dict (matching what
+        # yaml_loader._generate_wrapper_code emits for aux-bearing targets).
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["aux_scaled"],
+                "required_species": ["V_T.C1, f_aux"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    f = species_dict['f_aux'].to('dimensionless').magnitude\n"
+                    "    return float(np.mean(species_dict['V_T.C1'].magnitude)) * f"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+
+        # Two sims with distinct sample_indices, distinct aux draws.
+        sim_df = pd.DataFrame(
+            {
+                "sample_index": [42, 17],
+                "simulation_id": [0, 1],
+                "status": [0, 0],
+                "time": [[0.0, 1.0], [0.0, 1.0]],
+                "V_T.C1": [[100.0, 100.0], [200.0, 200.0]],
+            }
+        )
+        species_units = {"V_T.C1": "cell"}
+        aux_by_sample_index = {42: {"f_aux": 0.25}, 17: {"f_aux": 4.0}}
+        auxiliary_units = {"f_aux": "dimensionless"}
+
+        result = compute_test_statistics_batch(
+            sim_df,
+            test_stats_df,
+            registry,
+            species_units,
+            aux_by_sample_index=aux_by_sample_index,
+            auxiliary_units=auxiliary_units,
+        )
+        assert result[0, 0] == pytest.approx(100.0 * 0.25)
+        assert result[1, 0] == pytest.approx(200.0 * 4.0)
+
+    def test_missing_sample_index_in_aux_map_yields_nan(self):
+        # A sample_index that doesn't appear in aux_by_sample_index leaves
+        # species_dict['f_aux'] absent, so the wrapper KeyErrors → NaN.
+        test_stats_df = pd.DataFrame(
+            {
+                "test_statistic_id": ["aux_scaled"],
+                "required_species": ["V_T.C1, f_aux"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict, ureg):\n"
+                    "    return float(species_dict['f_aux'].to('dimensionless').magnitude)"
+                ],
+            }
+        )
+        registry = build_test_stat_registry(test_stats_df)
+        sim_df = pd.DataFrame(
+            {
+                "sample_index": [99],
+                "simulation_id": [0],
+                "status": [0],
+                "time": [[0.0]],
+                "V_T.C1": [[1.0]],
+            }
+        )
+        result = compute_test_statistics_batch(
+            sim_df,
+            test_stats_df,
+            registry,
+            {"V_T.C1": "cell"},
+            aux_by_sample_index={42: {"f_aux": 0.25}},
+            auxiliary_units={"f_aux": "dimensionless"},
+        )
+        assert np.isnan(result[0, 0])
+
+
 class TestSharedSpeciesDictAcrossTestStats:
     """Regression tests for the 2026-04-20 loop-order refactor (swap sim/
     test-stat nesting, hoist unit parsing). These exercise invariants that

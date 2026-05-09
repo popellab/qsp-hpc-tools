@@ -124,6 +124,8 @@ def compute_test_statistics_batch(
     test_stat_registry: dict,
     species_units: dict,
     template_defaults: dict[str, float] | None = None,
+    aux_by_sample_index: dict[int, dict[str, float]] | None = None,
+    auxiliary_units: dict[str, str] | None = None,
 ) -> np.ndarray:
     """
     Compute test statistics for a batch of simulations.
@@ -172,6 +174,32 @@ def compute_test_statistics_batch(
 
     time_unit = ureg.day
 
+    def aux_by_sample_index_first_keys(m):
+        """Union of aux names across all sample_indices in ``m``.
+
+        Aux names should be the same across all sample_indices in a
+        well-formed sidecar, but unioning is robust to partial fills.
+        """
+        names: set[str] = set()
+        for rec in (m or {}).values():
+            names.update(rec.keys())
+        return names
+
+    # Auxiliary parameter pre-wrapping: per-sim aux draws live in a sidecar
+    # CSV indexed by sample_index. The wrapper code emits
+    # ``species_dict[aux_name].to(<units>)``, so we just attach Pint units
+    # here once per (sim, aux) and let the wrapper convert. Pint Quantities
+    # are immutable under arithmetic, so we can stash them per-sample_index
+    # and reuse without copying. Empty dict when no aux is configured.
+    aux_by_sample_index = aux_by_sample_index or {}
+    auxiliary_units = auxiliary_units or {}
+    aux_unit_quantities = {
+        name: ureg.parse_expression(units_str) for name, units_str in auxiliary_units.items()
+    }
+    sample_index_col = (
+        sim_df["sample_index"].to_numpy() if "sample_index" in sim_df.columns else None
+    )
+
     # Per-test-stat metadata: (col_j, tsid, func, required_species, missing_required)
     # ``func is None`` → registry miss (logged once); ``missing_required`` is
     # the subset of required species that can't be resolved from sim_df or
@@ -201,6 +229,7 @@ def compute_test_statistics_batch(
     #                             this species fails fast with NaN
     species_plan: dict[str, tuple] = {}
     sim_cols = set(sim_df.columns)
+    aux_names_set = set(aux_by_sample_index_first_keys(aux_by_sample_index))
     for s in all_required:
         if s in sim_cols:
             species_plan[s] = ("series", _parse_unit(s))
@@ -208,6 +237,12 @@ def compute_test_statistics_batch(
             species_plan[s] = ("param", f"param:{s}", _parse_unit(s))
         elif s in template_defaults:
             species_plan[s] = ("template", float(template_defaults[s]) * _parse_unit(s))
+        elif s in aux_names_set:
+            # Aux names are populated per-sim from the aux samples sidecar
+            # (see the inner loop). Mark them with a noop strategy so the
+            # 'missing' guard below doesn't short-circuit aux-bearing test
+            # stats.
+            species_plan[s] = ("aux",)
         else:
             species_plan[s] = ("missing",)
 
@@ -279,6 +314,28 @@ def compute_test_statistics_batch(
             # 'missing' → not populated; any test stat requiring this
             # species was already marked NaN in tests_meta.
 
+        # Attach auxiliary parameter draws (one record per sample_index)
+        # as Pint Quantities under their declared units. The wrapper code
+        # emitted by ``yaml_loader._generate_wrapper_code`` reads them
+        # via ``species_dict[aux_name].to(<units>)``. When the parquet
+        # carries no sample_index — e.g. legacy single-batch test pools
+        # — aux merging is silently skipped (no sample_index → no join
+        # key), and aux-bearing test stats fall through the wrapper's
+        # KeyError path to NaN.
+        if aux_by_sample_index and sample_index_col is not None:
+            sid = int(sample_index_col[i])
+            aux_record = aux_by_sample_index.get(sid)
+            if aux_record is not None:
+                for aux_name, aux_value in aux_record.items():
+                    aux_unit_q = aux_unit_quantities.get(aux_name)
+                    if aux_unit_q is None:
+                        # Unit not in auxiliary_units map → fall back to
+                        # dimensionless. Catches the common case of
+                        # forgetting to populate auxiliary_units while
+                        # still passing aux_by_sample_index.
+                        aux_unit_q = ureg.dimensionless
+                    species_dict[aux_name] = float(aux_value) * aux_unit_q
+
         # Dispatch each test stat against the shared time_q + species_dict.
         for j, tsid, func, required, missing in tests_meta:
             if func is None:
@@ -320,6 +377,8 @@ def process_single_batch(
     species_units: dict,
     test_stats_output_dir: Path,
     template_defaults: dict[str, float] | None = None,
+    aux_by_sample_index: dict[int, dict[str, float]] | None = None,
+    auxiliary_units: dict[str, str] | None = None,
 ) -> int:
     """
     Process a single batch and save results.
@@ -425,6 +484,8 @@ def process_single_batch(
                         test_stat_registry,
                         species_units,
                         template_defaults=template_defaults,
+                        aux_by_sample_index=aux_by_sample_index,
+                        auxiliary_units=auxiliary_units,
                     )
                     np.savetxt(ts_f, test_stats_matrix_rg, delimiter=",", fmt="%.12e")
 
@@ -513,6 +574,50 @@ def main():
     else:
         logger.info("No pool_manifest.json found — assuming wide parquets (pre-#23 layout)")
 
+    # Auxiliary parameter samples: optional sidecar CSV indexed by
+    # sample_index, plus a {name: units} map. Both come from the
+    # inference orchestrator (sbi_runner) — derive-time concerns only,
+    # never seen by qsp_sim. When absent, aux-bearing wrapper code will
+    # KeyError on species_dict[aux_name] for those targets, leaving
+    # them NaN; non-aux targets are unaffected.
+    aux_samples_csv_str = config.get("aux_samples_csv")
+    auxiliary_units = config.get("auxiliary_units") or {}
+    aux_by_sample_index: dict[int, dict[str, float]] = {}
+    if aux_samples_csv_str:
+        aux_samples_csv = Path(aux_samples_csv_str)
+        if not aux_samples_csv.exists():
+            logger.warning(
+                "aux_samples_csv configured but not found at %s — aux-bearing "
+                "test stats will fail",
+                aux_samples_csv,
+            )
+        else:
+            aux_df = pd.read_csv(aux_samples_csv)
+            if "sample_index" not in aux_df.columns:
+                logger.error(
+                    "aux_samples_csv %s missing 'sample_index' column",
+                    aux_samples_csv,
+                )
+                sys.exit(1)
+            aux_names_csv = [c for c in aux_df.columns if c != "sample_index"]
+            for row in aux_df.itertuples(index=False):
+                sid = int(getattr(row, "sample_index"))
+                aux_by_sample_index[sid] = {
+                    name: float(getattr(row, name)) for name in aux_names_csv
+                }
+            logger.info(
+                "Loaded aux samples for %d sims, %d aux name(s): %s",
+                len(aux_by_sample_index),
+                len(aux_names_csv),
+                aux_names_csv,
+            )
+            missing_units = [n for n in aux_names_csv if n not in auxiliary_units]
+            if missing_units:
+                logger.warning(
+                    "aux names without units in auxiliary_units (will use " "dimensionless): %s",
+                    missing_units,
+                )
+
     # Find all batches in the pool. Supports two layouts:
     #   - Legacy (pre-#43): flat batch_*.parquet files (one per submission,
     #     produced by the retired cpp_combine_batch_worker).
@@ -554,6 +659,8 @@ def main():
             species_units=species_units,
             test_stats_output_dir=test_stats_output_dir,
             template_defaults=template_defaults,
+            aux_by_sample_index=aux_by_sample_index,
+            auxiliary_units=auxiliary_units,
         )
         total_sims += n_sims
 

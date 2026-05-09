@@ -147,8 +147,16 @@ def load_calibration_targets(yaml_dir: Path | str | List) -> pd.DataFrame:
         empirical = data["empirical_data"]
 
         # Extract species list
-        species_list = observable.get("species", [])
-        required_species = ",".join(species_list) if species_list else ""
+        species_list = list(observable.get("species", []) or [])
+        # Auxiliary parameter names ride alongside species in
+        # required_species so the derive worker resolves them via the
+        # same `param:<name>` / `species_dict[name]` rail used for QSP
+        # parameters and species. The wrapper code (below) then moves
+        # them into _constants under the YAML-declared units.
+        aux_params = observable.get("auxiliary_parameters") or []
+        aux_names = [a["name"] for a in aux_params]
+        all_required = species_list + aux_names
+        required_species = ",".join(all_required) if all_required else ""
 
         # Extract empirical data (lists with single elements for point-in-time targets)
         median_vals = empirical.get("median", [])
@@ -174,6 +182,7 @@ def load_calibration_targets(yaml_dir: Path | str | List) -> pd.DataFrame:
             observable_code=observable["code"],
             constants=observable.get("constants") or [],
             index_values=index_values,
+            auxiliary_parameters=aux_params,
         )
 
         rows.append(
@@ -267,8 +276,11 @@ def load_prediction_targets(yaml_dir: Path) -> pd.DataFrame:
         target_id = data["prediction_target_id"]
         observable = data["observable"]
 
-        species_list = observable.get("species", [])
-        required_species = ",".join(species_list) if species_list else ""
+        species_list = list(observable.get("species", []) or [])
+        aux_params = observable.get("auxiliary_parameters") or []
+        aux_names = [a["name"] for a in aux_params]
+        all_required = species_list + aux_names
+        required_species = ",".join(all_required) if all_required else ""
         units = observable.get("units", "")
 
         # Prediction targets keep their index_values at the top level
@@ -280,6 +292,7 @@ def load_prediction_targets(yaml_dir: Path) -> pd.DataFrame:
             observable_code=observable["code"],
             constants=observable.get("constants") or [],
             index_values=index_values,
+            auxiliary_parameters=aux_params,
         )
 
         rows.append(
@@ -326,22 +339,33 @@ def _generate_wrapper_code(
     observable_code: str,
     constants: list,
     index_values: list | None,
+    auxiliary_parameters: list | None = None,
 ) -> str:
     """
     Generate a 3-arg ``compute_test_statistic`` wrapper around a 4-arg observable.
 
     The wrapper:
     1. Builds a ``_constants`` dict with Pint units from the YAML constants list.
-    2. Embeds the original ``compute_observable`` function verbatim.
-    3. Calls ``compute_observable(time, species_dict, _constants, ureg)``.
-    4. Extracts a scalar value at the target time (from ``index_values`` or t=0).
-    5. Returns a scalar Pint Quantity.
+    2. Resolves any declared auxiliary parameters from ``species_dict`` (the
+       derive worker joins per-sim aux draws into ``species_dict`` from the
+       aux samples sidecar; see ``derive_test_stats_worker``).
+    3. Embeds the original ``compute_observable`` function verbatim.
+    4. Calls ``compute_observable(time, species_dict, _constants, ureg)``.
+    5. Extracts a scalar value at the target time (from ``index_values`` or t=0).
+    6. Returns a scalar Pint Quantity.
 
     Args:
         observable_code: The ``compute_observable`` function source from the YAML.
         constants: List of constant dicts with ``name``, ``value``, ``units`` keys.
         index_values: List of target time points (e.g., ``[21.0]``), or None/empty
                       for baseline (t=0) targets.
+        auxiliary_parameters: Optional list of aux parameter dicts from
+            ``observable.auxiliary_parameters`` (each with at least ``name``
+            and ``units``). When non-empty, the wrapper looks each name up
+            in ``species_dict`` and converts to the declared units before
+            handing it to ``compute_observable`` via ``_constants``. Caller
+            is responsible for appending aux names to ``required_species``
+            so the derive worker materializes them in ``species_dict``.
 
     Returns:
         String containing complete ``compute_test_statistic`` function source.
@@ -361,6 +385,19 @@ def _generate_wrapper_code(
         lines.append("")
     else:
         lines.append("    _constants = {}")
+        lines.append("")
+
+    # Auxiliary parameters: per-sim values are placed into species_dict by
+    # the derive worker (joined on sample_index from the aux samples
+    # sidecar). The wrapper just relocates them into _constants under
+    # the YAML-declared units so observable.code's signature matches.
+    if auxiliary_parameters:
+        for aux in auxiliary_parameters:
+            aux_name = aux["name"]
+            aux_units = aux["units"]
+            lines.append(
+                f"    _constants[{aux_name!r}] = species_dict[{aux_name!r}].to({aux_units!r})"
+            )
         lines.append("")
 
     # Embed the original compute_observable function, indented under the wrapper

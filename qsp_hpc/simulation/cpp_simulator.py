@@ -499,6 +499,38 @@ class CppSimulator:
 
         return compute_test_stats_hash(self.test_stats_csv, aux_samples_csv)
 
+    @staticmethod
+    def _aux_hash(
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]],
+        auxiliary_units: Optional[dict[str, str]],
+    ) -> str:
+        """SHA-256 over the per-sim aux draws and unit map.
+
+        Returns the all-zero digest when no aux is configured so existing
+        cache keys for non-aux callers stay backwards compatible (the
+        digest is still folded into the suffix-pool key, but it's a fixed
+        sentinel).
+        """
+        h = hashlib.sha256()
+        if aux_by_sample_index:
+            for sid in sorted(aux_by_sample_index.keys()):
+                rec = aux_by_sample_index[sid]
+                h.update(str(sid).encode())
+                h.update(b"|")
+                for name in sorted(rec.keys()):
+                    h.update(name.encode())
+                    h.update(b"=")
+                    h.update(repr(float(rec[name])).encode())
+                    h.update(b";")
+                h.update(b"\n")
+        if auxiliary_units:
+            for name in sorted(auxiliary_units.keys()):
+                h.update(name.encode())
+                h.update(b"=")
+                h.update(str(auxiliary_units[name]).encode())
+                h.update(b";")
+        return h.hexdigest()
+
     def _local_test_stats_path(self, test_stats_hash: str) -> Path:
         """Where downloaded HPC test stats land locally.
 
@@ -1025,6 +1057,8 @@ class CppSimulator:
         pool_suffix: str = "posterior_predictive",
         evolve_trajectory_dir: Optional[str | Path] = None,
         evolve_trajectory_dt_days: Optional[float] = None,
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]] = None,
+        auxiliary_units: Optional[dict[str, str]] = None,
     ) -> Tuple[np.ndarray, pa.Table]:
         """Run C++ simulations at explicit thetas and return derived test stats.
 
@@ -1119,16 +1153,20 @@ class CppSimulator:
         )
 
         # Cache key: theta + calibration targets + prediction targets + backend
-        # tag. Without the target hashes, editing a YAML silently hits a stale
-        # pool and the caller sees endpoint columns derived from the old
-        # observable code. The backend tag keeps local and HPC caches for the
-        # same theta distinct — they should agree, but leaving them isolated
-        # lets a local smoke reproduce against an HPC reference run.
+        # tag + aux draws. Without the target hashes, editing a YAML silently
+        # hits a stale pool and the caller sees endpoint columns derived from
+        # the old observable code. The backend tag keeps local and HPC caches
+        # for the same theta distinct. The aux hash folds in the per-sim aux
+        # draws so two PPC calls on the same theta but different posterior aux
+        # don't collide on the same cache.
         theta_hash = hashlib.sha256(theta.tobytes()).hexdigest()
         cal_hash = self._calibration_targets_hash()
         pred_hash = self._prediction_targets_hash(pred_dir)
+        aux_hash = self._aux_hash(aux_by_sample_index, auxiliary_units)
         key_hash = hashlib.sha256(
-            (theta_hash + "|" + cal_hash + "|" + pred_hash + f"|backend={backend}").encode()
+            (
+                theta_hash + "|" + cal_hash + "|" + pred_hash + f"|backend={backend}|aux={aux_hash}"
+            ).encode()
         ).hexdigest()[:HASH_PREFIX_LENGTH]
 
         suffix_pool_dir = self.pool_dir.parent / f"{self.pool_dir.name}_{pool_suffix}_{key_hash}"
@@ -1138,7 +1176,8 @@ class CppSimulator:
         self.logger.info(
             f"simulate_with_parameters: n={n_samples}, backend={backend}, "
             f"theta_hash={theta_hash[:8]}, "
-            f"cal_hash={cal_hash[:8]}, pred_hash={pred_hash[:8]}"
+            f"cal_hash={cal_hash[:8]}, pred_hash={pred_hash[:8]}, "
+            f"aux_hash={aux_hash[:8]}"
         )
         self.logger.info(f"  suffix pool: {suffix_pool_dir.name}")
 
@@ -1180,8 +1219,17 @@ class CppSimulator:
                 pool_suffix=pool_suffix,
                 evolve_trajectory_dir=evolve_trajectory_dir,
                 evolve_trajectory_dt_days=evolve_trajectory_dt_days,
+                aux_by_sample_index=aux_by_sample_index,
+                auxiliary_units=auxiliary_units,
             )
         else:
+            if aux_by_sample_index:
+                raise NotImplementedError(
+                    "simulate_with_parameters(backend='hpc', aux_by_sample_index=...) "
+                    "is not yet supported. Local backend handles aux PPC; "
+                    "extend the HPC submit path if cluster-side PPC with "
+                    "auxiliary parameters becomes a regular need."
+                )
             table = self._simulate_with_parameters_hpc(
                 theta=theta,
                 sample_indices=sample_indices,
@@ -1212,6 +1260,8 @@ class CppSimulator:
         pool_suffix: str,
         evolve_trajectory_dir: Optional[str | Path] = None,
         evolve_trajectory_dt_days: Optional[float] = None,
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]] = None,
+        auxiliary_units: Optional[dict[str, str]] = None,
     ) -> pa.Table:
         """Local backend for :meth:`simulate_with_parameters`.
 
@@ -1246,7 +1296,14 @@ class CppSimulator:
         )
 
         species_df = pd.read_parquet(species_parquet)
-        return self._derive_test_stats_table(species_df, test_stats_df, theta, sample_indices)
+        return self._derive_test_stats_table(
+            species_df,
+            test_stats_df,
+            theta,
+            sample_indices,
+            aux_by_sample_index=aux_by_sample_index,
+            auxiliary_units=auxiliary_units,
+        )
 
     def _simulate_with_parameters_hpc(
         self,
@@ -1484,6 +1541,9 @@ class CppSimulator:
         test_stats_df: pd.DataFrame,
         theta: np.ndarray,
         sample_indices: np.ndarray,
+        *,
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]] = None,
+        auxiliary_units: Optional[dict[str, str]] = None,
     ) -> pa.Table:
         """Build the output pa.Table: sample_index / status / param:* / ts:<id>."""
         from qsp_hpc.batch.derive_test_stats_worker import (
@@ -1507,6 +1567,8 @@ class CppSimulator:
             registry,
             species_units,
             template_defaults=template_defaults,
+            aux_by_sample_index=aux_by_sample_index,
+            auxiliary_units=auxiliary_units,
         )
 
         status_np = (

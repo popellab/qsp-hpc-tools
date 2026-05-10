@@ -864,7 +864,7 @@ def sample_calibration_targets_dir(tmp_path: Path) -> Path:
         "calibration_target_id": "spA_t0",
         "observable": {
             "code": (
-                "def compute_observable(time, species_dict, constants, ureg):\n"
+                "def compute_observable(time, species_dict, constants):\n"
                 "    return species_dict['spA']\n"
             ),
             "units": "cell",
@@ -1125,7 +1125,7 @@ def prediction_targets_dir(tmp_path: Path) -> Path:
         "description": "Prediction of spA species at t=0.",
         "observable": {
             "code": (
-                "def compute_observable(time, species_dict, constants, ureg):\n"
+                "def compute_observable(time, species_dict, constants):\n"
                 "    return species_dict['spA']\n"
             ),
             "units": "cell",
@@ -1407,7 +1407,7 @@ class TestSimulateWithParameters:
                     "description": "collision",
                     "observable": {
                         "code": (
-                            "def compute_observable(time, species_dict, constants, ureg):\n"
+                            "def compute_observable(time, species_dict, constants):\n"
                             "    return species_dict['spA']\n"
                         ),
                         "units": "cell",

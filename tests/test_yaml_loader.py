@@ -16,7 +16,6 @@ from qsp_hpc.calibration.yaml_loader import (
     load_calibration_targets,
     load_prediction_targets,
 )
-from qsp_hpc.utils.unit_registry import ureg
 
 # ============================================================================
 # YAML fixture data
@@ -26,11 +25,10 @@ BASELINE_YAML = {
     "calibration_target_id": "m1_m2_ratio",
     "observable": {
         "code": (
-            "def compute_observable(time, species_dict, constants, ureg):\n"
+            "def compute_observable(time, species_dict, constants):\n"
             "    M1 = species_dict['V_T.Mac_M1']\n"
             "    M2 = species_dict['V_T.Mac_M2']\n"
-            "    ratio = (M1 / M2).to('dimensionless')\n"
-            "    return ratio\n"
+            "    return M1 / M2\n"
         ),
         "units": "dimensionless",
         "species": ["V_T.Mac_M1", "V_T.Mac_M2"],
@@ -49,16 +47,16 @@ CONSTANTS_YAML = {
     "calibration_target_id": "cd8_density_baseline",
     "observable": {
         "code": (
-            "def compute_observable(time, species_dict, constants, ureg):\n"
+            "def compute_observable(time, species_dict, constants):\n"
+            "    # area_per_cell in mm**2/cell, cellularity dimensionless;\n"
+            "    # CD8 species in 'cell'. Density returned in cell/mm**2.\n"
             "    cd8_eff = species_dict['V_T.CD8']\n"
             "    cd8_exh = species_dict['V_T.CD8_exh']\n"
             "    c_cells = species_dict['V_T.C1']\n"
             "    area_per_cell = constants['pdac_cancer_cell_cross_section']\n"
             "    cellularity = constants['pdac_cellularity_fraction']\n"
             "    tumor_area = c_cells * area_per_cell / cellularity\n"
-            "    cd8_total = cd8_eff + cd8_exh\n"
-            "    density = cd8_total / tumor_area\n"
-            "    return density.to('cell/mm**2')\n"
+            "    return (cd8_eff + cd8_exh) / tumor_area\n"
         ),
         "units": "cell / millimeter**2",
         "species": ["V_T.CD8", "V_T.CD8_exh", "V_T.C1"],
@@ -88,14 +86,10 @@ TREATMENT_YAML = {
     "calibration_target_id": "cd8_fold_increase_gvax_nivo_d21",
     "observable": {
         "code": (
-            "def compute_observable(time, species_dict, constants, ureg):\n"
-            "    import numpy as np\n"
+            "def compute_observable(time, species_dict, constants):\n"
             "    cd8 = species_dict['V_T.CD8']\n"
             "    baseline = cd8[0]\n"
-            "    eps = 1e-12 * baseline.units\n"
-            "    effective_baseline = baseline + eps\n"
-            "    fold_change = cd8 / effective_baseline\n"
-            "    return fold_change.to('dimensionless')\n"
+            "    return cd8 / (baseline + 1e-12)\n"
         ),
         "units": "dimensionless",
         "species": ["V_T.CD8"],
@@ -342,28 +336,27 @@ class TestMultiDirCalibrationTargets:
 
 
 # ============================================================================
-# Tests: wrapper code generation (using real Pint)
+# Tests: wrapper code generation (Pintless — raw floats)
 # ============================================================================
 
 
 class TestGenerateWrapperCode:
     def test_wrapper_baseline_ratio(self, single_baseline_dir):
-        """Wrapper for M1/M2 ratio runs with real Pint quantities at t=0."""
+        """Wrapper for M1/M2 ratio runs at t=0 with raw float species."""
         df = load_calibration_targets(single_baseline_dir)
         code = df.iloc[0]["model_output_code"]
 
         ns = {}
         exec(code, ns)
 
-        time = np.array([0.0]) * ureg.day
+        time = np.array([0.0])
         species_dict = {
-            "V_T.Mac_M1": np.array([500.0]) * ureg.cell,
-            "V_T.Mac_M2": np.array([1000.0]) * ureg.cell,
+            "V_T.Mac_M1": np.array([500.0]),
+            "V_T.Mac_M2": np.array([1000.0]),
         }
 
-        result = ns["compute_test_statistic"](time, species_dict, ureg)
-        # 500/1000 = 0.5, scalar at t=0
-        assert float(result.magnitude) == pytest.approx(0.5)
+        result = ns["compute_test_statistic"](time, species_dict)
+        assert result == pytest.approx(0.5)
 
     def test_wrapper_with_constants(self, multi_yaml_dir):
         """Wrapper for cd8_density inlines constants and computes correctly."""
@@ -374,20 +367,16 @@ class TestGenerateWrapperCode:
         ns = {}
         exec(code, ns)
 
-        # Single-timepoint baseline
-        time = np.array([0.0]) * ureg.day
+        time = np.array([0.0])
         species_dict = {
-            "V_T.CD8": np.array([1000.0]) * ureg.cell,
-            "V_T.CD8_exh": np.array([200.0]) * ureg.cell,
-            "V_T.C1": np.array([1e6]) * ureg.cell,
+            "V_T.CD8": np.array([1000.0]),
+            "V_T.CD8_exh": np.array([200.0]),
+            "V_T.C1": np.array([1e6]),
         }
 
-        result = ns["compute_test_statistic"](time, species_dict, ureg)
-        # tumor_area = 1e6 * 0.000227 / 0.25 = 908 mm^2
-        # cd8_total = 1200 cells
-        # density = 1200 / 908 ≈ 1.3216 cell/mm^2
+        result = ns["compute_test_statistic"](time, species_dict)
         expected = 1200.0 / (1e6 * 0.000227 / 0.25)
-        assert float(result.magnitude) == pytest.approx(expected, rel=1e-4)
+        assert result == pytest.approx(expected, rel=1e-4)
 
     def test_wrapper_treatment_interp_at_d21(self, multi_yaml_dir):
         """Wrapper for fold-change target interpolates at day 21."""
@@ -398,22 +387,19 @@ class TestGenerateWrapperCode:
         ns = {}
         exec(code, ns)
 
-        # Time series: days 0, 7, 14, 21
-        time = np.array([0.0, 7.0, 14.0, 21.0]) * ureg.day
-        # CD8 cells grow from 100 to 300 over 21 days
+        time = np.array([0.0, 7.0, 14.0, 21.0])
         species_dict = {
-            "V_T.CD8": np.array([100.0, 150.0, 200.0, 300.0]) * ureg.cell,
+            "V_T.CD8": np.array([100.0, 150.0, 200.0, 300.0]),
         }
 
-        result = ns["compute_test_statistic"](time, species_dict, ureg)
-        # fold_change at d21 = 300/100 = 3.0
-        assert float(result.magnitude) == pytest.approx(3.0, rel=1e-6)
+        result = ns["compute_test_statistic"](time, species_dict)
+        assert result == pytest.approx(3.0, rel=1e-6)
 
     def test_wrapper_treatment_interp_between_points(self):
         """Wrapper interpolates correctly between time points."""
         code = _generate_wrapper_code(
             observable_code=(
-                "def compute_observable(time, species_dict, constants, ureg):\n"
+                "def compute_observable(time, species_dict, constants):\n"
                 "    return species_dict['V_T.CD8']\n"
             ),
             constants=[],
@@ -423,21 +409,20 @@ class TestGenerateWrapperCode:
         ns = {}
         exec(code, ns)
 
-        time = np.array([0.0, 7.0, 14.0, 21.0]) * ureg.day
+        time = np.array([0.0, 7.0, 14.0, 21.0])
         species_dict = {
-            "V_T.CD8": np.array([1.0, 2.0, 3.0, 4.0]) * ureg.cell,
+            "V_T.CD8": np.array([1.0, 2.0, 3.0, 4.0]),
         }
 
-        result = ns["compute_test_statistic"](time, species_dict, ureg)
-        # np.interp(15.0, [0,7,14,21], [1,2,3,4]) = 3 + 1*(1/7) ≈ 3.1429
+        result = ns["compute_test_statistic"](time, species_dict)
         expected = np.interp(15.0, [0.0, 7.0, 14.0, 21.0], [1.0, 2.0, 3.0, 4.0])
-        assert float(result.magnitude) == pytest.approx(expected, rel=1e-6)
+        assert result == pytest.approx(expected, rel=1e-6)
 
     def test_wrapper_inlines_constants(self):
-        """Verify constants appear in generated code."""
+        """Verify constants appear in generated code as raw floats."""
         code = _generate_wrapper_code(
             observable_code=(
-                "def compute_observable(time, species_dict, constants, ureg):\n"
+                "def compute_observable(time, species_dict, constants):\n"
                 "    return species_dict['V_T.C1']\n"
             ),
             constants=[
@@ -455,13 +440,14 @@ class TestGenerateWrapperCode:
         assert "0.000227" in code
         assert "pdac_cellularity_fraction" in code
         assert "0.25" in code
-        assert "ureg.parse_expression" in code
+        # Pintless wrapper does not call ureg.parse_expression.
+        assert "ureg.parse_expression" not in code
 
     def test_wrapper_extracts_at_target_time(self):
         """Treatment target with index_values evaluates at the correct time."""
         code = _generate_wrapper_code(
             observable_code=(
-                "def compute_observable(time, species_dict, constants, ureg):\n"
+                "def compute_observable(time, species_dict, constants):\n"
                 "    return species_dict['V_T.CD8']\n"
             ),
             constants=[],
@@ -474,7 +460,7 @@ class TestGenerateWrapperCode:
         """Baseline target evaluates at t=0."""
         code = _generate_wrapper_code(
             observable_code=(
-                "def compute_observable(time, species_dict, constants, ureg):\n"
+                "def compute_observable(time, species_dict, constants):\n"
                 "    return species_dict['V_T.CD8']\n"
             ),
             constants=[],
@@ -487,20 +473,20 @@ class TestGenerateWrapperCode:
         """Wrapper with no constants still passes _constants={} to observable."""
         code = _generate_wrapper_code(
             observable_code=(
-                "def compute_observable(time, species_dict, constants, ureg):\n" "    return 42\n"
+                "def compute_observable(time, species_dict, constants):\n" "    return 42\n"
             ),
             constants=[],
             index_values=None,
         )
 
         assert "_constants = {}" in code
-        assert "compute_observable(time, species_dict, _constants, ureg)" in code
+        assert "compute_observable(time, species_dict, _constants)" in code
 
     def test_wrapper_handles_scalar_result(self):
-        """Wrapper that returns a plain scalar (no Pint) works correctly."""
+        """Wrapper that returns a plain scalar works correctly."""
         code = _generate_wrapper_code(
             observable_code=(
-                "def compute_observable(time, species_dict, constants, ureg):\n" "    return 42.0\n"
+                "def compute_observable(time, species_dict, constants):\n" "    return 42.0\n"
             ),
             constants=[],
             index_values=None,
@@ -509,8 +495,8 @@ class TestGenerateWrapperCode:
         ns = {}
         exec(code, ns)
 
-        time = np.array([0.0]) * ureg.day
-        result = ns["compute_test_statistic"](time, {}, ureg)
+        time = np.array([0.0])
+        result = ns["compute_test_statistic"](time, {})
         assert result == 42.0
 
 
@@ -599,13 +585,13 @@ PREDICTION_YAML = {
     "description": "Overall survival at 12 months (alive=1 / dead=0).",
     "observable": {
         "code": (
-            "def compute_observable(time, species_dict, constants, ureg):\n"
+            "def compute_observable(time, species_dict, constants):\n"
             "    import numpy as np\n"
-            "    c1 = species_dict['V_T.C1'].to('cell').magnitude\n"
-            "    t = time.to('day').magnitude\n"
+            "    c1 = species_dict['V_T.C1']\n"
+            "    t = np.asarray(time)\n"
             "    mask = t <= 365.0\n"
             "    alive = 0.0 if (c1[mask].max() >= 1.0e11) else 1.0\n"
-            "    return np.full_like(t, alive) * ureg.dimensionless\n"
+            "    return np.full_like(t, alive)\n"
         ),
         "units": "dimensionless",
         "species": ["V_T.C1"],
@@ -624,11 +610,11 @@ PREDICTION_YAML_TTP = {
     "description": "Days to first RECIST PD; censored at 1095.",
     "observable": {
         "code": (
-            "def compute_observable(time, species_dict, constants, ureg):\n"
+            "def compute_observable(time, species_dict, constants):\n"
             "    import numpy as np\n"
             "    # Censored implementation: always return censoring time.\n"
-            "    t = time.to('day').magnitude\n"
-            "    return np.full_like(t, 1095.0) * ureg.day\n"
+            "    t = np.asarray(time)\n"
+            "    return np.full_like(t, 1095.0)\n"
         ),
         "units": "day",
         "species": ["V_T.C1"],
@@ -686,18 +672,18 @@ class TestLoadPredictionTargets:
         assert all("V_T.C1" in s for s in df["required_species"])
 
     def test_wrapper_compiles_and_returns_scalar(self, prediction_yaml_dir):
-        """The generated wrapper should compile and return a Pint scalar
+        """The generated wrapper compiles and returns a raw float scalar
         when fed a minimal species_dict/time grid."""
         df = load_prediction_targets(prediction_yaml_dir)
         os_row = df[df["test_statistic_id"] == "os_at_12mo"].iloc[0]
-        ns: dict = {"np": np, "ureg": ureg}
+        ns: dict = {"np": np}
         exec(os_row["model_output_code"], ns)
         fn = ns["compute_test_statistic"]
 
-        time_q = np.linspace(0, 400, 50) * ureg.day
-        c1 = np.full_like(time_q.magnitude, 1e9) * ureg.parse_expression("cell")
-        result = fn(time_q, {"V_T.C1": c1}, ureg)
-        assert result.to("dimensionless").magnitude == pytest.approx(1.0)
+        time = np.linspace(0, 400, 50)
+        c1 = np.full_like(time, 1e9)
+        result = fn(time, {"V_T.C1": c1})
+        assert result == pytest.approx(1.0)
 
     def test_nonexistent_dir_raises(self, temp_dir):
         with pytest.raises(FileNotFoundError):

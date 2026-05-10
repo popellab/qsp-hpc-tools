@@ -3,10 +3,15 @@ YAML Calibration / Prediction Target Loader
 
 Loads calibration target YAML files (from MAPLE) and converts them
 into the DataFrame format expected by the qsp-hpc-tools pipeline. Each YAML
-contains a 4-arg ``compute_observable`` function, optional constants, and
-empirical data with CI95 bounds. The loader generates 3-arg
-``compute_test_statistic`` wrapper functions that inline constants and extract
-scalar values at target times.
+contains a 3-arg ``compute_observable(time, species_dict, constants)`` function,
+optional constants, and empirical data with CI95 bounds. The loader generates
+2-arg ``compute_test_statistic(time, species_dict)`` wrapper functions that
+inline constants and extract scalar values at target times.
+
+All values flowing through the wrapper are raw floats / numpy arrays in
+canonical model_structure.json units; observable code is responsible for any
+inline numerical conversions (mirroring SubmodelTarget forward_model
+convention).
 
 Prediction targets (``prediction_target_id`` / no empirical block) share the
 observable-code protocol but carry no measurement. They are loaded through a
@@ -342,61 +347,59 @@ def _generate_wrapper_code(
     auxiliary_parameters: list | None = None,
 ) -> str:
     """
-    Generate a 3-arg ``compute_test_statistic`` wrapper around a 4-arg observable.
+    Generate a 2-arg ``compute_test_statistic`` wrapper around a 3-arg observable.
 
     The wrapper:
-    1. Builds a ``_constants`` dict with Pint units from the YAML constants list.
+    1. Builds a ``_constants`` dict of raw float values in YAML-declared units.
     2. Resolves any declared auxiliary parameters from ``species_dict`` (the
        derive worker joins per-sim aux draws into ``species_dict`` from the
-       aux samples sidecar; see ``derive_test_stats_worker``).
+       aux samples sidecar; see ``derive_test_stats_worker``) into ``_constants``.
     3. Embeds the original ``compute_observable`` function verbatim.
-    4. Calls ``compute_observable(time, species_dict, _constants, ureg)``.
-    5. Extracts a scalar value at the target time (from ``index_values`` or t=0).
-    6. Returns a scalar Pint Quantity.
+    4. Calls ``compute_observable(time, species_dict, _constants)``.
+    5. Extracts a scalar at the target time (from ``index_values`` or t=0).
+
+    All values are raw floats in their canonical / declared units; observable
+    code is responsible for any inline numerical conversions (matching the
+    submodel forward-model precedent).
 
     Args:
         observable_code: The ``compute_observable`` function source from the YAML.
         constants: List of constant dicts with ``name``, ``value``, ``units`` keys.
+            ``units`` is documentation only — the value is emitted as-is.
         index_values: List of target time points (e.g., ``[21.0]``), or None/empty
                       for baseline (t=0) targets.
         auxiliary_parameters: Optional list of aux parameter dicts from
-            ``observable.auxiliary_parameters`` (each with at least ``name``
-            and ``units``). When non-empty, the wrapper looks each name up
-            in ``species_dict`` and converts to the declared units before
-            handing it to ``compute_observable`` via ``_constants``. Caller
-            is responsible for appending aux names to ``required_species``
-            so the derive worker materializes them in ``species_dict``.
+            ``observable.auxiliary_parameters``. When non-empty, the wrapper
+            relocates ``species_dict[aux_name]`` (a raw float in the units
+            declared by ``auxiliary_units`` on the derive side) into
+            ``_constants[aux_name]``. Caller is responsible for appending
+            aux names to ``required_species``.
 
     Returns:
         String containing complete ``compute_test_statistic`` function source.
     """
-    lines = ["import numpy as np", "", "def compute_test_statistic(time, species_dict, ureg):"]
+    lines = ["import numpy as np", "", "def compute_test_statistic(time, species_dict):"]
 
-    # Build constants dict
     if constants:
         lines.append("    _constants = {}")
         for const in constants:
             name = const["name"]
             value = const["value"]
             units_str = const["units"]
-            lines.append(
-                f"    _constants[{name!r}] = {value!r} * ureg.parse_expression({units_str!r})"
-            )
+            # units kept in a comment for traceability; observable.code is
+            # authored knowing the declared unit per constant.
+            lines.append(f"    _constants[{name!r}] = {value!r}  # {units_str}")
         lines.append("")
     else:
         lines.append("    _constants = {}")
         lines.append("")
 
-    # Auxiliary parameters: per-sim values are placed into species_dict by
-    # the derive worker (joined on sample_index from the aux samples
-    # sidecar). The wrapper just relocates them into _constants under
-    # the YAML-declared units so observable.code's signature matches.
     if auxiliary_parameters:
         for aux in auxiliary_parameters:
             aux_name = aux["name"]
             aux_units = aux["units"]
             lines.append(
-                f"    _constants[{aux_name!r}] = species_dict[{aux_name!r}].to({aux_units!r})"
+                f"    _constants[{aux_name!r}] = species_dict[{aux_name!r}]  # {aux_units}"
             )
         lines.append("")
 
@@ -405,25 +408,19 @@ def _generate_wrapper_code(
     lines.append(indented_code.rstrip())
     lines.append("")
 
-    # Call the observable
-    lines.append("    _result = compute_observable(time, species_dict, _constants, ureg)")
+    lines.append("    _result = compute_observable(time, species_dict, _constants)")
     lines.append("")
 
-    # Determine target time
     if index_values and len(index_values) > 0:
         target_t = float(index_values[0])
     else:
         target_t = 0.0
 
-    # Extract scalar at target time
+    # Extract scalar at target time. Result is a raw float or numpy array.
     lines.append(f"    _target_t = {target_t!r}")
-    lines.append("    if hasattr(_result, 'magnitude'):")
-    lines.append("        _mag = _result.magnitude")
-    lines.append("        if hasattr(_mag, '__len__') and len(_mag) > 1:")
-    lines.append("            return np.interp(_target_t, time.magnitude, _mag) * _result.units")
-    lines.append(
-        "        return _mag.item() * _result.units if hasattr(_mag, '__len__') else _result"
-    )
-    lines.append("    return _result")
+    lines.append("    _arr = np.asarray(_result, dtype=float)")
+    lines.append("    if _arr.ndim > 0 and _arr.size > 1:")
+    lines.append("        return float(np.interp(_target_t, np.asarray(time, dtype=float), _arr))")
+    lines.append("    return float(_arr.item()) if _arr.size == 1 else float(_arr)")
 
     return "\n".join(lines)

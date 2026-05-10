@@ -21,8 +21,8 @@ class TestBuildTestStatRegistry:
                 "test_statistic_id": ["simple_mean"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    """def compute_test_statistic(time, species_dict, ureg):
-    return np.mean(species_dict['V_T.C1'].magnitude)"""
+                    """def compute_test_statistic(time, species_dict):
+    return np.mean(species_dict['V_T.C1'])"""
                 ],
             }
         )
@@ -33,11 +33,9 @@ class TestBuildTestStatRegistry:
         assert callable(registry["simple_mean"])
 
         # Test the function works - now uses species_dict signature
-        from qsp_hpc.utils.unit_registry import ureg
-
-        time = np.array([0, 1, 2, 3]) * ureg.day
-        species_dict = {"V_T.C1": np.array([10, 20, 30, 40]) * ureg.cell}
-        result = registry["simple_mean"](time, species_dict, ureg)
+        time = np.array([0, 1, 2, 3])
+        species_dict = {"V_T.C1": np.array([10, 20, 30, 40])}
+        result = registry["simple_mean"](time, species_dict)
         assert result == 25.0
 
     def test_multiple_species(self):
@@ -47,9 +45,9 @@ class TestBuildTestStatRegistry:
                 "test_statistic_id": ["ratio_test"],
                 "required_species": ["V_T.CD8, V_T.Treg"],
                 "model_output_code": [
-                    """def compute_test_statistic(time, species_dict, ureg):
-    cd8_0 = np.interp(0.0, time.magnitude, species_dict['V_T.CD8'].magnitude)
-    treg_0 = np.interp(0.0, time.magnitude, species_dict['V_T.Treg'].magnitude)
+                    """def compute_test_statistic(time, species_dict):
+    cd8_0 = np.interp(0.0, time, species_dict['V_T.CD8'])
+    treg_0 = np.interp(0.0, time, species_dict['V_T.Treg'])
     return cd8_0 / max(treg_0, 1e-12)"""
                 ],
             }
@@ -57,15 +55,13 @@ class TestBuildTestStatRegistry:
 
         registry = build_test_stat_registry(test_stats_df)
 
-        from qsp_hpc.utils.unit_registry import ureg
-
-        time = np.array([0.0, 1.0, 2.0]) * ureg.day
+        time = np.array([0.0, 1.0, 2.0])
         species_dict = {
-            "V_T.CD8": np.array([100.0, 110.0, 120.0]) * ureg.cell,
-            "V_T.Treg": np.array([50.0, 55.0, 60.0]) * ureg.cell,
+            "V_T.CD8": np.array([100.0, 110.0, 120.0]),
+            "V_T.Treg": np.array([50.0, 55.0, 60.0]),
         }
 
-        result = registry["ratio_test"](time, species_dict, ureg)
+        result = registry["ratio_test"](time, species_dict)
         assert result == pytest.approx(2.0, rel=1e-6)
 
     def test_growth_rate_calculation(self):
@@ -75,10 +71,10 @@ class TestBuildTestStatRegistry:
                 "test_statistic_id": ["log_growth_rate"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    """def compute_test_statistic(time, species_dict, ureg):
+                    """def compute_test_statistic(time, species_dict):
     t0, t1 = 0, 60
-    time_vals = time.magnitude
-    V_T_C1 = species_dict['V_T.C1'].magnitude
+    time_vals = time
+    V_T_C1 = species_dict['V_T.C1']
     if len(time_vals) == 0 or len(V_T_C1) == 0:
         return np.nan
 
@@ -95,16 +91,14 @@ class TestBuildTestStatRegistry:
 
         registry = build_test_stat_registry(test_stats_df)
 
-        from qsp_hpc.utils.unit_registry import ureg
-
         # Exponential growth: C(t) = c0 * exp(r*t) with r=0.01
-        time = np.linspace(0, 60, 61) * ureg.day
+        time = np.linspace(0, 60, 61)
         c0 = 1e6
         r = 0.01
-        tumor_cells = c0 * np.exp(r * np.linspace(0, 60, 61)) * ureg.cell
+        tumor_cells = c0 * np.exp(r * np.linspace(0, 60, 61))
         species_dict = {"V_T.C1": tumor_cells}
 
-        result = registry["log_growth_rate"](time, species_dict, ureg)
+        result = registry["log_growth_rate"](time, species_dict)
         assert result == pytest.approx(r, rel=1e-2)
 
     def test_missing_model_output_code_column(self):
@@ -140,7 +134,7 @@ class TestBuildTestStatRegistry:
                 "test_statistic_id": ["bad_syntax"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg)\n    return ???"
+                    "def compute_test_statistic(time, species_dict)\n    return ???"
                 ],  # Syntax error
             }
         )
@@ -155,8 +149,8 @@ class TestBuildTestStatRegistry:
                 "test_statistic_id": ["wrong_name"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    """def my_function(time, species_dict, ureg):
-    return np.mean(species_dict['V_T.C1'].magnitude)"""
+                    """def my_function(time, species_dict):
+    return np.mean(species_dict['V_T.C1'])"""
                 ],  # Wrong function name
             }
         )
@@ -173,9 +167,9 @@ class TestBuildTestStatRegistry:
                 "test_statistic_id": ["stat1", "stat2", "stat3"],
                 "required_species": ["V_T.C1", "V_T.C1", "V_T.C1"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)",
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.max(species_dict['V_T.C1'].magnitude)",
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.min(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict):\n    return np.mean(species_dict['V_T.C1'])",
+                    "def compute_test_statistic(time, species_dict):\n    return np.max(species_dict['V_T.C1'])",
+                    "def compute_test_statistic(time, species_dict):\n    return np.min(species_dict['V_T.C1'])",
                 ],
             }
         )
@@ -187,14 +181,12 @@ class TestBuildTestStatRegistry:
         assert "stat2" in registry
         assert "stat3" in registry
 
-        from qsp_hpc.utils.unit_registry import ureg
+        time = np.array([0, 1, 2])
+        species_dict = {"V_T.C1": np.array([10, 20, 30])}
 
-        time = np.array([0, 1, 2]) * ureg.day
-        species_dict = {"V_T.C1": np.array([10, 20, 30]) * ureg.cell}
-
-        assert registry["stat1"](time, species_dict, ureg) == 20.0
-        assert registry["stat2"](time, species_dict, ureg) == 30.0
-        assert registry["stat3"](time, species_dict, ureg) == 10.0
+        assert registry["stat1"](time, species_dict) == 20.0
+        assert registry["stat2"](time, species_dict) == 30.0
+        assert registry["stat3"](time, species_dict) == 10.0
 
 
 class TestTemplateDefaultsFallback:
@@ -210,9 +202,9 @@ class TestTemplateDefaultsFallback:
                 "test_statistic_id": ["k_times_rho"],
                 "required_species": ["V_T.C1, rho_collagen"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return species_dict['rho_collagen'].magnitude "
-                    "* np.mean(species_dict['V_T.C1'].magnitude)"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return species_dict['rho_collagen'] "
+                    "* np.mean(species_dict['V_T.C1'])"
                 ],
             }
         )
@@ -248,8 +240,8 @@ class TestTemplateDefaultsFallback:
                 "test_statistic_id": ["return_k"],
                 "required_species": ["k"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return species_dict['k'].magnitude"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return species_dict['k']"
                 ],
             }
         )
@@ -284,8 +276,8 @@ class TestTemplateDefaultsFallback:
                 "test_statistic_id": ["needs_z"],
                 "required_species": ["z"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return species_dict['z'].magnitude"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return species_dict['z']"
                 ],
             }
         )
@@ -314,7 +306,7 @@ class TestComputeTestStatisticsBatch:
                 "test_statistic_id": ["mean_tumor"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)"
+                    "def compute_test_statistic(time, species_dict):\n    return np.mean(species_dict['V_T.C1'])"
                 ],
             }
         )
@@ -348,7 +340,7 @@ class TestComputeTestStatisticsBatch:
                 "test_statistic_id": ["mean_tumor"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)"
+                    "def compute_test_statistic(time, species_dict):\n    return np.mean(species_dict['V_T.C1'])"
                 ],
             }
         )
@@ -380,9 +372,9 @@ class TestComputeTestStatisticsBatch:
                 "test_statistic_id": ["mean_tumor", "max_tumor", "min_tumor"],
                 "required_species": ["V_T.C1", "V_T.C1", "V_T.C1"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)",
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.max(species_dict['V_T.C1'].magnitude)",
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.min(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict):\n    return np.mean(species_dict['V_T.C1'])",
+                    "def compute_test_statistic(time, species_dict):\n    return np.max(species_dict['V_T.C1'])",
+                    "def compute_test_statistic(time, species_dict):\n    return np.min(species_dict['V_T.C1'])",
                 ],
             }
         )
@@ -414,9 +406,9 @@ class TestComputeTestStatisticsBatch:
                 "test_statistic_id": ["cd8_treg_ratio"],
                 "required_species": ["V_T.CD8, V_T.Treg"],
                 "model_output_code": [
-                    """def compute_test_statistic(time, species_dict, ureg):
-    cd8_0 = np.interp(0.0, time.magnitude, species_dict['V_T.CD8'].magnitude)
-    treg_0 = np.interp(0.0, time.magnitude, species_dict['V_T.Treg'].magnitude)
+                    """def compute_test_statistic(time, species_dict):
+    cd8_0 = np.interp(0.0, time, species_dict['V_T.CD8'])
+    treg_0 = np.interp(0.0, time, species_dict['V_T.Treg'])
     return cd8_0 / max(treg_0, 1e-12)"""
                 ],
             }
@@ -448,7 +440,7 @@ class TestComputeTestStatisticsBatch:
                 "test_statistic_id": ["stat_not_in_registry"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)"
+                    "def compute_test_statistic(time, species_dict):\n    return np.mean(species_dict['V_T.C1'])"
                 ],
             }
         )
@@ -475,7 +467,7 @@ class TestComputeTestStatisticsBatch:
                 "test_statistic_id": ["error_stat"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    """def compute_test_statistic(time, species_dict, ureg):
+                    """def compute_test_statistic(time, species_dict):
     raise ValueError("Test error")"""
                 ],
             }
@@ -507,9 +499,9 @@ class TestAuxiliaryParameterMerge:
                 "test_statistic_id": ["aux_scaled"],
                 "required_species": ["V_T.C1, f_aux"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    f = species_dict['f_aux'].to('dimensionless').magnitude\n"
-                    "    return float(np.mean(species_dict['V_T.C1'].magnitude)) * f"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    f = species_dict['f_aux']\n"
+                    "    return float(np.mean(species_dict['V_T.C1'])) * f"
                 ],
             }
         )
@@ -548,8 +540,8 @@ class TestAuxiliaryParameterMerge:
                 "test_statistic_id": ["aux_scaled"],
                 "required_species": ["V_T.C1, f_aux"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return float(species_dict['f_aux'].to('dimensionless').magnitude)"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return float(species_dict['f_aux'])"
                 ],
             }
         )
@@ -600,10 +592,10 @@ class TestSharedSpeciesDictAcrossTestStats:
                 "test_statistic_id": ["needs_missing", "needs_present"],
                 "required_species": ["V_T.missing", "V_T.C1"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return species_dict['V_T.missing'].magnitude",
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return np.mean(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return species_dict['V_T.missing']",
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return np.mean(species_dict['V_T.C1'])",
                 ],
             }
         )
@@ -636,10 +628,10 @@ class TestSharedSpeciesDictAcrossTestStats:
                 "test_statistic_id": ["mean_c1", "max_c1"],
                 "required_species": ["V_T.C1", "V_T.C1"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return np.mean(species_dict['V_T.C1'].magnitude)",
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return np.max(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return np.mean(species_dict['V_T.C1'])",
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return np.max(species_dict['V_T.C1'])",
                 ],
             }
         )
@@ -673,8 +665,8 @@ class TestSharedSpeciesDictAcrossTestStats:
                 "test_statistic_id": ["return_rho"],
                 "required_species": ["rho_collagen"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return species_dict['rho_collagen'].magnitude"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return species_dict['rho_collagen']"
                 ],
             }
         )
@@ -705,7 +697,7 @@ class TestNonSpeciesResolution:
     Regression tests for the bug where calibration targets referencing
     compartment volumes (e.g., V_T) or scalar parameters (e.g., rho_collagen)
     produced NaN because species_units only contained species, forcing
-    `.to('milliliter')` / `.to('gram/milliliter')` to fail on dimensionless defaults.
+    `` / `` to fail on dimensionless defaults.
     """
 
     def test_compartment_volume_resolves_with_units(self):
@@ -715,9 +707,9 @@ class TestNonSpeciesResolution:
                 "test_statistic_id": ["cellularity"],
                 "required_species": ["V_T.C1,V_T"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    cancer_cells = np.mean(species_dict['V_T.C1'].magnitude)\n"
-                    "    V_T_mL = species_dict['V_T'].to('milliliter').magnitude\n"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    cancer_cells = np.mean(species_dict['V_T.C1'])\n"
+                    "    V_T_mL = species_dict['V_T']\n"
                     "    return cancer_cells * 1e-9 / V_T_mL"
                 ],
             }
@@ -744,8 +736,8 @@ class TestNonSpeciesResolution:
                 "test_statistic_id": ["rho_identity"],
                 "required_species": ["rho_collagen"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return species_dict['rho_collagen'].to('gram/milliliter').magnitude"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return species_dict['rho_collagen']"
                 ],
             }
         )
@@ -762,27 +754,6 @@ class TestNonSpeciesResolution:
         result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
         assert result[0, 0] == pytest.approx(0.025)
 
-    def test_wrong_unit_yields_nan(self):
-        """Sanity check: if species_units is missing the right unit (old buggy behavior),
-        `.to('milliliter')` on a dimensionless default should fail and produce NaN.
-        """
-        test_stats_df = pd.DataFrame(
-            {
-                "test_statistic_id": ["cellularity"],
-                "required_species": ["V_T"],
-                "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return species_dict['V_T'].to('milliliter').magnitude"
-                ],
-            }
-        )
-        registry = build_test_stat_registry(test_stats_df)
-        sim_df = pd.DataFrame({"simulation_id": [0], "status": [0], "time": [[0.0]], "V_T": [0.5]})
-        # Deliberately omit V_T from species_units → defaults to dimensionless
-        species_units = {}
-        result = compute_test_statistics_batch(sim_df, test_stats_df, registry, species_units)
-        assert np.isnan(result[0, 0])
-
 
 class TestProcessSingleBatch:
     """Test process_single_batch function."""
@@ -795,8 +766,8 @@ class TestProcessSingleBatch:
                 "test_statistic_id": ["mean_tumor", "max_tumor"],
                 "required_species": ["V_T.C1", "V_T.C1"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['V_T.C1'].magnitude)",
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.max(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict):\n    return np.mean(species_dict['V_T.C1'])",
+                    "def compute_test_statistic(time, species_dict):\n    return np.max(species_dict['V_T.C1'])",
                 ],
             }
         )
@@ -909,7 +880,7 @@ class TestMaxBatchesLimit:
                 "test_statistic_id": ["mean_val"],
                 "required_species": ["value"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['value'].magnitude)"
+                    "def compute_test_statistic(time, species_dict):\n    return np.mean(species_dict['value'])"
                 ],
             }
         )
@@ -971,7 +942,7 @@ class TestMaxBatchesLimit:
                 "test_statistic_id": ["mean_val"],
                 "required_species": ["value"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['value'].magnitude)"
+                    "def compute_test_statistic(time, species_dict):\n    return np.mean(species_dict['value'])"
                 ],
             }
         )
@@ -1042,7 +1013,7 @@ class TestSingleTaskDerivation:
                 "test_statistic_id": ["mean_val"],
                 "required_species": ["value"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n    return np.mean(species_dict['value'].magnitude)"
+                    "def compute_test_statistic(time, species_dict):\n    return np.mean(species_dict['value'])"
                 ],
             }
         )
@@ -1107,10 +1078,10 @@ class TestProcessSingleBatchRowGroupStreaming:
                 "test_statistic_id": ["mean_tumor", "max_tumor"],
                 "required_species": ["V_T.C1", "V_T.C1"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return np.mean(species_dict['V_T.C1'].magnitude)",
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return np.max(species_dict['V_T.C1'].magnitude)",
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return np.mean(species_dict['V_T.C1'])",
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return np.max(species_dict['V_T.C1'])",
                 ],
             }
         )
@@ -1241,8 +1212,8 @@ class TestProcessSingleBatchSubdirLayout:
                 "test_statistic_id": ["mean_tumor"],
                 "required_species": ["V_T.C1"],
                 "model_output_code": [
-                    "def compute_test_statistic(time, species_dict, ureg):\n"
-                    "    return np.mean(species_dict['V_T.C1'].magnitude)"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return np.mean(species_dict['V_T.C1'])"
                 ],
             }
         )

@@ -137,6 +137,12 @@ class BatchConfig:
     # scp has no built-in timeout; a stale control socket can hang indefinitely.
     # Fail fast at 10 minutes so the retry loop can kick in instead.
     scp_timeout_s: int = 600
+    # SSH ControlMaster connection multiplexing. First ssh/scp call sets up
+    # a master socket under ~/.qsp_hpc_cm/cm-%C; subsequent calls reuse it
+    # and skip the ~1.5–2s handshake. ControlPersist=60s keeps the master
+    # alive between back-to-back commands. Disable for environments that
+    # ban multiplexing.
+    ssh_control_master: bool = True
 
 
 # Substrings observed in transient SSH/SCP failures against Rockfish login
@@ -275,6 +281,37 @@ class SSHTransport:
             return f"{self.config.ssh_user}@{self.config.ssh_host}"
         return self.config.ssh_host
 
+    def _control_master_opts(self) -> list[str]:
+        """OpenSSH ControlMaster options for connection multiplexing.
+
+        ControlMaster=auto opens a master socket on the first ssh/scp
+        call and routes subsequent calls through it, skipping the
+        ~1.5–2s TCP+TLS+key handshake. ControlPersist=60s keeps the
+        master alive a minute past the last child exit so back-to-back
+        commands within a session reuse the connection.
+
+        ``%C`` in ControlPath expands to a hash of (l,r,h,p,u) so
+        concurrent sessions to different hosts (or as different users)
+        don't fight over the same socket. A dedicated socket directory
+        under ``~/.qsp_hpc_cm/`` avoids colliding with the user's
+        global ssh config.
+
+        ``ssh_control_master=False`` in the BatchConfig disables this
+        for environments that ban multiplexing (rare).
+        """
+        if not getattr(self.config, "ssh_control_master", True):
+            return []
+        cm_dir = Path("~/.qsp_hpc_cm").expanduser()
+        cm_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return [
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPath={cm_dir}/cm-%C",
+            "-o",
+            "ControlPersist=60s",
+        ]
+
     def _warn_insecure_ssh(self):
         """Warn user once about disabled host key checking."""
         if not self._warned_about_host_key_checking and not self.config.strict_host_key_checking:
@@ -333,6 +370,7 @@ class SSHTransport:
                 "BatchMode=yes",
             ]
         )
+        ssh_cmd.extend(self._control_master_opts())
 
         ssh_cmd.append(self._build_ssh_target())
         ssh_cmd.append(command)
@@ -376,6 +414,7 @@ class SSHTransport:
                 f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
                 "-o",
                 "BatchMode=yes",
+                *self._control_master_opts(),
                 local_path,
                 remote_target,
             ]
@@ -417,6 +456,7 @@ class SSHTransport:
             [
                 "-o",
                 f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
+                *self._control_master_opts(),
                 remote_source,
                 local_dir,
             ]
@@ -674,14 +714,24 @@ class HPCJobManager:
         except Exception as exc:
             raise RuntimeError(f"SSH connection error: {exc}") from exc
 
-    def ensure_hpc_venv(self) -> None:
+    def ensure_hpc_venv(self, force: bool = False) -> None:
         """
         Ensure Python virtual environment is set up on HPC.
 
         Creates venv at configured hpc_venv_path if it doesn't exist and installs
         required packages for Parquet I/O and test statistics derivation.
+
+        Session memo: a successful call sets ``_session_venv_ready`` on
+        the manager; subsequent calls within the same instance no-op
+        unless ``force=True``. Saves the ~7s SSH-bound venv-check round
+        trip on every chained derivation submit / repeat caller. Defeat
+        with ``force=True`` (e.g. when a session may have wiped the
+        venv).
         """
-        return self.file_transfer.ensure_hpc_venv()
+        if not force and getattr(self, "_session_venv_ready", False):
+            return
+        self.file_transfer.ensure_hpc_venv()
+        self._session_venv_ready = True
 
     def ensure_cpp_binary(
         self,
@@ -690,6 +740,7 @@ class HPCJobManager:
         repo_path: Optional[str] = None,
         branch: Optional[str] = None,
         binary_path: Optional[str] = None,
+        force: bool = False,
     ) -> None:
         """Ensure the C++ qsp_sim binary on HPC is up-to-date with source.
 
@@ -698,6 +749,13 @@ class HPCJobManager:
         qsp_sim`` in the existing build directory. Incremental makes are
         near-zero cost when source is unchanged; a first build (or one after
         qsp_sim.cpp edits) pays the compile cost once.
+
+        Session memo: a successful call sets ``_session_cpp_binary_ready``
+        on the manager keyed by ``(repo_path, branch, binary_path)``;
+        subsequent calls with the same triple no-op unless ``force=True``.
+        Saves the 17–30s git-fetch + cmake step on every chained
+        derivation submit / repeat caller. Defeat with ``force=True``
+        when a session may have left source in a stale state.
 
         Args:
             skip_git_pull: Skip ``git fetch + checkout + pull``. Use when
@@ -728,6 +786,12 @@ class HPCJobManager:
                     "(path to the SPQSP_PDAC checkout on the HPC node)."
                 )
         branch = branch or self.config.cpp_branch
+
+        # Session memo: same (repo, branch, binary) triple already verified.
+        memo_key = (repo_path, branch, binary_path)
+        memo: Optional[set] = getattr(self, "_session_cpp_binary_ready", None)
+        if not force and memo is not None and memo_key in memo:
+            return
 
         build_modules = self.config.cpp_build_modules or self.config.cpp_runtime_modules
         module_prelude = (
@@ -848,6 +912,11 @@ class HPCJobManager:
             )
         self.logger.info(f"  ✓ qsp_sim binary ready at {binary_path}")
 
+        if memo is None:
+            self._session_cpp_binary_ready = {memo_key}
+        else:
+            memo.add(memo_key)
+
     def sync_codebase(self, skip_sync: bool = False) -> None:
         """
         Sync codebase to HPC using rsync.
@@ -965,7 +1034,7 @@ class HPCJobManager:
         num_simulations: int,
         simulation_pool_id: str,
         t_end_days: float = 180.0,
-        dt_days: float = 1.0,
+        min_cadence_hours: float = 4.0,
         scenario: str = "default",
         seed: int = 2025,
         jobs_per_chunk: Optional[int] = None,
@@ -988,6 +1057,17 @@ class HPCJobManager:
         model_structure_file: Optional[str] = None,
         evolve_cache: bool = True,
         retry_missing_chunks: int = 0,
+        skip_setup: bool = False,
+        samples_csv_remote: Optional[str] = None,
+        healthy_state_yaml_remote: Optional[str] = None,
+        model_structure_remote: Optional[str] = None,
+        scenario_yaml_remote: Optional[str] = None,
+        drug_metadata_yaml_remote: Optional[str] = None,
+        test_stats_csv_remote: Optional[str] = None,
+        aux_samples_csv: Optional[str] = None,
+        aux_samples_csv_remote: Optional[str] = None,
+        auxiliary_units: Optional[dict] = None,
+        samples_start_offset: int = 0,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
 
@@ -1002,7 +1082,7 @@ class HPCJobManager:
             simulation_pool_id: Pool directory name on HPC
                 (e.g. ``v1_a3f7b2c8_baseline``).
             t_end_days: Simulation end time (days).
-            dt_days: Output timestep (days).
+            min_cadence_hours: Upper bound on inter-row spacing in qsp_sim output (hours; CV_ONE_STEP cadence floor).
             scenario: Scenario name for Parquet filenames.
             seed: Random seed.
             jobs_per_chunk: Simulations per array task (default from config).
@@ -1128,7 +1208,7 @@ class HPCJobManager:
             "scenario": scenario,
             "seed": seed,
             "t_end_days": t_end_days,
-            "dt_days": dt_days,
+            "min_cadence_hours": min_cadence_hours,
         }
         for line in format_config(job_config):
             self.logger.info(line)
@@ -1136,12 +1216,20 @@ class HPCJobManager:
         with log_operation(self.logger, "Syncing codebase to HPC", log_start=not skip_sync):
             self.sync_codebase(skip_sync=skip_sync)
 
-        self.ensure_hpc_venv()
-        self.ensure_cpp_binary(
-            skip_git_pull=skip_git_pull,
-            skip_build=skip_build,
-            binary_path=binary_path,
-        )
+        # ``skip_setup`` is the HPCSession path's escape hatch:
+        # ``HPCSession.ensure_remote()`` already ran ensure_hpc_venv +
+        # ensure_cpp_binary once for the whole session, and re-running
+        # them per scenario costs ~30s of SSH round-trips that the
+        # local-eval rollout's Layer 2.5 was meant to factor out. Legacy
+        # CppSimulator callers leave skip_setup=False and pay the
+        # per-submit cost as before.
+        if not skip_setup:
+            self.ensure_hpc_venv()
+            self.ensure_cpp_binary(
+                skip_git_pull=skip_git_pull,
+                skip_build=skip_build,
+                binary_path=binary_path,
+            )
         # #48 follow-up: we deliberately do NOT call
         # _setup_remote_directories() here. Its historical behavior —
         # ``rm -rf`` then ``mkdir -p`` of batch_jobs/{input,output,scripts}
@@ -1165,15 +1253,33 @@ class HPCJobManager:
         # their remote paths so cpp_batch_worker can pass them into
         # CppBatchRunner. #48: pool_id scoping prevents parallel
         # scenarios from overwriting each other's YAMLs.
-        remote_scenario = self._upload_scenario_yaml(
-            scenario_yaml, "scenario.yaml", simulation_pool_id
-        )
-        remote_drug_meta = self._upload_scenario_yaml(
-            drug_metadata_yaml, "drug_metadata.yaml", simulation_pool_id
-        )
-        remote_healthy = self._upload_scenario_yaml(
-            healthy_state_yaml, "healthy_state.yaml", simulation_pool_id
-        )
+        # ``scenario_yaml_remote`` / ``drug_metadata_yaml_remote`` short-
+        # circuit the per-pool upload when MSR (or any caller) has
+        # pre-uploaded these YAMLs to the shared ``batch_jobs/input/``
+        # area. Same idempotent-cache shape as the other shared uploads.
+        if scenario_yaml_remote:
+            remote_scenario = scenario_yaml_remote
+        else:
+            remote_scenario = self._upload_scenario_yaml(
+                scenario_yaml, "scenario.yaml", simulation_pool_id
+            )
+        if drug_metadata_yaml_remote:
+            remote_drug_meta = drug_metadata_yaml_remote
+        else:
+            remote_drug_meta = self._upload_scenario_yaml(
+                drug_metadata_yaml, "drug_metadata.yaml", simulation_pool_id
+            )
+        # ``healthy_state_yaml_remote``, when set, references a shared
+        # session-level upload (``upload_shared_healthy_state``) so every
+        # scenario points at the same remote file instead of re-uploading.
+        # Healthy state is the same physiological IC across treatment
+        # arms — uploading it once per session is the natural shape.
+        if healthy_state_yaml_remote:
+            remote_healthy = healthy_state_yaml_remote
+        else:
+            remote_healthy = self._upload_scenario_yaml(
+                healthy_state_yaml, "healthy_state.yaml", simulation_pool_id
+            )
 
         # Evolve-cache root lives on scratch alongside the per-scenario
         # sim pools so every scenario job hitting the same theta shares
@@ -1200,7 +1306,7 @@ class HPCJobManager:
             seed=seed,
             jobs_per_chunk=jobs_per_chunk,
             t_end_days=t_end_days,
-            dt_days=dt_days,
+            min_cadence_hours=min_cadence_hours,
             simulation_pool_id=simulation_pool_id,
             scenario=scenario,
             max_workers=max_workers,
@@ -1210,8 +1316,15 @@ class HPCJobManager:
             healthy_state_yaml=remote_healthy,
             evolve_cache_root=evolve_cache_root,
             batch_subdir=batch_subdir,
+            samples_csv_remote=samples_csv_remote,
+            samples_start_offset=samples_start_offset,
         )
-        self._upload_parameter_csv(samples_csv, simulation_pool_id=simulation_pool_id)
+        # ``samples_csv_remote`` lets the caller hoist the upload above
+        # the per-scenario loop when every scenario uses byte-identical
+        # theta (e.g. the local-eval pattern: shared theta_pool sliced
+        # the same way per scenario).
+        if not samples_csv_remote:
+            self._upload_parameter_csv(samples_csv, simulation_pool_id=simulation_pool_id)
 
         # #48: pool-scoped sbatch script + worker config so parallel
         # submissions for different scenarios don't overwrite each
@@ -1298,6 +1411,12 @@ class HPCJobManager:
                 test_stats_hash=test_stats_hash,
                 model_structure_file=model_structure_file,
                 dependency=f"afterok:{derive_dep_id}",
+                skip_setup=skip_setup,
+                model_structure_remote=model_structure_remote,
+                test_stats_csv_remote=test_stats_csv_remote,
+                aux_samples_csv=aux_samples_csv,
+                aux_samples_csv_remote=aux_samples_csv_remote,
+                auxiliary_units=auxiliary_units,
             )
             job_ids.append(derive_job_id)
 
@@ -1367,7 +1486,7 @@ class HPCJobManager:
         seed: int,
         jobs_per_chunk: int,
         t_end_days: float,
-        dt_days: float,
+        min_cadence_hours: float,
         simulation_pool_id: str,
         scenario: str,
         max_workers: Optional[int],
@@ -1377,6 +1496,8 @@ class HPCJobManager:
         healthy_state_yaml: Optional[str] = None,
         evolve_cache_root: Optional[str] = None,
         batch_subdir: Optional[str] = None,
+        samples_csv_remote: Optional[str] = None,
+        samples_start_offset: int = 0,
     ) -> None:
         """Create and upload C++ job configuration JSON."""
         import json
@@ -1388,13 +1509,25 @@ class HPCJobManager:
             "template_path": template_path,
             "subtree": subtree,
             # #48: pool-scoped params path so concurrent scenarios don't
-            # overwrite each other's params.csv upload.
-            "param_csv": f"{pool_input_dir}/params.csv",
+            # overwrite each other's params.csv upload. Callers can
+            # override with a shared remote samples_csv (e.g. the local-eval
+            # rollout where every scenario uses byte-identical theta) by
+            # passing ``samples_csv_remote=<remote_path>``.
+            "param_csv": (
+                samples_csv_remote if samples_csv_remote else f"{pool_input_dir}/params.csv"
+            ),
             "n_simulations": num_simulations,
+            # Worker slices ``samples_csv[start_offset + chunk_lo : start_offset + chunk_hi]``.
+            # Lets the caller hoist the full theta CSV to a shared remote
+            # path even for top-up submits (where only rows
+            # ``[existing : N)`` are needed): the worker reads the full
+            # CSV but skips the first ``existing`` rows. Default 0
+            # preserves legacy behavior.
+            "samples_start_offset": int(samples_start_offset),
             "seed": seed,
             "jobs_per_chunk": jobs_per_chunk,
             "t_end_days": t_end_days,
-            "dt_days": dt_days,
+            "min_cadence_hours": min_cadence_hours,
             "simulation_pool_id": simulation_pool_id,
             "simulation_pool_path": self.config.simulation_pool_path,
             "scenario": scenario,
@@ -1491,7 +1624,7 @@ class HPCJobManager:
     def _wait_for_array_completion(
         self,
         array_id: str,
-        poll_s: float = 20.0,
+        poll_s: float = 5.0,
         timeout_s: Optional[float] = None,
     ) -> Dict[str, int]:
         """Block until ``array_id`` has no running/pending tasks.
@@ -1503,29 +1636,55 @@ class HPCJobManager:
         SLURM can take a few seconds to register a freshly-submitted
         array, so we tolerate an initial all-zeros window — the loop
         gives up only once we've SEEN the array live and it's now empty.
+
+        Each poll emits an INFO-level progress line so a tail of the
+        run log shows the array draining in real time (matches the
+        per-iteration cadence the legacy CppSimulator wait loop had).
+
+        Default ``poll_s=5`` assumes ControlMaster connection reuse
+        (each ``squeue`` round-trip ~0.1s rather than the ~2s of a
+        fresh ssh handshake). Without CM, raise to 20–30s to avoid
+        login-node load.
         """
         start = time.time()
         max_seen = 0
         while True:
-            status = self.check_job_status(array_id)
+            # Live polls: squeue only (sub-second). One final sacct sweep
+            # below once squeue empties, for accurate completed/failed
+            # counts.
+            status = self.check_job_status(array_id, squeue_only=True)
             total = sum(status.values())
             max_seen = max(max_seen, total)
             elapsed = time.time() - start
             active = status["running"] + status["pending"]
+            self.logger.info(
+                "  [%dm %02ds] array %s: %d/%d done | running=%d pending=%d failed=%d",
+                int(elapsed // 60),
+                int(elapsed % 60),
+                array_id,
+                status["completed"],
+                max(total, max_seen),
+                status["running"],
+                status["pending"],
+                status["failed"],
+            )
             if total > 0 and active == 0:
-                return status
+                # Squeue is empty after seeing the array live — fall back
+                # to one full check (sacct included) for accurate
+                # completed/failed counts.
+                return self.check_job_status(array_id, squeue_only=False)
             # Array is "gone" — either it finished too fast for sacct
             # propagation, or it never registered. Only give up if we've
             # waited past a generous registration window.
             if total == 0 and max_seen > 0 and elapsed > 30:
-                return status
+                return self.check_job_status(array_id, squeue_only=False)
             if total == 0 and elapsed > 120:
                 self.logger.warning(
                     "Array %s not visible after %.0fs — assuming complete",
                     array_id,
                     elapsed,
                 )
-                return status
+                return self.check_job_status(array_id, squeue_only=False)
             if timeout_s is not None and elapsed > timeout_s:
                 raise TimeoutError(
                     f"Array {array_id} incomplete after {timeout_s}s " f"(last status: {status})"
@@ -1605,6 +1764,166 @@ class HPCJobManager:
             simulation_pool_id,
             sim_config,
             dosing,
+        )
+
+    def upload_shared_samples_csv(self, csv_path: str, remote_filename: str) -> str:
+        """Upload a samples CSV to a non-pool-scoped shared remote path.
+
+        Writes to ``{remote_project_path}/batch_jobs/input/{remote_filename}``.
+        Returns the absolute remote path. Callers pass that path to
+        :meth:`submit_cpp_jobs` via ``samples_csv_remote=`` so the
+        per-scenario upload is skipped.
+
+        Routes through :meth:`_upload_shared_file` so the same
+        skip-if-exists + memoized-mkdir behavior applies. The caller
+        supplies ``remote_filename`` directly (since MSR pre-computes
+        the content hash to derive the shared theta CSV's name) — the
+        helper passes it through verbatim instead of re-computing.
+        """
+        return self._upload_shared_file(
+            csv_path, prefix="", suffix="", remote_filename=remote_filename
+        )
+
+    def _upload_shared_file(
+        self,
+        local_path: str,
+        prefix: str,
+        suffix: str,
+        remote_filename: Optional[str] = None,
+    ) -> str:
+        """Content-hash-keyed shared upload with skip-if-exists.
+
+        Idempotent across sessions: the remote filename is
+        ``{prefix}_{sha256[:12]}{suffix}``, so byte-identical content
+        produces the same remote path. Probes for existence first and
+        skips the SCP when the remote file is already there — turns
+        repeat sessions on the same inputs into a single ``test -f``
+        round-trip per file.
+
+        Args:
+            local_path: Local file to upload.
+            prefix: Filename prefix (e.g. ``"scenario_shared"``).
+            suffix: Filename suffix (extension), e.g. ``".yaml"``.
+            remote_filename: Override the auto-derived filename. Caller
+                is responsible for uniqueness.
+
+        Returns:
+            Absolute remote path under ``batch_jobs/input/``.
+        """
+        import hashlib
+        import shlex as _shlex
+
+        local = Path(local_path)
+        if not local.exists():
+            raise FileNotFoundError(f"shared upload source not found: {local}")
+        if remote_filename is None:
+            content_hash = hashlib.sha256(local.read_bytes()).hexdigest()[:12]
+            remote_filename = f"{prefix}_{content_hash}{suffix}"
+
+        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
+        remote_path = f"{remote_input_dir}/{remote_filename}"
+
+        # Combined mkdir + skip-if-exists probe in one ssh exec. mkdir
+        # is folded into the && chain on first call per HPCJobManager;
+        # subsequent calls drop it via the _shared_input_dir_ready memo
+        # to halve the round-trip count.
+        if getattr(self, "_shared_input_dir_ready", False):
+            probe = f"test -f {_shlex.quote(remote_path)} && echo y || echo n"
+        else:
+            probe = (
+                f"mkdir -p {_shlex.quote(remote_input_dir)} && "
+                f"test -f {_shlex.quote(remote_path)} && echo y || echo n"
+            )
+        rc, out = self.transport.exec(probe, timeout=15)
+        self._shared_input_dir_ready = True
+
+        if rc == 0 and out.strip().endswith("y"):
+            self.logger.debug("Shared upload cache HIT: %s", remote_path)
+            return remote_path
+
+        self.transport.upload(str(local), remote_path)
+        self.logger.debug("Shared upload cache MISS, uploaded: %s", remote_path)
+        return remote_path
+
+    def upload_shared_scenario_yaml(
+        self, scenario_yaml: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload a scenario YAML to the shared ``batch_jobs/input/``.
+
+        Content-hash-keyed + skip-if-exists, so back-to-back sessions
+        with the same scenario YAMLs cost one ``test -f`` per scenario
+        instead of an scp. Caller threads the returned path into
+        :meth:`submit_cpp_jobs` via ``scenario_yaml_remote=``.
+        """
+        return self._upload_shared_file(scenario_yaml, "scenario_shared", ".yaml", remote_filename)
+
+    def upload_shared_drug_metadata_yaml(
+        self, drug_metadata_yaml: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload a drug metadata YAML to the shared ``batch_jobs/input/``.
+
+        Same shape as :meth:`upload_shared_scenario_yaml` —
+        content-hash-keyed, skip-if-exists.
+        """
+        return self._upload_shared_file(
+            drug_metadata_yaml, "drug_metadata_shared", ".yaml", remote_filename
+        )
+
+    def upload_shared_test_stats_csv(
+        self, test_stats_csv: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload a test_statistics CSV to the shared ``batch_jobs/input/``.
+
+        Same shape as :meth:`upload_shared_scenario_yaml`. Caller
+        threads the returned path into :meth:`submit_derivation_job` via
+        ``test_stats_csv_remote=`` to skip the per-pool upload.
+        """
+        return self._upload_shared_file(
+            test_stats_csv, "test_stats_shared", ".csv", remote_filename
+        )
+
+    def upload_shared_healthy_state(
+        self, healthy_state_yaml: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload a healthy_state.yaml to a non-pool-scoped shared remote path.
+
+        Healthy state is the same physiological IC across treatment arms
+        in a multi-scenario sweep, so the natural shape is one upload
+        per session. Routes through :meth:`_upload_shared_file` for the
+        skip-if-exists + memoized-mkdir behavior.
+        """
+        return self._upload_shared_file(
+            healthy_state_yaml, "healthy_state_shared", ".yaml", remote_filename
+        )
+
+    def upload_shared_model_structure(
+        self, model_structure_file: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload model_structure.json to a non-pool-scoped shared remote path.
+
+        ``model_structure.json`` describes species metadata (names,
+        units, compartments) — same across every scenario. Routes
+        through :meth:`_upload_shared_file` for the skip-if-exists +
+        memoized-mkdir behavior.
+        """
+        return self._upload_shared_file(
+            model_structure_file, "model_structure_shared", ".json", remote_filename
+        )
+
+    def upload_shared_aux_samples_csv(
+        self, aux_samples_csv: str, remote_filename: Optional[str] = None
+    ) -> str:
+        """Upload an auxiliary parameter samples CSV to a session-shared path.
+
+        Aux draws are sampled once by the inference orchestrator,
+        keyed on ``sample_index``, and shared across every scenario in
+        a sweep (since aux is a measurement-bridge concept, not a
+        scenario-specific perturbation). Skip-if-exists is content-keyed
+        via :meth:`_upload_shared_file`, so re-runs with identical aux
+        CSVs are one ``test -f`` round-trip per session.
+        """
+        return self._upload_shared_file(
+            aux_samples_csv, "aux_samples_shared", ".csv", remote_filename
         )
 
     def _upload_parameter_csv(
@@ -2114,6 +2433,12 @@ class HPCJobManager:
         model_structure_file: Optional[str] = None,
         num_simulations: Optional[int] = None,
         dependency: Optional[str] = None,
+        skip_setup: bool = False,
+        model_structure_remote: Optional[str] = None,
+        test_stats_csv_remote: Optional[str] = None,
+        aux_samples_csv: Optional[str] = None,
+        aux_samples_csv_remote: Optional[str] = None,
+        auxiliary_units: Optional[dict] = None,
     ) -> str:
         """
         Submit SLURM job to derive test statistics from full simulations.
@@ -2140,23 +2465,38 @@ class HPCJobManager:
         self.logger.info(f"  Pool: {pool_path}")
         self.logger.info(f"  Test stats hash: {test_stats_hash[:8]}...")
 
-        # Ensure Python venv is set up
-        self.ensure_hpc_venv()
+        # Ensure Python venv is set up. Skipped when caller (e.g.
+        # MultiScenarioRunner.prepare_session) already configured the
+        # session venv — re-running pip install is ~10s of pure waste.
+        if not skip_setup:
+            self.ensure_hpc_venv()
 
         # Create persistent directory for derivation inputs (in batch_jobs)
         derivation_dir = f"{self.config.remote_project_path}/batch_jobs/derivation"
         self.transport.exec(f'mkdir -p "{derivation_dir}"')
 
-        # Upload test statistics CSV
-        # The CSV now contains Python function code in the model_output_code column,
-        # eliminating the need for separate test_stat_functions.py files
-        remote_test_stats_csv = f"{derivation_dir}/test_stats_{test_stats_hash[:8]}.csv"
-        self.logger.info("Uploading test statistics CSV to HPC...")
-        self.transport.upload(test_stats_csv, remote_test_stats_csv)
+        # Upload test statistics CSV. Hoisted: when MSR pre-uploaded the
+        # CSV via upload_shared_test_stats_csv, reuse that path instead
+        # of re-uploading per derivation submit.
+        if test_stats_csv_remote:
+            remote_test_stats_csv = test_stats_csv_remote
+        else:
+            # The CSV now contains Python function code in the
+            # model_output_code column, eliminating the need for
+            # separate test_stat_functions.py files.
+            remote_test_stats_csv = f"{derivation_dir}/test_stats_{test_stats_hash[:8]}.csv"
+            self.logger.info("Uploading test statistics CSV to HPC...")
+            self.transport.upload(test_stats_csv, remote_test_stats_csv)
 
-        # Upload species units file if provided
-        remote_model_structure_file = None
-        if model_structure_file:
+        # Upload species units file. Hoisted: if model_structure_remote
+        # was uploaded once at session level (via
+        # upload_shared_model_structure), reference that path instead of
+        # re-uploading per scenario. model_structure.json describes
+        # species (units, compartments) — same across scenarios.
+        remote_model_structure_file: Optional[str] = None
+        if model_structure_remote:
+            remote_model_structure_file = model_structure_remote
+        elif model_structure_file:
             remote_model_structure_file = f"{derivation_dir}/model_structure.json"
             self.logger.info("Uploading model structure file to HPC...")
             self.transport.upload(model_structure_file, remote_model_structure_file)
@@ -2175,6 +2515,19 @@ class HPCJobManager:
         else:
             n_batches = self._calculate_batches_needed(pool_path, num_simulations=None)
 
+        # Auxiliary samples sidecar: if a local path was provided and no
+        # session-shared remote was hoisted, upload per-derivation alongside
+        # the test_stats CSV. Otherwise reuse the hoisted remote path. The
+        # CSV is keyed on sample_index and joined into species_dict by the
+        # derive worker.
+        remote_aux_samples_csv: Optional[str] = None
+        if aux_samples_csv_remote:
+            remote_aux_samples_csv = aux_samples_csv_remote
+        elif aux_samples_csv:
+            remote_aux_samples_csv = f"{derivation_dir}/aux_samples_{test_stats_hash[:8]}.csv"
+            self.logger.info("Uploading aux samples CSV to HPC...")
+            self.transport.upload(aux_samples_csv, remote_aux_samples_csv)
+
         # Create derivation config JSON
         # Always derive ALL batches to handle incremental pool growth correctly.
         # Trying to derive only "first N batches" breaks when new batches are added
@@ -2186,6 +2539,8 @@ class HPCJobManager:
             "test_stats_hash": test_stats_hash,
             "model_structure_file": remote_model_structure_file,
             "max_batches": None,  # Always derive all batches
+            "aux_samples_csv": remote_aux_samples_csv,
+            "auxiliary_units": auxiliary_units or {},
         }
 
         # Write config locally then upload
@@ -2483,12 +2838,20 @@ class HPCJobManager:
 
         return downloaded_files
 
-    def check_job_status(self, job_id: str) -> Dict[str, int]:
+    def check_job_status(self, job_id: str, squeue_only: bool = False) -> Dict[str, int]:
         """
         Check status of SLURM job array.
 
         Args:
             job_id: SLURM job ID
+            squeue_only: When True, skip the ``sacct`` round-trip and
+                return only ``running`` / ``pending`` counts (with
+                ``completed`` / ``failed`` left at 0). On busy SLURM
+                clusters (e.g. Rockfish), ``sacct`` queries the
+                accounting DB and can take 3–5s; ``squeue`` is sub-second.
+                Wait loops use this for the live-poll fast path and only
+                fall back to a full ``sacct`` sweep once the array
+                empties.
 
         Returns:
             Dictionary with counts: {'completed': N, 'running': N, 'pending': N, 'failed': N}
@@ -2509,6 +2872,11 @@ class HPCJobManager:
                         status["running"] += 1
                     elif "PENDING" in state_upper:
                         status["pending"] += 1
+
+        # squeue-only fast path: skip the sacct DB query. Caller
+        # consumes only running/pending; completed/failed stay 0.
+        if squeue_only:
+            return status
 
         # Check sacct for completed/failed jobs
         sacct_cmd = f"sacct -j {job_id} --format=JobID,State --noheader --parsable2"

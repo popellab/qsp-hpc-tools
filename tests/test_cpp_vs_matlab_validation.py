@@ -1,10 +1,12 @@
 """M7 numerical validation: C++ qsp_sim vs MATLAB sbiosimulate.
 
 Wraps ``scripts/validate_cpp_vs_matlab.py`` as a pytest marker-gated test.
-Requires:
+Requires (all via env vars; absent → SKIP):
   - MATLAB on PATH
-  - qsp_sim binary built at the expected SPQSP_PDAC-cpp-sweep location
-  - pdac-build project root with immune_oncology_model_PDAC + priors
+  - QSP_SIM_BINARY: prebuilt qsp_sim binary
+  - QSP_SIM_TEMPLATE: param_all.xml template
+  - QSP_PRIORS_CSV: priors CSV from the consumer project
+  - QSP_MATLAB_PROJECT_ROOT: project root with the MATLAB model + priors
 
 Enable with::
 
@@ -15,17 +17,24 @@ Skipped by default so CI doesn't drag in MATLAB / C++ dependencies.
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
 import pytest
 
-PRIORS_CSV = Path("/Users/joeleliason/Projects/pdac-build/parameters/pdac_priors.csv")
-MATLAB_PROJECT_ROOT = Path("/Users/joeleliason/Projects/pdac-build")
-CPP_BINARY = Path("/Users/joeleliason/Projects/SPQSP_PDAC-cpp-sweep/PDAC/qsp/sim/build/qsp_sim")
-CPP_TEMPLATE = Path(
-    "/Users/joeleliason/Projects/SPQSP_PDAC-cpp-sweep/PDAC/sim/resource/param_all.xml"
-)
+
+def _env_path(var: str) -> Path | None:
+    val = os.environ.get(var)
+    if val and Path(val).exists():
+        return Path(val)
+    return None
+
+
+PRIORS_CSV = _env_path("QSP_PRIORS_CSV")
+MATLAB_PROJECT_ROOT = _env_path("QSP_MATLAB_PROJECT_ROOT")
+CPP_BINARY = _env_path("QSP_SIM_BINARY")
+CPP_TEMPLATE = _env_path("QSP_SIM_TEMPLATE")
 
 
 @pytest.mark.validation
@@ -40,9 +49,15 @@ def test_cpp_matches_matlab_20sims_30days(tmp_path):
     doesn't flake the test, but still catch regressions that would
     produce order-of-magnitude disagreement.
     """
-    for p in (PRIORS_CSV, MATLAB_PROJECT_ROOT, CPP_BINARY, CPP_TEMPLATE):
-        if not p.exists():
-            pytest.skip(f"required path missing: {p}")
+    required = {
+        "QSP_PRIORS_CSV": PRIORS_CSV,
+        "QSP_MATLAB_PROJECT_ROOT": MATLAB_PROJECT_ROOT,
+        "QSP_SIM_BINARY": CPP_BINARY,
+        "QSP_SIM_TEMPLATE": CPP_TEMPLATE,
+    }
+    missing = [name for name, p in required.items() if p is None]
+    if missing:
+        pytest.skip(f"required env var(s) unset/missing: {', '.join(missing)}")
     if shutil.which("matlab") is None:
         pytest.skip("matlab not on PATH")
 
@@ -73,7 +88,7 @@ def test_cpp_matches_matlab_20sims_30days(tmp_path):
         project_root=MATLAB_PROJECT_ROOT,
         model_script="immune_oncology_model_PDAC",
         t_end_days=30.0,
-        dt_days=0.5,
+        min_cadence_hours=0.5,
         seed=42,
         out_dir=tmp_path,
     )
@@ -83,7 +98,7 @@ def test_cpp_matches_matlab_20sims_30days(tmp_path):
         binary_path=CPP_BINARY,
         template_path=CPP_TEMPLATE,
         t_end_days=30.0,
-        dt_days=0.5,
+        min_cadence_hours=0.5,
         seed=42,
         out_dir=tmp_path,
     )

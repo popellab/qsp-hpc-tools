@@ -607,7 +607,7 @@ class TestSubmitCppJobsRetryLoop:
             time_limit="01:00:00",
             cpp_binary_path="/usr/bin/qsp_sim",
             cpp_template_path="/tmp/p.xml",
-            cpp_repo_path="/home/testuser/SPQSP_PDAC",
+            cpp_repo_path="/home/testuser/cpp-repo",
         )
         transport = Mock()
 

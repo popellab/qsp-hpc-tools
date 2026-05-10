@@ -17,7 +17,7 @@ from qsp_hpc.cpp.param_xml import (
 # A minimal template that mirrors the real param_all.xml shape: a Param
 # root with a QSP subtree (substitutable) and an ABM subtree where tags
 # may repeat across cell types. Kept local so the suite doesn't depend
-# on SPQSP_PDAC being checked out alongside this repo.
+# on a real consumer-project template being checked out alongside.
 MINI_TEMPLATE = b"""<Param>
   <QSP>
     <init_value>
@@ -153,28 +153,22 @@ def test_scientific_notation_round_trips(template_path: Path):
     assert float(_get_leaf_text(out, "k_C1_death")) == 1.234e-15
 
 
-# --- Integration with real SPQSP_PDAC template (opt-in) ---------------------
-# These run only if SPQSP_PDAC is checked out alongside this repo (or the
-# path is given via env var). They catch real template-structure drift.
+# --- Integration with real param template (opt-in) -------------------------
+# Runs only when QSP_SIM_TEMPLATE points at an existing param_all.xml-shaped
+# file. Catches real template-structure drift without baking in any
+# consumer repo path.
 
 
 def _real_template_path() -> Path | None:
-    env = os.environ.get("SPQSP_PDAC_ROOT")
-    if env:
-        candidate = Path(env) / "PDAC" / "sim" / "resource" / "param_all.xml"
-        return candidate if candidate.exists() else None
-    # Try sibling directories of this repo.
-    here = Path(__file__).resolve().parent.parent
-    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        candidate = here.parent / sibling / "PDAC" / "sim" / "resource" / "param_all.xml"
-        if candidate.exists():
-            return candidate
+    env = os.environ.get("QSP_SIM_TEMPLATE")
+    if env and Path(env).exists():
+        return Path(env)
     return None
 
 
 @pytest.mark.skipif(
     _real_template_path() is None,
-    reason="SPQSP_PDAC/PDAC/sim/resource/param_all.xml not found",
+    reason="QSP_SIM_TEMPLATE env var unset; skipping real-template integration test",
 )
 def test_real_template_loads_and_has_expected_params():
     path = _real_template_path()

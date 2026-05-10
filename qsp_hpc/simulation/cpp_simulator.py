@@ -62,7 +62,7 @@ class CppSimulator:
         scenario: str = "default",
         subtree: str | None = "QSP",
         t_end_days: float = 180.0,
-        dt_days: float = 1.0,
+        min_cadence_hours: float = 4.0,
         cache_dir: str | Path = "cache/sbi_simulations",
         seed: int = 2025,
         theta_pool_size: int = 100_000,
@@ -79,7 +79,7 @@ class CppSimulator:
         test_stats_csv: Optional[str | Path] = None,
         calibration_targets: Optional[str | Path | list] = None,
         model_structure_file: Optional[str | Path] = None,
-        poll_interval: float = 30.0,
+        poll_interval: float = 5.0,
         max_wait_time: Optional[float] = None,
         remote_binary_path: Optional[str] = None,
         remote_template_xml: Optional[str] = None,
@@ -99,7 +99,7 @@ class CppSimulator:
         self.scenario = scenario
         self.subtree = subtree
         self.t_end_days = t_end_days
-        self.dt_days = dt_days
+        self.min_cadence_hours = min_cadence_hours
         self.cache_dir = Path(cache_dir)
         self.seed = seed
         self.theta_pool_size = theta_pool_size
@@ -245,7 +245,7 @@ class CppSimulator:
             "config_hash": self.config_hash[:8] + "...",
             "pool_dir": str(self.pool_dir),
             "t_end_days": t_end_days,
-            "dt_days": dt_days,
+            "min_cadence_hours": min_cadence_hours,
             "seed": seed,
             "scenario_yaml": str(self.scenario_yaml) if self.scenario_yaml else "-",
             "drug_metadata_yaml": (
@@ -273,7 +273,7 @@ class CppSimulator:
         folded in so restricted and unrestricted pools (sharing all
         other config) get distinct on-disk pool dirs.
         """
-        from qsp_hpc.utils.hash_utils import compute_pool_id_hash
+        from qsp_hpc.utils.hash_utils import compute_pool_id_hash_legacy as compute_pool_id_hash
 
         base_hash = compute_pool_id_hash(
             priors_csv=self.priors_csv,
@@ -459,7 +459,7 @@ class CppSimulator:
             param_names=self.param_names,
             sample_indices=indices,
             t_end_days=self.t_end_days,
-            dt_days=self.dt_days,
+            min_cadence_hours=self.min_cadence_hours,
             output_path=output_path,
             scenario=self.scenario,
             seed=self.seed,
@@ -485,13 +485,51 @@ class CppSimulator:
         """
         return self.pool_dir.name
 
-    def _compute_test_stats_hash(self) -> str:
-        """SHA-256 of the test-stats CSV (matches QSPSimulator)."""
+    def _compute_test_stats_hash(self, aux_samples_csv: Optional[str] = None) -> str:
+        """SHA-256 of the test-stats CSV (+ aux samples CSV when present).
+
+        ``aux_samples_csv`` is folded in so two runs that share the
+        trajectory pool but disagree on aux draws (different RNG seed,
+        different aux declarations) get distinct derive-stage cache
+        keys. Sim pool key is unaffected; aux is purely derive-stage.
+        """
         if self.test_stats_csv is None:
             raise RuntimeError("test_stats_csv must be set to compute test_stats_hash")
         from qsp_hpc.utils.hash_utils import compute_test_stats_hash
 
-        return compute_test_stats_hash(self.test_stats_csv)
+        return compute_test_stats_hash(self.test_stats_csv, aux_samples_csv)
+
+    @staticmethod
+    def _aux_hash(
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]],
+        auxiliary_units: Optional[dict[str, str]],
+    ) -> str:
+        """SHA-256 over the per-sim aux draws and unit map.
+
+        Returns the all-zero digest when no aux is configured so existing
+        cache keys for non-aux callers stay backwards compatible (the
+        digest is still folded into the suffix-pool key, but it's a fixed
+        sentinel).
+        """
+        h = hashlib.sha256()
+        if aux_by_sample_index:
+            for sid in sorted(aux_by_sample_index.keys()):
+                rec = aux_by_sample_index[sid]
+                h.update(str(sid).encode())
+                h.update(b"|")
+                for name in sorted(rec.keys()):
+                    h.update(name.encode())
+                    h.update(b"=")
+                    h.update(repr(float(rec[name])).encode())
+                    h.update(b";")
+                h.update(b"\n")
+        if auxiliary_units:
+            for name in sorted(auxiliary_units.keys()):
+                h.update(name.encode())
+                h.update(b"=")
+                h.update(str(auxiliary_units[name]).encode())
+                h.update(b";")
+        return h.hexdigest()
 
     def _local_test_stats_path(self, test_stats_hash: str) -> Path:
         """Where downloaded HPC test stats land locally.
@@ -585,32 +623,50 @@ class CppSimulator:
         time.sleep(SLURM_REGISTRATION_DELAY)
         start = time.time()
         max_seen = 0
+        # Track expected total from the first nonzero squeue poll so the
+        # progress log can render "X/Y done" without paying the
+        # ~3–5s/poll sacct DB query during the live window. ``Y`` here
+        # is approximate (retries inflate it slightly) but the user-
+        # facing display is what matters.
+        expected_total = 0
         while True:
             totals = {"completed": 0, "running": 0, "pending": 0, "failed": 0}
             for jid in job_ids:
                 try:
-                    status = self.job_manager.check_job_status(jid)
+                    status = self.job_manager.check_job_status(jid, squeue_only=True)
                     for k in totals:
                         totals[k] += status[k]
                 except Exception as e:
                     self.logger.warning(f"Status check failed for job {jid}: {e}")
-            total = sum(totals.values())
-            max_seen = max(max_seen, total)
+            active = totals["running"] + totals["pending"]
+            expected_total = max(expected_total, active)
+            max_seen = max(max_seen, active)
+            # Approximate completed = (max active ever seen) - (current
+            # active). Off-by-one on retries; the final sacct sweep
+            # below corrects it.
+            completed_approx = max(0, expected_total - active)
             elapsed = time.time() - start
             self.logger.info(
                 f"  [{int(elapsed // 60)}m {int(elapsed % 60)}s] "
-                f"{totals['completed']}/{total} done | "
-                f"running={totals['running']} pending={totals['pending']} "
-                f"failed={totals['failed']}"
+                f"{completed_approx}/{expected_total} done | "
+                f"running={totals['running']} pending={totals['pending']}"
             )
-            active = totals["running"] + totals["pending"]
-            if total > 0 and active == 0:
-                if totals["failed"] > 0:
-                    self.logger.warning(f"{totals['failed']} task(s) failed")
+            if expected_total > 0 and active == 0:
+                # One sacct sweep to confirm the final completed/failed
+                # split — the only call that hits the accounting DB.
+                final = {"completed": 0, "running": 0, "pending": 0, "failed": 0}
+                for jid in job_ids:
+                    s = self.job_manager.check_job_status(jid, squeue_only=False)
+                    for k in final:
+                        final[k] += s[k]
+                if final["failed"] > 0:
+                    self.logger.warning(f"{final['failed']} task(s) failed")
+                self.logger.info(
+                    f"  array done: {final['completed']} completed, "
+                    f"{final['failed']} failed (sacct)"
+                )
                 return
-            if total == 0 and max_seen > 0 and elapsed > 30:
-                return
-            if total == 0 and elapsed > JOB_QUEUE_TIMEOUT:
+            if max_seen == 0 and elapsed > JOB_QUEUE_TIMEOUT:
                 self.logger.warning(f"No jobs visible after {JOB_QUEUE_TIMEOUT}s — proceeding")
                 return
             if self.max_wait_time and elapsed > self.max_wait_time:
@@ -760,7 +816,21 @@ class CppSimulator:
                 "template before submitting."
             )
 
-    def run_hpc(self, n: int) -> Tuple[np.ndarray, np.ndarray]:
+    def run_hpc(
+        self,
+        n: int,
+        *,
+        samples_csv_remote: Optional[str] = None,
+        healthy_state_yaml_remote: Optional[str] = None,
+        model_structure_remote: Optional[str] = None,
+        scenario_yaml_remote: Optional[str] = None,
+        drug_metadata_yaml_remote: Optional[str] = None,
+        test_stats_csv_remote: Optional[str] = None,
+        aux_samples_csv: Optional[str] = None,
+        aux_samples_csv_remote: Optional[str] = None,
+        auxiliary_units: Optional[dict] = None,
+        skip_setup: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Run ``n`` simulations through the 3-tier HPC cache.
 
         Returns ``(theta, test_stats)`` arrays — *not* full trajectories.
@@ -775,6 +845,19 @@ class CppSimulator:
 
         Requires ``job_manager`` and ``test_stats_csv`` set in the
         constructor.
+
+        Args:
+            n: Number of simulations requested.
+            samples_csv_remote: When set, ``submit_cpp_jobs`` references
+                this remote samples CSV instead of uploading a
+                per-pool copy. Used by :class:`MultiScenarioRunner` to
+                hoist the upload above the per-scenario loop when every
+                scenario shares theta. Caller must have uploaded the
+                CSV via :meth:`HPCJobManager.upload_shared_samples_csv`
+                first.
+            skip_setup: When True, ``submit_cpp_jobs`` skips the
+                venv-refresh / git pull / cmake setup phase. Used for
+                scenarios 2..N when scenario 1 already did the setup.
         """
         if self.job_manager is None:
             raise RuntimeError("run_hpc() requires job_manager")
@@ -808,7 +891,7 @@ class CppSimulator:
                 "and most cal-target unit conversions silently NaN out."
             )
 
-        test_stats_hash = self._compute_test_stats_hash()
+        test_stats_hash = self._compute_test_stats_hash(aux_samples_csv=aux_samples_csv)
         local_cache = self._local_test_stats_path(test_stats_hash)
 
         self.logger.info(f"HPC request: {n} simulations (scenario={self.scenario})")
@@ -871,6 +954,12 @@ class CppSimulator:
                 model_structure_file=(
                     str(self.model_structure_file) if self.model_structure_file else None
                 ),
+                skip_setup=skip_setup,
+                model_structure_remote=model_structure_remote,
+                test_stats_csv_remote=test_stats_csv_remote,
+                aux_samples_csv=aux_samples_csv,
+                aux_samples_csv_remote=aux_samples_csv_remote,
+                auxiliary_units=auxiliary_units,
             )
             self.logger.info(f"Derivation job: {derive_id}")
             self._wait_for_jobs([derive_id])
@@ -901,14 +990,21 @@ class CppSimulator:
             start_index = 0
             self.logger.info("HPC pool empty — submitting fresh sweep of %d sims", n_needed)
 
+        # When a shared full-pool CSV is hoisted via samples_csv_remote,
+        # the worker honors ``samples_start_offset=start_index`` and
+        # slices the right rows out of the shared CSV. Without
+        # samples_csv_remote we fall back to a per-pool deficit CSV
+        # upload (rows [start_index : n) of the deterministic theta
+        # pool); workers read from row 0 of that smaller file.
         params_csv = self._write_params_csv(n_needed, start_index=start_index)
+        samples_start_offset = start_index if samples_csv_remote is not None else 0
         try:
             info = self.job_manager.submit_cpp_jobs(
                 samples_csv=str(params_csv),
                 num_simulations=n_needed,
                 simulation_pool_id=self.simulation_pool_id,
                 t_end_days=self.t_end_days,
-                dt_days=self.dt_days,
+                min_cadence_hours=self.min_cadence_hours,
                 scenario=self.scenario,
                 seed=self.seed,
                 binary_path=remote_binary_path,
@@ -928,6 +1024,17 @@ class CppSimulator:
                     str(self.model_structure_file) if self.model_structure_file else None
                 ),
                 evolve_cache=self.evolve_cache_root is not None,
+                samples_csv_remote=samples_csv_remote,
+                healthy_state_yaml_remote=healthy_state_yaml_remote,
+                model_structure_remote=model_structure_remote,
+                scenario_yaml_remote=scenario_yaml_remote,
+                drug_metadata_yaml_remote=drug_metadata_yaml_remote,
+                test_stats_csv_remote=test_stats_csv_remote,
+                aux_samples_csv=aux_samples_csv,
+                aux_samples_csv_remote=aux_samples_csv_remote,
+                auxiliary_units=auxiliary_units,
+                samples_start_offset=samples_start_offset,
+                skip_setup=skip_setup,
             )
         finally:
             params_csv.unlink(missing_ok=True)
@@ -950,6 +1057,8 @@ class CppSimulator:
         pool_suffix: str = "posterior_predictive",
         evolve_trajectory_dir: Optional[str | Path] = None,
         evolve_trajectory_dt_days: Optional[float] = None,
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]] = None,
+        auxiliary_units: Optional[dict[str, str]] = None,
     ) -> Tuple[np.ndarray, pa.Table]:
         """Run C++ simulations at explicit thetas and return derived test stats.
 
@@ -1044,16 +1153,20 @@ class CppSimulator:
         )
 
         # Cache key: theta + calibration targets + prediction targets + backend
-        # tag. Without the target hashes, editing a YAML silently hits a stale
-        # pool and the caller sees endpoint columns derived from the old
-        # observable code. The backend tag keeps local and HPC caches for the
-        # same theta distinct — they should agree, but leaving them isolated
-        # lets a local smoke reproduce against an HPC reference run.
+        # tag + aux draws. Without the target hashes, editing a YAML silently
+        # hits a stale pool and the caller sees endpoint columns derived from
+        # the old observable code. The backend tag keeps local and HPC caches
+        # for the same theta distinct. The aux hash folds in the per-sim aux
+        # draws so two PPC calls on the same theta but different posterior aux
+        # don't collide on the same cache.
         theta_hash = hashlib.sha256(theta.tobytes()).hexdigest()
         cal_hash = self._calibration_targets_hash()
         pred_hash = self._prediction_targets_hash(pred_dir)
+        aux_hash = self._aux_hash(aux_by_sample_index, auxiliary_units)
         key_hash = hashlib.sha256(
-            (theta_hash + "|" + cal_hash + "|" + pred_hash + f"|backend={backend}").encode()
+            (
+                theta_hash + "|" + cal_hash + "|" + pred_hash + f"|backend={backend}|aux={aux_hash}"
+            ).encode()
         ).hexdigest()[:HASH_PREFIX_LENGTH]
 
         suffix_pool_dir = self.pool_dir.parent / f"{self.pool_dir.name}_{pool_suffix}_{key_hash}"
@@ -1063,7 +1176,8 @@ class CppSimulator:
         self.logger.info(
             f"simulate_with_parameters: n={n_samples}, backend={backend}, "
             f"theta_hash={theta_hash[:8]}, "
-            f"cal_hash={cal_hash[:8]}, pred_hash={pred_hash[:8]}"
+            f"cal_hash={cal_hash[:8]}, pred_hash={pred_hash[:8]}, "
+            f"aux_hash={aux_hash[:8]}"
         )
         self.logger.info(f"  suffix pool: {suffix_pool_dir.name}")
 
@@ -1105,8 +1219,17 @@ class CppSimulator:
                 pool_suffix=pool_suffix,
                 evolve_trajectory_dir=evolve_trajectory_dir,
                 evolve_trajectory_dt_days=evolve_trajectory_dt_days,
+                aux_by_sample_index=aux_by_sample_index,
+                auxiliary_units=auxiliary_units,
             )
         else:
+            if aux_by_sample_index:
+                raise NotImplementedError(
+                    "simulate_with_parameters(backend='hpc', aux_by_sample_index=...) "
+                    "is not yet supported. Local backend handles aux PPC; "
+                    "extend the HPC submit path if cluster-side PPC with "
+                    "auxiliary parameters becomes a regular need."
+                )
             table = self._simulate_with_parameters_hpc(
                 theta=theta,
                 sample_indices=sample_indices,
@@ -1137,6 +1260,8 @@ class CppSimulator:
         pool_suffix: str,
         evolve_trajectory_dir: Optional[str | Path] = None,
         evolve_trajectory_dt_days: Optional[float] = None,
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]] = None,
+        auxiliary_units: Optional[dict[str, str]] = None,
     ) -> pa.Table:
         """Local backend for :meth:`simulate_with_parameters`.
 
@@ -1160,7 +1285,7 @@ class CppSimulator:
             param_names=self.param_names,
             sample_indices=sample_indices,
             t_end_days=self.t_end_days,
-            dt_days=self.dt_days,
+            min_cadence_hours=self.min_cadence_hours,
             output_path=species_parquet,
             scenario=pool_suffix,
             seed=self.seed,
@@ -1171,7 +1296,14 @@ class CppSimulator:
         )
 
         species_df = pd.read_parquet(species_parquet)
-        return self._derive_test_stats_table(species_df, test_stats_df, theta, sample_indices)
+        return self._derive_test_stats_table(
+            species_df,
+            test_stats_df,
+            theta,
+            sample_indices,
+            aux_by_sample_index=aux_by_sample_index,
+            auxiliary_units=auxiliary_units,
+        )
 
     def _simulate_with_parameters_hpc(
         self,
@@ -1260,7 +1392,7 @@ class CppSimulator:
                     num_simulations=n_samples,
                     simulation_pool_id=hpc_pool_id,
                     t_end_days=self.t_end_days,
-                    dt_days=self.dt_days,
+                    min_cadence_hours=self.min_cadence_hours,
                     scenario=self.scenario,
                     seed=self.seed,
                     binary_path=remote_binary_path,
@@ -1409,6 +1541,9 @@ class CppSimulator:
         test_stats_df: pd.DataFrame,
         theta: np.ndarray,
         sample_indices: np.ndarray,
+        *,
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]] = None,
+        auxiliary_units: Optional[dict[str, str]] = None,
     ) -> pa.Table:
         """Build the output pa.Table: sample_index / status / param:* / ts:<id>."""
         from qsp_hpc.batch.derive_test_stats_worker import (
@@ -1432,6 +1567,8 @@ class CppSimulator:
             registry,
             species_units,
             template_defaults=template_defaults,
+            aux_by_sample_index=aux_by_sample_index,
+            auxiliary_units=auxiliary_units,
         )
 
         status_np = (

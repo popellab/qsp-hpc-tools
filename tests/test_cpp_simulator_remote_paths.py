@@ -62,8 +62,8 @@ def model_structure_file(tmp_path: Path) -> Path:
 
 def _make_job_manager(
     *,
-    cpp_binary_path: str = "/hpc/SPQSP_PDAC/PDAC/qsp/sim/build/qsp_sim",
-    cpp_template_path: str = "/hpc/SPQSP_PDAC/PDAC/sim/resource/param_all.xml",
+    cpp_binary_path: str = "/hpc/qsp_sim",
+    cpp_template_path: str = "/hpc/param_all.xml",
     simulation_pool_path: str = "/hpc/pools",
 ) -> MagicMock:
     """Build a mock HPCJobManager that answers just enough of run_hpc()'s

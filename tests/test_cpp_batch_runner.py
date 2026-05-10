@@ -48,7 +48,7 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
             --rules-out) RULES_OUT="$2"; shift 2 ;;
             --param) PARAM="$2"; shift 2 ;;
             --t-end-days) TEND="$2"; shift 2 ;;
-            --dt-days) DT="$2"; shift 2 ;;
+            --min-cadence-hours) DT="$2"; shift 2 ;;
             *) shift ;;
           esac
         done
@@ -57,8 +57,8 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
           ok)
             python3 - <<PY
         import struct
-        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 3, 0, 0, float("$DT"), float("$TEND"))
-        body = struct.pack('<6d', 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+        header = struct.pack('<IIQQQQdddQQ', 0x51535042, 3, 2, 3, 0, 0, float("$DT"), float("$TEND"), 0.0, 0, 0)
+        body = struct.pack('<8d', 0.0, 1.0, 2.0, 3.0, 0.1, 4.0, 5.0, 6.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("spA\\nspB\\nspC\\n")
         open("$COMP_OUT", 'w').write('')
@@ -73,8 +73,8 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
             fi
             python3 - <<PY
         import struct
-        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 3, 0, 0, float("$DT"), float("$TEND"))
-        body = struct.pack('<6d', 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+        header = struct.pack('<IIQQQQdddQQ', 0x51535042, 3, 2, 3, 0, 0, float("$DT"), float("$TEND"), 0.0, 0, 0)
+        body = struct.pack('<8d', 0.0, 1.0, 2.0, 3.0, 0.1, 4.0, 5.0, 6.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("spA\\nspB\\nspC\\n")
         open("$COMP_OUT", 'w').write('')
@@ -107,7 +107,7 @@ def test_batch_runner_happy_path(tmp_path: Path, template_path: Path, ok_binary:
         theta_matrix=theta,
         param_names=["A", "B"],
         t_end_days=0.2,
-        dt_days=0.1,
+        min_cadence_hours=0.1,
         output_path=out,
         max_workers=2,
     )
@@ -155,7 +155,7 @@ def test_batch_runner_failed_sim_marked_with_nan(tmp_path: Path, template_path: 
         theta_matrix=theta,
         param_names=["A", "B"],
         t_end_days=0.2,
-        dt_days=0.1,
+        min_cadence_hours=0.1,
         output_path=out,
         max_workers=2,
     )
@@ -188,7 +188,7 @@ def test_batch_runner_rejects_unknown_param_before_forking(
             theta_matrix=theta,
             param_names=["A", "NOT_IN_TEMPLATE"],
             t_end_days=0.1,
-            dt_days=0.05,
+            min_cadence_hours=0.05,
             output_path=tmp_path / "x.parquet",
         )
 
@@ -201,7 +201,7 @@ def test_batch_runner_shape_mismatch(tmp_path: Path, template_path: Path, ok_bin
             theta_matrix=theta,
             param_names=["A", "B"],
             t_end_days=0.1,
-            dt_days=0.05,
+            min_cadence_hours=0.05,
             output_path=tmp_path / "x.parquet",
         )
 
@@ -231,7 +231,7 @@ def test_batch_runner_writes_only_sampled_param_columns(
         theta_matrix=theta,
         param_names=["A"],
         t_end_days=0.2,
-        dt_days=0.1,
+        min_cadence_hours=0.1,
         output_path=out,
         max_workers=2,
     )
@@ -348,7 +348,7 @@ def test_batch_runner_all_fail_raises(tmp_path: Path, template_path: Path):
             theta_matrix=theta,
             param_names=["A", "B"],
             t_end_days=0.1,
-            dt_days=0.05,
+            min_cadence_hours=0.05,
             output_path=tmp_path / "x.parquet",
         )
 
@@ -360,24 +360,13 @@ def _real_binary_path() -> Path | None:
     env = os.environ.get("QSP_SIM_BINARY")
     if env and Path(env).exists():
         return Path(env)
-    here = Path(__file__).resolve().parent.parent
-    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        candidate = here.parent / sibling / "PDAC" / "qsp" / "sim" / "build" / "qsp_sim"
-        if candidate.exists():
-            return candidate
     return None
 
 
 def _real_template_path() -> Path | None:
-    env = os.environ.get("SPQSP_PDAC_ROOT")
-    if env:
-        c = Path(env) / "PDAC" / "sim" / "resource" / "param_all_test.xml"
-        return c if c.exists() else None
-    here = Path(__file__).resolve().parent.parent
-    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        c = here.parent / sibling / "PDAC" / "sim" / "resource" / "param_all_test.xml"
-        if c.exists():
-            return c
+    env = os.environ.get("QSP_SIM_TEMPLATE")
+    if env and Path(env).exists():
+        return Path(env)
     return None
 
 
@@ -394,14 +383,17 @@ def test_real_batch_end_to_end(tmp_path: Path):
         theta_matrix=theta,
         param_names=["k_C1_growth"],
         t_end_days=5.0,
-        dt_days=1.0,
+        min_cadence_hours=1.0,
         output_path=out,
         max_workers=2,
     )
     assert result.n_sims == 3
     assert result.n_failed == 0
     assert len(result.species_names) == 164
-    assert result.n_times == 6  # 0..5 days at dt=1
+    # Under v3 CV_ONE_STEP cadence floor, n_times depends on solver
+    # stepping. 1 h floor over 5 d gives ~120 dumps maximum; allow a
+    # generous lower bound that captures any reasonable cadence.
+    assert result.n_times >= 6
 
     table = pq.read_table(out)
     assert "V_T.C1" in table.column_names

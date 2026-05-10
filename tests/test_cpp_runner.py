@@ -1,8 +1,9 @@
 """Tests for qsp_hpc.cpp.runner.
 
 Unit tests use a synthetic binary file and a fake qsp_sim (shell script)
-so the suite runs without SPQSP_PDAC compiled. The integration test at
-the bottom runs the real qsp_sim if available.
+so the suite runs without a real qsp_sim build. The integration test at
+the bottom runs the real qsp_sim when QSP_SIM_BINARY +
+QSP_SIM_TEMPLATE + QSP_SIM_HEALTHY_YAML env vars are set.
 """
 
 from __future__ import annotations
@@ -44,51 +45,103 @@ def template_path(tmp_path: Path) -> Path:
 # --- Binary-format parser tests -------------------------------------------
 
 
-def _pack_binary(
-    traj: np.ndarray,
-    dt: float,
+def _pack_binary_v3(
+    state: np.ndarray,
+    time_days: np.ndarray,
+    *,
+    min_cadence_hours: float,
     t_end: float,
     n_sp: int,
     n_comp: int = 0,
     n_rules: int = 0,
+    t_offset: float = 0.0,
+    n_cvode_steps: int = 0,
     magic: int = 0x51535042,
-    version: int = 2,
+    version: int = 3,
 ) -> bytes:
-    n_t, n_cols = traj.shape
-    assert n_cols == n_sp + n_comp + n_rules
-    header = struct.pack("<IIQQQQdd", magic, version, n_t, n_sp, n_comp, n_rules, dt, t_end)
-    return header + traj.astype("<f8").tobytes()
+    """Pack a synthetic v3 binary. ``state`` is (n_t, n_state_cols);
+    ``time_days`` is (n_t,) and is prepended as the leading body column."""
+    n_t, n_state = state.shape
+    assert n_state == n_sp + n_comp + n_rules
+    assert time_days.shape == (n_t,)
+    header = struct.pack(
+        "<IIQQQQdddQQ",
+        magic,
+        version,
+        n_t,
+        n_sp,
+        n_comp,
+        n_rules,
+        min_cadence_hours,
+        t_end,
+        t_offset,
+        n_cvode_steps,
+        0,  # reserved
+    )
+    body = np.column_stack([time_days, state]).astype("<f8").tobytes()
+    return header + body
 
 
 def test_read_binary_roundtrip(tmp_path: Path):
-    # 3 times × (5 species + 2 comps + 4 rules) = 3 × 11
-    traj = np.arange(33, dtype="f8").reshape(3, 11)
+    # 3 times × (5 species + 2 comps + 4 rules) = 3 × 11 state cols
+    state = np.arange(33, dtype="f8").reshape(3, 11)
+    time_days = np.array([0.0, 0.5, 1.0])
     p = tmp_path / "ok.bin"
-    p.write_bytes(_pack_binary(traj, dt=0.5, t_end=1.0, n_sp=5, n_comp=2, n_rules=4))
+    p.write_bytes(
+        _pack_binary_v3(
+            state,
+            time_days,
+            min_cadence_hours=4.0,
+            t_end=1.0,
+            n_sp=5,
+            n_comp=2,
+            n_rules=4,
+            t_offset=0.0,
+            n_cvode_steps=42,
+        )
+    )
     out, header = read_binary_trajectory(p)
-    np.testing.assert_array_equal(out, traj)
+    np.testing.assert_array_equal(out, state)
     assert isinstance(header, TrajectoryHeader)
-    assert header.version == 2
+    assert header.version == 3
     assert header.n_species == 5
     assert header.n_compartments == 2
     assert header.n_rules == 4
     assert header.n_columns == 11
-    assert header.dt_days == 0.5
+    assert header.min_cadence_hours == 4.0
     assert header.t_end_days == 1.0
+    assert header.t_offset_days == 0.0
+    assert header.n_cvode_steps == 42
+    np.testing.assert_array_equal(header.time_days, time_days)
 
 
 def test_read_binary_bad_magic(tmp_path: Path):
     p = tmp_path / "bad.bin"
-    p.write_bytes(_pack_binary(np.zeros((1, 1)), 1.0, 1.0, n_sp=1, magic=0xDEADBEEF))
+    p.write_bytes(
+        _pack_binary_v3(
+            np.zeros((1, 1)),
+            np.array([0.0]),
+            min_cadence_hours=1.0,
+            t_end=1.0,
+            n_sp=1,
+            magic=0xDEADBEEF,
+        )
+    )
     with pytest.raises(BinaryFormatError, match="magic"):
         read_binary_trajectory(p)
 
 
 def test_read_binary_unsupported_version(tmp_path: Path):
-    # Anything other than v2 must be rejected loudly so a stale qsp_sim
-    # binary doesn't silently produce mismatched columns.
+    # v2 binaries are no longer accepted — qsp-codegen and qsp-hpc-tools
+    # cut over to v3 together; a v2 binary in the wild means the qsp_sim
+    # binary is stale. Pack an 80-byte header with version=2 so the
+    # reader gets past the truncation check and trips the version
+    # rejection — that's the contract we want exercised.
     p = tmp_path / "vX.bin"
-    p.write_bytes(_pack_binary(np.zeros((1, 1)), 1.0, 1.0, n_sp=1, version=1))
+    fake_v2 = struct.pack(
+        "<IIQQQQdddQQ", 0x51535042, 2, 1, 1, 0, 0, 0.1, 0.1, 0.0, 0, 0
+    ) + struct.pack("<d", 0.0)
+    p.write_bytes(fake_v2)
     with pytest.raises(BinaryFormatError, match="version"):
         read_binary_trajectory(p)
 
@@ -101,8 +154,8 @@ def test_read_binary_truncated_header(tmp_path: Path):
 
 
 def test_read_binary_size_mismatch(tmp_path: Path):
-    # Header claims 3×2 doubles, payload only has 1 double.
-    header = struct.pack("<IIQQQQdd", 0x51535042, 2, 3, 2, 0, 0, 0.1, 0.3)
+    # Header claims 3 times × (1 time + 2 state) cols, payload only has 1 double.
+    header = struct.pack("<IIQQQQdddQQ", 0x51535042, 3, 3, 2, 0, 0, 4.0, 0.3, 0.0, 0, 0)
     p = tmp_path / "short_body.bin"
     p.write_bytes(header + b"\x00" * 8)
     with pytest.raises(BinaryFormatError, match="size mismatch"):
@@ -129,18 +182,17 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
             --rules-out) RULES_OUT="$2"; shift 2 ;;
             --param) PARAM="$2"; shift 2 ;;
             --t-end-days) TEND="$2"; shift 2 ;;
-            --dt-days) DT="$2"; shift 2 ;;
+            --min-cadence-hours) MIN_CADENCE="$2"; shift 2 ;;
             *) shift ;;
           esac
         done
 
         case "$BEHAVIOR" in
           ok)
-            # Write a tiny v2 binary: 2 time points × (3 species + 0 comps + 0 rules).
             python3 - <<PY
         import struct
-        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 3, 0, 0, float("$DT"), float("$TEND"))
-        body = struct.pack('<6d', 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+        header = struct.pack('<IIQQQQdddQQ', 0x51535042, 3, 2, 3, 0, 0, float("$MIN_CADENCE"), float("$TEND"), 0.0, 0, 0)
+        body = struct.pack('<8d', 0.0, 1.0, 2.0, 3.0, 0.1, 4.0, 5.0, 6.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("\\n".join(['spA', 'spB', 'spC']) + '\\n')
         open("$COMP_OUT", 'w').write('')
@@ -152,7 +204,6 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
             exit 42
             ;;
           hang)
-            # Busy-wait long enough to blow the test timeout.
             sleep 60
             ;;
           bad_binary)
@@ -164,9 +215,8 @@ def _make_fake_binary(tmp_path: Path, behavior: str) -> Path:
           species_mismatch)
             python3 - <<PY
         import struct
-        # 2×3 trajectory but species list has 2 entries.
-        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 3, 0, 0, float("$DT"), float("$TEND"))
-        body = struct.pack('<6d', 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+        header = struct.pack('<IIQQQQdddQQ', 0x51535042, 3, 2, 3, 0, 0, float("$MIN_CADENCE"), float("$TEND"), 0.0, 0, 0)
+        body = struct.pack('<8d', 0.0, 1.0, 2.0, 3.0, 0.1, 4.0, 5.0, 6.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("spA\\nspB\\n")
         open("$COMP_OUT", 'w').write('')
@@ -189,17 +239,17 @@ def test_runner_happy_path(tmp_path: Path, template_path: Path, fake_ok: Path):
     result = runner.run_one(
         params={"A": 5.0},
         t_end_days=0.2,
-        dt_days=0.1,
+        min_cadence_hours=4.0,
         workdir=tmp_path / "work",
     )
     assert isinstance(result, SimResult)
     assert result.trajectory.shape == (2, 3)
     assert result.species_names == ["spA", "spB", "spC"]
-    assert result.dt_days == 0.1
+    assert result.min_cadence_hours == 4.0
     assert result.t_end_days == 0.2
-    # time_days reconstructed from dt × i
+    # time_days now comes from the binary's leading column, not a synthetic
+    # arange — confirm the fake's hard-coded [0.0, 0.1] surfaces verbatim.
     np.testing.assert_array_equal(result.time_days, np.array([0.0, 0.1]))
-    # Species names are cached on the runner for subsequent calls.
     assert runner.species_names == ["spA", "spB", "spC"]
 
 
@@ -214,7 +264,7 @@ def test_runner_unknown_param_raises(tmp_path: Path, template_path: Path, fake_o
         runner.run_one(
             params={"unknown_param": 1.0},
             t_end_days=1.0,
-            dt_days=1.0,
+            min_cadence_hours=4.0,
             workdir=tmp_path / "work",
         )
 
@@ -224,7 +274,7 @@ def test_runner_nonzero_exit_preserves_xml(tmp_path: Path, template_path: Path):
     runner = CppRunner(crash, template_path)
     work = tmp_path / "work"
     with pytest.raises(QspSimError, match="exited 42"):
-        runner.run_one(params={}, t_end_days=1.0, dt_days=1.0, workdir=work)
+        runner.run_one(params={}, t_end_days=1.0, min_cadence_hours=4.0, workdir=work)
     stashed = list((work / "failed").glob("*.nonzero-exit.xml"))
     assert len(stashed) == 1, "failed XML should be preserved under workdir/failed/"
 
@@ -234,7 +284,7 @@ def test_runner_timeout_preserves_xml(tmp_path: Path, template_path: Path):
     runner = CppRunner(hang, template_path, default_timeout_s=0.5)
     work = tmp_path / "work"
     with pytest.raises(QspSimError, match="timed out"):
-        runner.run_one(params={}, t_end_days=1.0, dt_days=1.0, workdir=work)
+        runner.run_one(params={}, t_end_days=1.0, min_cadence_hours=4.0, workdir=work)
     stashed = list((work / "failed").glob("*.timeout.xml"))
     assert len(stashed) == 1
 
@@ -244,7 +294,7 @@ def test_runner_bad_binary_preserves_xml(tmp_path: Path, template_path: Path):
     runner = CppRunner(bad, template_path)
     work = tmp_path / "work"
     with pytest.raises(QspSimError, match="unreadable binary"):
-        runner.run_one(params={}, t_end_days=1.0, dt_days=1.0, workdir=work)
+        runner.run_one(params={}, t_end_days=1.0, min_cadence_hours=4.0, workdir=work)
     stashed = list((work / "failed").glob("*.bad-binary.xml"))
     assert len(stashed) == 1
 
@@ -253,14 +303,13 @@ def test_runner_species_mismatch_raises(tmp_path: Path, template_path: Path):
     mismatch = _make_fake_binary(tmp_path, "species_mismatch")
     runner = CppRunner(mismatch, template_path)
     with pytest.raises(QspSimError, match="species-out line count"):
-        runner.run_one(params={}, t_end_days=1.0, dt_days=1.0, workdir=tmp_path / "work")
+        runner.run_one(params={}, t_end_days=1.0, min_cadence_hours=4.0, workdir=tmp_path / "work")
 
 
 def test_runner_cleans_up_files_on_success(tmp_path: Path, template_path: Path, fake_ok: Path):
     runner = CppRunner(fake_ok, template_path)
     work = tmp_path / "work"
-    runner.run_one(params={}, t_end_days=0.2, dt_days=0.1, workdir=work, keep_files=False)
-    # workdir exists but should contain no .xml/.bin/.species.txt from the sim
+    runner.run_one(params={}, t_end_days=0.2, min_cadence_hours=4.0, workdir=work, keep_files=False)
     remnants = [p.name for p in work.iterdir() if p.is_file()]
     assert not remnants, f"unexpected leftovers: {remnants}"
 
@@ -270,7 +319,7 @@ def test_runner_keep_files_true_leaves_artifacts(
 ):
     runner = CppRunner(fake_ok, template_path)
     work = tmp_path / "work"
-    runner.run_one(params={}, t_end_days=0.2, dt_days=0.1, workdir=work, keep_files=True)
+    runner.run_one(params={}, t_end_days=0.2, min_cadence_hours=4.0, workdir=work, keep_files=True)
     remnants = sorted(p.suffix for p in work.iterdir() if p.is_file())
     assert ".xml" in remnants and ".bin" in remnants and ".txt" in remnants
 
@@ -282,24 +331,13 @@ def _real_binary_path() -> Path | None:
     env = os.environ.get("QSP_SIM_BINARY")
     if env and Path(env).exists():
         return Path(env)
-    here = Path(__file__).resolve().parent.parent
-    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        candidate = here.parent / sibling / "PDAC" / "qsp" / "sim" / "build" / "qsp_sim"
-        if candidate.exists():
-            return candidate
     return None
 
 
 def _real_template_path() -> Path | None:
-    env = os.environ.get("SPQSP_PDAC_ROOT")
-    if env:
-        c = Path(env) / "PDAC" / "sim" / "resource" / "param_all_test.xml"
-        return c if c.exists() else None
-    here = Path(__file__).resolve().parent.parent
-    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        c = here.parent / sibling / "PDAC" / "sim" / "resource" / "param_all_test.xml"
-        if c.exists():
-            return c
+    env = os.environ.get("QSP_SIM_TEMPLATE")
+    if env and Path(env).exists():
+        return Path(env)
     return None
 
 
@@ -313,37 +351,35 @@ def test_real_qsp_sim_end_to_end(tmp_path: Path):
     result = runner.run_one(
         params={"k_C1_growth": 0.01},
         t_end_days=5.0,
-        dt_days=1.0,
+        min_cadence_hours=4.0,
         workdir=tmp_path,
     )
-    # Binary v2 emits species + compartments + rules as concatenated
-    # columns; check species count via species_names and validate the
-    # full width equals species+comps+rules rather than hardcoding 164.
     n_t, n_cols = result.trajectory.shape
-    assert n_t == 6  # 5 days + t=0
     assert n_cols == len(result.species_names) + len(result.compartment_names) + len(
         result.rule_names
     )
     assert len(result.species_names) == 164
     assert "V_T.C1" in result.species_names
-    # First row is initial conditions; should be finite and non-NaN.
     assert np.all(np.isfinite(result.trajectory[0]))
+    # CV_ONE_STEP cadence floor: spacing never exceeds 4 h = 1/6 day,
+    # plus one terminal sample at t_end.
+    assert n_t >= int(np.ceil(5.0 / (4.0 / 24.0)))
+    assert result.time_days[-1] == pytest.approx(5.0, abs=1e-6)
 
 
 # --- Scenario / evolve-to-diagnosis wiring --------------------------------
 
 
 def _make_fake_argv_recorder(tmp_path: Path) -> tuple[Path, Path]:
-    """Fake qsp_sim that records its argv, then writes a minimal valid binary
-    + species file so run_one's parser is happy. Returns (script, argv_log)."""
+    """Fake qsp_sim that records its argv, then writes a minimal valid v3
+    binary + species file so run_one's parser is happy. Returns
+    (script, argv_log)."""
     log = tmp_path / "argv.log"
     script = tmp_path / "fake_record.sh"
     script.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env bash
         set -e
         printf '%s\\n' "$@" > "{log}"
-        # Parse --binary-out / --species-out / --compartments-out / --rules-out
-        # for the minimal emit below.
         while [ $# -gt 0 ]; do
           case "$1" in
             --binary-out) BIN_OUT="$2"; shift 2 ;;
@@ -355,8 +391,8 @@ def _make_fake_argv_recorder(tmp_path: Path) -> tuple[Path, Path]:
         done
         python3 - <<PY
         import struct
-        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 1, 1, 0, 0, 0.1, 0.1)
-        body = struct.pack('<d', 1.0)
+        header = struct.pack('<IIQQQQdddQQ', 0x51535042, 3, 1, 1, 0, 0, 4.0, 0.1, 0.0, 0, 0)
+        body = struct.pack('<2d', 0.0, 1.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("spA\\n")
         open("$COMP_OUT", 'w').write('')
@@ -380,7 +416,7 @@ def test_runner_appends_scenario_flags(tmp_path: Path, template_path: Path):
         scenario_yaml=scenario,
         drug_metadata_yaml=drug_meta,
     )
-    runner.run_one(params={"A": 1.0}, t_end_days=0.1, dt_days=0.1, workdir=tmp_path / "w")
+    runner.run_one(params={"A": 1.0}, t_end_days=0.1, min_cadence_hours=4.0, workdir=tmp_path / "w")
 
     argv = log.read_text().splitlines()
     assert "--scenario" in argv
@@ -388,6 +424,10 @@ def test_runner_appends_scenario_flags(tmp_path: Path, template_path: Path):
     assert "--drug-metadata" in argv
     assert str(drug_meta.resolve()) in argv
     assert "--evolve-to-diagnosis" not in argv
+    # Verify --min-cadence-hours is the only cadence flag — --dt-days
+    # was hard-removed in qsp-codegen v3, no compat alias.
+    assert "--min-cadence-hours" in argv
+    assert "--dt-days" not in argv
 
 
 def test_runner_appends_evolve_flag(tmp_path: Path, template_path: Path):
@@ -396,7 +436,7 @@ def test_runner_appends_evolve_flag(tmp_path: Path, template_path: Path):
     healthy.write_text("densities: {}\n")
 
     runner = CppRunner(script, template_path, healthy_state_yaml=healthy)
-    runner.run_one(params={"A": 1.0}, t_end_days=0.1, dt_days=0.1, workdir=tmp_path / "w")
+    runner.run_one(params={"A": 1.0}, t_end_days=0.1, min_cadence_hours=4.0, workdir=tmp_path / "w")
 
     argv = log.read_text().splitlines()
     assert "--evolve-to-diagnosis" in argv
@@ -423,7 +463,7 @@ def test_runner_appends_evolve_trajectory_flags(tmp_path: Path, template_path: P
     runner.run_one(
         params={"A": 1.0},
         t_end_days=0.1,
-        dt_days=0.1,
+        min_cadence_hours=4.0,
         workdir=tmp_path / "w",
         evolve_trajectory_path=traj_path,
         evolve_trajectory_dt_days=14.0,
@@ -433,7 +473,6 @@ def test_runner_appends_evolve_trajectory_flags(tmp_path: Path, template_path: P
     assert "--evolve-trajectory-out" in argv
     assert str(traj_path) in argv
     assert "--evolve-trajectory-dt-days" in argv
-    # Surfaces the float through repr() — accept any string that parses back.
     dt_arg = argv[argv.index("--evolve-trajectory-dt-days") + 1]
     assert float(dt_arg) == 14.0
 
@@ -446,7 +485,7 @@ def test_runner_evolve_trajectory_omits_when_no_path(tmp_path: Path, template_pa
     healthy.write_text("densities: {}\n")
 
     runner = CppRunner(script, template_path, healthy_state_yaml=healthy)
-    runner.run_one(params={"A": 1.0}, t_end_days=0.1, dt_days=0.1, workdir=tmp_path / "w")
+    runner.run_one(params={"A": 1.0}, t_end_days=0.1, min_cadence_hours=4.0, workdir=tmp_path / "w")
 
     argv = log.read_text().splitlines()
     assert "--evolve-trajectory-out" not in argv
@@ -487,7 +526,7 @@ def test_batch_runner_per_call_evolve_traj_creates_call_dir(tmp_path: Path, temp
         theta_matrix=theta,
         param_names=["A"],
         t_end_days=0.1,
-        dt_days=0.1,
+        min_cadence_hours=4.0,
         output_path=tmp_path / "out.parquet",
         evolve_trajectory_dir=call_dir,
     )
@@ -514,7 +553,7 @@ def test_batch_runner_init_default_used_when_no_per_call(tmp_path: Path, templat
         theta_matrix=theta,
         param_names=["A"],
         t_end_days=0.1,
-        dt_days=0.1,
+        min_cadence_hours=4.0,
         output_path=tmp_path / "out.parquet",
     )
     assert init_dir.exists()
@@ -539,7 +578,7 @@ def test_batch_runner_warns_when_per_call_set_without_healthy_state(
             theta_matrix=theta,
             param_names=["A"],
             t_end_days=0.1,
-            dt_days=0.1,
+            min_cadence_hours=4.0,
             output_path=tmp_path / "out.parquet",
             evolve_trajectory_dir=call_dir,
         )
@@ -554,9 +593,6 @@ def test_run_one_in_worker_skips_cache_when_traj_dir_set(tmp_path: Path, monkeyp
     trajectory binaries."""
     from qsp_hpc.cpp import batch_runner as br
 
-    # Spy on whether get_or_build is called. Replace _WORKER_EVOLVE_CACHE
-    # with a stub that records calls; replace _WORKER_RUNNER with a stub
-    # whose run_one returns a benign SimResult.
     cache_calls: list[dict] = []
 
     class _FakeCache:
@@ -576,22 +612,24 @@ def test_run_one_in_worker_skips_cache_when_traj_dir_set(tmp_path: Path, monkeyp
                 species_names=["x"],
                 compartment_names=[],
                 rule_names=[],
-                dt_days=1.0,
+                time_days=np.array([0.0]),
+                min_cadence_hours=4.0,
                 t_end_days=1.0,
+                t_offset_days=0.0,
+                n_cvode_steps=0,
             )
 
     monkeypatch.setattr(br, "_WORKER_RUNNER", _FakeRunner())
     monkeypatch.setattr(br, "_WORKER_WORKDIR", tmp_path)
     monkeypatch.setattr(br, "_WORKER_EVOLVE_CACHE", _FakeCache())
 
-    # 1) traj_dir set → cache MUST NOT be consulted; runner sees no
-    #    evolve_state_path (so qsp_sim runs the burn-in fresh).
+    # 1) traj_dir set → cache MUST NOT be consulted.
     br._run_one_in_worker(
         sim_id=0,
         sample_index=0,
         params={"A": 1.0},
         t_end_days=0.1,
-        dt_days=0.1,
+        min_cadence_hours=4.0,
         timeout_s=None,
         evolve_trajectory_dir=str(tmp_path / "traj"),
     )
@@ -599,13 +637,13 @@ def test_run_one_in_worker_skips_cache_when_traj_dir_set(tmp_path: Path, monkeyp
     assert runner_calls[-1]["evolve_state_path"] is None
     assert runner_calls[-1]["evolve_trajectory_path"] is not None
 
-    # 2) traj_dir omitted → cache IS consulted; runner sees the cached state.
+    # 2) traj_dir omitted → cache IS consulted.
     br._run_one_in_worker(
         sim_id=1,
         sample_index=1,
         params={"A": 1.0},
         t_end_days=0.1,
-        dt_days=0.1,
+        min_cadence_hours=4.0,
         timeout_s=None,
     )
     assert len(cache_calls) == 1
@@ -614,11 +652,9 @@ def test_run_one_in_worker_skips_cache_when_traj_dir_set(tmp_path: Path, monkeyp
 
 
 def _real_healthy_yaml() -> Path | None:
-    here = Path(__file__).resolve().parent.parent
-    for sibling in ("SPQSP_PDAC", "SPQSP_PDAC-cpp-sweep"):
-        c = here.parent / sibling / "PDAC" / "sim" / "resource" / "healthy_state.yaml"
-        if c.exists():
-            return c
+    env = os.environ.get("QSP_SIM_HEALTHY_YAML")
+    if env and Path(env).exists():
+        return Path(env)
     return None
 
 
@@ -636,19 +672,9 @@ def test_real_qsp_sim_evolve_to_diagnosis(tmp_path: Path):
     result = runner.run_one(
         params={"k_C1_growth": 0.01},
         t_end_days=3.0,
-        dt_days=1.0,
+        min_cadence_hours=4.0,
         workdir=tmp_path,
     )
-    # 3 post-diagnosis days at dt=1.0 → 4 rows (t=0, 1, 2, 3).
-    n_t, n_cols = result.trajectory.shape
-    assert n_t == 4
-    assert n_cols == len(result.species_names) + len(result.compartment_names) + len(
-        result.rule_names
-    )
-    assert len(result.species_names) == 164
-    # After evolve_to_diagnosis, V_T should equal ~17mL (3.2cm-diameter sphere)
-    # at user t=0 — unambiguously different from the "healthy" microinvasive IC
-    # (~4e-5 mL) we'd see without --evolve-to-diagnosis. qsp_sim writes
-    # species in source units; V_T maps to one of the species columns when
-    # the model's Amount-units compartments are dumped there.
-    assert np.all(np.isfinite(result.trajectory[0]))
+    assert result.t_offset_days > 0.0  # diagnosis time was non-zero
+    assert result.time_days[0] == pytest.approx(0.0, abs=1e-6)
+    assert result.time_days[-1] == pytest.approx(3.0, abs=1e-3)

@@ -45,14 +45,14 @@ def _make_fake_binary(tmp_path: Path) -> Path:
             --rules-out) RULES_OUT="$2"; shift 2 ;;
             --param) shift 2 ;;
             --t-end-days) TEND="$2"; shift 2 ;;
-            --dt-days) DT="$2"; shift 2 ;;
+            --min-cadence-hours) DT="$2"; shift 2 ;;
             *) shift ;;
           esac
         done
         python3 - <<PY
         import struct
-        header = struct.pack('<IIQQQQdd', 0x51535042, 2, 2, 2, 0, 0, float("$DT"), float("$TEND"))
-        body = struct.pack('<4d', 10.0, 20.0, 30.0, 40.0)
+        header = struct.pack('<IIQQQQdddQQ', 0x51535042, 3, 2, 2, 0, 0, float("$DT"), float("$TEND"), 0.0, 0, 0)
+        body = struct.pack('<6d', 0.0, 10.0, 20.0, 0.1, 30.0, 40.0)
         open("$BIN_OUT", 'wb').write(header + body)
         open("$SP_OUT", 'w').write("spA\\nspB\\n")
         open("$COMP_OUT", 'w').write('')
@@ -103,7 +103,7 @@ class TestCppBatchWorker:
             "seed": 42,
             "jobs_per_chunk": 2,
             "t_end_days": 0.2,
-            "dt_days": 0.1,
+            "min_cadence_hours": 0.1,
             "simulation_pool_id": "test_pool",
             "simulation_pool_path": str(pool_dir),
             "scenario": "ctrl",
@@ -134,7 +134,7 @@ class TestCppBatchWorker:
             "seed": 42,
             "jobs_per_chunk": 2,
             "t_end_days": 0.2,
-            "dt_days": 0.1,
+            "min_cadence_hours": 0.1,
             "simulation_pool_id": "test_pool",
             "simulation_pool_path": str(pool_dir),
             "scenario": "ctrl",
@@ -172,7 +172,7 @@ class TestCppBatchWorker:
             "seed": 42,
             "jobs_per_chunk": 2,
             "t_end_days": 0.2,
-            "dt_days": 0.1,
+            "min_cadence_hours": 0.1,
             "simulation_pool_id": "test_pool",
             "simulation_pool_path": str(pool_dir),
             "scenario": "ctrl",
@@ -199,7 +199,7 @@ class TestCppBatchWorker:
             "seed": 42,
             "jobs_per_chunk": 2,
             "t_end_days": 0.2,
-            "dt_days": 0.1,
+            "min_cadence_hours": 0.1,
             "simulation_pool_id": "test_pool",
             "simulation_pool_path": str(pool_dir),
             "scenario": "ctrl",
@@ -319,7 +319,7 @@ class TestSubmitCppJobs:
             cpp_template_path=cpp_template,
             # Explicit repo_path so submit_cpp_jobs' ensure_cpp_binary call
             # doesn't try to derive from the stub `/usr/bin/qsp_sim`.
-            cpp_repo_path="/home/testuser/SPQSP_PDAC",
+            cpp_repo_path="/home/testuser/cpp-repo",
         )
         transport = MagicMock()
 
@@ -382,14 +382,14 @@ class TestSubmitCppJobs:
             simulation_pool_id="pool",
             skip_sync=True,
             t_end_days=90.0,
-            dt_days=0.5,
+            min_cadence_hours=0.5,
             scenario="treatment",
         )
 
         assert len(captured_configs) == 1
         uploaded_config = captured_configs[0]
         assert uploaded_config["t_end_days"] == 90.0
-        assert uploaded_config["dt_days"] == 0.5
+        assert uploaded_config["min_cadence_hours"] == 0.5
         assert uploaded_config["scenario"] == "treatment"
         assert uploaded_config["binary_path"] == "/usr/bin/qsp_sim"
 
@@ -469,6 +469,47 @@ class TestSubmitCppJobs:
         assert cfg["healthy_state_yaml"].endswith("/batch_jobs/input/pool/healthy_state.yaml")
         # params.csv now also lives under the per-pool input dir.
         assert cfg["param_csv"].endswith("/batch_jobs/input/pool/params.csv")
+
+    def test_samples_csv_remote_skips_upload_and_overrides_param_csv(self, tmp_path):
+        """``samples_csv_remote=`` lets a caller hoist the upload above
+        the per-scenario loop. With it set, submit_cpp_jobs must:
+          (a) skip the per-pool params.csv upload,
+          (b) write the supplied remote path into cpp_job_config.json's
+              param_csv field instead of the per-pool default.
+        Used by the local-eval pattern (every scenario gets the same
+        theta slice, one upload at session setup).
+        """
+        import json as _json
+
+        manager, transport = self._make_manager()
+
+        csv = tmp_path / "params.csv"
+        csv.write_text("sample_index,A\n0,1.0\n1,2.0\n")
+
+        captured: dict = {}
+
+        def capture(local, remote):
+            if "cpp_job_config.json" in remote:
+                with open(local) as f:
+                    captured["config"] = _json.load(f)
+
+        transport.upload.side_effect = capture
+
+        shared_remote = "/hpc/batch_jobs/input/_shared_samples_abc.csv"
+        manager.submit_cpp_jobs(
+            samples_csv=str(csv),
+            num_simulations=2,
+            simulation_pool_id="pool",
+            skip_sync=True,
+            samples_csv_remote=shared_remote,
+        )
+
+        # Per-pool params.csv upload is skipped.
+        upload_dests = [call.args[1] for call in transport.upload.call_args_list]
+        assert not any(d.endswith("/batch_jobs/input/pool/params.csv") for d in upload_dests)
+
+        # Worker config points at the shared remote samples path.
+        assert captured["config"]["param_csv"] == shared_remote
 
     def test_submit_cpp_jobs_concurrent_pool_scoped_uploads(self, tmp_path):
         """#48 regression: parallel submit_cpp_jobs() calls for different
@@ -773,9 +814,9 @@ class TestEnsureCppBinary:
         assert "-DPython3_EXECUTABLE=" in build_cmd
 
     def test_empty_codegen_source_skips_install_and_python_override(self):
-        """Empty ``cpp_codegen_source`` preserves the legacy SPQSP_PDAC build
-        (vendored qsp_sim_core, no codegen needed). No pip install, no python
-        override.
+        """Empty ``cpp_codegen_source`` preserves the legacy build flow with
+        a vendored qsp_sim_core (no codegen needed). No pip install, no
+        python override.
         """
         manager, transport = self._make_manager(cpp_codegen_source="")
         transport.exec.side_effect = self._exec_side_effect()
@@ -852,7 +893,7 @@ class TestSubmitCppJobsWithDerivation:
             time_limit="01:00:00",
             cpp_binary_path="/usr/bin/qsp_sim",
             cpp_template_path="/tmp/p.xml",
-            cpp_repo_path="/home/testuser/SPQSP_PDAC",
+            cpp_repo_path="/home/testuser/cpp-repo",
         )
         transport = MagicMock()
 

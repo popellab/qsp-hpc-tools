@@ -6,6 +6,7 @@ from qsp_hpc.utils.hash_utils import (
     _safe_sort_key,
     compute_definition_hash,
     compute_pool_id_hash,
+    compute_pool_id_hash_legacy,
     generate_filename,
     normalize_model_context,
 )
@@ -318,31 +319,39 @@ class TestComputePoolIdHash:
         path.write_text(content)
         return path
 
+    @staticmethod
+    def _write_inputs(tmp_path):
+        binary = tmp_path / "qsp_sim"
+        binary.write_bytes(b"\x7fELF...binary")
+        scenario_yaml = tmp_path / "scenario.yaml"
+        scenario_yaml.write_text("name: test\n")
+        return binary, scenario_yaml
+
     def test_different_seeds_produce_different_hashes(self, tmp_path):
         priors = self._write_priors(tmp_path / "priors.csv")
-        h_a = compute_pool_id_hash(priors, "m", seed=2025)
-        h_b = compute_pool_id_hash(priors, "m", seed=2026)
+        h_a = compute_pool_id_hash_legacy(priors, "m", seed=2025)
+        h_b = compute_pool_id_hash_legacy(priors, "m", seed=2026)
         assert h_a != h_b
 
     def test_same_seed_produces_stable_hash(self, tmp_path):
         priors = self._write_priors(tmp_path / "priors.csv")
-        h1 = compute_pool_id_hash(priors, "m", seed=2025)
-        h2 = compute_pool_id_hash(priors, "m", seed=2025)
+        h1 = compute_pool_id_hash_legacy(priors, "m", seed=2025)
+        h2 = compute_pool_id_hash_legacy(priors, "m", seed=2025)
         assert h1 == h2
 
     def test_seed_none_omits_seed_input(self, tmp_path):
         """seed=None (default) must equal omitting the seed argument so
         callers can opt in incrementally."""
         priors = self._write_priors(tmp_path / "priors.csv")
-        with_none = compute_pool_id_hash(priors, "m", seed=None)
-        without_seed = compute_pool_id_hash(priors, "m")
+        with_none = compute_pool_id_hash_legacy(priors, "m", seed=None)
+        without_seed = compute_pool_id_hash_legacy(priors, "m")
         assert with_none == without_seed
 
     def test_seed_changes_hash_vs_unseeded(self, tmp_path):
         """Passing a seed must produce a different hash than omitting it."""
         priors = self._write_priors(tmp_path / "priors.csv")
-        h_unseeded = compute_pool_id_hash(priors, "m")
-        h_seeded = compute_pool_id_hash(priors, "m", seed=2025)
+        h_unseeded = compute_pool_id_hash_legacy(priors, "m")
+        h_seeded = compute_pool_id_hash_legacy(priors, "m", seed=2025)
         assert h_unseeded != h_seeded
 
     def test_binary_content_changes_hash(self, tmp_path):
@@ -354,16 +363,16 @@ class TestComputePoolIdHash:
         bin_b = tmp_path / "qsp_sim_b"
         bin_a.write_bytes(b"\x7fELF...binary-A")
         bin_b.write_bytes(b"\x7fELF...binary-B")
-        h_a = compute_pool_id_hash(priors, "m", binary_path=bin_a)
-        h_b = compute_pool_id_hash(priors, "m", binary_path=bin_b)
+        h_a = compute_pool_id_hash_legacy(priors, "m", binary_path=bin_a)
+        h_b = compute_pool_id_hash_legacy(priors, "m", binary_path=bin_b)
         assert h_a != h_b
 
     def test_binary_path_omitted_matches_no_binary(self, tmp_path):
         """binary_path=None (default) must equal omitting the argument
         so MATLAB callers stay on the no-binary code path."""
         priors = self._write_priors(tmp_path / "priors.csv")
-        h_none = compute_pool_id_hash(priors, "m", binary_path=None)
-        h_omit = compute_pool_id_hash(priors, "m")
+        h_none = compute_pool_id_hash_legacy(priors, "m", binary_path=None)
+        h_omit = compute_pool_id_hash_legacy(priors, "m")
         assert h_none == h_omit
 
     def test_binary_present_changes_hash_vs_absent(self, tmp_path):
@@ -372,9 +381,100 @@ class TestComputePoolIdHash:
         priors = self._write_priors(tmp_path / "priors.csv")
         binary = tmp_path / "qsp_sim"
         binary.write_bytes(b"\x7fELF...binary")
-        h_no_bin = compute_pool_id_hash(priors, "m")
-        h_with_bin = compute_pool_id_hash(priors, "m", binary_path=binary)
+        h_no_bin = compute_pool_id_hash_legacy(priors, "m")
+        h_with_bin = compute_pool_id_hash_legacy(priors, "m", binary_path=binary)
         assert h_no_bin != h_with_bin
+
+    def test_priors_csv_change_changes_hash(self, tmp_path):
+        """Priors content shifts the hash so a different theta_pool can
+        never silently land in the same pool dir."""
+        binary, scenario_yaml = self._write_inputs(tmp_path)
+        priors_a = tmp_path / "priors_a.csv"
+        priors_a.write_text(
+            "name,median,units,distribution,dist_param1,dist_param2\nk,1.0,1/d,lognormal,0.0,0.5\n"
+        )
+        priors_b = tmp_path / "priors_b.csv"
+        priors_b.write_text(
+            "name,median,units,distribution,dist_param1,dist_param2\nk,2.0,1/d,lognormal,0.7,0.5\n"
+        )
+        h_a = compute_pool_id_hash(
+            binary_path=binary, scenario_yaml=scenario_yaml, priors_csv=priors_a
+        )
+        h_b = compute_pool_id_hash(
+            binary_path=binary, scenario_yaml=scenario_yaml, priors_csv=priors_b
+        )
+        assert h_a != h_b
+
+    def test_seed_changes_hash(self, tmp_path):
+        binary, scenario_yaml = self._write_inputs(tmp_path)
+        h_a = compute_pool_id_hash(binary_path=binary, scenario_yaml=scenario_yaml, seed=2025)
+        h_b = compute_pool_id_hash(binary_path=binary, scenario_yaml=scenario_yaml, seed=2026)
+        assert h_a != h_b
+
+    def test_restriction_classifier_dir_changes_hash(self, tmp_path):
+        binary, scenario_yaml = self._write_inputs(tmp_path)
+        clf_a = tmp_path / "clf_a"
+        clf_a.mkdir()
+        clf_b = tmp_path / "clf_b"
+        clf_b.mkdir()
+        h_a = compute_pool_id_hash(
+            binary_path=binary, scenario_yaml=scenario_yaml, restriction_classifier_dir=clf_a
+        )
+        h_b = compute_pool_id_hash(
+            binary_path=binary, scenario_yaml=scenario_yaml, restriction_classifier_dir=clf_b
+        )
+        assert h_a != h_b
+
+    def test_restriction_threshold_changes_hash(self, tmp_path):
+        binary, scenario_yaml = self._write_inputs(tmp_path)
+        h_a = compute_pool_id_hash(
+            binary_path=binary, scenario_yaml=scenario_yaml, restriction_threshold=0.5
+        )
+        h_b = compute_pool_id_hash(
+            binary_path=binary, scenario_yaml=scenario_yaml, restriction_threshold=0.7
+        )
+        assert h_a != h_b
+
+    def test_classifier_feature_fills_changes_hash(self, tmp_path):
+        binary, scenario_yaml = self._write_inputs(tmp_path)
+        h_a = compute_pool_id_hash(
+            binary_path=binary,
+            scenario_yaml=scenario_yaml,
+            classifier_feature_fills={"k": 1.0},
+        )
+        h_b = compute_pool_id_hash(
+            binary_path=binary,
+            scenario_yaml=scenario_yaml,
+            classifier_feature_fills={"k": 2.0},
+        )
+        assert h_a != h_b
+
+    def test_classifier_feature_fills_dict_order_invariant(self, tmp_path):
+        """Dict insertion order shouldn't perturb the hash."""
+        binary, scenario_yaml = self._write_inputs(tmp_path)
+        h_a = compute_pool_id_hash(
+            binary_path=binary,
+            scenario_yaml=scenario_yaml,
+            classifier_feature_fills={"alpha": 1.0, "beta": 2.0},
+        )
+        h_b = compute_pool_id_hash(
+            binary_path=binary,
+            scenario_yaml=scenario_yaml,
+            classifier_feature_fills={"beta": 2.0, "alpha": 1.0},
+        )
+        assert h_a == h_b
+
+    def test_optional_args_omitted_match_legacy_two_arg_call(self, tmp_path):
+        """All-args-omitted matches the previous (binary, scenario) call:
+        backwards-compatible default for callers that haven't migrated.
+
+        Note: hash bytes themselves changed in this commit because the
+        labeled-tag separators are new — this test only locks
+        consistency, not byte-stability vs the pre-change main."""
+        binary, scenario_yaml = self._write_inputs(tmp_path)
+        h_minimal_1 = compute_pool_id_hash(binary_path=binary, scenario_yaml=scenario_yaml)
+        h_minimal_2 = compute_pool_id_hash(binary_path=binary, scenario_yaml=scenario_yaml)
+        assert h_minimal_1 == h_minimal_2
 
 
 class TestHashIntegration:

@@ -26,8 +26,6 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-from qsp_hpc.utils.unit_registry import ureg
-
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
@@ -48,12 +46,12 @@ def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
     - model_output_code: Python function code as string
 
     The function code should define a function named 'compute_test_statistic' with signature:
-        def compute_test_statistic(time: np.ndarray, species_dict: dict, ureg) -> float
+        def compute_test_statistic(time: np.ndarray, species_dict: dict) -> float
 
     Where:
-        - time: numpy array of time points
-        - species_dict: maps species names (e.g., 'V_T.CD8') to numpy arrays
-        - ureg: Pint UnitRegistry for unit-aware calculations
+        - time: numpy array of time points (days)
+        - species_dict: maps species names (e.g., 'V_T.CD8') to raw floats or
+          numpy arrays in their canonical model_structure.json units
 
     Args:
         test_stats_df: DataFrame with test statistics configuration
@@ -85,10 +83,7 @@ def build_test_stat_registry(test_stats_df: pd.DataFrame) -> dict:
         function_code = row[function_col]
 
         try:
-            # Create isolated namespace for function
-            import pint
-
-            namespace = {"np": np, "numpy": np, "pint": pint, "ureg": ureg}
+            namespace = {"np": np, "numpy": np}
 
             # Compile and execute the function code in an isolated namespace.
             # Security note: function_code comes from user-authored calibration target
@@ -136,8 +131,11 @@ def compute_test_statistics_batch(
         test_stats_df: DataFrame with test statistics configuration
                        Columns: test_statistic_id, required_species, model_output_code
         test_stat_registry: Dict mapping test_statistic_id -> compiled function
-                           Functions have signature: compute_test_statistic(time, species_dict, ureg)
-        species_units: Dict mapping species names to unit strings (e.g., {'V_T.CD8': 'cell'})
+                           Functions have signature: compute_test_statistic(time, species_dict)
+        species_units: Dict mapping species names to unit strings (e.g., {'V_T.CD8': 'cell'}).
+            Retained for documentation / future reintroduction; no longer used
+            to wrap values, since species_dict carries raw floats in canonical
+            model_structure.json units.
         template_defaults: Optional ``{name: default}`` map loaded from the
             pool's ``pool_manifest.json``. When a calibration-target
             function's ``required_species`` lists a parameter that
@@ -159,20 +157,11 @@ def compute_test_statistics_batch(
 
     # ── Plan phase (once per batch) ──────────────────────────────────────────
     #
-    # The previous implementation nested `for test_stat: for sim: for species:`
-    # and called ``ureg.parse_expression(unit_str)`` and re-wrapped every
-    # species as a fresh Pint Quantity inside the innermost loop. For the
-    # 110k-sim PDAC baseline scenario that put ~60-75% of derive wall-clock
-    # on Pint symbolic algebra that reduces to compile-time constants
-    # (unit strings, template defaults, registry lookups never change between
-    # iterations). This plan phase hoists all of it.
-
-    def _parse_unit(species_name: str):
-        unit_info = species_units.get(species_name, "dimensionless")
-        unit_str = unit_info["units"] if isinstance(unit_info, dict) else unit_info
-        return ureg.parse_expression(unit_str)
-
-    time_unit = ureg.day
+    # Pintless derive: species_dict carries raw floats / numpy arrays in their
+    # canonical model_structure.json units. Observable code is responsible for
+    # any inline numerical conversions (mirroring SubmodelTarget forward_model
+    # convention). The plan phase still hoists registry / template / column
+    # lookups out of the inner loop for the 110k-sim hot path.
 
     def aux_by_sample_index_first_keys(m):
         """Union of aux names across all sample_indices in ``m``.
@@ -185,17 +174,11 @@ def compute_test_statistics_batch(
             names.update(rec.keys())
         return names
 
-    # Auxiliary parameter pre-wrapping: per-sim aux draws live in a sidecar
-    # CSV indexed by sample_index. The wrapper code emits
-    # ``species_dict[aux_name].to(<units>)``, so we just attach Pint units
-    # here once per (sim, aux) and let the wrapper convert. Pint Quantities
-    # are immutable under arithmetic, so we can stash them per-sample_index
-    # and reuse without copying. Empty dict when no aux is configured.
+    # Auxiliary parameter sidecar: per-sim aux draws keyed by sample_index.
+    # ``auxiliary_units`` is retained on the API surface but no longer used
+    # for wrapping — observable code knows the declared units per aux name.
     aux_by_sample_index = aux_by_sample_index or {}
     auxiliary_units = auxiliary_units or {}
-    aux_unit_quantities = {
-        name: ureg.parse_expression(units_str) for name, units_str in auxiliary_units.items()
-    }
     sample_index_col = (
         sim_df["sample_index"].to_numpy() if "sample_index" in sim_df.columns else None
     )
@@ -219,12 +202,13 @@ def compute_test_statistics_batch(
         tests_meta.append((j, tsid, func, required, []))
         all_required.update(required)
 
-    # Per-species resolution plan. Strategies:
-    #   ('series', unit)        — time-series column (or scalar compartment)
-    #   ('param', col, unit)    — param:<name> column (always scalar per sim)
-    #   ('template', qty)       — pre-wrapped template_defaults value (reused
-    #                             across every sim in the batch, zero
-    #                             per-sim Pint work)
+    # Per-species resolution plan. Strategies (Pintless: values are raw
+    # floats / numpy arrays, no Pint Quantities):
+    #   ('series',)             — time-series column (or scalar compartment)
+    #   ('param', col)          — param:<name> column (always scalar per sim)
+    #   ('template', float)     — pre-resolved template_defaults scalar reused
+    #                             across every sim in the batch
+    #   ('aux',)                — populated per-sim from aux_by_sample_index
     #   ('missing',)            — unresolvable; every test stat that requires
     #                             this species fails fast with NaN
     species_plan: dict[str, tuple] = {}
@@ -232,11 +216,11 @@ def compute_test_statistics_batch(
     aux_names_set = set(aux_by_sample_index_first_keys(aux_by_sample_index))
     for s in all_required:
         if s in sim_cols:
-            species_plan[s] = ("series", _parse_unit(s))
+            species_plan[s] = ("series",)
         elif f"param:{s}" in sim_cols:
-            species_plan[s] = ("param", f"param:{s}", _parse_unit(s))
+            species_plan[s] = ("param", f"param:{s}")
         elif s in template_defaults:
-            species_plan[s] = ("template", float(template_defaults[s]) * _parse_unit(s))
+            species_plan[s] = ("template", float(template_defaults[s]))
         elif s in aux_names_set:
             # Aux names are populated per-sim from the aux samples sidecar
             # (see the inner loop). Mark them with a noop strategy so the
@@ -267,10 +251,8 @@ def compute_test_statistics_batch(
     # ── Execute phase (sim outer, test-stat inner) ──────────────────────────
     #
     # Per sim we build ``time`` and ``species_dict`` once and hand them to
-    # every test stat. Pint algebra still runs per (test_stat, sim) — the
-    # test stat bodies may call .to(...) or parse new unit exprs internally —
-    # but the wrapping work done by the derive worker itself is now O(n_sims)
-    # instead of O(n_sims × n_test_stats × n_required).
+    # every test stat. With Pint removed the per-sim work is just float /
+    # array materialization; observable code does any inline conversions.
 
     for i in range(n_sims):
         if status_np[i] != 0:
@@ -278,19 +260,17 @@ def compute_test_statistics_batch(
             # leave the whole row NaN.
             continue
 
-        # Build time Quantity once per sim.
         try:
             if time_col_np is not None:
-                time_q = np.asarray(time_col_np[i]) * time_unit
+                time_arr = np.asarray(time_col_np[i], dtype=float)
             else:
-                time_q = None  # pragma: no cover — guarded by upstream
+                time_arr = None  # pragma: no cover — guarded by upstream
         except Exception as e:
             logger.warning(f"Error extracting time for simulation {i}: {e}")
             continue
 
         # Build species_dict once per sim — the union over all test stats'
-        # required species. Handing extra entries to a test stat is free
-        # (functions index by key), so we avoid rebuilding per test stat.
+        # required species. Handing extra entries to a test stat is free.
         species_dict: dict[str, object] = {}
         for s, plan in species_plan.items():
             kind = plan[0]
@@ -298,52 +278,33 @@ def compute_test_statistics_batch(
                 val = series_cols_np[s][i]
                 # Compartment columns (e.g. V_T) and non-time-series species
                 # arrive as Python/numpy scalars; time-series species arrive
-                # as list-of-floats. Distinguish to avoid wrapping a scalar
-                # as a 0-d array, which some test stats don't expect.
+                # as list-of-floats.
                 if isinstance(val, (int, float, np.integer, np.floating)):
-                    species_dict[s] = float(val) * plan[1]
+                    species_dict[s] = float(val)
                 else:
-                    species_dict[s] = np.asarray(val) * plan[1]
+                    species_dict[s] = np.asarray(val, dtype=float)
             elif kind == "param":
-                species_dict[s] = float(param_cols_np[s][i]) * plan[2]
+                species_dict[s] = float(param_cols_np[s][i])
             elif kind == "template":
-                # Pre-wrapped quantity — the same Pint object is handed to
-                # every sim. Safe because test stats don't mutate inputs
-                # (arithmetic returns new Quantities).
                 species_dict[s] = plan[1]
-            # 'missing' → not populated; any test stat requiring this
-            # species was already marked NaN in tests_meta.
+            # 'missing' / 'aux' → not populated here; aux is filled below.
 
-        # Attach auxiliary parameter draws (one record per sample_index)
-        # as Pint Quantities under their declared units. The wrapper code
-        # emitted by ``yaml_loader._generate_wrapper_code`` reads them
-        # via ``species_dict[aux_name].to(<units>)``. When the parquet
-        # carries no sample_index — e.g. legacy single-batch test pools
-        # — aux merging is silently skipped (no sample_index → no join
-        # key), and aux-bearing test stats fall through the wrapper's
-        # KeyError path to NaN.
+        # Attach auxiliary parameter draws (one record per sample_index) as
+        # raw floats. The wrapper relocates them into _constants under the
+        # YAML-declared units; observable code is authored knowing those
+        # units. When the parquet carries no sample_index — e.g. legacy
+        # single-batch test pools — aux merging is silently skipped.
         if aux_by_sample_index and sample_index_col is not None:
             sid = int(sample_index_col[i])
             aux_record = aux_by_sample_index.get(sid)
             if aux_record is not None:
                 for aux_name, aux_value in aux_record.items():
-                    aux_unit_q = aux_unit_quantities.get(aux_name)
-                    if aux_unit_q is None:
-                        # Unit not in auxiliary_units map → fall back to
-                        # dimensionless. Catches the common case of
-                        # forgetting to populate auxiliary_units while
-                        # still passing aux_by_sample_index.
-                        aux_unit_q = ureg.dimensionless
-                    species_dict[aux_name] = float(aux_value) * aux_unit_q
+                    species_dict[aux_name] = float(aux_value)
 
-        # Dispatch each test stat against the shared time_q + species_dict.
         for j, tsid, func, required, missing in tests_meta:
             if func is None:
                 continue
             if missing:
-                # Fire once per (test_stat, sim) to preserve the original
-                # logging volume — helps spot systematic missing-species
-                # bugs without swallowing the signal.
                 logger.warning(
                     f"Error computing {tsid} for simulation {i}: "
                     f"Species {missing} not found in simulation data or "
@@ -351,11 +312,8 @@ def compute_test_statistics_batch(
                 )
                 continue
             try:
-                result = func(time_q, species_dict, ureg)
-                if hasattr(result, "magnitude"):
-                    test_stats_matrix[i, j] = float(result.magnitude)
-                else:
-                    test_stats_matrix[i, j] = float(result)
+                result = func(time_arr, species_dict)
+                test_stats_matrix[i, j] = float(result)
             except Exception as e:
                 logger.warning(f"Error computing {tsid} for simulation {i}: {e}")
                 # test_stats_matrix[i, j] already NaN from np.full

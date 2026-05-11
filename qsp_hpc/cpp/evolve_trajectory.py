@@ -121,10 +121,19 @@ def assemble_evolve_trajectory_long(
         )
         # Time axis: under v3, the binary's leading time column is
         # already the per-row sample time (model-time days from start of
-        # evolve, i.e. healthy-IC = 0). t_end_days is the diagnosis time
-        # at which evolve stopped, so subtracting it pins t=0 at diagnosis
-        # with earlier rows negative.
-        t_to_diag = np.asarray(header.time_days, dtype=np.float64) - header.t_end_days
+        # evolve, i.e. healthy-IC = 0). Pin t=0 at the achieved evolve
+        # end time so earlier rows go negative. Post the qsp_sim_core
+        # TrajectoryWriter cutover (pdac-build PR #164), header.t_end_days
+        # is the *configured* max evolve duration (opts.max_days), not
+        # the achieved diagnosis time — so derive achieved end from the
+        # last row's time column instead, as that commit's message
+        # advises ("achieved end time is recoverable from the last row's
+        # time column"). The legacy hand-rolled writer patched t_end_days
+        # at finalize and the two values coincided; the new writer holds
+        # t_end_days fixed at construction.
+        time_days = np.asarray(header.time_days, dtype=np.float64)
+        t_achieved_end = float(time_days[-1]) if time_days.size else float(header.t_end_days)
+        t_to_diag = time_days - t_achieved_end
         sub = arr[:, keep_idx]
         # Long-form: one row per (timepoint, column).
         n_t = header.n_times

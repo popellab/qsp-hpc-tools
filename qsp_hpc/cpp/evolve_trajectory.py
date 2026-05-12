@@ -153,6 +153,64 @@ def assemble_evolve_trajectory_long(
     return pd.concat(rows, ignore_index=True)
 
 
+def assemble_evolve_trajectory_wide_per_sim(
+    traj_dir: str | Path,
+    species_names: list[str],
+    compartment_names: list[str],
+    rule_names: list[str],
+    columns: Optional[list[str]] = None,
+    sample_indices: Optional[Iterable[int]] = None,
+) -> dict[int, pd.DataFrame]:
+    """Wide-form variant of :func:`assemble_evolve_trajectory_long`.
+
+    Returns ``{sample_index: wide_df}`` where ``wide_df`` is indexed by
+    ``t_to_diagnosis_days`` (sorted) with one column per QSP column.
+    Skips the long-form melt + downstream pivot entirely — for callers
+    that ultimately want wide-per-sim (e.g. cal-target observable
+    evaluation), this avoids materializing an O(n_sims × n_t × n_cols)
+    long frame.
+    """
+    traj_dir = Path(traj_dir)
+    requested_idx: Optional[set[int]] = (
+        set(int(i) for i in sample_indices) if sample_indices is not None else None
+    )
+    all_names = list(species_names) + list(compartment_names) + list(rule_names)
+    if columns is not None:
+        col_lookup = {name: i for i, name in enumerate(all_names)}
+        missing = [c for c in columns if c not in col_lookup]
+        if missing:
+            raise KeyError(f"requested column(s) not in species/compartment/rule names: {missing}")
+        keep_idx = np.array([col_lookup[c] for c in columns], dtype=np.int64)
+        keep_names = list(columns)
+    else:
+        keep_idx = np.arange(len(all_names), dtype=np.int64)
+        keep_names = all_names
+
+    out: dict[int, pd.DataFrame] = {}
+    for ftraj in _iter_trajectory_files(traj_dir):
+        if requested_idx is not None and ftraj.sample_index not in requested_idx:
+            continue
+        arr, header = read_binary_trajectory(ftraj.path)
+        _validate_header_columns(
+            header,
+            len(species_names),
+            len(compartment_names),
+            len(rule_names),
+            ftraj.path,
+        )
+        time_days = np.asarray(header.time_days, dtype=np.float64)
+        t_achieved_end = float(time_days[-1]) if time_days.size else float(header.t_end_days)
+        t_to_diag = time_days - t_achieved_end
+        sub = arr[:, keep_idx]
+        wide = pd.DataFrame(
+            sub,
+            index=pd.Index(t_to_diag, name="t_to_diagnosis_days"),
+            columns=keep_names,
+        ).sort_index()
+        out[ftraj.sample_index] = wide
+    return out
+
+
 def _validate_header_columns(
     header: TrajectoryHeader,
     n_species: int,
@@ -302,3 +360,79 @@ def assemble_post_scenario_trajectory_long(
         return pd.DataFrame(columns=["sample_index", "time_days", "column", "value"])
     out = pd.concat(rows, ignore_index=True)
     return out.sort_values(["sample_index", "time_days"]).reset_index(drop=True)
+
+
+def assemble_post_scenario_trajectory_wide_per_sim(
+    species_parquet: str | Path,
+    *,
+    columns: Optional[list[str]] = None,
+    sample_indices: Optional[Iterable[int]] = None,
+    drop_failed: bool = True,
+    time_index_name: str = "t_to_diagnosis_days",
+) -> dict[int, pd.DataFrame]:
+    """Wide-form variant of :func:`assemble_post_scenario_trajectory_long`.
+
+    Returns ``{sample_index: wide_df}`` where ``wide_df`` is indexed by
+    the sim's time axis (renamed to ``time_index_name``; defaults to
+    ``t_to_diagnosis_days`` for compatibility with cal-target evaluators
+    that key on that index name) with one column per QSP column. Avoids
+    the long-form melt entirely — each list-typed parquet cell becomes a
+    numpy column directly.
+    """
+    species_parquet = Path(species_parquet)
+    if not species_parquet.exists():
+        raise FileNotFoundError(f"species parquet not found: {species_parquet}")
+
+    df = pd.read_parquet(species_parquet)
+    if "time" not in df.columns:
+        raise ValueError(
+            f"{species_parquet.name}: missing 'time' column (not a "
+            "CppBatchRunner species parquet?)"
+        )
+    if "sample_index" not in df.columns:
+        raise ValueError(f"{species_parquet.name}: missing 'sample_index' column")
+
+    if drop_failed and "status" in df.columns:
+        df = df[df["status"] == 0]
+    if sample_indices is not None:
+        wanted = set(int(i) for i in sample_indices)
+        df = df[df["sample_index"].isin(wanted)]
+    if df.empty:
+        return {}
+
+    data_cols = [
+        c for c in df.columns if c not in _SCENARIO_META_COLS and not c.startswith("param:")
+    ]
+    if columns is not None:
+        missing = [c for c in columns if c not in data_cols]
+        if missing:
+            raise ValueError(f"requested columns not in species parquet: {missing}")
+        keep_names = list(columns)
+    else:
+        keep_names = data_cols
+
+    out: dict[int, pd.DataFrame] = {}
+    for _, sim_row in df.iterrows():
+        time_arr = np.asarray(sim_row["time"], dtype=np.float64)
+        n_t = len(time_arr)
+        if n_t == 0:
+            continue
+        sample_idx = int(sim_row["sample_index"])
+        per_col: dict[str, np.ndarray] = {}
+        for col in keep_names:
+            arr = np.asarray(sim_row[col], dtype=np.float64)
+            if arr.shape == ():
+                arr = np.full(n_t, float(arr))
+            elif arr.shape[0] != n_t:
+                raise ValueError(
+                    f"{species_parquet.name}: column {col!r} has "
+                    f"{arr.shape[0]} entries but time has {n_t} for "
+                    f"sample_index={sample_idx}"
+                )
+            per_col[col] = arr
+        wide = pd.DataFrame(
+            per_col,
+            index=pd.Index(time_arr, name=time_index_name),
+        ).sort_index()
+        out[sample_idx] = wide
+    return out

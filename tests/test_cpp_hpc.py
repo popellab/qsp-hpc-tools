@@ -877,8 +877,8 @@ class TestDerivationDependency:
 
 
 class TestSubmitCppJobsWithDerivation:
-    """submit_cpp_jobs(derive_test_stats=True) chains a derivation job
-    with --dependency=afterok:<array_id>."""
+    """submit_cpp_jobs(derive_test_stats=True) runs derive inline inside
+    each array task — no chained derivation SLURM job."""
 
     def _make_manager(self):
         from qsp_hpc.batch.hpc_job_manager import BatchConfig, HPCJobManager
@@ -912,7 +912,7 @@ class TestSubmitCppJobsWithDerivation:
         transport.upload.return_value = None
         return HPCJobManager(config=config, transport=transport), transport
 
-    def test_chains_derivation_when_derive_test_stats_true(self, tmp_path):
+    def test_inline_derive_when_derive_test_stats_true(self, tmp_path):
         manager, transport = self._make_manager()
 
         params_csv = tmp_path / "params.csv"
@@ -920,14 +920,15 @@ class TestSubmitCppJobsWithDerivation:
         ts_csv = tmp_path / "test_stats.csv"
         ts_csv.write_text("name,model_output_code\n")
 
-        # The derivation script is a temp file deleted right after upload —
-        # snapshot its content during the upload call before it's gone.
-        captured_scripts: list[str] = []
+        # Capture the cpp_job_config.json content (it's a temp file
+        # deleted right after upload) so we can assert the derive inputs
+        # are embedded for the worker to pick up.
+        captured_configs: dict[str, str] = {}
 
         def capture_upload(local, remote):
-            if remote.endswith("derive_script.sh"):
+            if remote.endswith("cpp_job_config.json"):
                 with open(local) as f:
-                    captured_scripts.append(f.read())
+                    captured_configs["cpp"] = f.read()
 
         transport.upload.side_effect = capture_upload
 
@@ -945,15 +946,29 @@ class TestSubmitCppJobsWithDerivation:
             model_structure_file=str(ms_file),
         )
 
-        # Two sbatch submissions chain together: array → derivation.
-        # #43 option A removed the combine step — array tasks write chunks
-        # into a per-submission batch subdir and derive walks that directly.
-        assert info.job_ids == ["11111", "22222"]
+        # Inline-derive: only the array job is submitted. The chained
+        # derivation SLURM job is gone — each array task computes its own
+        # shard immediately after writing its parquet.
+        assert info.job_ids == ["11111"]
 
-        # Derivation depends on the array job (11111) — with no combine
-        # step in the middle, afterok:<array> is what gates derive now.
-        assert len(captured_scripts) == 1
-        assert "#SBATCH --dependency=afterok:11111" in captured_scripts[0]
+        # No derive_script.sh upload anywhere.
+        upload_dests = [call.args[1] for call in transport.upload.call_args_list]
+        assert not any(d.endswith("derive_script.sh") for d in upload_dests)
+
+        # Derive inputs are hoisted into the cpp_job_config so the worker
+        # can read them inline. test_stats CSV + model_structure are
+        # uploaded up front to batch_jobs/derivation/.
+        import json as _json
+
+        cpp_config = _json.loads(captured_configs["cpp"])
+        assert cpp_config["test_stats_hash"] == "deadbeef" * 8
+        assert cpp_config["test_stats_csv"].endswith(".csv")
+        assert cpp_config["model_structure_file"].endswith("model_structure.json")
+
+        # The test-stats CSV and model_structure went to the shared
+        # derivation upload dir (reusing the same upload path the
+        # cold-path submit_derivation_job uses).
+        assert any("/batch_jobs/derivation/" in d for d in upload_dests)
 
     def test_derive_test_stats_requires_csv(self, tmp_path):
         manager, _ = self._make_manager()

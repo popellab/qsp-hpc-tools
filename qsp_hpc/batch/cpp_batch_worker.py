@@ -24,8 +24,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from qsp_hpc.cpp.batch_runner import CppBatchRunner, write_pool_manifest
+from qsp_hpc.batch.test_stats_compute import (
+    build_test_stat_registry,
+    derive_chunk_to_csv,
+)
+from qsp_hpc.cpp.batch_runner import CppBatchRunner, load_pool_manifest, write_pool_manifest
 from qsp_hpc.utils.logging_config import setup_logger
+from qsp_hpc.utils.model_structure_units import load_units_from_model_structure
 
 # Plain getLogger at module scope so `import cpp_batch_worker` (tests,
 # subagents, etc.) doesn't mutate the root-logger-adjacent state.
@@ -58,6 +63,87 @@ def _resolve_max_workers(config_value: int | None) -> int | None:
     if slurm:
         return int(slurm)
     return None
+
+
+def _run_inline_derive(
+    config: dict,
+    chunk_parquet: Path,
+    pool_dir: Path,
+    batch_subdir: str,
+    array_idx: int,
+) -> None:
+    """Derive test stats for this chunk into the pool's test_stats tree.
+
+    Replaces the chained derivation SLURM job for the hot path: every
+    array task computes its own shard immediately after writing its
+    trajectory parquet, so derive runs N-way parallel across the array
+    instead of serially in one downstream job.
+
+    Output: ``pool_dir/test_stats/<hash>/<batch_subdir>/chunk_NNN_*.csv``.
+    The per-batch subdir prevents collision across submissions sharing
+    one pool, since each submission writes into its own ``batch_*/``
+    sim dir already. ``combine_test_stats_chunks`` walks recursively so
+    flat (cold-path) and nested (inline) layouts coexist.
+
+    No-ops silently when ``test_stats_csv`` is absent from the config —
+    that's the "sims-only" submission path (caller will trigger
+    cold-path derive later).
+    """
+    test_stats_csv = config.get("test_stats_csv")
+    test_stats_hash = config.get("test_stats_hash")
+    if not test_stats_csv or not test_stats_hash:
+        logger.info("Inline derive skipped: no test_stats_csv / test_stats_hash in config")
+        return
+
+    t0 = time.time()
+    test_stats_csv_path = Path(test_stats_csv)
+    test_stats_df = pd.read_csv(test_stats_csv_path)
+    logger.info("Inline derive: %d test statistics loaded", len(test_stats_df))
+
+    registry = build_test_stat_registry(test_stats_df)
+
+    model_structure_file = config.get("model_structure_file")
+    if model_structure_file and Path(model_structure_file).exists():
+        species_units = load_units_from_model_structure(Path(model_structure_file))
+    else:
+        species_units = {}
+
+    pool_manifest = load_pool_manifest(pool_dir)
+    template_defaults: dict[str, float] | None = None
+    if pool_manifest is not None:
+        template_defaults = {
+            str(k): float(v) for k, v in pool_manifest.get("template_defaults", {}).items()
+        }
+
+    aux_samples_csv = config.get("aux_samples_csv")
+    auxiliary_units = config.get("auxiliary_units") or {}
+    aux_by_sample_index: dict[int, dict[str, float]] = {}
+    if aux_samples_csv and Path(aux_samples_csv).exists():
+        aux_df = pd.read_csv(aux_samples_csv)
+        if "sample_index" in aux_df.columns:
+            aux_names = [c for c in aux_df.columns if c != "sample_index"]
+            for row in aux_df.itertuples(index=False):
+                sid = int(getattr(row, "sample_index"))
+                aux_by_sample_index[sid] = {name: float(getattr(row, name)) for name in aux_names}
+
+    output_dir = pool_dir / "test_stats" / test_stats_hash / batch_subdir
+    n_sims = derive_chunk_to_csv(
+        chunk_parquet=chunk_parquet,
+        output_dir=output_dir,
+        chunk_idx=array_idx,
+        test_stats_df=test_stats_df,
+        test_stat_registry=registry,
+        species_units=species_units,
+        template_defaults=template_defaults,
+        aux_by_sample_index=aux_by_sample_index,
+        auxiliary_units=auxiliary_units,
+    )
+    logger.info(
+        "Inline derive complete: %d sims in %.1fs, wrote %s",
+        n_sims,
+        time.time() - t0,
+        output_dir,
+    )
 
 
 def run_chunk(config: dict, array_idx: int) -> None:
@@ -219,6 +305,14 @@ def run_chunk(config: dict, array_idx: int) -> None:
         result.n_sims,
         elapsed,
         output_path,
+    )
+
+    _run_inline_derive(
+        config=config,
+        chunk_parquet=output_path,
+        pool_dir=pool_dir,
+        batch_subdir=batch_dir.name,
+        array_idx=array_idx,
     )
 
 

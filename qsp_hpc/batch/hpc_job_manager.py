@@ -1297,6 +1297,34 @@ class HPCJobManager:
         batch_ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1e6) % 1_000_000:06d}"
         batch_subdir = f"batch_{batch_ts}_{scenario}_seed{seed}"
 
+        # When derive_test_stats=True, hoist the derive inputs (test-stats
+        # CSV, model_structure.json, aux samples) up to HPC NOW so every
+        # array task can read them inline after writing its parquet. The
+        # chained ``submit_derivation_job`` call below is then skipped —
+        # derive runs N-way parallel across the array instead of serially
+        # in one downstream job.
+        remote_test_stats_csv: Optional[str] = None
+        remote_model_structure_file: Optional[str] = None
+        remote_aux_samples_csv: Optional[str] = None
+        if derive_test_stats:
+            if not (test_stats_csv and test_stats_hash):
+                raise ValueError(
+                    "derive_test_stats=True requires test_stats_csv and test_stats_hash"
+                )
+            (
+                remote_test_stats_csv,
+                remote_model_structure_file,
+                remote_aux_samples_csv,
+            ) = self._upload_derive_inputs(
+                test_stats_csv=test_stats_csv,
+                test_stats_hash=test_stats_hash,
+                model_structure_file=model_structure_file,
+                model_structure_remote=model_structure_remote,
+                test_stats_csv_remote=test_stats_csv_remote,
+                aux_samples_csv=aux_samples_csv,
+                aux_samples_csv_remote=aux_samples_csv_remote,
+            )
+
         self.logger.info("Uploading C++ job configuration and parameters...")
         self._upload_cpp_job_config(
             binary_path=binary_path,
@@ -1318,6 +1346,11 @@ class HPCJobManager:
             batch_subdir=batch_subdir,
             samples_csv_remote=samples_csv_remote,
             samples_start_offset=samples_start_offset,
+            test_stats_csv=remote_test_stats_csv,
+            test_stats_hash=test_stats_hash if derive_test_stats else None,
+            model_structure_file=remote_model_structure_file,
+            aux_samples_csv=remote_aux_samples_csv,
+            auxiliary_units=auxiliary_units,
         )
         # ``samples_csv_remote`` lets the caller hoist the upload above
         # the per-scenario loop when every scenario uses byte-identical
@@ -1341,7 +1374,6 @@ class HPCJobManager:
         self.logger.info("Job submitted: %s", job_id)
 
         job_ids = [job_id]
-        hpc_pool_path = f"{self.config.simulation_pool_path}/{simulation_pool_id}"
 
         # Resolve the per-submission batch subdir (issue #43 option A:
         # no combine step — tasks write chunks straight into the pool).
@@ -1400,25 +1432,22 @@ class HPCJobManager:
         else:
             derive_dep_id = job_id
 
+        # Derive runs inline inside each array task (see _run_inline_derive
+        # in cpp_batch_worker) — the test_stats/{hash}/{batch_subdir}/chunk_*.csv
+        # shards are written immediately after each task's parquet. No
+        # chained derivation SLURM job. The legacy ``submit_derivation_job``
+        # entry point is still available for cold-path backfill (sims
+        # already exist, test_stats hash changed) — callers invoke it
+        # directly when needed.
         if derive_test_stats:
             self.logger.info(
-                "Chaining test-stats derivation after C++ array (afterok:%s)",
-                derive_dep_id,
+                "Test-stats derivation runs inline per array task — "
+                "no chained derivation job submitted."
             )
-            derive_job_id = self.submit_derivation_job(
-                pool_path=hpc_pool_path,
-                test_stats_csv=test_stats_csv,
-                test_stats_hash=test_stats_hash,
-                model_structure_file=model_structure_file,
-                dependency=f"afterok:{derive_dep_id}",
-                skip_setup=skip_setup,
-                model_structure_remote=model_structure_remote,
-                test_stats_csv_remote=test_stats_csv_remote,
-                aux_samples_csv=aux_samples_csv,
-                aux_samples_csv_remote=aux_samples_csv_remote,
-                auxiliary_units=auxiliary_units,
-            )
-            job_ids.append(derive_job_id)
+            # ``derive_dep_id`` is unused on the inline path; computed
+            # upstream because the retry loop populates it as a side
+            # effect (last successful array id).
+            _ = derive_dep_id
 
         job_info = JobInfo(
             job_ids=job_ids,
@@ -1498,6 +1527,11 @@ class HPCJobManager:
         batch_subdir: Optional[str] = None,
         samples_csv_remote: Optional[str] = None,
         samples_start_offset: int = 0,
+        test_stats_csv: Optional[str] = None,
+        test_stats_hash: Optional[str] = None,
+        model_structure_file: Optional[str] = None,
+        aux_samples_csv: Optional[str] = None,
+        auxiliary_units: Optional[dict] = None,
     ) -> None:
         """Create and upload C++ job configuration JSON."""
         import json
@@ -1544,6 +1578,16 @@ class HPCJobManager:
             # ``{pool}/{batch_subdir}/chunk_NNN.parquet``. None falls back
             # to a SLURM_ARRAY_JOB_ID-derived default in the worker.
             "batch_subdir": batch_subdir,
+            # Inline-derive fields. When ``test_stats_csv`` is present,
+            # each array task derives its own shard immediately after
+            # writing its trajectory parquet — no chained derivation
+            # SLURM job. ``None`` preserves the sims-only path (caller
+            # triggers cold-path derive separately).
+            "test_stats_csv": test_stats_csv,
+            "test_stats_hash": test_stats_hash,
+            "model_structure_file": model_structure_file,
+            "aux_samples_csv": aux_samples_csv,
+            "auxiliary_units": auxiliary_units or {},
         }
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -2235,12 +2279,14 @@ class HPCJobManager:
         """
         test_stats_dir = f"{pool_path}/test_stats/{test_stats_hash}"
 
-        # Check if test stats directory exists and has both params and test stats chunk files
-        # (derivation worker creates chunk_XXX_params.csv and chunk_XXX_test_stats.csv files)
+        # Check if test stats directory exists and has both params and test stats chunk files.
+        # ``find`` recursive so both layouts are caught: legacy flat
+        # (``test_stats/<hash>/chunk_*.csv``) and inline-derive nested
+        # (``test_stats/<hash>/<batch_subdir>/chunk_*.csv``).
         check_cmd = f"""
             test -d "{test_stats_dir}" || exit 1
-            echo "TEST_STATS_CHUNKS:$(ls "{test_stats_dir}"/chunk_*_test_stats.csv 2>/dev/null | wc -l)"
-            echo "PARAMS_CHUNKS:$(ls "{test_stats_dir}"/chunk_*_params.csv 2>/dev/null | wc -l)"
+            echo "TEST_STATS_CHUNKS:$(find "{test_stats_dir}" -type f -name 'chunk_*_test_stats.csv' 2>/dev/null | wc -l)"
+            echo "PARAMS_CHUNKS:$(find "{test_stats_dir}" -type f -name 'chunk_*_params.csv' 2>/dev/null | wc -l)"
         """
         status, output = self.transport.exec(check_cmd)
 
@@ -2282,9 +2328,13 @@ class HPCJobManager:
             count_cmd = f"""
                 cd "{test_stats_dir}" 2>/dev/null || exit 1
 
-                # Check if combined file exists, otherwise combine chunks
+                # Check if combined file exists, otherwise combine chunks.
+                # ``find ... -exec cat`` walks both flat (legacy) and
+                # nested ``<batch_subdir>/chunk_*.csv`` (inline-derive)
+                # layouts. Sort for determinism.
                 if [ ! -f combined_test_stats.csv ]; then
-                    cat chunk_*_test_stats.csv > combined_test_stats.csv 2>/dev/null
+                    find . -type f -name 'chunk_*_test_stats.csv' 2>/dev/null \
+                        | sort | xargs cat > combined_test_stats.csv 2>/dev/null
                 fi
 
                 # Count lines in combined file
@@ -2348,7 +2398,8 @@ class HPCJobManager:
             f'if [ -f "{test_stats_dir}/combined_test_stats.csv" ]; then '
             f'  wc -l < "{test_stats_dir}/combined_test_stats.csv"; '
             f"else "
-            f'  cat "{test_stats_dir}"/chunk_*_test_stats.csv 2>/dev/null | wc -l; '
+            f'  find "{test_stats_dir}" -type f -name "chunk_*_test_stats.csv" '
+            f"    2>/dev/null -exec cat {{}} + | wc -l; "
             f"fi"
         )
         status, output = self.transport.exec(cmd)
@@ -2425,6 +2476,53 @@ class HPCJobManager:
 
         return batches_needed
 
+    def _upload_derive_inputs(
+        self,
+        test_stats_csv: str,
+        test_stats_hash: str,
+        model_structure_file: Optional[str] = None,
+        model_structure_remote: Optional[str] = None,
+        test_stats_csv_remote: Optional[str] = None,
+        aux_samples_csv: Optional[str] = None,
+        aux_samples_csv_remote: Optional[str] = None,
+    ) -> tuple[str, Optional[str], Optional[str]]:
+        """Upload (or resolve) the test-stats / model-structure / aux-samples
+        inputs the derive code needs on HPC.
+
+        Returns ``(remote_test_stats_csv, remote_model_structure_file,
+        remote_aux_samples_csv)``. Shared between :meth:`submit_derivation_job`
+        (cold path) and :meth:`submit_cpp_jobs` (inline-derive hot path) so
+        the upload semantics — hoisted ``*_remote`` overrides, MSR-pre-uploaded
+        session paths — stay consistent across both entry points.
+        """
+        derivation_dir = f"{self.config.remote_project_path}/batch_jobs/derivation"
+        self.transport.exec(f'mkdir -p "{derivation_dir}"')
+
+        if test_stats_csv_remote:
+            remote_test_stats_csv = test_stats_csv_remote
+        else:
+            remote_test_stats_csv = f"{derivation_dir}/test_stats_{test_stats_hash[:8]}.csv"
+            self.logger.info("Uploading test statistics CSV to HPC...")
+            self.transport.upload(test_stats_csv, remote_test_stats_csv)
+
+        remote_model_structure_file: Optional[str] = None
+        if model_structure_remote:
+            remote_model_structure_file = model_structure_remote
+        elif model_structure_file:
+            remote_model_structure_file = f"{derivation_dir}/model_structure.json"
+            self.logger.info("Uploading model structure file to HPC...")
+            self.transport.upload(model_structure_file, remote_model_structure_file)
+
+        remote_aux_samples_csv: Optional[str] = None
+        if aux_samples_csv_remote:
+            remote_aux_samples_csv = aux_samples_csv_remote
+        elif aux_samples_csv:
+            remote_aux_samples_csv = f"{derivation_dir}/aux_samples_{test_stats_hash[:8]}.csv"
+            self.logger.info("Uploading aux samples CSV to HPC...")
+            self.transport.upload(aux_samples_csv, remote_aux_samples_csv)
+
+        return remote_test_stats_csv, remote_model_structure_file, remote_aux_samples_csv
+
     def submit_derivation_job(
         self,
         pool_path: str,
@@ -2471,35 +2569,23 @@ class HPCJobManager:
         if not skip_setup:
             self.ensure_hpc_venv()
 
-        # Create persistent directory for derivation inputs (in batch_jobs)
+        # Reuse the shared upload helper so cold-path derive and inline
+        # derive (submit_cpp_jobs) speak the same hoisted-remote / shared-
+        # session-path semantics.
+        (
+            remote_test_stats_csv,
+            remote_model_structure_file,
+            remote_aux_samples_csv,
+        ) = self._upload_derive_inputs(
+            test_stats_csv=test_stats_csv,
+            test_stats_hash=test_stats_hash,
+            model_structure_file=model_structure_file,
+            model_structure_remote=model_structure_remote,
+            test_stats_csv_remote=test_stats_csv_remote,
+            aux_samples_csv=aux_samples_csv,
+            aux_samples_csv_remote=aux_samples_csv_remote,
+        )
         derivation_dir = f"{self.config.remote_project_path}/batch_jobs/derivation"
-        self.transport.exec(f'mkdir -p "{derivation_dir}"')
-
-        # Upload test statistics CSV. Hoisted: when MSR pre-uploaded the
-        # CSV via upload_shared_test_stats_csv, reuse that path instead
-        # of re-uploading per derivation submit.
-        if test_stats_csv_remote:
-            remote_test_stats_csv = test_stats_csv_remote
-        else:
-            # The CSV now contains Python function code in the
-            # model_output_code column, eliminating the need for
-            # separate test_stat_functions.py files.
-            remote_test_stats_csv = f"{derivation_dir}/test_stats_{test_stats_hash[:8]}.csv"
-            self.logger.info("Uploading test statistics CSV to HPC...")
-            self.transport.upload(test_stats_csv, remote_test_stats_csv)
-
-        # Upload species units file. Hoisted: if model_structure_remote
-        # was uploaded once at session level (via
-        # upload_shared_model_structure), reference that path instead of
-        # re-uploading per scenario. model_structure.json describes
-        # species (units, compartments) — same across scenarios.
-        remote_model_structure_file: Optional[str] = None
-        if model_structure_remote:
-            remote_model_structure_file = model_structure_remote
-        elif model_structure_file:
-            remote_model_structure_file = f"{derivation_dir}/model_structure.json"
-            self.logger.info("Uploading model structure file to HPC...")
-            self.transport.upload(model_structure_file, remote_model_structure_file)
 
         # Expand $HOME in pool_path (Python won't expand shell variables)
         # Get the actual home directory from HPC
@@ -2514,19 +2600,6 @@ class HPCJobManager:
             n_batches = -1  # sentinel: count unknown, will be populated by upstream job
         else:
             n_batches = self._calculate_batches_needed(pool_path, num_simulations=None)
-
-        # Auxiliary samples sidecar: if a local path was provided and no
-        # session-shared remote was hoisted, upload per-derivation alongside
-        # the test_stats CSV. Otherwise reuse the hoisted remote path. The
-        # CSV is keyed on sample_index and joined into species_dict by the
-        # derive worker.
-        remote_aux_samples_csv: Optional[str] = None
-        if aux_samples_csv_remote:
-            remote_aux_samples_csv = aux_samples_csv_remote
-        elif aux_samples_csv:
-            remote_aux_samples_csv = f"{derivation_dir}/aux_samples_{test_stats_hash[:8]}.csv"
-            self.logger.info("Uploading aux samples CSV to HPC...")
-            self.transport.upload(aux_samples_csv, remote_aux_samples_csv)
 
         # Create derivation config JSON
         # Always derive ALL batches to handle incremental pool growth correctly.
@@ -2741,7 +2814,10 @@ class HPCJobManager:
         # "Failed to combine chunks" error 5s later. Raising here names
         # the likely cause (failed/timed-out derive) and points at the
         # SLURM logs so the user doesn't have to dig.
-        count_cmd = f'ls "{test_stats_dir}"/chunk_*_test_stats.csv 2>/dev/null | wc -l'
+        count_cmd = (
+            f'find "{test_stats_dir}" -type f -name "chunk_*_test_stats.csv" '
+            f"2>/dev/null | wc -l"
+        )
         status_cnt, cnt_output = self.transport.exec(count_cmd)
         try:
             n_chunks = int(cnt_output.strip()) if status_cnt == 0 else 0

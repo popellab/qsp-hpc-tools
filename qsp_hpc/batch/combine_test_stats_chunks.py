@@ -16,9 +16,20 @@ Args:
     test_stats_dir: Directory containing chunk files
 """
 
-import glob
 import sys
 from pathlib import Path
+
+
+def _find_chunks(test_stats_dir: Path, pattern: str) -> list[str]:
+    """Find chunk files at any depth under ``test_stats_dir``.
+
+    Inline-derive writes shards to ``test_stats/<hash>/<batch_subdir>/chunk_*.csv``;
+    the legacy cold-path derive worker wrote them flat at
+    ``test_stats/<hash>/chunk_*.csv``. ``rglob`` matches both so pools
+    with mixed-history layouts combine cleanly. Sorted lexicographically
+    so chunk order is deterministic across runs.
+    """
+    return sorted(str(p) for p in test_stats_dir.rglob(pattern))
 
 
 def combine_test_stats(test_stats_dir: Path) -> int:
@@ -31,7 +42,7 @@ def combine_test_stats(test_stats_dir: Path) -> int:
     Returns:
         Number of chunks combined
     """
-    chunk_files = sorted(glob.glob(str(test_stats_dir / "chunk_*_test_stats.csv")))
+    chunk_files = _find_chunks(test_stats_dir, "chunk_*_test_stats.csv")
 
     if not chunk_files:
         print("WARNING: No test stats chunk files found")
@@ -59,7 +70,7 @@ def combine_params(test_stats_dir: Path) -> int:
     Returns:
         Number of chunks combined
     """
-    chunk_files = sorted(glob.glob(str(test_stats_dir / "chunk_*_params.csv")))
+    chunk_files = _find_chunks(test_stats_dir, "chunk_*_params.csv")
 
     if not chunk_files:
         print("INFO: No params chunk files found (may be older format)")

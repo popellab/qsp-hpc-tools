@@ -247,7 +247,7 @@ def _run_one_in_worker(
     assert _WORKER_RUNNER is not None, "_worker_init must be called first"
     assert _WORKER_WORKDIR is not None
     _worker_t0 = time.time()
-    logging.getLogger(__name__).info(
+    logging.getLogger(__name__).debug(
         "worker pid=%d start sim_id=%d sample_index=%d",
         os.getpid(),
         sim_id,
@@ -300,7 +300,7 @@ def _run_one_in_worker(
             # distinct theta this worker has seen.
             if evolve_state_path is not None:
                 Path(evolve_state_path).unlink(missing_ok=True)
-        logging.getLogger(__name__).info(
+        logging.getLogger(__name__).debug(
             "worker pid=%d done  sim_id=%d sample_index=%d (%.2fs, n_times=%d)",
             os.getpid(),
             sim_id,
@@ -319,7 +319,10 @@ def _run_one_in_worker(
             None,
         )
     except (QspSimError, ParamNotFoundError) as e:
-        logging.getLogger(__name__).info(
+        # Per-worker FAIL is logged at debug — the collector loop emits a
+        # single aggregate "sim N failed" warning per failure (see run()),
+        # which is the non-verbose failure report.
+        logging.getLogger(__name__).debug(
             "worker pid=%d FAIL sim_id=%d sample_index=%d (%.2fs): %s",
             os.getpid(),
             sim_id,
@@ -649,20 +652,27 @@ class CppBatchRunner:
                         errors[sim_id] = err
                         logger.warning("sim %d failed: %s", sim_id, err)
 
-                    # Heartbeat: log every 10% of n_sims so a hang
-                    # post-sim shows up as "stopped at 80%" not silence.
-                    every = max(1, n_sims // 10)
+                    # Progress heartbeat: one line every 5% of n_sims so a
+                    # hang post-sim shows up as "stopped at 80%" not silence.
+                    # A logfile-friendly ASCII bar (no \r spam) stands in for
+                    # a tqdm progress bar, which doesn't survive nohup well.
+                    every = max(1, n_sims // 20)
                     if n_completed % every == 0 or n_completed == n_sims:
+                        n_ok = sum(1 for s in statuses if s == STATUS_OK)
+                        n_bad = sum(
+                            1 for s in statuses if s not in (STATUS_OK, STATUS_FUTURE_TIMEOUT, None)
+                        )
+                        frac = n_completed / n_sims
+                        filled = int(round(frac * 30))
+                        bar = "#" * filled + "-" * (30 - filled)
                         logger.info(
-                            "Collected %d/%d sims (%d ok, %d failed, %d future-timeout)",
+                            "[%s] %3.0f%%  %d/%d sims (%d ok, %d failed, %d future-timeout)",
+                            bar,
+                            frac * 100,
                             n_completed,
                             n_sims,
-                            sum(1 for s in statuses if s == STATUS_OK),
-                            sum(
-                                1
-                                for s in statuses
-                                if s not in (STATUS_OK, STATUS_FUTURE_TIMEOUT, None)
-                            ),
+                            n_ok,
+                            n_bad,
                             n_timeouts,
                         )
             except FuturesTimeoutError:

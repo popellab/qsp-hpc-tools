@@ -539,6 +539,32 @@ class CppSimulator:
         """
         return self.pool_dir / "test_stats" / test_stats_hash / "test_stats.parquet"
 
+    def local_cache_satisfies(self, n: int, aux_samples_csv: Optional[str] = None) -> bool:
+        """True when the local test-stats cache already covers ``n`` sims.
+
+        Cheap pre-check for :class:`MultiScenarioRunner`: resolves the
+        same ``test_stats_hash`` that :meth:`run_hpc` Tier 1 uses and
+        reads *only* the Parquet footer (row count) — no column data,
+        no SSH, no ``job_manager`` needed. Lets the runner skip the HPC
+        session prep + uploads entirely when every scenario is already
+        locally satisfied.
+
+        Returns False (rather than raising) on any resolution failure —
+        a missing / corrupt / legacy Parquet just falls back to the
+        normal :meth:`run_hpc` tier walk, which is the safe default.
+        """
+        if self.test_stats_csv is None:
+            return False
+        try:
+            test_stats_hash = self._compute_test_stats_hash(aux_samples_csv=aux_samples_csv)
+            local_cache = self._local_test_stats_path(test_stats_hash)
+            if not local_cache.exists():
+                return False
+            return pq.read_metadata(str(local_cache)).num_rows >= n
+        except Exception as exc:  # noqa: BLE001 — conservative fallback
+            self.logger.debug("local_cache_satisfies: probe failed (%s) — treating as miss", exc)
+            return False
+
     def _load_local_test_stats(self, path: Path) -> Tuple[np.ndarray, np.ndarray]:
         """Load the cached (params, test_stats) Parquet.
 

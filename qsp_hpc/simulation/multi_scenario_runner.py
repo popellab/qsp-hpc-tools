@@ -304,14 +304,41 @@ class MultiScenarioRunner:
         self._shared_healthy_remote = self.job_manager.upload_shared_healthy_state(str(local))
         return self._shared_healthy_remote
 
+    def _all_local(self, n: int) -> bool:
+        """True when *every* simulator's local test-stats cache covers ``n``.
+
+        Pre-check that lets :meth:`run_all` skip the entire HPC preamble
+        (``prepare_session`` + shared-file uploads) when no scenario
+        needs the cluster. All-or-nothing: a single scenario that needs
+        HPC forces the session prep, since the others' ``run_hpc`` calls
+        run with ``skip_setup=True`` and depend on it.
+
+        The aux-samples CSV (when attached) is folded into each
+        simulator's test-stats hash, so the same local aux path that the
+        per-scenario :meth:`CppSimulator.run_hpc` call would use is
+        threaded into the probe — otherwise the probe resolves a
+        different cache key than the call.
+        """
+        aux = str(self._aux_samples_local) if self._aux_samples_local else None
+        return all(
+            sim.local_cache_satisfies(n, aux_samples_csv=aux) for sim in self.simulators.values()
+        )
+
     def run_all(self, n: int) -> Dict[str, ScenarioResult]:
         """Submit each scenario for ``n`` simulations against the shared
         theta pool, wait, return per-scenario ``(theta, x, sample_index)``.
 
         Strategy:
-        - Hoist :meth:`prepare_session` (venv + binary setup) before the
-          loop, then submit every scenario with ``skip_setup=True``.
-          Decouples HPC setup from any scenario's cache-tier resolution.
+        - If every scenario is already satisfied from its local
+          test-stats cache (:meth:`_all_local`), skip the HPC preamble
+          entirely — no venv refresh, no cmake probe, no uploads — and
+          go straight to the per-scenario loop, where each
+          :meth:`CppSimulator.run_hpc` Tier 1 returns from the local
+          Parquet without touching the cluster.
+        - Otherwise hoist :meth:`prepare_session` (venv + binary setup)
+          before the loop, then submit every scenario with
+          ``skip_setup=True``. Decouples HPC setup from any scenario's
+          cache-tier resolution.
         - Hoist one ``upload_shared_samples_csv``.
         - Each scenario internally tier-checks (local cache → HPC cache
           → derive → submit), so re-runs hit local cache and the runner
@@ -319,12 +346,31 @@ class MultiScenarioRunner:
 
         Returns ``{name: ScenarioResult}`` in scenario-insertion order.
         """
-        self.prepare_session()
-        shared_remote = self.upload_shared_samples_csv(n)
-        shared_healthy_remote = self.upload_shared_healthy_state()
-        shared_model_structure_remote = self.upload_shared_model_structure()
-        shared_aux_remote = self.upload_shared_aux_samples_csv()
-        per_scen_remotes = self._preupload_per_scenario_files()
+        if self._all_local(n):
+            logger.info(
+                "MSR: all %d scenario(s) satisfied from local cache — "
+                "skipping HPC session prep + shared uploads",
+                len(self.simulators),
+            )
+            shared_remote = None
+            shared_healthy_remote = None
+            shared_model_structure_remote = None
+            shared_aux_remote = None
+            per_scen_remotes = {
+                name: {
+                    "scenario_yaml": None,
+                    "drug_metadata_yaml": None,
+                    "test_stats_csv": None,
+                }
+                for name in self.simulators
+            }
+        else:
+            self.prepare_session()
+            shared_remote = self.upload_shared_samples_csv(n)
+            shared_healthy_remote = self.upload_shared_healthy_state()
+            shared_model_structure_remote = self.upload_shared_model_structure()
+            shared_aux_remote = self.upload_shared_aux_samples_csv()
+            per_scen_remotes = self._preupload_per_scenario_files()
 
         results: Dict[str, ScenarioResult] = {}
         for name, sim in self.simulators.items():

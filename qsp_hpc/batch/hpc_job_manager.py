@@ -1068,6 +1068,8 @@ class HPCJobManager:
         aux_samples_csv_remote: Optional[str] = None,
         auxiliary_units: Optional[dict] = None,
         samples_start_offset: int = 0,
+        evolve_pack_key: Optional[str] = None,
+        evolve_pack_mode: str = "emit",
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
 
@@ -1289,6 +1291,19 @@ class HPCJobManager:
         if evolve_cache and remote_healthy:
             evolve_cache_root = f"{self.config.simulation_pool_path}/evolve_cache"
 
+        # Per-task evolve-pack dir (#86) — the NFS-safe successor to the
+        # LMDB evolve cache. When ``evolve_pack_key`` is given (the joint
+        # runner's shared-theta hash) and there is an evolve phase, this
+        # array writes/reads ``{pool_path}/evolve_packs/{key}/chunk_NNN.qsep``
+        # per ``evolve_pack_mode`` ("emit" for scenario 1, "consume" for
+        # 2..N). Scenario-independent path: the evolve state depends on
+        # theta + healthy_state + binary, not the scenario. Supersedes the
+        # LMDB cache — the two are alternatives, never both.
+        evolve_pack_dir: Optional[str] = None
+        if evolve_pack_key and remote_healthy:
+            evolve_pack_dir = f"{self.config.simulation_pool_path}/evolve_packs/{evolve_pack_key}"
+            evolve_cache_root = None
+
         # Per-submission batch subdir name — fixed at submit time so every
         # array task (and every retry) writes into the same
         # ``{pool}/batch_{ts}_{scenario}_seed{S}/`` directory (issue #43
@@ -1343,6 +1358,8 @@ class HPCJobManager:
             drug_metadata_yaml=remote_drug_meta,
             healthy_state_yaml=remote_healthy,
             evolve_cache_root=evolve_cache_root,
+            evolve_pack_dir=evolve_pack_dir,
+            evolve_pack_mode=evolve_pack_mode,
             batch_subdir=batch_subdir,
             samples_csv_remote=samples_csv_remote,
             samples_start_offset=samples_start_offset,
@@ -1524,6 +1541,8 @@ class HPCJobManager:
         drug_metadata_yaml: Optional[str] = None,
         healthy_state_yaml: Optional[str] = None,
         evolve_cache_root: Optional[str] = None,
+        evolve_pack_dir: Optional[str] = None,
+        evolve_pack_mode: str = "emit",
         batch_subdir: Optional[str] = None,
         samples_csv_remote: Optional[str] = None,
         samples_start_offset: int = 0,
@@ -1573,6 +1592,12 @@ class HPCJobManager:
             "healthy_state_yaml": healthy_state_yaml,
             # Absolute remote path; None disables the M13 evolve-cache.
             "evolve_cache_root": evolve_cache_root,
+            # Per-task evolve-pack dir + mode (#86). When evolve_pack_dir is
+            # set the worker emits ("emit") or consumes ("consume") one
+            # QSEP pack per array task at {evolve_pack_dir}/chunk_NNN.qsep.
+            # None disables. Mutually exclusive with evolve_cache_root.
+            "evolve_pack_dir": evolve_pack_dir,
+            "evolve_pack_mode": evolve_pack_mode,
             # Per-submission batch subdir name (issue #43 option A).
             # Every task in the array writes chunks into
             # ``{pool}/{batch_subdir}/chunk_NNN.parquet``. None falls back

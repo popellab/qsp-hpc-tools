@@ -44,7 +44,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from qsp_hpc.cpp.evolve_cache import CppEvolveCache
+from qsp_hpc.cpp.evolve_cache import CppEvolveCache, theta_hash_for_xml, wire_hash
+from qsp_hpc.cpp.evolve_pack import EvolveStatePackWriter
 from qsp_hpc.cpp.param_xml import ParamNotFoundError
 from qsp_hpc.cpp.runner import CppRunner, QspSimError, SimResult
 
@@ -144,6 +145,10 @@ class BatchResult:
     n_times: int
     compartment_names: list[str] | None = None
     rule_names: list[str] | None = None
+    # Per-task QSEP evolve-state pack written when evolve_pack emission is
+    # active (#86). None when emission was off or no evolve states were
+    # captured (e.g. trajectory-dump mode, or no healthy_state_yaml).
+    evolve_pack_path: Path | None = None
 
 
 # --- Worker (module-level so ProcessPoolExecutor can pickle it) -------------
@@ -227,6 +232,7 @@ def _run_one_in_worker(
     timeout_s: float | None,
     evolve_trajectory_dir: str | None = None,
     evolve_trajectory_dt_days: float | None = None,
+    emit_evolve_pack: bool = False,
 ) -> tuple[
     int,
     int,
@@ -236,13 +242,24 @@ def _run_one_in_worker(
     list[str] | None,
     list[str] | None,
     str | None,
+    str | None,
+    bytes | None,
 ]:
-    """Return (sim_id, status, trajectory, species, comps, rules, err).
+    """Return (sim_id, status, trajectory, species, comps, rules, err,
+    theta_hash, evolve_blob).
 
     ``evolve_trajectory_dir`` / ``evolve_trajectory_dt_days`` are the
     *effective* values resolved by the caller (CppBatchRunner.run()) —
     per-call overrides take priority over __init__ defaults. ``None``
     here means "no dump for this sim".
+
+    ``emit_evolve_pack``: when True (and there is an evolve phase and no
+    trajectory dump), the worker evolves via ``--dump-state``, captures
+    the QSTH blob, and runs the scenario from it via ``--initial-state``.
+    ``theta_hash`` + ``evolve_blob`` carry that blob back to the parent
+    for the per-task QSEP pack (#86); both are None when emission is off.
+    The blob is returned even when the scenario sim fails — a completed
+    evolve is reusable regardless of the scenario outcome.
     """
     assert _WORKER_RUNNER is not None, "_worker_init must be called first"
     assert _WORKER_WORKDIR is not None
@@ -253,21 +270,51 @@ def _run_one_in_worker(
         sim_id,
         sample_index,
     )
+    # theta_hash / evolve_blob carry the per-task pack payload (#86) back
+    # to the parent. Bound before the try so the except path can still
+    # return a blob captured by a successful evolve when the scenario sim
+    # afterwards fails — a completed evolve is reusable either way.
+    theta_hash: str | None = None
+    evolve_blob: bytes | None = None
     try:
-        # If the evolve cache is active, materialize the post-evolve state
-        # for this theta (build-if-missing) and pass it to qsp_sim via
-        # --initial-state. Scenarios sharing a theta amortize the evolve
-        # across all runs; the first one pays ~0.5s, the rest ~0ms.
+        # Resolve the post-evolve ODE state for this theta. The evolve
+        # modes below are all skipped when ``evolve_trajectory_dir`` is
+        # set: cached-state mode loads a post-evolve snapshot, which by
+        # design skips the burn-in entirely, and honoring it would
+        # silently produce zero trajectory binaries (#69's worker-side
+        # "trajectories take priority over cache" half).
         #
-        # Skip the cache when ``evolve_trajectory_dir`` is set: cached-state
-        # mode loads a post-evolve snapshot, which by design skips the
-        # burn-in phase entirely. Honoring the cache here would silently
-        # produce zero trajectory binaries even when the caller asked for
-        # them (caught locally on a 50-sim smoke; this is the worker-side
-        # half of #69's "trajectories take priority over cache" semantics).
+        #   - emit_evolve_pack: evolve via --dump-state, capture the QSTH
+        #     blob for the per-task QSEP pack, then run the scenario from
+        #     it via --initial-state. No shared store — the parent packs
+        #     the blobs, so there is no concurrent-writer NFS hazard (#86).
+        #   - evolve cache (LMDB): get_or_build amortizes the evolve
+        #     across scenarios sharing a theta.
+        #   - neither: a plain full evolve+scenario run.
         evolve_state_path: Path | None = None
         params_hash: str | None = None
-        if _WORKER_EVOLVE_CACHE is not None and evolve_trajectory_dir is None:
+        # emit_evolve_pack is checked first so the healthy_state_yaml
+        # attribute access short-circuits away in the non-emission path
+        # (the worker runner is always a real CppRunner there, but test
+        # stubs need not carry every attribute).
+        if (
+            emit_evolve_pack
+            and evolve_trajectory_dir is None
+            and _WORKER_RUNNER.healthy_state_yaml is not None
+        ):
+            xml = _WORKER_RUNNER._renderer.render(params)
+            theta_hash = theta_hash_for_xml(xml)
+            params_hash = wire_hash(theta_hash)
+            evolve_state_path = _WORKER_WORKDIR / f"{theta_hash[:16]}.evolve_state.bin"
+            _WORKER_RUNNER.dump_evolve_state(
+                params=params,
+                params_hash=params_hash,
+                state_out=evolve_state_path,
+                workdir=_WORKER_WORKDIR,
+                timeout_s=timeout_s,
+            )
+            evolve_blob = evolve_state_path.read_bytes()
+        elif _WORKER_EVOLVE_CACHE is not None and evolve_trajectory_dir is None:
             evolve_state_path, params_hash = _WORKER_EVOLVE_CACHE.get_or_build(
                 params,
                 workdir=_WORKER_WORKDIR,
@@ -317,6 +364,8 @@ def _run_one_in_worker(
             result.compartment_names,
             result.rule_names,
             None,
+            theta_hash,
+            evolve_blob,
         )
     except (QspSimError, ParamNotFoundError) as e:
         # Per-worker FAIL is logged at debug — the collector loop emits a
@@ -330,7 +379,21 @@ def _run_one_in_worker(
             time.time() - _worker_t0,
             str(e)[:120],
         )
-        return sim_id, STATUS_FAILED, None, None, None, None, None, str(e)
+        # theta_hash / evolve_blob are populated when the evolve completed
+        # before the scenario sim failed — still emitted so the pack keeps
+        # a reusable evolve state for that theta.
+        return (
+            sim_id,
+            STATUS_FAILED,
+            None,
+            None,
+            None,
+            None,
+            None,
+            str(e),
+            theta_hash,
+            evolve_blob,
+        )
 
 
 # --- Public batch runner ----------------------------------------------------
@@ -349,6 +412,7 @@ class CppBatchRunner:
         drug_metadata_yaml: str | Path | None = None,
         healthy_state_yaml: str | Path | None = None,
         evolve_cache_root: str | Path | None = None,
+        evolve_pack_path: str | Path | None = None,
         evolve_trajectory_dir: str | Path | None = None,
         evolve_trajectory_dt_days: float | None = None,
     ):
@@ -384,6 +448,27 @@ class CppBatchRunner:
                 evolve_cache_root,
             )
             evolve_cache_root = None
+        # evolve_pack_path: per-task QSEP pack emission (#86). When set,
+        # every sim evolves via --dump-state, the QSTH blob is captured,
+        # and run() writes one pack for the whole batch. Supersedes the
+        # LMDB cache for this batch — emission is the NFS-safe successor,
+        # so a caller passing both gets emission (the LMDB write path is
+        # the thing being retired). Like the cache, it needs an evolve
+        # phase to have anything to pack.
+        if evolve_pack_path is not None and probe.healthy_state_yaml is None:
+            logger.warning(
+                "evolve_pack_path=%s ignored: no healthy_state_yaml " "(no evolve phase to pack)",
+                evolve_pack_path,
+            )
+            evolve_pack_path = None
+        if evolve_pack_path is not None and evolve_cache_root is not None:
+            logger.info(
+                "evolve_pack_path set — superseding evolve_cache_root=%s for this "
+                "batch (per-task pack emission replaces the shared LMDB cache)",
+                evolve_cache_root,
+            )
+            evolve_cache_root = None
+        self.evolve_pack_path = Path(evolve_pack_path).resolve() if evolve_pack_path else None
         self.evolve_cache_root = Path(evolve_cache_root).resolve() if evolve_cache_root else None
         # Burn-in trajectory dump dir (passed to qsp_sim as
         # --evolve-trajectory-out per sim). Same caveat as evolve_cache:
@@ -425,6 +510,7 @@ class CppBatchRunner:
         sample_indices: np.ndarray | None = None,
         evolve_trajectory_dir: str | Path | None = None,
         evolve_trajectory_dt_days: float | None = None,
+        evolve_pack_path: str | Path | None = None,
     ) -> BatchResult:
         """Execute a batch and write the Parquet.
 
@@ -541,6 +627,34 @@ class CppBatchRunner:
             )
         traj_dir_str = str(effective_traj_dir) if effective_traj_dir else None
 
+        # Effective per-task evolve-pack emission (#86): per-call arg
+        # overrides the __init__ default. Emission needs an evolve phase
+        # and is incompatible with trajectory-dump mode (that dumps the
+        # burn-in itself; there is no post-evolve snapshot to pack).
+        effective_evolve_pack_path = (
+            Path(evolve_pack_path) if evolve_pack_path is not None else self.evolve_pack_path
+        )
+        emit_evolve_pack = (
+            effective_evolve_pack_path is not None
+            and self.healthy_state_yaml is not None
+            and effective_traj_dir is None
+        )
+        if effective_evolve_pack_path is not None and not emit_evolve_pack:
+            logger.warning(
+                "evolve_pack_path=%s not emitted: %s",
+                effective_evolve_pack_path,
+                (
+                    "no healthy_state_yaml (no evolve phase)"
+                    if self.healthy_state_yaml is None
+                    else "trajectory-dump mode active (burn-in is dumped, not packed)"
+                ),
+            )
+        if emit_evolve_pack:
+            logger.info("Evolve-pack emission: ENABLED (path=%s)", effective_evolve_pack_path)
+        # Collected (theta_hash, QSTH blob) pairs from workers; packed once
+        # after the collection loop.
+        evolve_pack_entries: list[tuple[str, bytes]] = []
+
         with ProcessPoolExecutor(
             max_workers=max_workers,
             initializer=_worker_init,
@@ -578,6 +692,7 @@ class CppBatchRunner:
                     per_sim_timeout_s,
                     traj_dir_str,
                     effective_traj_dt,
+                    emit_evolve_pack,
                 )
                 futures.append(fut)
                 sim_id_to_sample_idx[id(fut)] = (i, int(_sample_idx[i]))
@@ -596,9 +711,18 @@ class CppBatchRunner:
             try:
                 for fut in as_completed(futures, timeout=future_wait_s * (n_sims + 1)):
                     try:
-                        sim_id, status, traj, t_days, sp, comps, rules, err = fut.result(
-                            timeout=future_wait_s,
-                        )
+                        (
+                            sim_id,
+                            status,
+                            traj,
+                            t_days,
+                            sp,
+                            comps,
+                            rules,
+                            err,
+                            theta_hash,
+                            evolve_blob,
+                        ) = fut.result(timeout=future_wait_s)
                     except FuturesTimeoutError:
                         # Future never completed within future_wait_s.
                         # Worker may be hung in a kernel call (e.g.
@@ -640,6 +764,11 @@ class CppBatchRunner:
                         break
 
                     n_completed += 1
+                    # Capture the evolve-state blob for the per-task pack —
+                    # kept even for STATUS_FAILED sims, since a completed
+                    # evolve is reusable regardless of the scenario outcome.
+                    if theta_hash is not None and evolve_blob is not None:
+                        evolve_pack_entries.append((theta_hash, evolve_blob))
                     statuses[sim_id] = status
                     if status == STATUS_OK:
                         trajectories[sim_id] = traj
@@ -746,6 +875,31 @@ class CppBatchRunner:
             time.time() - _write_t0,
         )
 
+        # Per-task evolve-state pack (#86). Written after the parquet so a
+        # pack failure can never cost the batch its results — emission is a
+        # speedup for *later* scenarios, not load-bearing for this one.
+        written_evolve_pack: Path | None = None
+        if emit_evolve_pack and evolve_pack_entries:
+            try:
+                writer = EvolveStatePackWriter()
+                for theta_hash, blob in evolve_pack_entries:
+                    writer.add(theta_hash, blob)
+                written_evolve_pack = writer.write(effective_evolve_pack_path)
+                logger.info(
+                    "Evolve-pack written: %s (%d/%d evolve states captured)",
+                    written_evolve_pack,
+                    len(evolve_pack_entries),
+                    n_sims,
+                )
+            except Exception as e:  # noqa: BLE001 — pack is an optimization
+                logger.error(
+                    "Evolve-pack write failed (%s) — batch parquet is unaffected; "
+                    "later scenarios will re-evolve instead of reusing the pack.",
+                    e,
+                )
+        elif emit_evolve_pack:
+            logger.warning("Evolve-pack emission was ON but 0 evolve states were captured.")
+
         logger.info(
             "Batch complete: %d/%d succeeded, wrote %s (cols: %d species + %d comps + %d rules)",
             n_sims - n_failed,
@@ -763,6 +917,7 @@ class CppBatchRunner:
             n_times=n_times,
             compartment_names=compartment_names,
             rule_names=rule_names,
+            evolve_pack_path=written_evolve_pack,
         )
 
 

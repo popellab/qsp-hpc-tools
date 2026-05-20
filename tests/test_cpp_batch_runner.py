@@ -401,3 +401,90 @@ def test_real_batch_end_to_end(tmp_path: Path):
     # values meaningfully across rows.
     final_c1 = [row[-1] for row in table.column("V_T.C1").to_pylist()]
     assert final_c1[0] != final_c1[2], "V_T.C1 should differ across k_C1_growth values"
+
+
+# --- Per-task evolve-pack emission (#86) -----------------------------------
+
+
+def _real_healthy_yaml() -> Path | None:
+    env = os.environ.get("QSP_SIM_HEALTHY_YAML")
+    if env and Path(env).exists():
+        return Path(env)
+    return None
+
+
+def test_evolve_pack_disabled_without_healthy_state(
+    tmp_path: Path, template_path: Path, ok_binary: Path, caplog
+):
+    """evolve_pack_path is inert without a healthy_state_yaml — there is
+    no evolve phase to pack. The runner warns and disables it rather than
+    silently emitting an empty pack."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        runner = CppBatchRunner(ok_binary, template_path, evolve_pack_path=tmp_path / "out.qsep")
+    assert runner.evolve_pack_path is None
+    assert "no healthy_state_yaml" in caplog.text
+
+
+def test_evolve_pack_supersedes_evolve_cache(tmp_path: Path, template_path: Path, ok_binary: Path):
+    """When both evolve_pack_path and evolve_cache_root are given, pack
+    emission wins — it is the NFS-safe successor to the LMDB cache."""
+    healthy = tmp_path / "healthy.yaml"
+    healthy.write_text("# dummy healthy state for the ctor probe\n")
+    runner = CppBatchRunner(
+        ok_binary,
+        template_path,
+        healthy_state_yaml=healthy,
+        evolve_cache_root=tmp_path / "evolve_cache",
+        evolve_pack_path=tmp_path / "out.qsep",
+    )
+    assert runner.evolve_pack_path is not None
+    assert runner.evolve_cache_root is None  # superseded
+
+
+@pytest.mark.skipif(
+    _real_binary_path() is None or _real_template_path() is None or _real_healthy_yaml() is None,
+    reason="qsp_sim binary / template / healthy_state.yaml not found; set "
+    "QSP_SIM_BINARY, QSP_SIM_TEMPLATE, QSP_SIM_HEALTHY_YAML",
+)
+def test_real_batch_emits_evolve_pack(tmp_path: Path):
+    """A batch with evolve_pack_path writes one QSEP pack holding every
+    sim's post-evolve QSTH blob, keyed by theta_hash."""
+    from qsp_hpc.cpp.evolve_cache import QsthHeader
+    from qsp_hpc.cpp.evolve_pack import EvolveStatePackReader
+
+    pack_path = tmp_path / "evolve_states" / "chunk_000.qsep"
+    runner = CppBatchRunner(
+        _real_binary_path(),
+        _real_template_path(),
+        healthy_state_yaml=_real_healthy_yaml(),
+        evolve_pack_path=pack_path,
+    )
+    # 3 distinct thetas, all with k_C1_growth fast enough that
+    # evolve_to_diagnosis reaches the 3.2 cm target (slow-growth values
+    # get REJECTED before the burn-in finishes).
+    theta = np.array([[0.4], [0.6], [0.8]])
+    result = runner.run(
+        theta_matrix=theta,
+        param_names=["k_C1_growth"],
+        t_end_days=1.0,
+        min_cadence_hours=4.0,
+        output_path=tmp_path / "batch.parquet",
+        max_workers=2,
+    )
+    assert result.n_failed == 0
+    assert result.evolve_pack_path == pack_path
+    assert pack_path.exists()
+
+    reader = EvolveStatePackReader(pack_path)
+    assert len(reader) == 3, "one evolve blob per distinct theta"
+    # Distinct thetas → distinct hashes; every blob is a valid QSTH.
+    assert len(set(reader.theta_hashes)) == 3
+    for th in reader.theta_hashes:
+        blob = reader.get(th)
+        header = QsthHeader.parse_bytes(blob, source=th[:16])
+        assert header.t_diagnosis_days > 0
+    # materialize round-trips a blob to disk for qsp_sim --initial-state.
+    out = reader.materialize(reader.theta_hashes[0], tmp_path / "wd")
+    assert out.read_bytes() == reader.get(reader.theta_hashes[0])

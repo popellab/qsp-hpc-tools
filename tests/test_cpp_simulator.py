@@ -675,6 +675,30 @@ class TestCppSimulatorRunHpc:
         jm.check_hpc_test_stats.assert_not_called()
         jm.submit_cpp_jobs.assert_not_called()
 
+    def test_local_cache_satisfies_probe(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        """local_cache_satisfies reads the Parquet footer row count and
+        never touches the job manager."""
+        sim, jm = self._make_sim(priors_csv, binary_path, template_path, cache_dir, tmp_path)
+        ts_hash = sim._compute_test_stats_hash()
+
+        # No local cache yet → miss.
+        assert sim.local_cache_satisfies(1) is False
+
+        rng = np.random.default_rng(0)
+        sim._persist_local_test_stats(
+            sim._local_test_stats_path(ts_hash),
+            rng.uniform(size=(5, 2)),
+            rng.uniform(size=(5, 3)),
+        )
+        # Row count drives the verdict.
+        assert sim.local_cache_satisfies(5) is True
+        assert sim.local_cache_satisfies(3) is True
+        assert sim.local_cache_satisfies(6) is False
+        # Pure local probe — no HPC contact.
+        jm.check_hpc_test_stats.assert_not_called()
+
     def test_run_hpc_tier2_downloads_from_hpc(
         self, priors_csv, binary_path, template_path, cache_dir, tmp_path
     ):

@@ -41,6 +41,9 @@ def _fake_sim(
     sim.job_manager = job_manager
     sim.healthy_state_yaml = healthy_state_yaml
     sim.last_sample_index = None
+    # Default to a local-cache miss so tests exercise the full HPC path
+    # unless they explicitly opt into the all-local fast path.
+    sim.local_cache_satisfies.return_value = False
     return sim
 
 
@@ -246,6 +249,58 @@ class TestRunAll:
         r = MultiScenarioRunner({"a": a})
         results = r.run_all(3)
         np.testing.assert_array_equal(results["a"].sample_index, [0, 1, 2])
+
+
+class TestAllLocalFastPath:
+    """run_all skips HPC session prep + uploads when every scenario is
+    locally cached."""
+
+    def test_all_local_skips_prepare_session_and_uploads(self, tmp_path):
+        jm = _fake_jm()
+        a = _fake_sim(job_manager=jm, pool_id="pool_a")
+        b = _fake_sim(job_manager=jm, pool_id="pool_b")
+        a.local_cache_satisfies.return_value = True
+        b.local_cache_satisfies.return_value = True
+        a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+        b.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+
+        r = MultiScenarioRunner({"a": a, "b": b})
+        results = r.run_all(1)
+
+        # No HPC session prep, no shared uploads.
+        assert jm.ensure_hpc_venv.call_count == 0
+        assert jm.ensure_cpp_binary.call_count == 0
+        assert jm.upload_shared_samples_csv.call_count == 0
+        assert jm.upload_shared_healthy_state.call_count == 0
+        # run_hpc still called per scenario (Tier 1 returns locally) with
+        # all remotes None.
+        for sim in (a, b):
+            kw = sim.run_hpc.call_args.kwargs
+            assert kw["samples_csv_remote"] is None
+            assert kw["healthy_state_yaml_remote"] is None
+            assert kw["scenario_yaml_remote"] is None
+        assert set(results) == {"a", "b"}
+
+    def test_one_scenario_uncached_forces_full_hpc_preamble(self, tmp_path):
+        jm = _fake_jm()
+        a = _fake_sim(job_manager=jm, pool_id="pool_a")
+        b = _fake_sim(job_manager=jm, pool_id="pool_b")
+        a.local_cache_satisfies.return_value = True
+        b.local_cache_satisfies.return_value = False  # one miss → full prep
+        csv = tmp_path / "samples.csv"
+        csv.write_text("sample_index,k\n0,1\n")
+        a._write_params_csv.return_value = csv
+        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+        b.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+
+        r = MultiScenarioRunner({"a": a, "b": b})
+        r.run_all(1)
+
+        # A single uncached scenario forces the session prep + shared upload.
+        assert jm.ensure_hpc_venv.call_count == 1
+        assert jm.upload_shared_samples_csv.call_count == 1
+        assert a.run_hpc.call_args.kwargs["samples_csv_remote"] == "/remote/shared.csv"
 
 
 class TestJointNanMask:

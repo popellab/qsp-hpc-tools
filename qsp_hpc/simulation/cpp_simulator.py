@@ -856,6 +856,8 @@ class CppSimulator:
         aux_samples_csv_remote: Optional[str] = None,
         auxiliary_units: Optional[dict] = None,
         skip_setup: bool = False,
+        evolve_pack_key: Optional[str] = None,
+        evolve_pack_mode: str = "emit",
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Run ``n`` simulations through the 3-tier HPC cache.
 
@@ -1061,6 +1063,8 @@ class CppSimulator:
                 auxiliary_units=auxiliary_units,
                 samples_start_offset=samples_start_offset,
                 skip_setup=skip_setup,
+                evolve_pack_key=evolve_pack_key,
+                evolve_pack_mode=evolve_pack_mode,
             )
         finally:
             params_csv.unlink(missing_ok=True)

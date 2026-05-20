@@ -70,6 +70,7 @@ class MultiScenarioRunner:
         simulators: Mapping[str, CppSimulator],
         *,
         job_manager=None,
+        use_evolve_packs: bool = True,
     ):
         if not simulators:
             raise ValueError("simulators cannot be empty")
@@ -85,9 +86,18 @@ class MultiScenarioRunner:
 
         self._shared_samples_remote: Optional[str] = None
         self._shared_samples_local: Optional[Path] = None
+        # Content hash of the shared (sample_index, theta) CSV — keys the
+        # per-run evolve-pack directory (#86). Set by upload_shared_samples_csv.
+        self._shared_samples_hash: Optional[str] = None
         self._aux_samples_local: Optional[Path] = None
         self._aux_samples_remote: Optional[str] = None
         self._auxiliary_units: Optional[dict] = None
+        # Evolve-pack amortization (#86): scenario 1's array emits per-task
+        # QSEP packs of post-evolve ODE states; scenarios 2..N consume them
+        # via --initial-state instead of redoing the (~97%-of-runtime)
+        # burn-in. Kill switch — set False to fall back to a full evolve
+        # per scenario.
+        self.use_evolve_packs = use_evolve_packs
 
     def _validate_alignment(self) -> None:
         """Fail fast if simulators disagree on joint-inference invariants.
@@ -132,6 +142,7 @@ class MultiScenarioRunner:
         local_path = first._write_params_csv(n, start_index=0)
         try:
             content_hash = hashlib.sha256(local_path.read_bytes()).hexdigest()[:12]
+            self._shared_samples_hash = content_hash
             remote_filename = f"samples_shared_{content_hash}.csv"
             self._shared_samples_remote = self.job_manager.upload_shared_samples_csv(
                 str(local_path), remote_filename
@@ -372,9 +383,39 @@ class MultiScenarioRunner:
             shared_aux_remote = self.upload_shared_aux_samples_csv()
             per_scen_remotes = self._preupload_per_scenario_files()
 
+        # Evolve-pack amortization (#86): scenario 1's array emits per-task
+        # QSEP packs of post-evolve ODE states; scenarios 2..N consume them
+        # via --initial-state, skipping the ~97%-of-runtime burn-in. Needs
+        # >1 scenario (nothing to amortize otherwise), an evolve phase, and
+        # the shared-samples hash that keys the per-run pack dir — the hash
+        # is only set on the non-fast-path (i.e. when something submits to
+        # HPC; the all-local path never reaches a submit).
+        first_sim = next(iter(self.simulators.values()))
+        use_packs = (
+            self.use_evolve_packs
+            and len(self.simulators) > 1
+            and first_sim.healthy_state_yaml is not None
+            and self._shared_samples_hash is not None
+        )
+        evolve_pack_key = self._shared_samples_hash if use_packs else None
+        if use_packs:
+            logger.info(
+                "MSR: evolve-pack amortization ON (key=%s) — scenario 1 emits, " "2..N consume",
+                evolve_pack_key,
+            )
+
         results: Dict[str, ScenarioResult] = {}
-        for name, sim in self.simulators.items():
-            logger.info("MSR: %s run_hpc(n=%d, skip_setup=True)", name, n)
+        for scen_idx, (name, sim) in enumerate(self.simulators.items()):
+            # Strict ordering: run_all's loop is serial (each run_hpc
+            # blocks), so scenario 1 has finished emitting before any
+            # consumer runs. First scenario emits; the rest consume.
+            pack_mode = "emit" if scen_idx == 0 else "consume"
+            logger.info(
+                "MSR: %s run_hpc(n=%d, skip_setup=True, evolve_pack=%s)",
+                name,
+                n,
+                pack_mode if use_packs else "off",
+            )
             theta_scen, x_scen = sim.run_hpc(
                 n,
                 samples_csv_remote=shared_remote,
@@ -387,6 +428,8 @@ class MultiScenarioRunner:
                 aux_samples_csv_remote=shared_aux_remote,
                 auxiliary_units=self._auxiliary_units,
                 skip_setup=True,
+                evolve_pack_key=evolve_pack_key,
+                evolve_pack_mode=pack_mode,
             )
             sample_index_scen = (
                 np.asarray(sim.last_sample_index, dtype=np.int64)

@@ -328,6 +328,62 @@ class TestEvolvePackOrchestration:
         keys = {s.run_hpc.call_args.kwargs["evolve_pack_key"] for s in sims.values()}
         assert len(keys) == 1 and next(iter(keys)) is not None
 
+    def test_cached_first_scenario_shifts_emitter(self, tmp_path):
+        """When scenario 1 is locally cached it never submits an array and
+        emits no packs — the emitter must shift to the first scenario that
+        actually submits, else every consumer crashes on a missing chunk."""
+        jm = _fake_jm()
+        sims = {n: _fake_sim(job_manager=jm, pool_id=f"pool_{n}") for n in ("a", "b", "c")}
+        sims["a"].local_cache_satisfies.return_value = True  # cached → no submit
+        csv = tmp_path / "samples.csv"
+        csv.write_text("sample_index,k\n0,1\n")
+        next(iter(sims.values()))._write_params_csv.return_value = csv
+        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        for s in sims.values():
+            s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+
+        MultiScenarioRunner(sims).run_all(1)
+
+        modes = [s.run_hpc.call_args.kwargs["evolve_pack_mode"] for s in sims.values()]
+        assert modes == ["off", "emit", "consume"]
+
+    def test_all_cached_no_packs(self, tmp_path):
+        """Every scenario satisfied from local cache — nothing submits, so
+        there is no emitter and no pack key is threaded."""
+        jm = _fake_jm()
+        sims = {n: _fake_sim(job_manager=jm, pool_id=f"pool_{n}") for n in ("a", "b")}
+        for s in sims.values():
+            s.local_cache_satisfies.return_value = True
+            s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+        csv = tmp_path / "samples.csv"
+        csv.write_text("sample_index,k\n0,1\n")
+        next(iter(sims.values()))._write_params_csv.return_value = csv
+
+        MultiScenarioRunner(sims).run_all(1)
+
+        for s in sims.values():
+            assert s.run_hpc.call_args.kwargs["evolve_pack_key"] is None
+            assert s.run_hpc.call_args.kwargs["evolve_pack_mode"] == "off"
+
+    def test_last_scenario_emitter_no_consumers(self, tmp_path):
+        """If the only submitting scenario is last there is nothing after
+        it to consume — packs stay off rather than emitting a dead pack."""
+        jm = _fake_jm()
+        sims = {n: _fake_sim(job_manager=jm, pool_id=f"pool_{n}") for n in ("a", "b")}
+        sims["a"].local_cache_satisfies.return_value = True
+        sims["b"].local_cache_satisfies.return_value = False
+        csv = tmp_path / "samples.csv"
+        csv.write_text("sample_index,k\n0,1\n")
+        next(iter(sims.values()))._write_params_csv.return_value = csv
+        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        for s in sims.values():
+            s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+
+        MultiScenarioRunner(sims).run_all(1)
+
+        for s in sims.values():
+            assert s.run_hpc.call_args.kwargs["evolve_pack_key"] is None
+
     def test_use_evolve_packs_false_disables(self, tmp_path):
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a")

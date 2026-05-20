@@ -570,3 +570,39 @@ def test_real_batch_consumes_evolve_pack(tmp_path: Path, caplog):
     for sp in ("V_T.C1",):
         for er, cr in zip(emit_t.column(sp).to_pylist(), consume_t.column(sp).to_pylist()):
             np.testing.assert_array_equal(er, cr)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    _real_binary_path() is None or _real_template_path() is None or _real_healthy_yaml() is None,
+    reason="qsp_sim binary / template / healthy_state.yaml not found; set "
+    "QSP_SIM_BINARY, QSP_SIM_TEMPLATE, QSP_SIM_HEALTHY_YAML",
+)
+def test_consume_missing_pack_falls_back_to_full_evolve(tmp_path: Path, caplog):
+    """A consume batch pointed at a pack that does not exist (the emitting
+    scenario hit a local cache and submitted nothing) must NOT crash the
+    ProcessPool initializer — every worker falls back to a full evolve."""
+    import logging
+
+    binary, template, healthy = (
+        _real_binary_path(),
+        _real_template_path(),
+        _real_healthy_yaml(),
+    )
+    theta = np.array([[0.4], [0.6]])
+    missing_pack = tmp_path / "evolve_states" / "chunk_000.qsep"  # never created
+    consume = CppBatchRunner(
+        binary, template, healthy_state_yaml=healthy, evolve_pack_read_path=missing_pack
+    )
+    with caplog.at_level(logging.INFO):
+        res = consume.run(
+            theta_matrix=theta,
+            output_path=tmp_path / "out.parquet",
+            param_names=["k_C1_growth"],
+            t_end_days=1.0,
+            min_cadence_hours=4.0,
+            max_workers=2,
+        )
+    assert res.n_failed == 0
+    assert "does not exist" in caplog.text
+    assert "falling back to a full evolve" in caplog.text

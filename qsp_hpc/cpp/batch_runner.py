@@ -230,7 +230,13 @@ def _worker_init(
             healthy_state_yaml,
         )
 
-    if evolve_pack_read_path is not None:
+    # Consume mode: open the prior scenario's pack read-only. A missing
+    # pack is NOT fatal — it just means the emitting scenario didn't run
+    # (e.g. it hit a test-stats cache and never submitted, so emitted
+    # nothing). Treat that as "no pack" → reader stays None → every sim
+    # falls through to a normal full evolve+scenario. Crashing here would
+    # take down the whole ProcessPool initializer and fail every task.
+    if evolve_pack_read_path is not None and Path(evolve_pack_read_path).exists():
         _WORKER_EVOLVE_PACK_READER = EvolveStatePackReader(evolve_pack_read_path)
         logger.info(
             "worker %d: evolve-pack consume ENABLED, %d states from %s",
@@ -240,6 +246,13 @@ def _worker_init(
         )
     else:
         _WORKER_EVOLVE_PACK_READER = None
+        if evolve_pack_read_path is not None:
+            logger.info(
+                "worker %d: evolve-pack consume requested but pack absent (%s) "
+                "— falling back to full evolve per sim",
+                os.getpid(),
+                evolve_pack_read_path,
+            )
 
 
 def _run_one_in_worker(
@@ -731,6 +744,13 @@ class CppBatchRunner:
             )
         if consume_evolve_pack:
             logger.info("Evolve-pack consume: ENABLED (read=%s)", effective_evolve_pack_read_path)
+            if not effective_evolve_pack_read_path.exists():
+                logger.warning(
+                    "Evolve-pack consume: read path %s does not exist — the "
+                    "emitting scenario produced no pack; workers will fall "
+                    "back to a full evolve per sim",
+                    effective_evolve_pack_read_path,
+                )
 
         with ProcessPoolExecutor(
             max_workers=max_workers,

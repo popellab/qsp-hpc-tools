@@ -290,12 +290,14 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # depending on evolve_pack_mode; only one is non-None per task.
     evolve_pack_path = None  # emit target
     evolve_pack_read_path = None  # consume source
-    if evolve_pack_dir:
+    if evolve_pack_dir and evolve_pack_mode in ("emit", "consume"):
         _per_task_qsep = Path(evolve_pack_dir) / f"chunk_{array_idx:03d}.qsep"
         if evolve_pack_mode == "consume":
             evolve_pack_read_path = _per_task_qsep
         else:
             evolve_pack_path = _per_task_qsep
+    # mode "off" (a locally-cached scenario that never submits, defensively
+    # threaded through) is a true no-op: neither emit nor consume.
 
     t0 = time.time()
 

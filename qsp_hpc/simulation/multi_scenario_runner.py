@@ -388,38 +388,68 @@ class MultiScenarioRunner:
             shared_aux_remote = self.upload_shared_aux_samples_csv()
             per_scen_remotes = self._preupload_per_scenario_files()
 
-        # Evolve-pack amortization (#86): scenario 1's array emits per-task
-        # QSEP packs of post-evolve ODE states; scenarios 2..N consume them
-        # via --initial-state, skipping the ~97%-of-runtime burn-in. Needs
-        # >1 scenario (nothing to amortize otherwise), an evolve phase, and
-        # the shared-samples hash that keys the per-run pack dir — the hash
-        # is only set on the non-fast-path (i.e. when something submits to
-        # HPC; the all-local path never reaches a submit).
+        # Evolve-pack amortization (#86): the emitter scenario's array emits
+        # per-task QSEP packs of post-evolve ODE states; later scenarios
+        # consume them via --initial-state, skipping the ~97%-of-runtime
+        # burn-in. Needs >1 scenario (nothing to amortize otherwise), an
+        # evolve phase, and the shared-samples hash that keys the per-run
+        # pack dir — the hash is only set on the non-fast-path (i.e. when
+        # something submits to HPC; the all-local path never reaches a
+        # submit).
+        #
+        # The emitter is NOT blindly scenario 1: if scenario 1 is satisfied
+        # from its local test-stats cache it never submits an array, so it
+        # would emit no packs and every consumer would crash on a missing
+        # chunk file. Pick the emitter as the first scenario (insertion
+        # order) that will actually submit — i.e. is not locally cached.
+        # Scenarios before it are local-cache hits (run "off"); scenarios
+        # after it consume. The serial blocking loop guarantees the emitter
+        # finishes before any consumer starts.
         first_sim = next(iter(self.simulators.values()))
+        aux_probe = str(self._aux_samples_local) if self._aux_samples_local else None
+        cache_satisfied = [
+            sim.local_cache_satisfies(n, aux_samples_csv=aux_probe)
+            for sim in self.simulators.values()
+        ]
+        emitter_idx = next((i for i, hit in enumerate(cache_satisfied) if not hit), None)
         use_packs = (
             self.use_evolve_packs
             and len(self.simulators) > 1
             and first_sim.healthy_state_yaml is not None
             and self._shared_samples_hash is not None
+            # An emitter that submits, with at least one scenario after it
+            # to consume — otherwise there is nothing to amortize.
+            and emitter_idx is not None
+            and emitter_idx < len(self.simulators) - 1
         )
         evolve_pack_key = self._shared_samples_hash if use_packs else None
         if use_packs:
+            emitter_name = list(self.simulators.keys())[emitter_idx]
             logger.info(
-                "MSR: evolve-pack amortization ON (key=%s) — scenario 1 emits, " "2..N consume",
+                "MSR: evolve-pack amortization ON (key=%s) — '%s' (scenario %d) "
+                "emits, later scenarios consume",
                 evolve_pack_key,
+                emitter_name,
+                emitter_idx + 1,
             )
 
         results: Dict[str, ScenarioResult] = {}
         for scen_idx, (name, sim) in enumerate(self.simulators.items()):
-            # Strict ordering: run_all's loop is serial (each run_hpc
-            # blocks), so scenario 1 has finished emitting before any
-            # consumer runs. First scenario emits; the rest consume.
-            pack_mode = "emit" if scen_idx == 0 else "consume"
+            # Emitter emits; scenarios after it consume; locally-cached
+            # scenarios before the emitter run "off" (they never submit).
+            if not use_packs:
+                pack_mode = "off"
+            elif scen_idx == emitter_idx:
+                pack_mode = "emit"
+            elif scen_idx > emitter_idx:
+                pack_mode = "consume"
+            else:
+                pack_mode = "off"
             logger.info(
                 "MSR: %s run_hpc(n=%d, skip_setup=True, evolve_pack=%s)",
                 name,
                 n,
-                pack_mode if use_packs else "off",
+                pack_mode,
             )
             theta_scen, x_scen = sim.run_hpc(
                 n,

@@ -175,6 +175,14 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # fcntl lock; every other task (including future scenario arrays) for
     # the same theta skips evolve via --initial-state. None disables.
     evolve_cache_root = config.get("evolve_cache_root")
+    # Per-task evolve-pack emission (#86): when ``evolve_pack_dir`` is set,
+    # this task writes its post-evolve QSTH blobs to one QSEP pack —
+    # ``{evolve_pack_dir}/chunk_NNN.qsep``, matching the chunk-parquet
+    # naming so later scenario arrays can pair pack ↔ parquet by index.
+    # No shared writable store, so it is the NFS-safe successor to the
+    # LMDB evolve cache above (the two are mutually exclusive — emission
+    # supersedes the cache inside CppBatchRunner).
+    evolve_pack_dir = config.get("evolve_pack_dir")
     # samples_start_offset: when the caller hoisted the FULL theta pool to
     # a shared remote CSV (samples_csv_remote=...) but this submit is a
     # top-up needing only rows ``[existing : N)``, the offset shifts the
@@ -190,9 +198,10 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # Logging here pins down "0 blobs written" to a specific cause without
     # needing a debug rerun.
     logger.info(
-        "Evolve-cache config: healthy_state_yaml=%s evolve_cache_root=%s",
+        "Evolve-cache config: healthy_state_yaml=%s evolve_cache_root=%s " "evolve_pack_dir=%s",
         healthy_state_yaml,
         evolve_cache_root,
+        evolve_pack_dir,
     )
 
     start = array_idx * jobs_per_chunk
@@ -263,6 +272,12 @@ def run_chunk(config: dict, array_idx: int) -> None:
     filename = f"chunk_{array_idx:03d}.parquet"
     output_path = batch_dir / filename
 
+    # Per-task evolve-pack: one QSEP per array task, named to match the
+    # chunk parquet so pack ↔ parquet pair by index. None disables (#86).
+    evolve_pack_path = (
+        Path(evolve_pack_dir) / f"chunk_{array_idx:03d}.qsep" if evolve_pack_dir else None
+    )
+
     t0 = time.time()
 
     runner = CppBatchRunner(
@@ -295,16 +310,18 @@ def run_chunk(config: dict, array_idx: int) -> None:
         seed=seed,
         max_workers=max_workers,
         per_sim_timeout_s=per_sim_timeout_s,
+        evolve_pack_path=evolve_pack_path,
     )
 
     elapsed = time.time() - t0
     logger.info(
-        "Task %d complete: %d/%d succeeded in %.1fs, wrote %s",
+        "Task %d complete: %d/%d succeeded in %.1fs, wrote %s%s",
         array_idx,
         result.n_sims - result.n_failed,
         result.n_sims,
         elapsed,
         output_path,
+        f" + evolve pack {result.evolve_pack_path}" if result.evolve_pack_path else "",
     )
 
     _run_inline_derive(

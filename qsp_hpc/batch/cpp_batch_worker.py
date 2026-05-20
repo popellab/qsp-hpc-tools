@@ -175,14 +175,18 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # fcntl lock; every other task (including future scenario arrays) for
     # the same theta skips evolve via --initial-state. None disables.
     evolve_cache_root = config.get("evolve_cache_root")
-    # Per-task evolve-pack emission (#86): when ``evolve_pack_dir`` is set,
-    # this task writes its post-evolve QSTH blobs to one QSEP pack —
-    # ``{evolve_pack_dir}/chunk_NNN.qsep``, matching the chunk-parquet
-    # naming so later scenario arrays can pair pack ↔ parquet by index.
-    # No shared writable store, so it is the NFS-safe successor to the
-    # LMDB evolve cache above (the two are mutually exclusive — emission
-    # supersedes the cache inside CppBatchRunner).
+    # Per-task evolve-pack (#86). ``evolve_pack_dir`` + ``evolve_pack_mode``
+    # together drive the NFS-safe successor to the LMDB evolve cache:
+    #   - mode "emit"   (default): this task writes its post-evolve QSTH
+    #     blobs to ``{evolve_pack_dir}/chunk_NNN.qsep``.
+    #   - mode "consume": this task reads ``{evolve_pack_dir}/chunk_NNN.qsep``
+    #     (a prior scenario's pack at the same index — the chunking is
+    #     identical across scenarios sharing a theta pool) and runs from
+    #     each evolve state via --initial-state, skipping the burn-in.
+    # Either way the per-task file is chunk-NNN-named so pack ↔ parquet
+    # pair by array index. No shared writable store.
     evolve_pack_dir = config.get("evolve_pack_dir")
+    evolve_pack_mode = config.get("evolve_pack_mode", "emit")
     # samples_start_offset: when the caller hoisted the FULL theta pool to
     # a shared remote CSV (samples_csv_remote=...) but this submit is a
     # top-up needing only rows ``[existing : N)``, the offset shifts the
@@ -198,10 +202,12 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # Logging here pins down "0 blobs written" to a specific cause without
     # needing a debug rerun.
     logger.info(
-        "Evolve-cache config: healthy_state_yaml=%s evolve_cache_root=%s " "evolve_pack_dir=%s",
+        "Evolve-cache config: healthy_state_yaml=%s evolve_cache_root=%s "
+        "evolve_pack_dir=%s evolve_pack_mode=%s",
         healthy_state_yaml,
         evolve_cache_root,
         evolve_pack_dir,
+        evolve_pack_mode if evolve_pack_dir else "(n/a)",
     )
 
     start = array_idx * jobs_per_chunk
@@ -272,11 +278,18 @@ def run_chunk(config: dict, array_idx: int) -> None:
     filename = f"chunk_{array_idx:03d}.parquet"
     output_path = batch_dir / filename
 
-    # Per-task evolve-pack: one QSEP per array task, named to match the
-    # chunk parquet so pack ↔ parquet pair by index. None disables (#86).
-    evolve_pack_path = (
-        Path(evolve_pack_dir) / f"chunk_{array_idx:03d}.qsep" if evolve_pack_dir else None
-    )
+    # Per-task evolve-pack file: one QSEP per array task, named to match
+    # the chunk parquet so pack <-> parquet pair by index (#86). The same
+    # chunk_NNN.qsep path is the emit *target* or the consume *source*
+    # depending on evolve_pack_mode; only one is non-None per task.
+    evolve_pack_path = None  # emit target
+    evolve_pack_read_path = None  # consume source
+    if evolve_pack_dir:
+        _per_task_qsep = Path(evolve_pack_dir) / f"chunk_{array_idx:03d}.qsep"
+        if evolve_pack_mode == "consume":
+            evolve_pack_read_path = _per_task_qsep
+        else:
+            evolve_pack_path = _per_task_qsep
 
     t0 = time.time()
 
@@ -311,6 +324,7 @@ def run_chunk(config: dict, array_idx: int) -> None:
         max_workers=max_workers,
         per_sim_timeout_s=per_sim_timeout_s,
         evolve_pack_path=evolve_pack_path,
+        evolve_pack_read_path=evolve_pack_read_path,
     )
 
     elapsed = time.time() - t0

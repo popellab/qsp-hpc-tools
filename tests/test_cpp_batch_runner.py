@@ -488,3 +488,85 @@ def test_real_batch_emits_evolve_pack(tmp_path: Path):
     # materialize round-trips a blob to disk for qsp_sim --initial-state.
     out = reader.materialize(reader.theta_hashes[0], tmp_path / "wd")
     assert out.read_bytes() == reader.get(reader.theta_hashes[0])
+
+
+def test_evolve_pack_emit_and_consume_mutually_exclusive(
+    tmp_path: Path, template_path: Path, ok_binary: Path
+):
+    """A batch emits OR consumes a pack, never both — the ctor rejects it."""
+    healthy = tmp_path / "healthy.yaml"
+    healthy.write_text("# dummy\n")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        CppBatchRunner(
+            ok_binary,
+            template_path,
+            healthy_state_yaml=healthy,
+            evolve_pack_path=tmp_path / "out.qsep",
+            evolve_pack_read_path=tmp_path / "in.qsep",
+        )
+
+
+def test_evolve_pack_consume_disabled_without_healthy_state(
+    tmp_path: Path, template_path: Path, ok_binary: Path, caplog
+):
+    """evolve_pack_read_path needs a healthy_state_yaml — a pack miss has
+    no evolve fallback without one. The runner warns and disables it."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        runner = CppBatchRunner(
+            ok_binary, template_path, evolve_pack_read_path=tmp_path / "in.qsep"
+        )
+    assert runner.evolve_pack_read_path is None
+    assert "no healthy_state_yaml" in caplog.text
+
+
+@pytest.mark.skipif(
+    _real_binary_path() is None or _real_template_path() is None or _real_healthy_yaml() is None,
+    reason="qsp_sim binary / template / healthy_state.yaml not found; set "
+    "QSP_SIM_BINARY, QSP_SIM_TEMPLATE, QSP_SIM_HEALTHY_YAML",
+)
+def test_real_batch_consumes_evolve_pack(tmp_path: Path, caplog):
+    """A consume batch loads evolve states from a prior emit batch's pack
+    and runs the scenario from them — producing byte-identical results to
+    the emit batch (same θ, same evolve, same scenario)."""
+    import logging
+
+    binary, template, healthy = (
+        _real_binary_path(),
+        _real_template_path(),
+        _real_healthy_yaml(),
+    )
+    theta = np.array([[0.4], [0.6], [0.8]])
+    kw = dict(
+        param_names=["k_C1_growth"],
+        t_end_days=1.0,
+        min_cadence_hours=4.0,
+        max_workers=2,
+    )
+
+    # 1. Emit run — evolves every θ, writes the pack, runs the scenario.
+    pack = tmp_path / "evolve_states" / "chunk_000.qsep"
+    emit = CppBatchRunner(binary, template, healthy_state_yaml=healthy, evolve_pack_path=pack)
+    emit_res = emit.run(theta_matrix=theta, output_path=tmp_path / "emit.parquet", **kw)
+    assert emit_res.n_failed == 0 and pack.exists()
+
+    # 2. Consume run — reads the pack, runs the scenario via --initial-state.
+    consume = CppBatchRunner(
+        binary, template, healthy_state_yaml=healthy, evolve_pack_read_path=pack
+    )
+    with caplog.at_level(logging.INFO):
+        consume_res = consume.run(
+            theta_matrix=theta, output_path=tmp_path / "consume.parquet", **kw
+        )
+    assert consume_res.n_failed == 0
+    assert consume_res.evolve_pack_path is None  # consume emits nothing
+    assert "Evolve-pack consume: ENABLED" in caplog.text
+
+    # 3. Correctness: consume read the exact blobs emit wrote, so the
+    # scenario trajectories must match bit-for-bit.
+    emit_t = pq.read_table(tmp_path / "emit.parquet")
+    consume_t = pq.read_table(tmp_path / "consume.parquet")
+    for sp in ("V_T.C1",):
+        for er, cr in zip(emit_t.column(sp).to_pylist(), consume_t.column(sp).to_pylist()):
+            np.testing.assert_array_equal(er, cr)

@@ -45,7 +45,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from qsp_hpc.cpp.evolve_cache import CppEvolveCache, theta_hash_for_xml, wire_hash
-from qsp_hpc.cpp.evolve_pack import EvolveStatePackWriter
+from qsp_hpc.cpp.evolve_pack import EvolveStatePackReader, EvolveStatePackWriter
 from qsp_hpc.cpp.param_xml import ParamNotFoundError
 from qsp_hpc.cpp.runner import CppRunner, QspSimError, SimResult
 
@@ -164,6 +164,12 @@ _WORKER_WORKDIR: Path | None = None
 # binary. Workers lookup via the cache per-sim; the fcntl lock inside
 # get_or_build serializes builds across workers hitting the same theta.
 _WORKER_EVOLVE_CACHE: CppEvolveCache | None = None
+# Optional: when the batch was constructed with evolve_pack_read_path,
+# workers hold a read-only EvolveStatePackReader over a prior scenario's
+# per-task QSEP pack. Per-sim, the worker looks up this theta's evolve
+# state and runs the scenario from it via --initial-state; a miss falls
+# back to a normal full evolve+scenario run (#86).
+_WORKER_EVOLVE_PACK_READER: EvolveStatePackReader | None = None
 
 
 def _worker_init(
@@ -176,8 +182,10 @@ def _worker_init(
     drug_metadata_yaml: str | None,
     healthy_state_yaml: str | None,
     evolve_cache_root: str | None,
+    evolve_pack_read_path: str | None = None,
 ) -> None:
     global _WORKER_RUNNER, _WORKER_WORKDIR, _WORKER_EVOLVE_CACHE
+    global _WORKER_EVOLVE_PACK_READER
     # Configure the qsp_hpc parent logger inside the worker so descendant
     # loggers (qsp_hpc.cpp.evolve_cache, this module) emit to stdout even
     # when the pool was created with the "spawn" start method (Python 3.14+
@@ -221,6 +229,17 @@ def _worker_init(
             evolve_cache_root,
             healthy_state_yaml,
         )
+
+    if evolve_pack_read_path is not None:
+        _WORKER_EVOLVE_PACK_READER = EvolveStatePackReader(evolve_pack_read_path)
+        logger.info(
+            "worker %d: evolve-pack consume ENABLED, %d states from %s",
+            os.getpid(),
+            len(_WORKER_EVOLVE_PACK_READER),
+            evolve_pack_read_path,
+        )
+    else:
+        _WORKER_EVOLVE_PACK_READER = None
 
 
 def _run_one_in_worker(
@@ -314,6 +333,21 @@ def _run_one_in_worker(
                 timeout_s=timeout_s,
             )
             evolve_blob = evolve_state_path.read_bytes()
+        elif _WORKER_EVOLVE_PACK_READER is not None and evolve_trajectory_dir is None:
+            # Consume: look this theta's evolve state up in a prior
+            # scenario's QSEP pack and run the scenario from it via
+            # --initial-state. A miss leaves evolve_state_path None → a
+            # normal full evolve+scenario fallback runs (correct, just
+            # not amortized — e.g. an upstream task failed to pack this
+            # chunk). theta_hash/evolve_blob stay None: consume emits
+            # nothing back to the parent.
+            xml = _WORKER_RUNNER._renderer.render(params)
+            _th = theta_hash_for_xml(xml)
+            blob = _WORKER_EVOLVE_PACK_READER.get(_th)
+            if blob is not None:
+                params_hash = wire_hash(_th)
+                evolve_state_path = _WORKER_WORKDIR / f"{_th[:16]}.evolve_state.bin"
+                evolve_state_path.write_bytes(blob)
         elif _WORKER_EVOLVE_CACHE is not None and evolve_trajectory_dir is None:
             evolve_state_path, params_hash = _WORKER_EVOLVE_CACHE.get_or_build(
                 params,
@@ -413,6 +447,7 @@ class CppBatchRunner:
         healthy_state_yaml: str | Path | None = None,
         evolve_cache_root: str | Path | None = None,
         evolve_pack_path: str | Path | None = None,
+        evolve_pack_read_path: str | Path | None = None,
         evolve_trajectory_dir: str | Path | None = None,
         evolve_trajectory_dt_days: float | None = None,
     ):
@@ -469,6 +504,25 @@ class CppBatchRunner:
             )
             evolve_cache_root = None
         self.evolve_pack_path = Path(evolve_pack_path).resolve() if evolve_pack_path else None
+        # evolve_pack_read_path: consume a prior scenario's QSEP pack (#86).
+        # Mutually exclusive with evolve_pack_path — a batch emits OR
+        # consumes, never both. Needs a healthy_state_yaml so a pack miss
+        # has a full-evolve fallback.
+        if evolve_pack_path is not None and evolve_pack_read_path is not None:
+            raise ValueError(
+                "evolve_pack_path (emit) and evolve_pack_read_path (consume) are "
+                "mutually exclusive — a batch does one or the other"
+            )
+        if evolve_pack_read_path is not None and probe.healthy_state_yaml is None:
+            logger.warning(
+                "evolve_pack_read_path=%s ignored: no healthy_state_yaml "
+                "(a pack miss would have no evolve fallback)",
+                evolve_pack_read_path,
+            )
+            evolve_pack_read_path = None
+        self.evolve_pack_read_path = (
+            Path(evolve_pack_read_path).resolve() if evolve_pack_read_path else None
+        )
         self.evolve_cache_root = Path(evolve_cache_root).resolve() if evolve_cache_root else None
         # Burn-in trajectory dump dir (passed to qsp_sim as
         # --evolve-trajectory-out per sim). Same caveat as evolve_cache:
@@ -511,6 +565,7 @@ class CppBatchRunner:
         evolve_trajectory_dir: str | Path | None = None,
         evolve_trajectory_dt_days: float | None = None,
         evolve_pack_path: str | Path | None = None,
+        evolve_pack_read_path: str | Path | None = None,
     ) -> BatchResult:
         """Execute a batch and write the Parquet.
 
@@ -655,6 +710,28 @@ class CppBatchRunner:
         # after the collection loop.
         evolve_pack_entries: list[tuple[str, bytes]] = []
 
+        # Effective per-task evolve-pack consumption (#86): workers read a
+        # prior scenario's QSEP pack and run from it via --initial-state,
+        # falling back to a full evolve on a miss. Mutually exclusive with
+        # emission; skipped under trajectory-dump mode.
+        effective_evolve_pack_read_path = (
+            Path(evolve_pack_read_path)
+            if evolve_pack_read_path is not None
+            else self.evolve_pack_read_path
+        )
+        consume_evolve_pack = (
+            effective_evolve_pack_read_path is not None
+            and self.healthy_state_yaml is not None
+            and effective_traj_dir is None
+        )
+        if emit_evolve_pack and consume_evolve_pack:
+            raise ValueError(
+                "evolve-pack emit and consume are mutually exclusive — a batch "
+                "does one or the other"
+            )
+        if consume_evolve_pack:
+            logger.info("Evolve-pack consume: ENABLED (read=%s)", effective_evolve_pack_read_path)
+
         with ProcessPoolExecutor(
             max_workers=max_workers,
             initializer=_worker_init,
@@ -668,6 +745,7 @@ class CppBatchRunner:
                 str(self.drug_metadata_yaml) if self.drug_metadata_yaml else None,
                 str(self.healthy_state_yaml) if self.healthy_state_yaml else None,
                 str(self.evolve_cache_root) if self.evolve_cache_root else None,
+                (str(effective_evolve_pack_read_path) if consume_evolve_pack else None),
             ),
         ) as pool:
             # sample_indices is the canonical theta-pool index for each row;

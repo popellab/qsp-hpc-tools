@@ -187,6 +187,12 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # pair by array index. No shared writable store.
     evolve_pack_dir = config.get("evolve_pack_dir")
     evolve_pack_mode = config.get("evolve_pack_mode", "emit")
+    # discard_trajectories: once test stats are derived inline, the raw
+    # trajectory chunk parquet is dead weight for an SBI run (only test
+    # stats are consumed downstream) and is the bulk of pool disk. When
+    # set, the parquet is unlinked after a successful inline-derive. No
+    # effect on the sims-only path (no derive → parquet IS the deliverable).
+    discard_trajectories = bool(config.get("discard_trajectories", False))
     # samples_start_offset: when the caller hoisted the FULL theta pool to
     # a shared remote CSV (samples_csv_remote=...) but this submit is a
     # top-up needing only rows ``[existing : N)``, the offset shifts the
@@ -345,6 +351,18 @@ def run_chunk(config: dict, array_idx: int) -> None:
         batch_subdir=batch_dir.name,
         array_idx=array_idx,
     )
+
+    # Drop the raw trajectory parquet now that test stats are derived.
+    # Gated on test_stats_csv so the sims-only path (no inline-derive) keeps
+    # the parquet as its deliverable; reached only if _run_inline_derive
+    # returned without raising, so a derive failure leaves the parquet for
+    # retry. The bulk of pool disk lives in these parquets.
+    if discard_trajectories and config.get("test_stats_csv"):
+        try:
+            output_path.unlink(missing_ok=True)
+            logger.info("Discarded trajectory parquet %s (test stats derived)", output_path.name)
+        except OSError as e:  # noqa: BLE001 — cleanup, never fatal
+            logger.warning("Could not discard %s: %s", output_path.name, e)
 
 
 def main() -> None:

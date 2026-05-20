@@ -71,6 +71,7 @@ class MultiScenarioRunner:
         *,
         job_manager=None,
         use_evolve_packs: bool = True,
+        discard_trajectories: bool = False,
     ):
         if not simulators:
             raise ValueError("simulators cannot be empty")
@@ -98,6 +99,10 @@ class MultiScenarioRunner:
         # burn-in. Kill switch — set False to fall back to a full evolve
         # per scenario.
         self.use_evolve_packs = use_evolve_packs
+        # When True, array tasks unlink their raw trajectory parquet after
+        # inline-derive — only the test stats are kept. The trajectories are
+        # the bulk of pool disk and dead weight for an SBI run.
+        self.discard_trajectories = discard_trajectories
 
     def _validate_alignment(self) -> None:
         """Fail fast if simulators disagree on joint-inference invariants.
@@ -430,6 +435,7 @@ class MultiScenarioRunner:
                 skip_setup=True,
                 evolve_pack_key=evolve_pack_key,
                 evolve_pack_mode=pack_mode,
+                discard_trajectories=self.discard_trajectories,
             )
             sample_index_scen = (
                 np.asarray(sim.last_sample_index, dtype=np.int64)

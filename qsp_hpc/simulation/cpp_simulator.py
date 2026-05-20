@@ -858,6 +858,7 @@ class CppSimulator:
         skip_setup: bool = False,
         evolve_pack_key: Optional[str] = None,
         evolve_pack_mode: str = "emit",
+        discard_trajectories: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Run ``n`` simulations through the 3-tier HPC cache.
 
@@ -1065,6 +1066,7 @@ class CppSimulator:
                 skip_setup=skip_setup,
                 evolve_pack_key=evolve_pack_key,
                 evolve_pack_mode=evolve_pack_mode,
+                discard_trajectories=discard_trajectories,
             )
         finally:
             params_csv.unlink(missing_ok=True)

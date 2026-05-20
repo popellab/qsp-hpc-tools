@@ -1028,6 +1028,89 @@ class HPCJobManager:
 
         return job_info
 
+    def prune_simulation_pools(
+        self,
+        keep: Optional[set] = None,
+        retention_days: float = 2.0,
+        always_keep: Tuple[str, ...] = ("theta_pools", "evolve_packs"),
+    ) -> dict:
+        """Delete stale simulation-pool directories to free allocation quota.
+
+        Because the pool-id config hash churns run-to-run, old pools are
+        never reused — they just accumulate until the HPC allocation
+        quota is hit. This prunes them. A pool directory under
+        ``simulation_pool_path`` is deleted only when ALL hold:
+
+        - its name is not in ``keep`` (the current run's pool ids), and
+        - its name is not in ``always_keep`` (the theta-pool cache and the
+          evolve-pack tree — small, shared, regenerable), and
+        - its directory mtime is older than ``retention_days``.
+
+        Age-based by design: a concurrent run's freshly-created pools are
+        young, so they are never touched even without being passed in
+        ``keep``. ``keep`` is belt-and-braces for the calling run.
+
+        Returns ``{"deleted": [...], "kept": [...], "errors": [...]}``.
+        Best-effort — never raises on a remote failure; logs and reports.
+        """
+        keep = set(keep or ())
+        pool_path = self.config.simulation_pool_path
+        # find: one line per immediate subdir as "<mtime_epoch>\t<name>".
+        rc, out = self.transport.exec(
+            f"find {shlex.quote(pool_path)} -maxdepth 1 -mindepth 1 -type d "
+            f"-printf '%T@\\t%f\\n' 2>/dev/null",
+            timeout=120,
+        )
+        if rc != 0:
+            self.logger.warning("prune_simulation_pools: could not list %s", pool_path)
+            return {"deleted": [], "kept": [], "errors": ["list failed"]}
+
+        cutoff = time.time() - retention_days * 86400.0
+        to_delete, kept = [], []
+        for line in out.splitlines():
+            if "\t" not in line:
+                continue
+            mtime_str, name = line.split("\t", 1)
+            name = name.strip()
+            try:
+                mtime = float(mtime_str)
+            except ValueError:
+                continue
+            if name in keep or name in always_keep:
+                kept.append(name)
+            elif mtime < cutoff:
+                to_delete.append(name)
+            else:
+                kept.append(name)  # too recent — concurrent-run safe
+
+        if not to_delete:
+            self.logger.info(
+                "prune_simulation_pools: nothing older than %.1f d to prune "
+                "(%d pool dir(s) kept)",
+                retention_days,
+                len(kept),
+            )
+            return {"deleted": [], "kept": kept, "errors": []}
+
+        self.logger.info(
+            "prune_simulation_pools: deleting %d pool dir(s) older than %.1f d " "(keeping %d)",
+            len(to_delete),
+            retention_days,
+            len(kept),
+        )
+        # Explicit enumerated rm — never a glob. cd-guarded; each name is a
+        # find-confirmed immediate subdir of pool_path.
+        quoted = " ".join(shlex.quote(n) for n in to_delete)
+        rc, out = self.transport.exec(
+            f"cd {shlex.quote(pool_path)} && for d in {quoted}; do "
+            f'rm -rf -- "./$d" && echo "PRUNED $d"; done',
+            timeout=900,
+        )
+        errors = [] if rc == 0 else [f"rm rc={rc}"]
+        for name in to_delete:
+            self.logger.info("  pruned stale pool: %s", name)
+        return {"deleted": to_delete, "kept": kept, "errors": errors}
+
     def submit_cpp_jobs(
         self,
         samples_csv: str,
@@ -1070,6 +1153,7 @@ class HPCJobManager:
         samples_start_offset: int = 0,
         evolve_pack_key: Optional[str] = None,
         evolve_pack_mode: str = "emit",
+        discard_trajectories: bool = False,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
 
@@ -1360,6 +1444,7 @@ class HPCJobManager:
             evolve_cache_root=evolve_cache_root,
             evolve_pack_dir=evolve_pack_dir,
             evolve_pack_mode=evolve_pack_mode,
+            discard_trajectories=discard_trajectories,
             batch_subdir=batch_subdir,
             samples_csv_remote=samples_csv_remote,
             samples_start_offset=samples_start_offset,
@@ -1543,6 +1628,7 @@ class HPCJobManager:
         evolve_cache_root: Optional[str] = None,
         evolve_pack_dir: Optional[str] = None,
         evolve_pack_mode: str = "emit",
+        discard_trajectories: bool = False,
         batch_subdir: Optional[str] = None,
         samples_csv_remote: Optional[str] = None,
         samples_start_offset: int = 0,
@@ -1598,6 +1684,9 @@ class HPCJobManager:
             # None disables. Mutually exclusive with evolve_cache_root.
             "evolve_pack_dir": evolve_pack_dir,
             "evolve_pack_mode": evolve_pack_mode,
+            # When True, each task unlinks its raw trajectory chunk parquet
+            # after a successful inline-derive — only test stats are kept.
+            "discard_trajectories": discard_trajectories,
             # Per-submission batch subdir name (issue #43 option A).
             # Every task in the array writes chunks into
             # ``{pool}/{batch_subdir}/chunk_NNN.parquet``. None falls back

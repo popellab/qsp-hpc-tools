@@ -1547,3 +1547,71 @@ class TestDownloadTestStatsFullChunkValidation:
 
         assert result == "sentinel"
         manager._combine_chunks_on_hpc.assert_called_once_with("/pool/test_stats/abc")
+
+
+class TestPruneSimulationPools:
+    """prune_simulation_pools: age-based deletion of stale pool dirs (#disk-hygiene)."""
+
+    @staticmethod
+    def _mgr_with_fake_transport(mock_hpc_config, find_out):
+        """HPCJobManager whose transport.exec replays a canned `find`
+        output, then records the `rm` command."""
+        mgr = HPCJobManager(config=mock_hpc_config)
+        calls = []
+
+        def fake_exec(cmd, timeout=None):
+            calls.append(cmd)
+            if cmd.lstrip().startswith("find"):
+                return (0, find_out)
+            return (0, "PRUNED")
+
+        mgr.transport = Mock()
+        mgr.transport.exec = fake_exec
+        return mgr, calls
+
+    def test_age_based_prune_keeps_recent_and_keep_set(self, mock_hpc_config):
+        now = time.time()
+        old = now - 5 * 86400  # 5 days — prune
+        recent = now - 3600  # 1 hour — keep (concurrent-run safe)
+        find_out = "\n".join(
+            [
+                f"{old}\tmsv5_old_aaaa_baseline",
+                f"{old}\tmsv5_old_bbbb_clinical",
+                f"{recent}\tmsv5_new_cccc_baseline",
+                f"{old}\ttheta_pools",
+                f"{old}\tevolve_packs",
+                f"{old}\tmsv5_keepme_dddd_baseline",
+            ]
+        )
+        mgr, calls = self._mgr_with_fake_transport(mock_hpc_config, find_out)
+        result = mgr.prune_simulation_pools(keep={"msv5_keepme_dddd_baseline"}, retention_days=2.0)
+        assert set(result["deleted"]) == {"msv5_old_aaaa_baseline", "msv5_old_bbbb_clinical"}
+        for kept in (
+            "msv5_new_cccc_baseline",
+            "theta_pools",
+            "evolve_packs",
+            "msv5_keepme_dddd_baseline",
+        ):
+            assert kept in result["kept"]
+        assert result["errors"] == []
+        # rm command names exactly the two stale pools, nothing else.
+        rm_cmd = calls[1]
+        assert "msv5_old_aaaa_baseline" in rm_cmd and "msv5_old_bbbb_clinical" in rm_cmd
+        for spared in ("new_cccc", "theta_pools", "evolve_packs", "keepme"):
+            assert spared not in rm_cmd
+
+    def test_nothing_to_prune_issues_no_rm(self, mock_hpc_config):
+        now = time.time()
+        find_out = f"{now - 3600}\tmsv5_recent_baseline"
+        mgr, calls = self._mgr_with_fake_transport(mock_hpc_config, find_out)
+        result = mgr.prune_simulation_pools(retention_days=2.0)
+        assert result["deleted"] == []
+        assert calls and calls[0].lstrip().startswith("find")
+        assert len(calls) == 1, "no rm should be issued when nothing is stale"
+
+    def test_list_failure_is_non_fatal(self, mock_hpc_config):
+        mgr = HPCJobManager(config=mock_hpc_config)
+        mgr.transport = Mock()
+        mgr.transport.exec = Mock(return_value=(1, ""))  # find fails
+        result = mgr.prune_simulation_pools(retention_days=2.0)
+        assert result["deleted"] == [] and result["errors"]

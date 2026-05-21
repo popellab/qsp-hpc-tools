@@ -3148,6 +3148,132 @@ class HPCJobManager:
         # Download combined files and load
         return self._download_combined_files(test_stats_dir, local_dest)
 
+    def download_test_stats_fused(
+        self,
+        scenarios: List[Dict[str, str]],
+        local_dest: Path,
+    ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+        """Combine + download every scenario's test stats in one shot.
+
+        The fused successor to a per-scenario loop of
+        :meth:`download_test_stats_full`. After a fused multi-scenario
+        array, every scenario's chunks sit in its own
+        ``{pool}/test_stats/{hash}/`` dir. This method:
+
+        1. Runs **one** remote ``combine_test_stats_chunks --fused`` over
+           all directories (one ssh round-trip, not N). The combine
+           retry doubles as the NFS-visibility wait — a fused array's
+           last scenario can finish writing its chunks microseconds
+           before this runs, and the login node's directory cache lags.
+        2. Tars each scenario's ``combined_test_stats.csv`` +
+           ``combined_sample_index.csv`` and downloads **one** tarball.
+        3. Returns ``{name: (sample_index, test_stats)}``.
+
+        Crucially it never downloads ``combined_params.csv``: theta is
+        regenerated locally from the deterministic theta pool, so only
+        the sample_index -> row map has to come back (the tiny sidecar).
+
+        Args:
+            scenarios: one dict per scenario with keys ``name``,
+                ``pool_path`` (may contain ``$HOME``), ``test_stats_hash``.
+            local_dest: local directory for the extracted files.
+
+        Returns:
+            ``{name: (sample_index int64[N], test_stats float[N, K])}``.
+        """
+        local_dest.mkdir(parents=True, exist_ok=True)
+
+        # Expand $HOME once for the whole batch.
+        home_dir = None
+        test_stats_dirs: Dict[str, str] = {}
+        for scen in scenarios:
+            pool_path = scen["pool_path"]
+            if "$HOME" in pool_path:
+                if home_dir is None:
+                    _, home_dir = self.transport.exec("echo $HOME")
+                    home_dir = home_dir.strip()
+                pool_path = pool_path.replace("$HOME", home_dir)
+            test_stats_dirs[scen["name"]] = f"{pool_path}/test_stats/{scen['test_stats_hash']}"
+
+        dir_args = " ".join(f'"{d}"' for d in test_stats_dirs.values())
+        combine_cmd = (
+            f"{self.config.hpc_venv_path}/bin/python -m "
+            f"qsp_hpc.batch.combine_test_stats_chunks --fused {dir_args}"
+        )
+
+        # One combine for all scenarios; retry absorbs NFS-visibility lag.
+        max_attempts = 6
+        for attempt in range(max_attempts):
+            status, output = self.transport.exec(combine_cmd, timeout=180)
+            if status == 0:
+                break
+            transient = "no chunks combined" in output or "Directory not found" in output
+            if attempt < max_attempts - 1 and transient:
+                backoff = 5 * (attempt + 1)
+                self.logger.info(
+                    "Fused combine attempt %d/%d not ready (NFS lag?) — " "retrying in %ds",
+                    attempt + 1,
+                    max_attempts,
+                    backoff,
+                )
+                time.sleep(backoff)
+                continue
+            raise RuntimeError(f"Fused combine failed on HPC (rc={status}):\n{output}")
+        if self.verbose:
+            self.logger.info("Fused combine output:")
+            for line in output.strip().split("\n"):
+                self.logger.info(f"  {line}")
+
+        # Stage the two small files per scenario into one dir, tar, download once.
+        stamp = f"fused_dl_{int(time.time() * 1000)}"
+        remote_stage = f"/tmp/{stamp}"
+        remote_tarball = f"/tmp/{stamp}.tgz"
+        stage_lines = [f'mkdir -p "{remote_stage}"']
+        for name, ts_dir in test_stats_dirs.items():
+            stage_lines.append(
+                f'cp "{ts_dir}/combined_test_stats.csv" ' f'"{remote_stage}/{name}__test_stats.csv"'
+            )
+            stage_lines.append(
+                f'cp "{ts_dir}/combined_sample_index.csv" '
+                f'"{remote_stage}/{name}__sample_index.csv"'
+            )
+        stage_lines.append(f'tar -C "{remote_stage}" -czf "{remote_tarball}" .')
+        status, output = self.transport.exec(" && ".join(stage_lines), timeout=120)
+        if status != 0:
+            raise RuntimeError(f"Fused stage/tar failed on HPC:\n{output}")
+
+        self.transport.download(remote_tarball, str(local_dest))
+        self.transport.exec(f'rm -rf "{remote_stage}" "{remote_tarball}"')
+
+        import tarfile
+
+        local_tarball = local_dest / f"{stamp}.tgz"
+        with tarfile.open(local_tarball, "r:gz") as tf:
+            try:
+                tf.extractall(local_dest, filter="data")
+            except TypeError:
+                # ``filter`` predates this Python point release.
+                tf.extractall(local_dest)
+        local_tarball.unlink(missing_ok=True)
+
+        results: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        for name in test_stats_dirs:
+            ts_file = local_dest / f"{name}__test_stats.csv"
+            si_file = local_dest / f"{name}__sample_index.csv"
+            test_stats = pd.read_csv(ts_file, header=None).values
+            if test_stats.ndim == 1:
+                test_stats = test_stats.reshape(1, -1)
+            sample_index = pd.read_csv(si_file, header=None).values.ravel().astype(np.int64)
+            if len(sample_index) != len(test_stats):
+                raise RuntimeError(
+                    f"{name}: sample_index ({len(sample_index)}) and test_stats "
+                    f"({len(test_stats)}) row counts disagree — combine misaligned"
+                )
+            if self.verbose:
+                self.logger.info("Fused download %s: test_stats %s", name, test_stats.shape)
+            results[name] = (sample_index, test_stats)
+        return results
+
     def download_test_stats(
         self, pool_path: str, test_stats_hash: str, local_dest: Path
     ) -> Tuple[Optional[np.ndarray], np.ndarray]:

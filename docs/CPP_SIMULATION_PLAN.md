@@ -569,9 +569,48 @@ Removed: `CppEvolveCache` (LMDB), `evolve_pack_path` / `evolve_pack_read_path`
 `evolve_pack.py`'s `EvolveStatePackWriter` / `EvolveStatePackReader` /
 QSEP format are kept — `evolve_cache.py` builds on them.
 
-Status: code + unit tests landed; HPC end-to-end validation pending
-(`scripts/smoke_test_evolve_cache_hpc.py`). Issue #90 Phases 2–4
-(scenario-fused task, local-PPC reuse, compaction job) are follow-ups.
+Status: code + unit tests landed; HPC end-to-end validated. Issue #90
+Phase 2 (scenario-fused task) landed next; Phases 3–4 (local-PPC reuse,
+compaction job + namespace pruning) are follow-ups.
+
+#### #90 Phase 2 — scenario-fused multi-scenario task
+
+Where Phase 1 made the evolve reusable *across runs*, Phase 2 makes it
+shared *across scenarios within one run*. An N-scenario joint run used
+to submit N serial SLURM arrays, each paying the ~90s fixed per-task
+overhead. Phase 2 submits **one** array: each task, per theta, resolves
+the post-evolve state once (Phase 1 cache hit, or one `--dump-state`
+evolve) and runs **every** scenario from it via `--initial-state`.
+
+New code, all additive — the single-scenario path is untouched:
+
+- `CppRunner.run_one` gains per-call `scenario_yaml` / `drug_metadata_yaml`
+  overrides, so one scenario-agnostic runner serves every scenario.
+- `CppBatchRunner.run_fused(scenarios=[FusedScenarioSpec, ...])` —
+  per theta evolve once, loop scenarios, write one
+  `chunk_NNN.parquet` per scenario into that scenario's own pool dir.
+  A failed evolve fails every scenario for that theta; a failed
+  scenario sim fails only itself.
+- `cpp_batch_worker.run_fused_chunk` — dispatched by `main()` when the
+  job config carries a `scenarios` list; per-scenario inline-derive +
+  optional trajectory discard.
+- `HPCJobManager.submit_cpp_fused_jobs` — one fused array, MSR-only
+  entry point; per-scenario YAMLs / test-stats ride in the config.
+- `MultiScenarioRunner.run_all` — `_plan_fused` probes each scenario's
+  existing test-stats depth (`CppSimulator.hpc_existing_depth`), fuses
+  only the scenarios still needing sims, submits ONE array spanning the
+  union of their deficits, then the per-scenario `run_hpc` loop runs
+  purely as a download.
+
+**Per-scenario deficits.** Scenarios can sit at different pool depths.
+The fused array spans `[min_X(n_X), n)`; each `FusedScenarioSpec`
+carries its own `start_index = n_X`, and a theta with global
+`sample_index < start_index` is skipped for that scenario — so a
+half-done scenario sims only its deficit tail, byte-identical to a
+per-scenario top-up. Fusion and the Phase 1 cache compose: fusion
+amortizes the evolve across scenarios in-run, the cache across runs.
+
+Status: code + unit tests landed; HPC end-to-end validation pending.
 
 ## Completed milestones and benchmarks (2026-04-15 through 2026-04-16)
 

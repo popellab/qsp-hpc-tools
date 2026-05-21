@@ -330,38 +330,39 @@ class MultiScenarioRunner:
         )
 
     def run_all(self, n: int) -> Dict[str, ScenarioResult]:
-        """Submit each scenario for ``n`` simulations against the shared
+        """Run every scenario for ``n`` simulations against the shared
         theta pool, wait, return per-scenario ``(theta, x, sample_index)``.
 
-        Strategy:
+        Strategy (#90 Phase 2 — scenario-fused submission):
+
         - If every scenario is already satisfied from its local
           test-stats cache (:meth:`_all_local`), skip the HPC preamble
-          entirely — no venv refresh, no cmake probe, no uploads — and
-          go straight to the per-scenario loop, where each
-          :meth:`CppSimulator.run_hpc` Tier 1 returns from the local
-          Parquet without touching the cluster.
+          entirely and go straight to the per-scenario download loop,
+          where each :meth:`CppSimulator.run_hpc` Tier 1 returns from
+          the local Parquet without touching the cluster.
         - Otherwise hoist :meth:`prepare_session` (venv + binary setup)
-          before the loop, then submit every scenario with
-          ``skip_setup=True``. Decouples HPC setup from any scenario's
-          cache-tier resolution.
-        - Hoist one ``upload_shared_samples_csv``.
-        - Each scenario internally tier-checks (local cache → HPC cache
-          → derive → submit), so re-runs hit local cache and the runner
-          is safely re-callable.
+          and the shared uploads, then submit **one fused array** for
+          every scenario still needing sims (:meth:`_plan_fused` /
+          :meth:`_submit_fused_array`). Each fused task evolves each
+          theta once and runs all scenarios from that state — the fixed
+          per-task overhead is paid once instead of N times.
+        - Then the per-scenario :meth:`CppSimulator.run_hpc` loop runs
+          purely as a **download**: the fused array has already
+          populated every scenario's HPC test stats, so each
+          ``run_hpc`` resolves at Tier 1/2 without submitting. Scenarios
+          excluded from the fused set (already fully cached) are picked
+          up by the same loop.
 
         Returns ``{name: ScenarioResult}`` in scenario-insertion order.
         """
+        aux = str(self._aux_samples_local) if self._aux_samples_local else None
         if self._all_local(n):
             logger.info(
                 "MSR: all %d scenario(s) satisfied from local cache — "
                 "skipping HPC session prep + shared uploads",
                 len(self.simulators),
             )
-            shared_remote = None
-            shared_healthy_remote = None
-            shared_model_structure_remote = None
-            shared_aux_remote = None
-            per_scen_remotes = {
+            none_remotes = {
                 name: {
                     "scenario_yaml": None,
                     "drug_metadata_yaml": None,
@@ -369,26 +370,182 @@ class MultiScenarioRunner:
                 }
                 for name in self.simulators
             }
-        else:
-            self.prepare_session()
-            shared_remote = self.upload_shared_samples_csv(n)
-            shared_healthy_remote = self.upload_shared_healthy_state()
-            shared_model_structure_remote = self.upload_shared_model_structure()
-            shared_aux_remote = self.upload_shared_aux_samples_csv()
-            per_scen_remotes = self._preupload_per_scenario_files()
+            return self._assemble_results(
+                n,
+                shared_remote=None,
+                shared_healthy_remote=None,
+                shared_model_structure_remote=None,
+                shared_aux_remote=None,
+                per_scen_remotes=none_remotes,
+            )
 
-        # Each scenario submits its own array; the persistent evolve cache
-        # (#90) carries post-evolve ODE states across them. The evolve
-        # state depends on theta + healthy_state + binary, never on the
-        # scenario, so scenario 1's array writes its post-evolve states
-        # through into the shared theta-keyed namespace and — because this
-        # loop is serial and blocking — scenarios 2..N find them already
-        # there and skip the ~84%-of-runtime burn-in. Write-through,
-        # first-writer-wins: no emitter, no emit/consume ordering. A
-        # locally-cached scenario simply never submits and reads nothing.
+        self.prepare_session()
+        shared_remote = self.upload_shared_samples_csv(n)
+        shared_healthy_remote = self.upload_shared_healthy_state()
+        shared_model_structure_remote = self.upload_shared_model_structure()
+        shared_aux_remote = self.upload_shared_aux_samples_csv()
+        per_scen_remotes = self._preupload_per_scenario_files()
+
+        # One fused array for every scenario still needing sims. The
+        # persistent evolve cache (#90 Phase 1) composes underneath:
+        # fusion shares the evolve across scenarios within this run; the
+        # cache carries it across runs and to scenarios that drop out of
+        # the fused set on a later top-up.
+        plan = self._plan_fused(n, aux)
+        if plan:
+            self._submit_fused_array(
+                n,
+                plan,
+                aux,
+                shared_remote=shared_remote,
+                shared_healthy_remote=shared_healthy_remote,
+                shared_model_structure_remote=shared_model_structure_remote,
+                shared_aux_remote=shared_aux_remote,
+                per_scen_remotes=per_scen_remotes,
+            )
+        else:
+            logger.info(
+                "MSR: every scenario already has %d test stats on HPC/local — "
+                "no fused array needed, downloading directly",
+                n,
+            )
+
+        return self._assemble_results(
+            n,
+            shared_remote=shared_remote,
+            shared_healthy_remote=shared_healthy_remote,
+            shared_model_structure_remote=shared_model_structure_remote,
+            shared_aux_remote=shared_aux_remote,
+            per_scen_remotes=per_scen_remotes,
+        )
+
+    # ---- Phase 2 fused submission ---------------------------------------
+
+    def _plan_fused(self, n: int, aux: Optional[str]) -> list:
+        """Decide which scenarios go into the fused array, at what depth.
+
+        Probes each scenario's existing test-stats depth
+        (:meth:`CppSimulator.hpc_existing_depth`). A scenario already at
+        ``>= n`` is **not** fused — its :meth:`CppSimulator.run_hpc` in
+        the download loop will just resolve it from cache. A scenario
+        short of ``n`` joins the fused set with ``start_index`` = its
+        current depth, so the fused array sims only its deficit tail
+        ``[depth, n)`` (#90 partial-miss design).
+
+        Returns a list of ``(name, sim, start_index)`` for the fused
+        scenarios, in scenario-insertion order.
+        """
+        plan = []
+        for name, sim in self.simulators.items():
+            depth = sim.hpc_existing_depth(n, aux_samples_csv=aux)
+            if depth >= n:
+                logger.info(
+                    "MSR: scenario %s already has %d/%d test stats — not fused",
+                    name,
+                    depth,
+                    n,
+                )
+            else:
+                logger.info(
+                    "MSR: scenario %s needs sims [%d, %d) — joining fused array",
+                    name,
+                    depth,
+                    n,
+                )
+                plan.append((name, sim, depth))
+        return plan
+
+    def _submit_fused_array(
+        self,
+        n: int,
+        plan: list,
+        aux: Optional[str],
+        *,
+        shared_remote: Optional[str],
+        shared_healthy_remote: Optional[str],
+        shared_model_structure_remote: Optional[str],
+        shared_aux_remote: Optional[str],
+        per_scen_remotes: Dict[str, Dict[str, Optional[str]]],
+    ) -> None:
+        """Submit the one fused array for the scenarios in ``plan`` and block.
+
+        The array spans ``[min_offset, n)`` where ``min_offset`` is the
+        smallest per-scenario deficit start — the union of every fused
+        scenario's deficit. Each fused task evolves a theta once and
+        runs from that state every scenario whose ``start_index`` admits
+        it.
+        """
+        first = next(iter(self.simulators.values()))
+        min_offset = min(start for (_n, _s, start) in plan)
+
+        scenarios = []
+        for name, sim, start in plan:
+            scenarios.append(
+                {
+                    "name": name,
+                    "simulation_pool_id": sim.simulation_pool_id,
+                    "scenario_yaml_remote": per_scen_remotes[name]["scenario_yaml"],
+                    "drug_metadata_yaml_remote": per_scen_remotes[name]["drug_metadata_yaml"],
+                    "test_stats_csv_remote": per_scen_remotes[name]["test_stats_csv"],
+                    "test_stats_hash": sim._compute_test_stats_hash(aux_samples_csv=aux),
+                    "samples_start_offset": start,
+                }
+            )
+
+        # HPC-side binary/template: per-sim override → credentials.
+        remote_binary = first.remote_binary_path or self.job_manager.config.cpp_binary_path
+        remote_template = first.remote_template_xml or self.job_manager.config.cpp_template_path
+
+        logger.info(
+            "MSR: submitting ONE fused array — %d scenario(s), deficit [%d, %d)",
+            len(plan),
+            min_offset,
+            n,
+        )
+        job_info = self.job_manager.submit_cpp_fused_jobs(
+            scenarios=scenarios,
+            samples_csv_remote=shared_remote,
+            num_simulations=n - min_offset,
+            samples_start_offset=min_offset,
+            t_end_days=first.t_end_days,
+            min_cadence_hours=first.min_cadence_hours,
+            seed=first.seed,
+            binary_path=remote_binary,
+            template_path=remote_template,
+            subtree=first.subtree,
+            healthy_state_yaml_remote=shared_healthy_remote,
+            model_structure_remote=shared_model_structure_remote,
+            aux_samples_csv_remote=shared_aux_remote,
+            auxiliary_units=self._auxiliary_units,
+            evolve_cache=first.evolve_cache_root is not None,
+            per_sim_timeout_s=first.per_sim_timeout_s or 300.0,
+            discard_trajectories=self.discard_trajectories,
+            skip_setup=True,  # prepare_session already ran
+        )
+        logger.info("MSR: fused array submitted (%s) — waiting", job_info.job_ids)
+        first._wait_for_jobs(job_info.job_ids)
+
+    def _assemble_results(
+        self,
+        n: int,
+        *,
+        shared_remote: Optional[str],
+        shared_healthy_remote: Optional[str],
+        shared_model_structure_remote: Optional[str],
+        shared_aux_remote: Optional[str],
+        per_scen_remotes: Dict[str, Dict[str, Optional[str]]],
+    ) -> Dict[str, ScenarioResult]:
+        """Per-scenario :meth:`CppSimulator.run_hpc` → ``{name: ScenarioResult}``.
+
+        After a fused array (or in the all-local fast path) every
+        scenario's test stats are already on HPC / local, so each
+        ``run_hpc`` resolves at Tier 1/2 as a pure download. A scenario
+        whose fused chunk partially failed degrades gracefully — its
+        ``run_hpc`` tier walk tops up the remaining deficit on its own.
+        """
         results: Dict[str, ScenarioResult] = {}
         for name, sim in self.simulators.items():
-            logger.info("MSR: %s run_hpc(n=%d, skip_setup=True)", name, n)
+            logger.info("MSR: %s run_hpc(n=%d, skip_setup=True) — download/assemble", name, n)
             theta_scen, x_scen = sim.run_hpc(
                 n,
                 samples_csv_remote=shared_remote,

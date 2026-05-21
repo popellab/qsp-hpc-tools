@@ -1552,6 +1552,216 @@ class HPCJobManager:
 
         return job_info
 
+    def submit_cpp_fused_jobs(
+        self,
+        *,
+        scenarios: List[dict],
+        samples_csv_remote: str,
+        num_simulations: int,
+        samples_start_offset: int = 0,
+        t_end_days: float = 180.0,
+        min_cadence_hours: float = 4.0,
+        seed: int = 2025,
+        binary_path: Optional[str] = None,
+        template_path: Optional[str] = None,
+        subtree: Optional[str] = None,
+        healthy_state_yaml_remote: Optional[str] = None,
+        model_structure_remote: Optional[str] = None,
+        aux_samples_csv_remote: Optional[str] = None,
+        auxiliary_units: Optional[dict] = None,
+        evolve_cache: bool = True,
+        jobs_per_chunk: Optional[int] = None,
+        max_workers: Optional[int] = None,
+        per_sim_timeout_s: float = 300.0,
+        cpp_cpus_per_task: int = 1,
+        cpp_memory: str = "4G",
+        skip_sync: bool = True,
+        skip_setup: bool = False,
+        skip_git_pull: bool = False,
+        skip_build: bool = False,
+        discard_trajectories: bool = False,
+    ) -> JobInfo:
+        """Submit ONE fused multi-scenario C++ array (#90 Phase 2).
+
+        Where :meth:`submit_cpp_jobs` submits one array per scenario,
+        this submits a single array whose every task evolves each theta
+        **once** and runs every scenario from that state — paying the
+        ~90s fixed per-task overhead once instead of N times, and
+        sharing the ~84%-of-runtime ``evolve_to_diagnosis`` burn-in
+        across scenarios. Each scenario still writes its own
+        ``chunk_NNN.parquet`` into its own pool dir and derives test
+        stats inline into its own ``test_stats/`` tree, so per-scenario
+        pools stay independently cacheable.
+
+        This is a :class:`MultiScenarioRunner`-only entry point: the
+        per-scenario YAMLs, test-stats CSV, model structure and aux
+        samples must already be uploaded (MSR's shared-upload rail does
+        this) and are passed in as ``*_remote`` paths.
+
+        Args:
+            scenarios: one dict per scenario in the fused set. Keys:
+                ``name`` (scenario label), ``simulation_pool_id`` (HPC
+                pool dir), ``test_stats_hash`` (derive output subdir
+                key), ``samples_start_offset`` (the depth this
+                scenario's pool already has — thetas below it are
+                skipped; the issue #90 per-scenario deficit), and
+                optionally ``scenario_yaml_remote``,
+                ``drug_metadata_yaml_remote``, ``test_stats_csv_remote``.
+            samples_csv_remote: shared (sample_index, theta) CSV on HPC
+                — every task slices its chunk out of it.
+            num_simulations: the fused deficit row count, i.e.
+                ``n - samples_start_offset``. The array spans the union
+                of the scenarios' deficits.
+            samples_start_offset: where the fused range starts in the
+                shared CSV — ``min`` over the scenarios' own offsets.
+            healthy_state_yaml_remote: shared healthy-state YAML on HPC.
+                Required for fusion (no evolve phase without it).
+            evolve_cache: when True (default) and a healthy state is
+                set, wire the persistent theta-keyed evolve cache (#90
+                Phase 1) — composes with fusion.
+
+        Returns:
+            :class:`JobInfo` with the single fused array's job id.
+        """
+        if not scenarios:
+            raise ValueError("submit_cpp_fused_jobs requires at least one scenario")
+        if not samples_csv_remote:
+            raise ValueError("submit_cpp_fused_jobs requires samples_csv_remote")
+
+        binary_path = binary_path or self.config.cpp_binary_path
+        template_path = template_path or self.config.cpp_template_path
+        subtree = subtree or self.config.cpp_subtree
+        if not binary_path:
+            raise ValueError(
+                "cpp.binary_path must be set in credentials.yaml or passed as argument"
+            )
+        if not template_path:
+            raise ValueError(
+                "cpp.template_path must be set in credentials.yaml or passed as argument"
+            )
+        if jobs_per_chunk is None:
+            jobs_per_chunk = self.config.jobs_per_chunk
+
+        from qsp_hpc.batch.batch_utils import calculate_num_tasks
+
+        n_jobs = calculate_num_tasks(num_simulations, jobs_per_chunk)
+
+        self.logger.info("Preparing FUSED C++ HPC job submission:")
+        fused_config = {
+            "scenarios": ", ".join(s["name"] for s in scenarios),
+            "fused_simulations": num_simulations,
+            "fused_offset": samples_start_offset,
+            "array_tasks": n_jobs,
+            "sims_per_task": jobs_per_chunk,
+            "binary": binary_path,
+            "seed": seed,
+        }
+        for line in format_config(fused_config):
+            self.logger.info(line)
+
+        with log_operation(self.logger, "Syncing codebase to HPC", log_start=not skip_sync):
+            self.sync_codebase(skip_sync=skip_sync)
+
+        if not skip_setup:
+            self.ensure_hpc_venv()
+            self.ensure_cpp_binary(
+                skip_git_pull=skip_git_pull,
+                skip_build=skip_build,
+                binary_path=binary_path,
+            )
+
+        # Evolve-cache root: scratch-level, outside any per-scenario pool
+        # — the fused array, every scenario, every run share one
+        # theta-keyed namespace of post-evolve states (#90).
+        evolve_cache_root: Optional[str] = None
+        if evolve_cache and healthy_state_yaml_remote:
+            evolve_cache_root = f"{self.config.simulation_pool_path}/evolve_cache"
+
+        # One timestamp anchors both the fused input dir / sbatch script
+        # name (pool-scoped to dodge the #48 parallel-submit race) and
+        # every scenario's per-submission batch subdir.
+        batch_ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1e6) % 1_000_000:06d}"
+        fused_id = f"fused_{batch_ts}"
+
+        scenario_entries: List[dict] = []
+        for s in scenarios:
+            scenario_entries.append(
+                {
+                    "name": s["name"],
+                    "simulation_pool_id": s["simulation_pool_id"],
+                    "scenario_yaml": s.get("scenario_yaml_remote"),
+                    "drug_metadata_yaml": s.get("drug_metadata_yaml_remote"),
+                    "test_stats_csv": s.get("test_stats_csv_remote"),
+                    "test_stats_hash": s.get("test_stats_hash"),
+                    "batch_subdir": f"batch_{batch_ts}_{s['name']}_seed{seed}",
+                    # Per-scenario deficit threshold: thetas with a global
+                    # sample_index below this are already cached for this
+                    # scenario and skipped (#90 partial-miss design).
+                    "samples_start_offset": int(s.get("samples_start_offset", 0)),
+                }
+            )
+
+        config = {
+            "binary_path": binary_path,
+            "template_path": template_path,
+            "subtree": subtree,
+            "param_csv": samples_csv_remote,
+            "n_simulations": num_simulations,
+            "samples_start_offset": int(samples_start_offset),
+            "seed": seed,
+            "jobs_per_chunk": jobs_per_chunk,
+            "t_end_days": t_end_days,
+            "min_cadence_hours": min_cadence_hours,
+            "simulation_pool_path": self.config.simulation_pool_path,
+            "max_workers": max_workers,
+            "per_sim_timeout_s": per_sim_timeout_s,
+            "healthy_state_yaml": healthy_state_yaml_remote,
+            "evolve_cache_root": evolve_cache_root,
+            "discard_trajectories": discard_trajectories,
+            # Shared (scenario-agnostic) derive inputs.
+            "model_structure_file": model_structure_remote,
+            "aux_samples_csv": aux_samples_csv_remote,
+            "auxiliary_units": auxiliary_units or {},
+            # The presence of this list flips cpp_batch_worker into
+            # run_fused_chunk; one entry per fused scenario.
+            "scenarios": scenario_entries,
+        }
+
+        # Upload the fused config into its own pool-scoped input dir so
+        # parallel submissions never clobber each other (#48).
+        import json
+
+        pool_input_dir = self._ensure_pool_input_dir(fused_id)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config, f, indent=2)
+            temp_file = f.name
+        try:
+            remote_config = f"{pool_input_dir}/cpp_job_config.json"
+            self.transport.upload(temp_file, remote_config)
+        finally:
+            Path(temp_file).unlink()
+
+        pool_input_dir_rel = f"batch_jobs/input/{fused_id}"
+        self.logger.info("Submitting FUSED C++ SLURM array job with %d tasks...", n_jobs)
+        job_id = self.slurm_submitter.submit_cpp_job(
+            n_jobs=n_jobs,
+            cpus_per_task=cpp_cpus_per_task,
+            memory=cpp_memory,
+            config_path=f"{pool_input_dir_rel}/cpp_job_config.json",
+            script_name=f"qsp_cpp_fused_job_{fused_id}.sh",
+        )
+        self.logger.info("Fused job submitted: %s", job_id)
+
+        job_info = JobInfo(
+            job_ids=[job_id],
+            state_file="",
+            n_jobs=n_jobs,
+            n_simulations=num_simulations,
+            submission_time=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        job_info.state_file = self._save_job_state(job_info)
+        return job_info
+
     def _pool_input_dir(self, simulation_pool_id: str) -> str:
         """Per-pool HPC upload directory for job config, params, scenario YAMLs.
 

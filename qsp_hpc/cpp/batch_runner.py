@@ -153,6 +153,31 @@ class BatchResult:
     evolve_shard_path: Path | None = None
 
 
+@dataclass
+class FusedScenarioSpec:
+    """One scenario inside a fused multi-scenario batch (#90 Phase 2).
+
+    A fused batch resolves each theta's post-evolve ODE state **once**
+    and runs every scenario from it. Each scenario still gets its own
+    Parquet (``output_path``) so per-scenario pools / test_stats trees
+    stay independently cacheable — fusion is task-execution-level, not
+    storage-level.
+
+    ``start_index`` is the global ``sample_index`` below which this
+    scenario is skipped: a partially-cached scenario (pool already at
+    depth ``n_X``) only needs the deficit tail, so a theta with
+    ``sample_index < start_index`` is not run for it even though the
+    fused array spans the union of all scenarios' deficits. See the
+    issue #90 "partial misses & per-scenario deficits" design note.
+    """
+
+    name: str
+    output_path: Path
+    scenario_yaml: str | Path | None = None
+    drug_metadata_yaml: str | Path | None = None
+    start_index: int = 0
+
+
 # --- Worker (module-level so ProcessPoolExecutor can pickle it) -------------
 
 # Each worker process holds one CppRunner for its lifetime; we initialize it
@@ -401,6 +426,138 @@ def _run_one_in_worker(
             theta_hash,
             evolve_blob,
         )
+
+
+def _run_one_fused_in_worker(
+    sim_id: int,
+    sample_index: int,
+    params: dict[str, float],
+    t_end_days: float,
+    min_cadence_hours: float,
+    timeout_s: float | None,
+    scenario_specs: list[tuple[str, str | None, str | None]],
+) -> tuple[int, str | None, bytes | None, list[tuple]]:
+    """Evolve one theta once, run every requested scenario from that state.
+
+    The fused multi-scenario worker (#90 Phase 2). ``scenario_specs`` is
+    the subset of scenarios this theta participates in —
+    ``(name, scenario_yaml, drug_metadata_yaml)`` tuples; the parent has
+    already filtered out scenarios whose ``start_index`` excludes this
+    theta. ``scenario_yaml`` is None for an undosed scenario.
+
+    Returns ``(sim_id, theta_hash, evolve_blob, results)``:
+      - ``theta_hash`` / ``evolve_blob`` carry the evolve-cache
+        write-through payload — non-None only when a persistent cache is
+        wired AND this worker evolved the theta on a cache miss.
+      - ``results`` is a list aligned with ``scenario_specs``, each entry
+        ``(name, status, trajectory, time_days, species, comps, rules, err)``.
+
+    The evolve is resolved exactly once — a persistent-cache hit
+    materializes the cached post-evolve state, a miss (or a wired-off
+    cache) runs ``--dump-state`` once. Every scenario then runs from that
+    single state via ``--initial-state``. A failed evolve fails every
+    scenario for this theta; a failed scenario sim fails only itself
+    (the evolve state stays reusable, so its write-through payload is
+    still returned).
+    """
+    assert _WORKER_RUNNER is not None, "_worker_init must be called first"
+    assert _WORKER_WORKDIR is not None
+    _worker_t0 = time.time()
+    theta_hash: str | None = None
+    evolve_blob: bytes | None = None
+    evolve_state_path: Path | None = None
+    results: list[tuple] = []
+    try:
+        # Resolve the post-evolve ODE state for this theta exactly once.
+        # params_hash is needed for every scenario's --initial-state call,
+        # so render + hash unconditionally (cheap relative to a sim).
+        xml = _WORKER_RUNNER._renderer.render(params)
+        th = theta_hash_for_xml(xml)
+        params_hash = wire_hash(th)
+        evolve_state_path = _WORKER_WORKDIR / f"{th[:16]}.{sim_id}.evolve_state.bin"
+        cached = _WORKER_EVOLVE_CACHE.get(th) if _WORKER_EVOLVE_CACHE is not None else None
+        if cached is not None:
+            # HIT — materialize the cached state for --initial-state.
+            evolve_state_path.write_bytes(cached)
+        else:
+            # MISS (or no persistent cache) — evolve once via --dump-state.
+            # Fusion shares this one evolve across every scenario even
+            # when the persistent cache is off; the cache only adds
+            # cross-run reuse on top.
+            _WORKER_RUNNER.dump_evolve_state(
+                params=params,
+                params_hash=params_hash,
+                state_out=evolve_state_path,
+                workdir=_WORKER_WORKDIR,
+                timeout_s=timeout_s,
+            )
+            if _WORKER_EVOLVE_CACHE is not None:
+                theta_hash = th
+                evolve_blob = evolve_state_path.read_bytes()
+        try:
+            for name, scen_yaml, drug_yaml in scenario_specs:
+                try:
+                    res: SimResult = _WORKER_RUNNER.run_one(
+                        params=params,
+                        t_end_days=t_end_days,
+                        min_cadence_hours=min_cadence_hours,
+                        workdir=_WORKER_WORKDIR,
+                        timeout_s=timeout_s,
+                        evolve_state_path=evolve_state_path,
+                        params_hash=params_hash,
+                        scenario_yaml=scen_yaml,
+                        drug_metadata_yaml=drug_yaml,
+                    )
+                    results.append(
+                        (
+                            name,
+                            STATUS_OK,
+                            res.trajectory,
+                            res.time_days,
+                            res.species_names,
+                            res.compartment_names,
+                            res.rule_names,
+                            None,
+                        )
+                    )
+                except (QspSimError, ParamNotFoundError) as e:
+                    logging.getLogger(__name__).debug(
+                        "worker pid=%d FAIL sim_id=%d scenario=%s: %s",
+                        os.getpid(),
+                        sim_id,
+                        name,
+                        str(e)[:120],
+                    )
+                    results.append((name, STATUS_FAILED, None, None, None, None, None, str(e)))
+        finally:
+            evolve_state_path.unlink(missing_ok=True)
+        logging.getLogger(__name__).debug(
+            "worker pid=%d done fused sim_id=%d sample_index=%d (%d scenario(s), %.2fs)",
+            os.getpid(),
+            sim_id,
+            sample_index,
+            len(scenario_specs),
+            time.time() - _worker_t0,
+        )
+        return (sim_id, theta_hash, evolve_blob, results)
+    except (QspSimError, ParamNotFoundError) as e:
+        # The evolve itself failed (XML render or --dump-state) — no state
+        # to run any scenario from. theta_hash / evolve_blob stay None
+        # (nothing reusable was produced). Mark every scenario failed.
+        if evolve_state_path is not None:
+            evolve_state_path.unlink(missing_ok=True)
+        logging.getLogger(__name__).debug(
+            "worker pid=%d FAIL fused evolve sim_id=%d: %s",
+            os.getpid(),
+            sim_id,
+            str(e)[:120],
+        )
+        err = str(e)
+        results = [
+            (name, STATUS_FAILED, None, None, None, None, None, err)
+            for (name, _s, _d) in scenario_specs
+        ]
+        return (sim_id, theta_hash, evolve_blob, results)
 
 
 # --- Public batch runner ----------------------------------------------------
@@ -908,6 +1065,349 @@ class CppBatchRunner:
             rule_names=rule_names,
             evolve_shard_path=written_evolve_shard,
         )
+
+    def run_fused(
+        self,
+        theta_matrix: np.ndarray,
+        param_names: Sequence[str],
+        t_end_days: float,
+        min_cadence_hours: float,
+        scenarios: Sequence[FusedScenarioSpec],
+        sample_indices: np.ndarray,
+        workdir: str | Path | None = None,
+        max_workers: int | None = None,
+        per_sim_timeout_s: float | None = None,
+    ) -> list[BatchResult | None]:
+        """Run a fused multi-scenario batch — evolve once per theta, run
+        every scenario from that state (#90 Phase 2).
+
+        For each theta in ``theta_matrix`` the post-``evolve_to_diagnosis``
+        ODE state is resolved exactly once (persistent-cache hit, or one
+        ``--dump-state`` evolve), then **every** scenario in ``scenarios``
+        whose ``start_index`` admits this theta is run from it via
+        ``--initial-state``. One Parquet is written per scenario at its
+        ``output_path`` — per-scenario pools / test_stats stay
+        independently cacheable; fusion only amortizes the shared evolve.
+
+        The runner MUST be scenario-agnostic (constructed with
+        ``scenario_yaml=None``): each scenario's YAML is supplied per
+        :class:`FusedScenarioSpec`, so an undosed scenario (``scenario_yaml
+        =None``) is honored as such rather than inheriting a runner
+        default.
+
+        Args:
+            theta_matrix: shape (n_sims, n_params); row i is one theta.
+            param_names: priors-CSV column names aligned with the columns.
+            t_end_days, min_cadence_hours: passed through to qsp_sim.
+            scenarios: the fused scenario set. Non-empty.
+            sample_indices: length-n_sims int64 array — row i's global
+                theta-pool index. Required: per-scenario ``start_index``
+                filtering keys off it.
+            workdir: scratch dir for per-sim XML + binary outputs.
+            max_workers: process-pool size. Default = CPU count.
+            per_sim_timeout_s: per-simulation timeout override.
+
+        Returns:
+            A list aligned with ``scenarios``; entry k is the
+            :class:`BatchResult` for ``scenarios[k]``, or ``None`` when
+            that scenario had no thetas in this chunk (its ``start_index``
+            excluded every row).
+        """
+        n_sims, n_params = theta_matrix.shape
+        if len(param_names) != n_params:
+            raise ValueError(
+                f"theta_matrix has {n_params} columns but {len(param_names)} "
+                f"param_names were given"
+            )
+        if len(sample_indices) != n_sims:
+            raise ValueError(
+                f"sample_indices has {len(sample_indices)} entries "
+                f"but theta_matrix has {n_sims} rows"
+            )
+        if not scenarios:
+            raise ValueError("run_fused requires at least one scenario")
+        if self.scenario_yaml is not None:
+            raise ValueError(
+                "run_fused requires a scenario-agnostic CppBatchRunner "
+                "(construct with scenario_yaml=None); per-scenario YAMLs "
+                "are supplied via FusedScenarioSpec"
+            )
+        if self.healthy_state_yaml is None:
+            raise ValueError(
+                "run_fused requires healthy_state_yaml — fusion amortizes "
+                "the evolve_to_diagnosis burn-in, and there is no burn-in "
+                "without a healthy state"
+            )
+        unknown = set(param_names) - self.parameter_names
+        if unknown:
+            raise ParamNotFoundError(
+                f"{len(unknown)} priors column(s) not in XML template: " f"{sorted(unknown)[:10]}"
+            )
+        for s in scenarios:
+            if s.scenario_yaml is not None and s.drug_metadata_yaml is None:
+                raise ValueError(
+                    f"fused scenario {s.name!r}: scenario_yaml requires " f"drug_metadata_yaml"
+                )
+
+        sample_idx = np.asarray(sample_indices, dtype=np.int64)
+        if workdir is None:
+            workdir = Path(scenarios[0].output_path).parent / ".workdir_fused"
+        workdir = Path(workdir)
+        workdir.mkdir(parents=True, exist_ok=True)
+        for s in scenarios:
+            Path(s.output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            "Starting fused batch: %d sims × %d params, %d scenario(s), %d workers",
+            n_sims,
+            n_params,
+            len(scenarios),
+            max_workers or os.cpu_count(),
+        )
+        for s in scenarios:
+            logger.info(
+                "  fused scenario %s: start_index=%d scenario_yaml=%s",
+                s.name,
+                s.start_index,
+                s.scenario_yaml,
+            )
+
+        # Persistent evolve cache (#90 Phase 1) — composes with fusion:
+        # fusion shares the evolve across scenarios within this run, the
+        # cache shares it across runs. A miss travels back here for a
+        # single write-through shard.
+        evolve_cache: EvolveCache | None = None
+        if self.evolve_cache_root is not None and self.healthy_state_yaml is not None:
+            evolve_cache = EvolveCache.for_run(
+                self.evolve_cache_root,
+                binary_path=self.binary_path,
+                healthy_state_yaml=self.healthy_state_yaml,
+            )
+            logger.info(
+                "Fused evolve-cache: ENABLED (namespace=%s, dir=%s)",
+                evolve_cache.namespace,
+                evolve_cache.namespace_dir,
+            )
+        else:
+            logger.info("Fused evolve-cache: DISABLED (evolve still shared across scenarios)")
+        worker_evolve_cache_root = str(self.evolve_cache_root) if evolve_cache is not None else None
+
+        # collected[sim_id] -> results list from _run_one_fused_in_worker.
+        collected: dict[int, list[tuple]] = {}
+        evolve_miss_entries: list[tuple[str, bytes]] = []
+
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_worker_init,
+            initargs=(
+                str(self.binary_path),
+                str(self.template_path),
+                self.subtree,
+                str(workdir),
+                self.default_timeout_s,
+                None,  # scenario_yaml — fused workers are scenario-agnostic
+                None,  # drug_metadata_yaml
+                str(self.healthy_state_yaml),
+                worker_evolve_cache_root,
+            ),
+        ) as pool:
+            futures = []
+            fut_meta: dict = {}
+            for i in range(n_sims):
+                abs_idx = int(sample_idx[i])
+                specs_for_i = [
+                    (
+                        s.name,
+                        str(s.scenario_yaml) if s.scenario_yaml is not None else None,
+                        (str(s.drug_metadata_yaml) if s.drug_metadata_yaml is not None else None),
+                    )
+                    for s in scenarios
+                    if abs_idx >= s.start_index
+                ]
+                if not specs_for_i:
+                    # No scenario admits this theta — nothing to run. (Only
+                    # reachable if the caller's fused range dips below every
+                    # start_index; normally min(start_index) bounds it.)
+                    continue
+                params = {name: float(theta_matrix[i, j]) for j, name in enumerate(param_names)}
+                fut = pool.submit(
+                    _run_one_fused_in_worker,
+                    i,
+                    abs_idx,
+                    params,
+                    t_end_days,
+                    min_cadence_hours,
+                    per_sim_timeout_s,
+                    specs_for_i,
+                )
+                futures.append(fut)
+                fut_meta[id(fut)] = (i, abs_idx, [s[0] for s in specs_for_i])
+
+            future_wait_s = float(per_sim_timeout_s or 300.0) + 60.0
+            n_completed = 0
+            n_total = len(futures)
+            try:
+                for fut in as_completed(futures, timeout=future_wait_s * (n_total + 1)):
+                    i, abs_idx, names = fut_meta[id(fut)]
+                    try:
+                        sim_id, theta_hash, evolve_blob, results = fut.result(timeout=future_wait_s)
+                    except FuturesTimeoutError:
+                        logger.warning(
+                            "Future-level timeout (%.0fs) on fused sim_id=%d "
+                            "sample_index=%d — marking all scenarios failed.",
+                            future_wait_s,
+                            i,
+                            abs_idx,
+                        )
+                        collected[i] = [
+                            (
+                                name,
+                                STATUS_FUTURE_TIMEOUT,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                f"future-level timeout after {future_wait_s:.0f}s",
+                            )
+                            for name in names
+                        ]
+                        n_completed += 1
+                        continue
+                    except BrokenExecutor as e:
+                        logger.error(
+                            "ProcessPool broken: %s. %d/%d fused sims completed; "
+                            "remaining sims will be marked failed.",
+                            e,
+                            n_completed,
+                            n_total,
+                        )
+                        break
+                    collected[sim_id] = results
+                    if theta_hash is not None and evolve_blob is not None:
+                        evolve_miss_entries.append((theta_hash, evolve_blob))
+                    n_completed += 1
+                    every = max(1, n_total // 20)
+                    if n_completed % every == 0 or n_completed == n_total:
+                        logger.info("fused: %d/%d sims completed", n_completed, n_total)
+            except FuturesTimeoutError:
+                logger.error(
+                    "as_completed-level timeout: %d/%d fused sims completed — "
+                    "proceeding with what we have.",
+                    n_completed,
+                    n_total,
+                )
+
+        # Schema (species / compartments / rules) is binary-determined, so
+        # it is identical across scenarios — borrow it from the first
+        # successful sim anywhere in the batch.
+        global_species: list[str] | None = None
+        global_comps: list[str] = []
+        global_rules: list[str] = []
+        for results in collected.values():
+            for entry in results:
+                _name, status, _traj, _t, sp, comp, rule, _err = entry
+                if status == STATUS_OK and sp is not None:
+                    global_species = sp
+                    global_comps = comp or []
+                    global_rules = rule or []
+                    break
+            if global_species is not None:
+                break
+        if global_species is None:
+            raise QspSimError(
+                f"All fused sims failed across all {len(scenarios)} scenario(s); "
+                f"cannot infer species schema.\n"
+                f"First error: "
+                f"{next((e for r in collected.values() for (*_, e) in r if e), '(none)')}"
+            )
+
+        # Assemble one Parquet per scenario. Each scenario keeps only the
+        # rows its start_index admits — a partially-cached scenario writes
+        # just its deficit tail, byte-identical to a per-scenario top-up.
+        written_evolve_shard: Path | None = None
+        if evolve_cache is not None and evolve_miss_entries:
+            try:
+                shard_writer = evolve_cache.writer()
+                for theta_hash, blob in evolve_miss_entries:
+                    shard_writer.add(theta_hash, blob)
+                written_evolve_shard = shard_writer.flush()
+                logger.info(
+                    "Fused evolve-cache write-through: shard %s (%d theta(s) evolved)",
+                    written_evolve_shard,
+                    len(evolve_miss_entries),
+                )
+            except Exception as e:  # noqa: BLE001 — the cache is an optimization
+                logger.error("Fused evolve-cache shard write failed (%s)", e)
+        elif evolve_cache is not None:
+            logger.info("Fused evolve-cache write-through: nothing to write (all hit)")
+
+        batch_results: list[BatchResult | None] = []
+        for spec in scenarios:
+            included = [i for i in range(n_sims) if int(sample_idx[i]) >= spec.start_index]
+            if not included:
+                logger.info(
+                    "fused scenario %s: no thetas in this chunk "
+                    "(start_index=%d > every sample_index) — no parquet written",
+                    spec.name,
+                    spec.start_index,
+                )
+                batch_results.append(None)
+                continue
+            statuses: list[int] = []
+            trajectories: list[np.ndarray | None] = []
+            time_arrays: list[np.ndarray | None] = []
+            for i in included:
+                entry = next((r for r in collected.get(i, []) if r[0] == spec.name), None)
+                if entry is None:
+                    # Sim never returned a result for this scenario (broken
+                    # pool before it ran). Mark failed.
+                    statuses.append(STATUS_FAILED)
+                    trajectories.append(None)
+                    time_arrays.append(None)
+                else:
+                    _name, status, traj, t_days, *_rest = entry
+                    statuses.append(status)
+                    trajectories.append(traj if status == STATUS_OK else None)
+                    time_arrays.append(t_days if status == STATUS_OK else None)
+            out_path = Path(spec.output_path)
+            parquet_path = _write_batch_parquet(
+                output_path=out_path,
+                theta_matrix=theta_matrix[included],
+                param_names=list(param_names),
+                statuses=statuses,
+                trajectories=trajectories,
+                time_arrays=time_arrays,
+                species_names=global_species,
+                compartment_names=global_comps,
+                rule_names=global_rules,
+                t_end_days=t_end_days,
+                min_cadence_hours=min_cadence_hours,
+                sample_indices=sample_idx[included],
+            )
+            n_failed = sum(1 for s in statuses if s != STATUS_OK)
+            first_ok = next((k for k, s in enumerate(statuses) if s == STATUS_OK), None)
+            n_times = trajectories[first_ok].shape[0] if first_ok is not None else 1
+            logger.info(
+                "fused scenario %s: %d/%d ok, wrote %s",
+                spec.name,
+                len(included) - n_failed,
+                len(included),
+                parquet_path,
+            )
+            batch_results.append(
+                BatchResult(
+                    parquet_path=parquet_path,
+                    n_sims=len(included),
+                    n_failed=n_failed,
+                    species_names=global_species,
+                    n_times=n_times,
+                    compartment_names=global_comps,
+                    rule_names=global_rules,
+                    evolve_shard_path=written_evolve_shard,
+                )
+            )
+        return batch_results
 
 
 # --- Parquet writer ---------------------------------------------------------

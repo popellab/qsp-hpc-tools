@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Mapping, Optional
@@ -535,46 +536,96 @@ class MultiScenarioRunner:
         shared_aux_remote: Optional[str],
         per_scen_remotes: Dict[str, Dict[str, Optional[str]]],
     ) -> Dict[str, ScenarioResult]:
-        """Per-scenario :meth:`CppSimulator.run_hpc` → ``{name: ScenarioResult}``.
+        """Assemble ``{name: ScenarioResult}`` with a fused teardown.
 
-        After a fused array (or in the all-local fast path) every
-        scenario's test stats are already on HPC / local, so each
-        ``run_hpc`` resolves at Tier 1/2 as a pure download. A scenario
-        whose fused chunk partially failed degrades gracefully — its
-        ``run_hpc`` tier walk tops up the remaining deficit on its own.
+        Scenarios split two ways:
+
+        - **Locally cached** — read straight from the local test-stats
+          cache via :meth:`CppSimulator.run_hpc` (a Tier-1 read, no HPC).
+        - **From the fused array** — every remaining scenario is combined
+          and downloaded in ONE shot via
+          :meth:`HPCJobManager.download_test_stats_fused`: one remote
+          combine, one tarball. ``combined_params.csv`` is never
+          downloaded — theta is regenerated locally from the
+          deterministic theta pool (:meth:`CppSimulator._generate_parameters`),
+          keyed by the ``sample_index`` sidecar.
+
+        Replaces the old per-scenario ``run_hpc`` download loop (N
+        combines + 2N file transfers). Note: per-scenario auto-top-up is
+        gone — a fused array runs every scenario over the same theta set,
+        so a genuine shortfall just leaves NaN rows for the joint filter.
         """
+        aux = str(self._aux_samples_local) if self._aux_samples_local else None
+        pool_root = self.job_manager.config.simulation_pool_path
         results: Dict[str, ScenarioResult] = {}
+
+        # Partition: locally-cached scenarios vs. those that need the
+        # fused HPC combine+download.
+        fused: list = []  # [(name, sim)]
         for name, sim in self.simulators.items():
-            logger.info("MSR: %s run_hpc(n=%d, skip_setup=True) — download/assemble", name, n)
-            theta_scen, x_scen = sim.run_hpc(
-                n,
-                samples_csv_remote=shared_remote,
-                healthy_state_yaml_remote=shared_healthy_remote,
-                model_structure_remote=shared_model_structure_remote,
-                scenario_yaml_remote=per_scen_remotes[name]["scenario_yaml"],
-                drug_metadata_yaml_remote=per_scen_remotes[name]["drug_metadata_yaml"],
-                test_stats_csv_remote=per_scen_remotes[name]["test_stats_csv"],
-                aux_samples_csv=(str(self._aux_samples_local) if self._aux_samples_local else None),
-                aux_samples_csv_remote=shared_aux_remote,
-                auxiliary_units=self._auxiliary_units,
-                skip_setup=True,
-                discard_trajectories=self.discard_trajectories,
+            if sim.local_cache_satisfies(n, aux_samples_csv=aux):
+                logger.info("MSR: %s — local test-stats cache, reading directly", name)
+                theta_scen, x_scen = sim.run_hpc(
+                    n,
+                    samples_csv_remote=shared_remote,
+                    healthy_state_yaml_remote=shared_healthy_remote,
+                    model_structure_remote=shared_model_structure_remote,
+                    scenario_yaml_remote=per_scen_remotes[name]["scenario_yaml"],
+                    drug_metadata_yaml_remote=per_scen_remotes[name]["drug_metadata_yaml"],
+                    test_stats_csv_remote=per_scen_remotes[name]["test_stats_csv"],
+                    aux_samples_csv=aux,
+                    aux_samples_csv_remote=shared_aux_remote,
+                    auxiliary_units=self._auxiliary_units,
+                    skip_setup=True,
+                    discard_trajectories=self.discard_trajectories,
+                )
+                sample_index_scen = (
+                    np.asarray(sim.last_sample_index, dtype=np.int64)
+                    if getattr(sim, "last_sample_index", None) is not None
+                    else np.arange(len(theta_scen), dtype=np.int64)
+                )
+                results[name] = ScenarioResult(
+                    theta=theta_scen,
+                    x=x_scen,
+                    sample_index=sample_index_scen,
+                    pool_id=sim.simulation_pool_id,
+                    pool_path=f"{pool_root}/{sim.simulation_pool_id}",
+                )
+            else:
+                fused.append((name, sim))
+
+        # One fused combine + download for every non-cached scenario.
+        if fused:
+            scen_specs = [
+                {
+                    "name": name,
+                    "pool_path": f"{pool_root}/{sim.simulation_pool_id}",
+                    "test_stats_hash": sim._compute_test_stats_hash(aux_samples_csv=aux),
+                }
+                for name, sim in fused
+            ]
+            logger.info(
+                "MSR: fused combine+download — %d scenario(s) in one round-trip",
+                len(fused),
             )
-            sample_index_scen = (
-                np.asarray(sim.last_sample_index, dtype=np.int64)
-                if getattr(sim, "last_sample_index", None) is not None
-                else np.arange(len(theta_scen), dtype=np.int64)
-            )
-            results[name] = ScenarioResult(
-                theta=theta_scen,
-                x=x_scen,
-                sample_index=sample_index_scen,
-                pool_id=sim.simulation_pool_id,
-                pool_path=(
-                    f"{self.job_manager.config.simulation_pool_path}/{sim.simulation_pool_id}"
-                ),
-            )
-        return results
+            with tempfile.TemporaryDirectory(prefix="msr_fused_dl_") as tmp:
+                fused_dl = self.job_manager.download_test_stats_fused(scen_specs, Path(tmp))
+            for name, sim in fused:
+                sample_index_scen, x_scen = fused_dl[name]
+                # Theta regenerated locally from the deterministic theta
+                # pool — never downloaded. sample_index is the join key.
+                theta_scen = sim._generate_parameters(sample_index_scen)
+                sim.last_sample_index = sample_index_scen
+                results[name] = ScenarioResult(
+                    theta=theta_scen,
+                    x=x_scen,
+                    sample_index=sample_index_scen,
+                    pool_id=sim.simulation_pool_id,
+                    pool_path=f"{pool_root}/{sim.simulation_pool_id}",
+                )
+
+        # Preserve scenario insertion order.
+        return {name: results[name] for name in self.simulators}
 
     # ---- joint NaN filter (static) ---------------------------------------
 

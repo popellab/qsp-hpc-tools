@@ -1615,3 +1615,93 @@ class TestPruneSimulationPools:
         mgr.transport.exec = Mock(return_value=(1, ""))  # find fails
         result = mgr.prune_simulation_pools(retention_days=2.0)
         assert result["deleted"] == [] and result["errors"]
+
+
+class TestDownloadTestStatsFused:
+    """The fused teardown: one remote combine + one tarball for every
+    scenario, theta never downloaded (#90)."""
+
+    def test_one_combine_one_tarball_no_params(self, mock_hpc_config, tmp_path):
+        import tarfile
+
+        manager = HPCJobManager(config=mock_hpc_config)
+        scenarios = [
+            {"name": "a", "pool_path": "/pools/pool_a", "test_stats_hash": "h_a"},
+            {"name": "b", "pool_path": "/pools/pool_b", "test_stats_hash": "h_b"},
+        ]
+        data = {
+            "a": (np.array([0, 1, 2]), np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])),
+            "b": (np.array([4, 5, 6]), np.array([[7.0], [8.0], [9.0]])),
+        }
+
+        exec_calls = []
+
+        def fake_exec(cmd, timeout=None):
+            exec_calls.append(cmd)
+            return (0, "Done!")
+
+        def fake_download(remote_path, local_dir):
+            # Stand in for scp: build the tarball the real fetch returns.
+            stage = Path(local_dir) / "_stage"
+            stage.mkdir(exist_ok=True)
+            for name, (si, ts) in data.items():
+                np.savetxt(stage / f"{name}__test_stats.csv", ts, delimiter=",")
+                np.savetxt(stage / f"{name}__sample_index.csv", si, fmt="%d")
+            tarball = Path(local_dir) / Path(remote_path).name
+            with tarfile.open(tarball, "w:gz") as tf:
+                for f in stage.iterdir():
+                    tf.add(f, arcname=f.name)
+
+        manager.transport.exec = fake_exec
+        manager.transport.download = fake_download
+
+        result = manager.download_test_stats_fused(scenarios, tmp_path)
+
+        # Exactly one --fused combine, spanning both test-stats dirs.
+        combine = [c for c in exec_calls if "combine_test_stats_chunks --fused" in c]
+        assert len(combine) == 1
+        assert "pool_a/test_stats/h_a" in combine[0]
+        assert "pool_b/test_stats/h_b" in combine[0]
+        # combined_params.csv is never fetched — theta is local.
+        assert not any("combined_params.csv" in c for c in exec_calls)
+
+        for name in ("a", "b"):
+            si, ts = result[name]
+            np.testing.assert_array_equal(si, data[name][0])
+            assert si.dtype == np.int64
+            np.testing.assert_array_equal(ts, data[name][1])
+
+    def test_combine_retries_on_nfs_lag(self, mock_hpc_config, tmp_path, monkeypatch):
+        """A transient 'no chunks combined' (NFS visibility lag) is retried
+        rather than raised."""
+        import tarfile
+
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        manager = HPCJobManager(config=mock_hpc_config)
+        scenarios = [{"name": "a", "pool_path": "/pools/pa", "test_stats_hash": "h"}]
+
+        attempts = {"n": 0}
+
+        def fake_exec(cmd, timeout=None):
+            if "--fused" in cmd:
+                attempts["n"] += 1
+                if attempts["n"] == 1:
+                    return (1, "ERROR: no chunks combined for: /pools/pa/test_stats/h")
+                return (0, "Done!")
+            return (0, "")
+
+        def fake_download(remote_path, local_dir):
+            stage = Path(local_dir) / "_s"
+            stage.mkdir(exist_ok=True)
+            np.savetxt(stage / "a__test_stats.csv", np.array([[1.0]]), delimiter=",")
+            np.savetxt(stage / "a__sample_index.csv", np.array([0]), fmt="%d")
+            with tarfile.open(Path(local_dir) / Path(remote_path).name, "w:gz") as tf:
+                for f in stage.iterdir():
+                    tf.add(f, arcname=f.name)
+
+        manager.transport.exec = fake_exec
+        manager.transport.download = fake_download
+
+        result = manager.download_test_stats_fused(scenarios, tmp_path)
+        assert attempts["n"] == 2  # retried once
+        assert "a" in result

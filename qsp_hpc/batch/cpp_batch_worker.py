@@ -335,6 +335,186 @@ def run_chunk(config: dict, array_idx: int) -> None:
             logger.warning("Could not discard %s: %s", output_path.name, e)
 
 
+def run_fused_chunk(config: dict, array_idx: int) -> None:
+    """Execute one fused multi-scenario array-task chunk (#90 Phase 2).
+
+    The fused config carries a ``scenarios`` list — one entry per
+    scenario in the joint run. This task slices its chunk of the shared
+    theta pool, resolves each theta's post-evolve state **once**, and
+    runs every scenario from it (those whose per-scenario
+    ``samples_start_offset`` admits the theta). Each scenario gets its
+    own ``chunk_NNN.parquet`` in its own pool dir, then an inline derive
+    into its own ``test_stats/`` tree — per-scenario pools stay
+    independently cacheable; only the evolve is shared.
+
+    ``config["samples_start_offset"]`` is the fused array's offset
+    (= ``min`` over the scenarios' own offsets); a scenario's own
+    ``samples_start_offset`` is the depth its pool already had, below
+    which it is skipped. See :meth:`CppBatchRunner.run_fused`.
+    """
+    from qsp_hpc.cpp.batch_runner import FusedScenarioSpec
+
+    binary_path = config["binary_path"]
+    template_path = config["template_path"]
+    subtree = config.get("subtree", "QSP")
+    param_csv = config["param_csv"]
+    n_simulations = config["n_simulations"]
+    # ``seed`` rides on each scenario's ``batch_subdir`` (fixed at submit
+    # time), so the fused worker never needs it directly.
+    jobs_per_chunk = config["jobs_per_chunk"]
+    t_end_days = config["t_end_days"]
+    min_cadence_hours = config["min_cadence_hours"]
+    pool_base = config["simulation_pool_path"]
+    max_workers = _resolve_max_workers(config.get("max_workers"))
+    per_sim_timeout_s = config.get("per_sim_timeout_s", 300.0)
+    healthy_state_yaml = config.get("healthy_state_yaml")
+    evolve_cache_root = config.get("evolve_cache_root")
+    discard_trajectories = bool(config.get("discard_trajectories", False))
+    # The fused array's offset into the shared theta CSV: the union of
+    # the scenarios' deficits starts here (= min over per-scenario
+    # offsets). n_simulations is the deficit count, not the pool size.
+    fused_offset = int(config.get("samples_start_offset", 0))
+    scenarios_cfg = config["scenarios"]
+
+    logger.info("ProcessPool max_workers resolved to %s", max_workers)
+    logger.info(
+        "Fused chunk: %d scenario(s), fused_offset=%d, evolve_cache_root=%s",
+        len(scenarios_cfg),
+        fused_offset,
+        evolve_cache_root,
+    )
+
+    start = array_idx * jobs_per_chunk
+    end = min(start + jobs_per_chunk, n_simulations)
+    chunk_size = end - start
+    if chunk_size <= 0:
+        logger.info(
+            "No simulations for fused task %d (start=%d >= n=%d)",
+            array_idx,
+            start,
+            n_simulations,
+        )
+        return
+
+    abs_lo = fused_offset + start
+    abs_hi = fused_offset + end
+    logger.info(
+        "Fused task %d: sims [%d, %d) — absolute theta indices [%d, %d)",
+        array_idx,
+        start,
+        end,
+        abs_lo,
+        abs_hi,
+    )
+
+    params_df = pd.read_csv(param_csv)
+    if "sample_index" in params_df.columns:
+        sample_index_all = params_df["sample_index"].astype(np.int64).values
+        sample_indices_chunk = sample_index_all[abs_lo:abs_hi]
+        params_df = params_df.drop(columns=["sample_index"])
+    else:
+        sample_indices_chunk = np.arange(abs_lo, abs_hi, dtype=np.int64)
+    param_names = list(params_df.columns)
+    theta_chunk = params_df.iloc[abs_lo:abs_hi].values.astype(np.float64)
+
+    logger.info("Loaded %d parameters for fused chunk", len(param_names))
+
+    # Scenario-agnostic runner: each scenario's YAML rides on its
+    # FusedScenarioSpec, not the runner.
+    runner = CppBatchRunner(
+        binary_path=binary_path,
+        template_path=template_path,
+        subtree=subtree,
+        default_timeout_s=per_sim_timeout_s,
+        scenario_yaml=None,
+        drug_metadata_yaml=None,
+        healthy_state_yaml=healthy_state_yaml,
+        evolve_cache_root=evolve_cache_root,
+    )
+
+    fused_specs: list[FusedScenarioSpec] = []
+    for s in scenarios_cfg:
+        pool_dir = Path(pool_base) / s["simulation_pool_id"]
+        pool_dir.mkdir(parents=True, exist_ok=True)
+        # #23: one pool_manifest.json per scenario pool dir.
+        write_pool_manifest(pool_dir, runner.template_defaults, param_names)
+        batch_dir = pool_dir / s["batch_subdir"]
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        fused_specs.append(
+            FusedScenarioSpec(
+                name=s["name"],
+                output_path=batch_dir / f"chunk_{array_idx:03d}.parquet",
+                scenario_yaml=s.get("scenario_yaml"),
+                drug_metadata_yaml=s.get("drug_metadata_yaml"),
+                start_index=int(s.get("samples_start_offset", 0)),
+            )
+        )
+
+    t0 = time.time()
+    results = runner.run_fused(
+        theta_matrix=theta_chunk,
+        param_names=param_names,
+        sample_indices=sample_indices_chunk,
+        t_end_days=t_end_days,
+        min_cadence_hours=min_cadence_hours,
+        scenarios=fused_specs,
+        max_workers=max_workers,
+        per_sim_timeout_s=per_sim_timeout_s,
+    )
+    elapsed = time.time() - t0
+    shard = next((r.evolve_shard_path for r in results if r is not None), None)
+    logger.info(
+        "Fused task %d complete: %d scenario(s) in %.1fs%s",
+        array_idx,
+        sum(1 for r in results if r is not None),
+        elapsed,
+        f" + evolve-cache shard {shard}" if shard else "",
+    )
+
+    # Per-scenario inline derive + optional trajectory discard. Each
+    # scenario derives into its own pool's test_stats tree using its own
+    # test_stats CSV/hash; model_structure + aux are shared (scenario-
+    # agnostic) and ride on the top-level config.
+    for s, res in zip(scenarios_cfg, results):
+        if res is None:
+            logger.info(
+                "Fused scenario %s: no chunk parquet (no thetas in range) "
+                "— skipping inline derive",
+                s["name"],
+            )
+            continue
+        pool_dir = Path(pool_base) / s["simulation_pool_id"]
+        derive_cfg = {
+            "test_stats_csv": s.get("test_stats_csv"),
+            "test_stats_hash": s.get("test_stats_hash"),
+            "model_structure_file": config.get("model_structure_file"),
+            "aux_samples_csv": config.get("aux_samples_csv"),
+            "auxiliary_units": config.get("auxiliary_units") or {},
+        }
+        _run_inline_derive(
+            config=derive_cfg,
+            chunk_parquet=res.parquet_path,
+            pool_dir=pool_dir,
+            batch_subdir=s["batch_subdir"],
+            array_idx=array_idx,
+        )
+        if discard_trajectories and s.get("test_stats_csv"):
+            try:
+                res.parquet_path.unlink(missing_ok=True)
+                logger.info(
+                    "Fused scenario %s: discarded trajectory parquet %s",
+                    s["name"],
+                    res.parquet_path.name,
+                )
+            except OSError as e:  # noqa: BLE001 — cleanup, never fatal
+                logger.warning(
+                    "Fused scenario %s: could not discard %s: %s",
+                    s["name"],
+                    res.parquet_path.name,
+                    e,
+                )
+
+
 def main() -> None:
     # Wire the qsp_hpc parent logger + this module's logger only when
     # running as a script (i.e. SLURM worker invocation). Descendant
@@ -358,7 +538,14 @@ def main() -> None:
     with open(config_file) as f:
         config = json.load(f)
 
-    run_chunk(config, array_idx)
+    # A ``scenarios`` list marks a fused multi-scenario config (#90
+    # Phase 2): one array, every task evolves each theta once and runs
+    # all scenarios from it. Absent it, this is a single-scenario config.
+    if config.get("scenarios"):
+        logger.info("Fused multi-scenario config detected (%d scenarios)", len(config["scenarios"]))
+        run_fused_chunk(config, array_idx)
+    else:
+        run_chunk(config, array_idx)
 
 
 if __name__ == "__main__":

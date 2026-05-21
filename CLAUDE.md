@@ -65,6 +65,18 @@ This document provides context for AI assistants (particularly Claude Code) work
      first-writer-wins (append-only QSEP shards, never a shared mutable
      store — LMDB deadlocked on NFS, #86). Reuse spans scenarios and
      runs. `EvolveCache.compact()` folds shard scans into `manifest.json`.
+   - Scenario-fused multi-scenario task (issue #90 Phase 2): an
+     N-scenario joint run submits **one** SLURM array, not N. Each task,
+     per theta, resolves the evolve once and runs every scenario from it
+     via `--initial-state` — paying the ~90s fixed per-task overhead 1×.
+     `CppBatchRunner.run_fused(scenarios=[FusedScenarioSpec, ...])`,
+     `cpp_batch_worker.run_fused_chunk` (dispatched by a `scenarios` key
+     in the job config), `HPCJobManager.submit_cpp_fused_jobs`,
+     `MultiScenarioRunner.run_all` (`_plan_fused` fuses only scenarios
+     still needing sims, each at its own deficit `start_index`). Fusion
+     amortizes the evolve across scenarios in-run; the Phase 1 cache
+     amortizes it across runs — they compose. Single-scenario path
+     (`submit_cpp_jobs` / `CppSimulator.run_hpc`) untouched.
    - Full plan + history in `docs/CPP_SIMULATION_PLAN.md`.
 
 ### File Organization (Recently Updated)

@@ -258,12 +258,24 @@ class CppRunner:
         params_hash: str | None = None,
         evolve_trajectory_path: str | Path | None = None,
         evolve_trajectory_dt_days: float | None = None,
+        scenario_yaml: str | Path | None = None,
+        drug_metadata_yaml: str | Path | None = None,
     ) -> SimResult:
         """Run one simulation end-to-end.
 
         Args:
             params: Subset of `self.parameter_names` to override in the
                 XML template. Unknown names raise ParamNotFoundError.
+            scenario_yaml: Per-call override of the runner-level
+                ``scenario_yaml`` — when set, ``--scenario`` points here
+                instead. Used by the fused multi-scenario task (#90
+                Phase 2): one scenario-agnostic runner evolves a theta
+                once, then runs every scenario from that state by passing
+                each scenario's YAML per call. ``None`` falls back to the
+                runner's ``self.scenario_yaml``. Requires a matching
+                ``drug_metadata_yaml`` override (or a runner-level one).
+            drug_metadata_yaml: Per-call override of the runner-level
+                ``drug_metadata_yaml``; paired with ``scenario_yaml``.
             t_end_days: Simulation end time (days).
             min_cadence_hours: Upper bound on inter-row spacing in the
                 output trajectory. qsp_sim runs CV_ONE_STEP and emits a
@@ -313,6 +325,14 @@ class CppRunner:
                 "run_one: params_hash is required when evolve_state_path "
                 "is set — it guards against theta/cache drift"
             )
+        # Per-call scenario override (#90 Phase 2 fused task). When the
+        # caller passes a scenario_yaml, it supersedes the runner-level
+        # one for this call; otherwise the runner default applies. The
+        # scenario→drug pairing constraint is the same as __init__'s.
+        scen = scenario_yaml if scenario_yaml is not None else self.scenario_yaml
+        drug = drug_metadata_yaml if drug_metadata_yaml is not None else self.drug_metadata_yaml
+        if scen is not None and drug is None:
+            raise ValueError("run_one: scenario_yaml requires drug_metadata_yaml")
         work = Path(workdir)
         work.mkdir(parents=True, exist_ok=True)
         sim_id = uuid.uuid4().hex[:12]
@@ -341,12 +361,12 @@ class CppRunner:
             "--min-cadence-hours",
             repr(float(min_cadence_hours)),
         ]
-        if self.scenario_yaml is not None:
+        if scen is not None:
             cmd += [
                 "--scenario",
-                str(self.scenario_yaml),
+                str(scen),
                 "--drug-metadata",
-                str(self.drug_metadata_yaml),
+                str(drug),
             ]
         if evolve_state_path is not None:
             # qsp_sim's QSTH header stores a 32-char params_hash. Truncate

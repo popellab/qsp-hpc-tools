@@ -699,6 +699,43 @@ class TestCppSimulatorRunHpc:
         # Pure local probe — no HPC contact.
         jm.check_hpc_test_stats.assert_not_called()
 
+    def test_hpc_existing_depth_uses_local_when_deepest(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        """hpc_existing_depth (#90 Phase 2) caps at n and takes the deeper
+        of the local Parquet footer and the HPC test-stats count."""
+        sim, jm = self._make_sim(priors_csv, binary_path, template_path, cache_dir, tmp_path)
+        ts_hash = sim._compute_test_stats_hash()
+
+        rng = np.random.default_rng(0)
+        sim._persist_local_test_stats(
+            sim._local_test_stats_path(ts_hash),
+            rng.uniform(size=(8, 2)),
+            rng.uniform(size=(8, 3)),
+        )
+        # HPC has fewer than local → local (8) wins, capped at n.
+        jm.check_hpc_test_stats.return_value = True
+        jm.count_hpc_test_stats.return_value = 3
+        assert sim.hpc_existing_depth(20) == 8
+        assert sim.hpc_existing_depth(5) == 5  # capped at n
+
+    def test_hpc_existing_depth_uses_hpc_when_deepest(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        """No local cache → the HPC test-stats count drives the depth."""
+        sim, jm = self._make_sim(priors_csv, binary_path, template_path, cache_dir, tmp_path)
+        jm.check_hpc_test_stats.return_value = True
+        jm.count_hpc_test_stats.return_value = 12000
+        assert sim.hpc_existing_depth(20000) == 12000
+
+    def test_hpc_existing_depth_zero_when_nothing_derived(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        """No local cache, no HPC test stats → 0 (full deficit)."""
+        sim, jm = self._make_sim(priors_csv, binary_path, template_path, cache_dir, tmp_path)
+        jm.check_hpc_test_stats.return_value = False
+        assert sim.hpc_existing_depth(20000) == 0
+
     def test_run_hpc_tier2_downloads_from_hpc(
         self, priors_csv, binary_path, template_path, cache_dir, tmp_path
     ):

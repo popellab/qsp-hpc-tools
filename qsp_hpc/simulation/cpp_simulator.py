@@ -565,6 +565,48 @@ class CppSimulator:
             self.logger.debug("local_cache_satisfies: probe failed (%s) — treating as miss", exc)
             return False
 
+    def hpc_existing_depth(self, n: int, *, aux_samples_csv: Optional[str] = None) -> int:
+        """How many of the first ``n`` test stats already exist for this
+        scenario — across the local cache and the HPC pool.
+
+        Used by :meth:`MultiScenarioRunner.run_all` to size each
+        scenario's deficit before a fused multi-scenario submit (#90
+        Phase 2). The theta pool is index-deterministic and top-ups
+        always append, so the derived rows form a contiguous prefix
+        ``[0, depth)``; the fused array only has to sim the deficit tail
+        ``[depth, n)`` for this scenario.
+
+        Returns ``min(n, max(local_depth, hpc_depth))``. Cheap — a
+        Parquet footer read locally and a ``wc -l`` over SSH for the HPC
+        side; no column data, no download. Returns 0 (treat everything
+        as a deficit) on any probe failure — conservative, never a wrong
+        skip.
+        """
+        if self.test_stats_csv is None or self.job_manager is None:
+            return 0
+        try:
+            test_stats_hash = self._compute_test_stats_hash(aux_samples_csv=aux_samples_csv)
+        except Exception as exc:  # noqa: BLE001 — conservative fallback
+            self.logger.debug("hpc_existing_depth: hash probe failed (%s)", exc)
+            return 0
+        local_depth = 0
+        try:
+            local_cache = self._local_test_stats_path(test_stats_hash)
+            if local_cache.exists():
+                local_depth = pq.read_metadata(str(local_cache)).num_rows
+        except Exception as exc:  # noqa: BLE001 — conservative fallback
+            self.logger.debug("hpc_existing_depth: local probe failed (%s)", exc)
+        hpc_depth = 0
+        try:
+            hpc_pool_path = (
+                f"{self.job_manager.config.simulation_pool_path}/{self.simulation_pool_id}"
+            )
+            if self.job_manager.check_hpc_test_stats(hpc_pool_path, test_stats_hash):
+                hpc_depth = self.job_manager.count_hpc_test_stats(hpc_pool_path, test_stats_hash)
+        except Exception as exc:  # noqa: BLE001 — conservative fallback
+            self.logger.debug("hpc_existing_depth: HPC probe failed (%s)", exc)
+        return min(n, max(int(local_depth), int(hpc_depth)))
+
     def _load_local_test_stats(self, path: Path) -> Tuple[np.ndarray, np.ndarray]:
         """Load the cached (params, test_stats) Parquet.
 

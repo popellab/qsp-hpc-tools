@@ -2,9 +2,10 @@
 
 The runner is a thin orchestrator over :class:`CppSimulator` — most
 behavior under test is "did we wire the right kwargs through, did we
-fail-fast on misalignment, does the joint-NaN mask intersect right."
-End-to-end ``run_all`` is exercised in the integration smoke
-(``workflows/sbi_runner`` driving a real SLURM array).
+fail-fast on misalignment, did we plan + submit one fused array for the
+uncached scenarios (#90 Phase 2), does the joint-NaN mask intersect
+right." End-to-end ``run_all`` against a live SLURM array is exercised
+in the integration smoke (``workflows/sbi_runner``).
 """
 
 from __future__ import annotations
@@ -29,9 +30,15 @@ def _fake_sim(
     pool_id="poolXYZ",
     job_manager=None,
     healthy_state_yaml="healthy.yaml",
+    existing_depth=0,
 ):
     """A MagicMock-backed CppSimulator surrogate carrying just the attrs
-    the runner reads off it."""
+    the runner reads off it.
+
+    ``existing_depth`` is what :meth:`CppSimulator.hpc_existing_depth`
+    returns — 0 (the default) means fully uncached, so the scenario
+    joins the fused array; ``>= n`` means already satisfied and excluded.
+    """
     sim = MagicMock()
     sim.priors_csv = priors_csv
     sim.seed = seed
@@ -44,6 +51,9 @@ def _fake_sim(
     # Default to a local-cache miss so tests exercise the full HPC path
     # unless they explicitly opt into the all-local fast path.
     sim.local_cache_satisfies.return_value = False
+    # Phase 2 fused planning probe.
+    sim.hpc_existing_depth.return_value = existing_depth
+    sim._compute_test_stats_hash.return_value = f"tshash_{pool_id}"
     return sim
 
 
@@ -133,27 +143,32 @@ class TestUploadSharedSamplesCsv:
         assert len(remote_filename) == len("samples_shared_") + 12 + len(".csv")
 
 
+def _wire_samples(jm, sim, tmp_path):
+    """Common run_all plumbing: a deterministic shared samples CSV."""
+    csv = tmp_path / "samples.csv"
+    csv.write_text("sample_index,k\n0,1\n")
+    sim._write_params_csv.return_value = csv
+    jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+
+
 class TestRunAll:
     def test_prepare_session_runs_once_then_all_scenarios_skip_setup(self, tmp_path):
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a")
         b = _fake_sim(job_manager=jm, pool_id="pool_b")
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        a._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
-
+        _wire_samples(jm, a, tmp_path)
         a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
         b.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
 
         r = MultiScenarioRunner({"a": a, "b": b})
         results = r.run_all(1)
 
-        # Session setup runs exactly once before any scenario.
+        # Session setup runs exactly once before any submit.
         assert jm.ensure_hpc_venv.call_count == 1
         assert jm.ensure_cpp_binary.call_count == 1
 
-        # Both scenarios get skip_setup=True (setup already done above).
+        # The download/assemble loop hits run_hpc once per scenario with
+        # skip_setup=True (setup + the fused submit already happened).
         a_kw = a.run_hpc.call_args.kwargs
         b_kw = b.run_hpc.call_args.kwargs
         assert a_kw["skip_setup"] is True
@@ -170,10 +185,7 @@ class TestRunAll:
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a", healthy_state_yaml="hs.yaml")
         b = _fake_sim(job_manager=jm, pool_id="pool_b", healthy_state_yaml="hs.yaml")
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        a._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        _wire_samples(jm, a, tmp_path)
         jm.upload_shared_healthy_state.return_value = "/remote/healthy.yaml"
         a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
         b.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
@@ -181,19 +193,19 @@ class TestRunAll:
         r = MultiScenarioRunner({"a": a, "b": b})
         r.run_all(1)
 
-        # Healthy state uploaded once, shared remote threaded into both run_hpc calls.
+        # Healthy state uploaded once; the shared remote is threaded into
+        # both the fused submit and the per-scenario run_hpc download.
         assert jm.upload_shared_healthy_state.call_count == 1
         assert a.run_hpc.call_args.kwargs["healthy_state_yaml_remote"] == "/remote/healthy.yaml"
         assert b.run_hpc.call_args.kwargs["healthy_state_yaml_remote"] == "/remote/healthy.yaml"
+        fused_kw = jm.submit_cpp_fused_jobs.call_args.kwargs
+        assert fused_kw["healthy_state_yaml_remote"] == "/remote/healthy.yaml"
 
     def test_mixed_healthy_state_falls_back_to_per_pool_upload(self, tmp_path):
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a", healthy_state_yaml="hs_a.yaml")
         b = _fake_sim(job_manager=jm, pool_id="pool_b", healthy_state_yaml="hs_b.yaml")
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        a._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        _wire_samples(jm, a, tmp_path)
         a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
         b.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
 
@@ -208,10 +220,7 @@ class TestRunAll:
     def test_prepare_session_idempotent(self, tmp_path):
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a")
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        a._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        _wire_samples(jm, a, tmp_path)
         a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
 
         r = MultiScenarioRunner({"a": a})
@@ -225,10 +234,7 @@ class TestRunAll:
     def test_sample_index_pulled_from_simulator(self, tmp_path):
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a")
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n5,1\n7,2\n")
-        a._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        _wire_samples(jm, a, tmp_path)
         a.run_hpc.return_value = (np.zeros((2, 1)), np.zeros((2, 1)))
         a.last_sample_index = np.array([5, 7], dtype=np.int64)
 
@@ -239,10 +245,7 @@ class TestRunAll:
     def test_sample_index_falls_back_to_arange_when_missing(self, tmp_path):
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a")
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        a._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        _wire_samples(jm, a, tmp_path)
         a.run_hpc.return_value = (np.zeros((3, 1)), np.zeros((3, 1)))
         a.last_sample_index = None
 
@@ -252,10 +255,10 @@ class TestRunAll:
 
 
 class TestAllLocalFastPath:
-    """run_all skips HPC session prep + uploads when every scenario is
-    locally cached."""
+    """run_all skips HPC session prep + uploads + the fused submit when
+    every scenario is locally cached."""
 
-    def test_all_local_skips_prepare_session_and_uploads(self, tmp_path):
+    def test_all_local_skips_prepare_session_and_fused_submit(self, tmp_path):
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a")
         b = _fake_sim(job_manager=jm, pool_id="pool_b")
@@ -267,11 +270,12 @@ class TestAllLocalFastPath:
         r = MultiScenarioRunner({"a": a, "b": b})
         results = r.run_all(1)
 
-        # No HPC session prep, no shared uploads.
+        # No HPC session prep, no shared uploads, no fused array.
         assert jm.ensure_hpc_venv.call_count == 0
         assert jm.ensure_cpp_binary.call_count == 0
         assert jm.upload_shared_samples_csv.call_count == 0
         assert jm.upload_shared_healthy_state.call_count == 0
+        assert jm.submit_cpp_fused_jobs.call_count == 0
         # run_hpc still called per scenario (Tier 1 returns locally) with
         # all remotes None.
         for sim in (a, b):
@@ -285,12 +289,9 @@ class TestAllLocalFastPath:
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a")
         b = _fake_sim(job_manager=jm, pool_id="pool_b")
-        a.local_cache_satisfies.return_value = True
+        a.local_cache_satisfies.return_value = True  # locally cached
         b.local_cache_satisfies.return_value = False  # one miss → full prep
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        a._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        _wire_samples(jm, a, tmp_path)
         a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
         b.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
 
@@ -303,37 +304,113 @@ class TestAllLocalFastPath:
         assert a.run_hpc.call_args.kwargs["samples_csv_remote"] == "/remote/shared.csv"
 
 
-class TestEvolveCacheOrchestration:
-    """run_all submits each scenario serially; the persistent evolve cache
-    (#90) carries post-evolve states across them — no emit/consume modes,
-    no emitter selection, no per-run pack key threaded through run_hpc."""
+class TestFusedSubmission:
+    """#90 Phase 2: run_all collapses N per-scenario arrays into ONE
+    fused array spanning the union of the scenarios' deficits."""
 
-    def test_run_all_submits_every_scenario_with_skip_setup(self, tmp_path):
+    def test_cold_run_submits_one_fused_array_for_all_scenarios(self, tmp_path):
         jm = _fake_jm()
-        sims = {n: _fake_sim(job_manager=jm, pool_id=f"pool_{n}") for n in ("a", "b", "c")}
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        next(iter(sims.values()))._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        sims = {
+            n: _fake_sim(job_manager=jm, pool_id=f"pool_{n}", existing_depth=0)
+            for n in ("a", "b", "c")
+        }
+        _wire_samples(jm, next(iter(sims.values())), tmp_path)
         for s in sims.values():
             s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
 
-        results = MultiScenarioRunner(sims).run_all(1)
+        MultiScenarioRunner(sims).run_all(20000)
 
-        assert set(results) == {"a", "b", "c"}
-        for s in sims.values():
+        # Exactly one fused submit — not one array per scenario.
+        jm.submit_cpp_fused_jobs.assert_called_once()
+        kw = jm.submit_cpp_fused_jobs.call_args.kwargs
+        # Cold: every scenario starts at 0, fused range is the full [0, n).
+        assert kw["num_simulations"] == 20000
+        assert kw["samples_start_offset"] == 0
+        assert {s["name"] for s in kw["scenarios"]} == {"a", "b", "c"}
+        for entry in kw["scenarios"]:
+            assert entry["samples_start_offset"] == 0
+        assert kw["skip_setup"] is True
+
+    def test_per_scenario_deficits_span_union(self, tmp_path):
+        """Scenarios at different pool depths → the fused array spans
+        [min_depth, n); each scenario carries its own start offset."""
+        jm = _fake_jm()
+        baseline = _fake_sim(job_manager=jm, pool_id="pool_base", existing_depth=20000)
+        gvax = _fake_sim(job_manager=jm, pool_id="pool_gvax", existing_depth=5000)
+        gvax_nivo = _fake_sim(job_manager=jm, pool_id="pool_gn", existing_depth=0)
+        _wire_samples(jm, baseline, tmp_path)
+        for s in (baseline, gvax, gvax_nivo):
+            s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+
+        sims = {"baseline": baseline, "gvax": gvax, "gvax_nivo": gvax_nivo}
+        MultiScenarioRunner(sims).run_all(20000)
+
+        kw = jm.submit_cpp_fused_jobs.call_args.kwargs
+        # baseline (20000/20000) is already satisfied — excluded.
+        assert {s["name"] for s in kw["scenarios"]} == {"gvax", "gvax_nivo"}
+        # Fused range = union of deficits = [min(5000, 0), 20000) = [0, 20000).
+        assert kw["samples_start_offset"] == 0
+        assert kw["num_simulations"] == 20000
+        offsets = {s["name"]: s["samples_start_offset"] for s in kw["scenarios"]}
+        assert offsets == {"gvax": 5000, "gvax_nivo": 0}
+
+    def test_fused_offset_is_min_when_all_partial(self, tmp_path):
+        """When every fused scenario is partway done, the fused array
+        starts at the shallowest depth, not 0."""
+        jm = _fake_jm()
+        a = _fake_sim(job_manager=jm, pool_id="pool_a", existing_depth=8000)
+        b = _fake_sim(job_manager=jm, pool_id="pool_b", existing_depth=12000)
+        _wire_samples(jm, a, tmp_path)
+        for s in (a, b):
+            s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+
+        MultiScenarioRunner({"a": a, "b": b}).run_all(20000)
+
+        kw = jm.submit_cpp_fused_jobs.call_args.kwargs
+        assert kw["samples_start_offset"] == 8000
+        assert kw["num_simulations"] == 12000  # n - min_offset
+        offsets = {s["name"]: s["samples_start_offset"] for s in kw["scenarios"]}
+        assert offsets == {"a": 8000, "b": 12000}
+
+    def test_all_scenarios_satisfied_skips_fused_submit(self, tmp_path):
+        """Every scenario already has n test stats on HPC (but not local,
+        so _all_local is False) → no fused array, just downloads."""
+        jm = _fake_jm()
+        a = _fake_sim(job_manager=jm, pool_id="pool_a", existing_depth=100)
+        b = _fake_sim(job_manager=jm, pool_id="pool_b", existing_depth=100)
+        _wire_samples(jm, a, tmp_path)
+        for s in (a, b):
+            s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+
+        MultiScenarioRunner({"a": a, "b": b}).run_all(100)
+
+        assert jm.submit_cpp_fused_jobs.call_count == 0
+        # The download loop still runs per scenario.
+        for s in (a, b):
             s.run_hpc.assert_called_once()
-            assert s.run_hpc.call_args.kwargs["skip_setup"] is True
 
-    def test_run_all_threads_no_evolve_pack_kwargs(self, tmp_path):
+    def test_fused_array_waited_on_before_download(self, tmp_path):
+        """The fused array is waited on (via the first simulator's
+        _wait_for_jobs) before the per-scenario download loop."""
+        jm = _fake_jm()
+        a = _fake_sim(job_manager=jm, pool_id="pool_a", existing_depth=0)
+        b = _fake_sim(job_manager=jm, pool_id="pool_b", existing_depth=0)
+        _wire_samples(jm, a, tmp_path)
+        for s in (a, b):
+            s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+        jm.submit_cpp_fused_jobs.return_value = MagicMock(job_ids=["9001"])
+
+        MultiScenarioRunner({"a": a, "b": b}).run_all(10)
+
+        # First simulator's _wait_for_jobs got the fused array's job ids.
+        a._wait_for_jobs.assert_called_once_with(["9001"])
+
+    def test_run_hpc_threads_no_evolve_pack_kwargs(self, tmp_path):
         """The evolve-pack emit/consume plumbing is retired — run_hpc must
         not receive evolve_pack_key / evolve_pack_mode (#90)."""
         jm = _fake_jm()
         sims = {n: _fake_sim(job_manager=jm, pool_id=f"pool_{n}") for n in ("a", "b")}
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        next(iter(sims.values()))._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        _wire_samples(jm, next(iter(sims.values())), tmp_path)
         for s in sims.values():
             s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
 
@@ -344,7 +421,7 @@ class TestEvolveCacheOrchestration:
             assert "evolve_pack_key" not in kwargs
             assert "evolve_pack_mode" not in kwargs
 
-    def test_use_evolve_packs_kwarg_removed(self, tmp_path):
+    def test_use_evolve_packs_kwarg_removed(self):
         """The use_evolve_packs constructor kwarg no longer exists (#90)."""
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a")

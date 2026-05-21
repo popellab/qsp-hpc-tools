@@ -638,6 +638,210 @@ class TestSubmitCppJobs:
 
 
 # ---------------------------------------------------------------------------
+# HPCJobManager.submit_cpp_fused_jobs — fused multi-scenario array (#90 Ph2)
+# ---------------------------------------------------------------------------
+
+
+class TestSubmitCppFusedJobs:
+    def _make_manager(self, cpp_binary="/usr/bin/qsp_sim", cpp_template="/tmp/p.xml"):
+        from qsp_hpc.batch.hpc_job_manager import BatchConfig, HPCJobManager
+
+        config = BatchConfig(
+            ssh_host="test.edu",
+            ssh_user="testuser",
+            simulation_pool_path="/scratch/sims",
+            hpc_venv_path="/home/testuser/.venv/qsp",
+            remote_project_path="/home/testuser/project",
+            partition="shared",
+            time_limit="01:00:00",
+            cpp_binary_path=cpp_binary,
+            cpp_template_path=cpp_template,
+            cpp_repo_path="/home/testuser/cpp-repo",
+        )
+        transport = MagicMock()
+
+        def exec_side_effect(cmd, *args, **kwargs):
+            if "echo OK" in cmd:
+                return (0, "OK")
+            return (0, "Submitted batch job 12345")
+
+        transport.exec.side_effect = exec_side_effect
+        transport.upload.return_value = None
+        manager = HPCJobManager(config=config, transport=transport)
+        return manager, transport
+
+    @staticmethod
+    def _capture_config(transport) -> list:
+        captured: list = []
+
+        def cap(local, remote):
+            if "cpp_job_config.json" in remote:
+                with open(local) as f:
+                    captured.append(json.load(f))
+
+        transport.upload.side_effect = cap
+        return captured
+
+    def test_returns_job_info_for_one_array(self):
+        manager, _ = self._make_manager()
+        info = manager.submit_cpp_fused_jobs(
+            scenarios=[
+                {
+                    "name": "a",
+                    "simulation_pool_id": "pa",
+                    "test_stats_hash": "ha",
+                    "samples_start_offset": 0,
+                },
+                {
+                    "name": "b",
+                    "simulation_pool_id": "pb",
+                    "test_stats_hash": "hb",
+                    "samples_start_offset": 0,
+                },
+            ],
+            samples_csv_remote="/remote/shared.csv",
+            num_simulations=100,
+            samples_start_offset=0,
+            healthy_state_yaml_remote="/remote/healthy.yaml",
+            skip_setup=True,
+        )
+        # ONE array — not one per scenario.
+        assert info.job_ids == ["12345"]
+        assert info.n_simulations == 100
+
+    def test_uploads_fused_config_with_scenario_bundle(self):
+        manager, transport = self._make_manager()
+        captured = self._capture_config(transport)
+        manager.submit_cpp_fused_jobs(
+            scenarios=[
+                {
+                    "name": "baseline",
+                    "simulation_pool_id": "pool_base",
+                    "test_stats_hash": "hbase",
+                    "samples_start_offset": 5000,
+                    "scenario_yaml_remote": "/r/scen_base.yaml",
+                    "drug_metadata_yaml_remote": "/r/drug_base.yaml",
+                    "test_stats_csv_remote": "/r/ts_base.csv",
+                },
+                {
+                    "name": "gvax",
+                    "simulation_pool_id": "pool_gvax",
+                    "test_stats_hash": "hgvax",
+                    "samples_start_offset": 0,
+                },
+            ],
+            samples_csv_remote="/remote/shared.csv",
+            num_simulations=20000,
+            samples_start_offset=0,
+            seed=99,
+            healthy_state_yaml_remote="/remote/healthy.yaml",
+            model_structure_remote="/remote/ms.json",
+            skip_setup=True,
+        )
+        assert len(captured) == 1
+        cfg = captured[0]
+        assert cfg["n_simulations"] == 20000
+        assert cfg["samples_start_offset"] == 0
+        assert cfg["param_csv"] == "/remote/shared.csv"
+        assert cfg["healthy_state_yaml"] == "/remote/healthy.yaml"
+        assert cfg["model_structure_file"] == "/remote/ms.json"
+        assert len(cfg["scenarios"]) == 2
+
+        by_name = {s["name"]: s for s in cfg["scenarios"]}
+        base = by_name["baseline"]
+        assert base["simulation_pool_id"] == "pool_base"
+        assert base["test_stats_hash"] == "hbase"
+        # Per-scenario deficit threshold carried through.
+        assert base["samples_start_offset"] == 5000
+        assert base["scenario_yaml"] == "/r/scen_base.yaml"
+        assert base["drug_metadata_yaml"] == "/r/drug_base.yaml"
+        assert base["test_stats_csv"] == "/r/ts_base.csv"
+        # Per-scenario batch subdir embeds name + seed.
+        assert base["batch_subdir"].startswith("batch_")
+        assert "baseline" in base["batch_subdir"]
+        assert base["batch_subdir"].endswith("seed99")
+        # An undosed scenario carries no scenario YAML.
+        assert by_name["gvax"]["scenario_yaml"] is None
+
+    def test_evolve_cache_root_wired_with_healthy_state(self):
+        manager, transport = self._make_manager()
+        captured = self._capture_config(transport)
+        manager.submit_cpp_fused_jobs(
+            scenarios=[
+                {
+                    "name": "a",
+                    "simulation_pool_id": "pa",
+                    "test_stats_hash": "ha",
+                    "samples_start_offset": 0,
+                }
+            ],
+            samples_csv_remote="/remote/shared.csv",
+            num_simulations=10,
+            healthy_state_yaml_remote="/remote/healthy.yaml",
+            evolve_cache=True,
+            skip_setup=True,
+        )
+        assert captured[0]["evolve_cache_root"] == "/scratch/sims/evolve_cache"
+
+    def test_evolve_cache_root_none_without_healthy_state(self):
+        manager, transport = self._make_manager()
+        captured = self._capture_config(transport)
+        manager.submit_cpp_fused_jobs(
+            scenarios=[
+                {
+                    "name": "a",
+                    "simulation_pool_id": "pa",
+                    "test_stats_hash": "ha",
+                    "samples_start_offset": 0,
+                }
+            ],
+            samples_csv_remote="/remote/shared.csv",
+            num_simulations=10,
+            healthy_state_yaml_remote=None,
+            evolve_cache=True,
+            skip_setup=True,
+        )
+        assert captured[0]["evolve_cache_root"] is None
+
+    def test_empty_scenarios_rejected(self):
+        manager, _ = self._make_manager()
+        with pytest.raises(ValueError, match="at least one scenario"):
+            manager.submit_cpp_fused_jobs(
+                scenarios=[],
+                samples_csv_remote="/remote/shared.csv",
+                num_simulations=10,
+                skip_setup=True,
+            )
+
+    def test_submits_with_fused_script_name(self):
+        manager, _ = self._make_manager()
+        recorded: dict = {}
+
+        def fake_submit_cpp_job(**kwargs):
+            recorded.update(kwargs)
+            return "12345"
+
+        manager.slurm_submitter.submit_cpp_job = fake_submit_cpp_job
+        manager.submit_cpp_fused_jobs(
+            scenarios=[
+                {
+                    "name": "a",
+                    "simulation_pool_id": "pa",
+                    "test_stats_hash": "ha",
+                    "samples_start_offset": 0,
+                }
+            ],
+            samples_csv_remote="/remote/shared.csv",
+            num_simulations=10,
+            healthy_state_yaml_remote="/remote/healthy.yaml",
+            skip_setup=True,
+        )
+        assert recorded["script_name"].startswith("qsp_cpp_fused_job_")
+        # The config path is pool-scoped to the fused id (dodges #48 races).
+        assert "input/fused_" in recorded["config_path"]
+
+
+# ---------------------------------------------------------------------------
 # HPCJobManager.ensure_cpp_binary
 # ---------------------------------------------------------------------------
 

@@ -285,7 +285,7 @@ class CppRunner:
                 dumped ODE state. Mutually exclusive with any runner-level
                 ``healthy_state_yaml`` for this call: the cached state
                 supersedes it. Typically supplied by
-                :class:`CppEvolveCache`.
+                :class:`~qsp_hpc.cpp.evolve_cache.EvolveCache`.
             params_hash: Optional SHA-256 hex of the rendered param-XML
                 bytes, passed to qsp_sim as ``--params-hash`` for
                 cache-consistency checks. Required when
@@ -353,7 +353,7 @@ class CppRunner:
             # here so callers can pass the full 64-char SHA-256 digest
             # (which is what the cache keeps for filenames / diagnostics)
             # without having to know the on-wire length.
-            from qsp_hpc.cpp.evolve_cache import wire_hash
+            from qsp_hpc.cpp.qsth import wire_hash
 
             cmd += [
                 "--initial-state",
@@ -470,8 +470,9 @@ class CppRunner:
         post-evolve ODE state to ``state_out`` (QSTH binary blob).
 
         This is the cache-population path used by
-        :class:`CppEvolveCache`. No trajectory output is produced — qsp_sim
-        exits 0 as soon as it has written the blob. ``params_hash`` is
+        :class:`~qsp_hpc.cpp.evolve_cache.EvolveCache`. No trajectory
+        output is produced — qsp_sim exits 0 as soon as it has written
+        the blob. ``params_hash`` is
         stamped into the blob header so the corresponding load
         (``--initial-state``) can verify it against the current theta.
 

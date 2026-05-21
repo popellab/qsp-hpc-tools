@@ -593,16 +593,24 @@ def test_run_one_in_worker_skips_cache_when_traj_dir_set(tmp_path: Path, monkeyp
     trajectory binaries."""
     from qsp_hpc.cpp import batch_runner as br
 
-    cache_calls: list[dict] = []
+    get_calls: list[str] = []
 
     class _FakeCache:
-        def get_or_build(self, params, workdir, timeout_s):
-            cache_calls.append({"params": params, "workdir": workdir, "timeout_s": timeout_s})
-            return Path("/tmp/state.bin"), "abcdef"
+        def get(self, theta_hash):
+            get_calls.append(theta_hash)
+            # Hit: an opaque blob the worker materializes for --initial-state.
+            return b"cached-evolve-state-blob"
+
+    class _FakeRenderer:
+        def render(self, params):
+            return repr(sorted(params.items())).encode()
 
     runner_calls: list[dict] = []
 
     class _FakeRunner:
+        _renderer = _FakeRenderer()
+        healthy_state_yaml = "/fake/healthy_state.yaml"
+
         def run_one(self, **kwargs):
             runner_calls.append(kwargs)
             from qsp_hpc.cpp.runner import SimResult
@@ -633,11 +641,11 @@ def test_run_one_in_worker_skips_cache_when_traj_dir_set(tmp_path: Path, monkeyp
         timeout_s=None,
         evolve_trajectory_dir=str(tmp_path / "traj"),
     )
-    assert cache_calls == [], "cache was hit despite evolve_trajectory_dir"
+    assert get_calls == [], "cache was hit despite evolve_trajectory_dir"
     assert runner_calls[-1]["evolve_state_path"] is None
     assert runner_calls[-1]["evolve_trajectory_path"] is not None
 
-    # 2) traj_dir omitted → cache IS consulted.
+    # 2) traj_dir omitted → cache IS consulted; a hit drives --initial-state.
     br._run_one_in_worker(
         sim_id=1,
         sample_index=1,
@@ -646,8 +654,8 @@ def test_run_one_in_worker_skips_cache_when_traj_dir_set(tmp_path: Path, monkeyp
         min_cadence_hours=4.0,
         timeout_s=None,
     )
-    assert len(cache_calls) == 1
-    assert runner_calls[-1]["evolve_state_path"] == Path("/tmp/state.bin")
+    assert len(get_calls) == 1
+    assert runner_calls[-1]["evolve_state_path"] is not None
     assert runner_calls[-1]["evolve_trajectory_path"] is None
 
 

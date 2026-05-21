@@ -517,6 +517,62 @@ handles the rare case of wanting a full purge.
   blob. Add from day one — it's cheap and the alternative is silent
   duplicate work.
 
+### M13 evolve-cache — implementation history (superseded by #90)
+
+The M13 design above went through three on-disk implementations:
+
+1. **LMDB env** (`CppEvolveCache`). One LMDB env per
+   (healthy_state, binary) pair, theta-keyed. Correct locally;
+   **deadlocked on NFS** under SLURM fan-out — LMDB needs coherent
+   `mmap` + POSIX `fcntl`, which NFS does not provide (qsp-hpc-tools#86).
+2. **Per-run QSEP packs** (`evolve_pack.py`, #86/#87/#88/#89). The
+   NFS-safe fix: never share a writable store — each array task writes
+   its own `chunk_NNN.qsep`. But the packs were per-run and
+   chunk-indexed, driven by an emit/consume pipeline with a hard
+   ordering constraint (scenario 1 emits, 2..N consume) and an
+   emitter-selection rule. Reuse did not span runs.
+3. **Persistent theta-keyed cache** (`evolve_cache.py`, issue #90
+   Phase 1 — *current*). Generalizes the QSEP pack into a persistent,
+   namespaced, NFS-safe cache. One `EvolveCache` mechanism; the LMDB
+   `CppEvolveCache` and the emit/consume plumbing are both removed.
+
+#### #90 Phase 1 — persistent evolve cache
+
+Layout: `{simulation_pool_path}/evolve_cache/{namespace}/shard_*.qsep`
+(+ optional `manifest.json`). `namespace = sha256(binary_bytes,
+healthy_state_yaml)[:16]` — a rebuild or healthy-state edit lands
+requests in a fresh namespace, so stale states are ignored, never
+silently reused. `theta_hash` (SHA-256 of the rendered param-XML) is
+the per-entry key.
+
+Write-through, first-writer-wins: any task that evolves a theta on a
+cache miss packs the new state into its own append-only
+`shard_<uuid>.qsep`. No designated emitter, no emit/consume ordering —
+shards are never mutated, so concurrent writers never collide (the
+NFS-safe property). A reader builds a `theta_hash -> (shard, offset,
+length)` index by scanning shard footers (`read_pack_index` — footer +
+index only, never blob bytes); `compact()` folds the scan into
+`manifest.json` to bound later readers' scan cost.
+
+Reuse now spans **scenarios and runs**: any later array — a different
+scenario, a re-run, an independently-submitted single scenario — over
+the same theta pool and binary hits the shards. `MultiScenarioRunner`
+keeps its serial per-scenario loop; scenario 1's shards land before
+scenario 2 submits, so 2..N skip the burn-in. The QSTH blob format
+moved to `qsp_hpc/cpp/qsth.py` so `evolve_pack` (QSEP format) and
+`evolve_cache` (persistent layer) can share it without an import cycle.
+The `lmdb` dependency is dropped.
+
+Removed: `CppEvolveCache` (LMDB), `evolve_pack_path` / `evolve_pack_read_path`
+/ `evolve_pack_dir` / `evolve_pack_mode` / `evolve_pack_key`,
+`MultiScenarioRunner.use_evolve_packs` and its emitter-selection logic.
+`evolve_pack.py`'s `EvolveStatePackWriter` / `EvolveStatePackReader` /
+QSEP format are kept — `evolve_cache.py` builds on them.
+
+Status: code + unit tests landed; HPC end-to-end validation pending
+(`scripts/smoke_test_evolve_cache_hpc.py`). Issue #90 Phases 2–4
+(scenario-fused task, local-PPC reuse, compaction job) are follow-ups.
+
 ## Completed milestones and benchmarks (2026-04-15 through 2026-04-16)
 
 ### M1-M7 + M10: DONE

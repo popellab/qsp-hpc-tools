@@ -303,14 +303,12 @@ class TestAllLocalFastPath:
         assert a.run_hpc.call_args.kwargs["samples_csv_remote"] == "/remote/shared.csv"
 
 
-class TestEvolvePackOrchestration:
-    """run_all threads evolve-pack emit/consume modes through run_hpc (#86)."""
+class TestEvolveCacheOrchestration:
+    """run_all submits each scenario serially; the persistent evolve cache
+    (#90) carries post-evolve states across them — no emit/consume modes,
+    no emitter selection, no per-run pack key threaded through run_hpc."""
 
-    @staticmethod
-    def _wire(jm, sim, csv):
-        sim.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
-
-    def test_scenario_1_emits_2_to_n_consume(self, tmp_path):
+    def test_run_all_submits_every_scenario_with_skip_setup(self, tmp_path):
         jm = _fake_jm()
         sims = {n: _fake_sim(job_manager=jm, pool_id=f"pool_{n}") for n in ("a", "b", "c")}
         csv = tmp_path / "samples.csv"
@@ -320,58 +318,18 @@ class TestEvolvePackOrchestration:
         for s in sims.values():
             s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
 
-        MultiScenarioRunner(sims).run_all(1)
+        results = MultiScenarioRunner(sims).run_all(1)
 
-        modes = [s.run_hpc.call_args.kwargs["evolve_pack_mode"] for s in sims.values()]
-        assert modes == ["emit", "consume", "consume"]
-        # All scenarios key the same per-run pack dir.
-        keys = {s.run_hpc.call_args.kwargs["evolve_pack_key"] for s in sims.values()}
-        assert len(keys) == 1 and next(iter(keys)) is not None
-
-    def test_cached_first_scenario_shifts_emitter(self, tmp_path):
-        """When scenario 1 is locally cached it never submits an array and
-        emits no packs — the emitter must shift to the first scenario that
-        actually submits, else every consumer crashes on a missing chunk."""
-        jm = _fake_jm()
-        sims = {n: _fake_sim(job_manager=jm, pool_id=f"pool_{n}") for n in ("a", "b", "c")}
-        sims["a"].local_cache_satisfies.return_value = True  # cached → no submit
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        next(iter(sims.values()))._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
+        assert set(results) == {"a", "b", "c"}
         for s in sims.values():
-            s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
+            s.run_hpc.assert_called_once()
+            assert s.run_hpc.call_args.kwargs["skip_setup"] is True
 
-        MultiScenarioRunner(sims).run_all(1)
-
-        modes = [s.run_hpc.call_args.kwargs["evolve_pack_mode"] for s in sims.values()]
-        assert modes == ["off", "emit", "consume"]
-
-    def test_all_cached_no_packs(self, tmp_path):
-        """Every scenario satisfied from local cache — nothing submits, so
-        there is no emitter and no pack key is threaded."""
+    def test_run_all_threads_no_evolve_pack_kwargs(self, tmp_path):
+        """The evolve-pack emit/consume plumbing is retired — run_hpc must
+        not receive evolve_pack_key / evolve_pack_mode (#90)."""
         jm = _fake_jm()
         sims = {n: _fake_sim(job_manager=jm, pool_id=f"pool_{n}") for n in ("a", "b")}
-        for s in sims.values():
-            s.local_cache_satisfies.return_value = True
-            s.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        next(iter(sims.values()))._write_params_csv.return_value = csv
-
-        MultiScenarioRunner(sims).run_all(1)
-
-        for s in sims.values():
-            assert s.run_hpc.call_args.kwargs["evolve_pack_key"] is None
-            assert s.run_hpc.call_args.kwargs["evolve_pack_mode"] == "off"
-
-    def test_last_scenario_emitter_no_consumers(self, tmp_path):
-        """If the only submitting scenario is last there is nothing after
-        it to consume — packs stay off rather than emitting a dead pack."""
-        jm = _fake_jm()
-        sims = {n: _fake_sim(job_manager=jm, pool_id=f"pool_{n}") for n in ("a", "b")}
-        sims["a"].local_cache_satisfies.return_value = True
-        sims["b"].local_cache_satisfies.return_value = False
         csv = tmp_path / "samples.csv"
         csv.write_text("sample_index,k\n0,1\n")
         next(iter(sims.values()))._write_params_csv.return_value = csv
@@ -382,37 +340,16 @@ class TestEvolvePackOrchestration:
         MultiScenarioRunner(sims).run_all(1)
 
         for s in sims.values():
-            assert s.run_hpc.call_args.kwargs["evolve_pack_key"] is None
+            kwargs = s.run_hpc.call_args.kwargs
+            assert "evolve_pack_key" not in kwargs
+            assert "evolve_pack_mode" not in kwargs
 
-    def test_use_evolve_packs_false_disables(self, tmp_path):
+    def test_use_evolve_packs_kwarg_removed(self, tmp_path):
+        """The use_evolve_packs constructor kwarg no longer exists (#90)."""
         jm = _fake_jm()
         a = _fake_sim(job_manager=jm, pool_id="pool_a")
-        b = _fake_sim(job_manager=jm, pool_id="pool_b")
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        a._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
-        a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
-        b.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
-
-        MultiScenarioRunner({"a": a, "b": b}, use_evolve_packs=False).run_all(1)
-
-        assert a.run_hpc.call_args.kwargs["evolve_pack_key"] is None
-        assert b.run_hpc.call_args.kwargs["evolve_pack_key"] is None
-
-    def test_single_scenario_gets_no_pack(self, tmp_path):
-        """One scenario has nothing to amortize — no pack key threaded."""
-        jm = _fake_jm()
-        a = _fake_sim(job_manager=jm, pool_id="pool_a")
-        csv = tmp_path / "samples.csv"
-        csv.write_text("sample_index,k\n0,1\n")
-        a._write_params_csv.return_value = csv
-        jm.upload_shared_samples_csv.return_value = "/remote/shared.csv"
-        a.run_hpc.return_value = (np.zeros((1, 1)), np.zeros((1, 1)))
-
-        MultiScenarioRunner({"a": a}).run_all(1)
-
-        assert a.run_hpc.call_args.kwargs["evolve_pack_key"] is None
+        with pytest.raises(TypeError, match="use_evolve_packs"):
+            MultiScenarioRunner({"a": a}, use_evolve_packs=False)
 
 
 class TestJointNanMask:

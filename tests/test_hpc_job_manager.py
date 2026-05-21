@@ -1705,3 +1705,94 @@ class TestDownloadTestStatsFused:
         result = manager.download_test_stats_fused(scenarios, tmp_path)
         assert attempts["n"] == 2  # retried once
         assert "a" in result
+
+
+class TestDeferredSharedUploads:
+    """Batched shared-input upload: register every shared file, then
+    rsync the whole set in one round-trip instead of one test-f per
+    file (#90 follow-on)."""
+
+    def test_registration_does_no_roundtrip(self, mock_hpc_config, tmp_path):
+        mgr = HPCJobManager(config=mock_hpc_config)
+        mgr.transport = Mock()
+        a = tmp_path / "a.yaml"
+        a.write_text("scenario A")
+        b = tmp_path / "b.yaml"
+        b.write_text("scenario B")
+
+        mgr.begin_deferred_shared_uploads()
+        p1 = mgr.upload_shared_scenario_yaml(str(a))
+        p2 = mgr.upload_shared_scenario_yaml(str(b))
+
+        # No ssh exec, no scp during registration.
+        mgr.transport.exec.assert_not_called()
+        mgr.transport.upload.assert_not_called()
+        # Deterministic content-hash remote paths.
+        assert "scenario_shared_" in p1 and p1.endswith(".yaml")
+        assert p1 != p2
+        assert len(mgr._pending_shared_uploads) == 2
+
+    def test_flush_is_one_rsync(self, mock_hpc_config, tmp_path):
+        mgr = HPCJobManager(config=mock_hpc_config)
+        mgr.transport = Mock()
+        mgr.transport.exec.return_value = (0, "")
+        a = tmp_path / "a.yaml"
+        a.write_text("A")
+        c = tmp_path / "c.csv"
+        c.write_text("C")
+
+        mgr.begin_deferred_shared_uploads()
+        mgr.upload_shared_scenario_yaml(str(a))
+        mgr.upload_shared_test_stats_csv(str(c))
+        mgr.flush_shared_uploads()
+
+        # Whole batch → one rsync, zero per-file scp.
+        mgr.transport.rsync_dir.assert_called_once()
+        mgr.transport.upload.assert_not_called()
+        # Deferred mode cleared afterwards.
+        assert mgr._defer_shared_uploads is False
+        assert mgr._pending_shared_uploads == []
+
+    def test_identical_content_registered_once(self, mock_hpc_config, tmp_path):
+        """Byte-identical files (e.g. drug_metadata shared across
+        scenarios) collapse to a single pending entry."""
+        mgr = HPCJobManager(config=mock_hpc_config)
+        mgr.transport = Mock()
+        f1 = tmp_path / "drug.yaml"
+        f1.write_text("same bytes")
+        f2 = tmp_path / "drug_copy.yaml"
+        f2.write_text("same bytes")
+
+        mgr.begin_deferred_shared_uploads()
+        p1 = mgr.upload_shared_drug_metadata_yaml(str(f1))
+        p2 = mgr.upload_shared_drug_metadata_yaml(str(f2))
+
+        assert p1 == p2
+        assert len(mgr._pending_shared_uploads) == 1
+
+    def test_flush_noop_when_nothing_pending(self, mock_hpc_config):
+        mgr = HPCJobManager(config=mock_hpc_config)
+        mgr.transport = Mock()
+        mgr.begin_deferred_shared_uploads()
+        mgr.flush_shared_uploads()
+        mgr.transport.rsync_dir.assert_not_called()
+        assert mgr._defer_shared_uploads is False
+
+    def test_rsync_dir_command_has_ignore_existing(self, mock_hpc_config, tmp_path):
+        """SSHTransport.rsync_dir issues an rsync with --ignore-existing
+        over an -e ssh tunnel."""
+        transport = SSHTransport(mock_hpc_config)
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            transport.rsync_dir(str(tmp_path), "/remote/batch_jobs/input")
+
+        cmd = captured["cmd"]
+        assert cmd[0] == "rsync"
+        assert "--ignore-existing" in cmd
+        assert "-e" in cmd
+        assert cmd[-1].endswith(":/remote/batch_jobs/input/")

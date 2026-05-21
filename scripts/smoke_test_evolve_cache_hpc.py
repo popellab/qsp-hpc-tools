@@ -1,11 +1,12 @@
-"""M13 evolve-cache end-to-end smoke test on HPC.
+"""Persistent evolve-cache end-to-end smoke test on HPC (#90).
 
 Submits two tiny C++ batches to the cluster under the SAME theta but
 DIFFERENT scenario pool IDs, then verifies:
 
-  1. Exactly one QSTH blob landed in ``{simulation_pool_path}/evolve_cache``
-     — so the second batch reused the first batch's evolve state instead
-     of re-running the ~857-day healthy-state integration.
+  1. Batch 1 (cache miss) writes at least one QSEP shard into the cache
+     namespace under ``{simulation_pool_path}/evolve_cache``; batch 2
+     (cache hit) writes NO new shard — so it reused batch 1's evolve
+     state instead of re-running the ~857-day healthy-state integration.
   2. The second batch's wall time is substantially shorter than the first
      (first pays the evolve cost; second is dominated by post-diagnosis
      integration only).
@@ -43,7 +44,7 @@ def build_tiny_params_csv(priors_csv: Path, out_csv: Path, n_sims: int) -> list[
     """Emit a params.csv with n_sims IDENTICAL rows (prior medians).
 
     Identical rows is the whole point of the test: every sim should hash
-    to the same theta and share one cached evolve blob. Uses the
+    to the same theta and share one cached evolve state. Uses the
     ``median`` column — the parameter value itself, in its natural units
     (positive rate constants, positive concentrations, etc.). An earlier
     version of this function sampled ``dist_param1``, but for lognormal
@@ -133,17 +134,18 @@ def submit_and_wait(
 
 
 def check_evolve_cache(manager, cache_root: str) -> tuple[int, list[str]]:
-    """Return (env_count, ls_output_lines) from the HPC cache dir.
+    """Return (shard_count, shard_paths) from the HPC cache dir.
 
-    The packed layout has one LMDB env per (healthy_state, binary) pair,
-    each materialized as a `data.mdb` file under
-    `<cache_root>/<hs_hash>_<bin_hash>/`. Counting those gives the
-    number of distinct (model, config) caches present.
+    The persistent cache (#90) is a directory of append-only QSEP shards:
+    one ``shard_<uuid>.qsep`` per array task that evolved a cache miss,
+    under ``<cache_root>/<namespace>/``. Counting shards across batches
+    tells us whether a batch wrote new states (miss) or reused existing
+    ones (hit — adds zero shards).
     """
     find_cmd = (
         f"bash -lc "
         f'\'if [ -d "{cache_root}" ]; then '
-        f'find "{cache_root}" -name "data.mdb" -type f; '
+        f'find "{cache_root}" -name "shard_*.qsep" -type f; '
         f"fi'"
     )
     status, output = manager.transport.exec(find_cmd, timeout=30)
@@ -187,7 +189,8 @@ def main() -> int:
         "--n-sims",
         type=int,
         default=4,
-        help="Sims per batch (default 4). All identical → " "they all share one cache blob.",
+        help="Sims per batch (default 4). All identical → "
+        "they all share one cached evolve state.",
     )
     ap.add_argument(
         "--t-end-days",
@@ -242,7 +245,7 @@ def main() -> int:
         action="store_true",
         help="Remove the remote evolve_cache directory before "
         "running. Recommended for reliable timing signal; "
-        "otherwise a previous run's blob may make the "
+        "otherwise a previous run's cached state may make the "
         "first batch look fast.",
     )
     args = ap.parse_args()
@@ -253,7 +256,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 72)
-    print("M13 evolve-cache HPC smoke test")
+    print("Persistent evolve-cache HPC smoke test (#90)")
     print()
     print("NOTE: the HPC qsp_sim binary must be built from a branch that")
     print("includes the M13 --dump-state / --initial-state flags. Before")
@@ -337,10 +340,10 @@ def main() -> int:
         poll_interval=args.poll_interval,
         max_wait_s=args.max_wait_s,
     )
-    n_blobs_after_1, blob_paths_1 = check_evolve_cache(manager, cache_root)
+    n_shards_after_1, shard_paths_1 = check_evolve_cache(manager, cache_root)
     print(f"\n  batch 1 elapsed (wall): {t1:.1f}s  job={job1}")
-    print(f"  cache blobs after batch 1: {n_blobs_after_1}")
-    for p in blob_paths_1:
+    print(f"  cache shards after batch 1: {n_shards_after_1}")
+    for p in shard_paths_1:
         print(f"    {p}")
 
     # 3. Batch 2 — same theta, different pool_id. Should HIT the cache.
@@ -364,9 +367,9 @@ def main() -> int:
         poll_interval=args.poll_interval,
         max_wait_s=args.max_wait_s,
     )
-    n_blobs_after_2, blob_paths_2 = check_evolve_cache(manager, cache_root)
+    n_shards_after_2, shard_paths_2 = check_evolve_cache(manager, cache_root)
     print(f"\n  batch 2 elapsed (wall): {t2:.1f}s  job={job2}")
-    print(f"  cache blobs after batch 2: {n_blobs_after_2}")
+    print(f"  cache shards after batch 2: {n_shards_after_2}")
 
     # 4. Assertions.
     print("\n" + "=" * 72)
@@ -376,15 +379,19 @@ def main() -> int:
     print(f"  batch 2 wall:  {t2:.1f}s  (cache hit  — skipped evolve)")
     ratio = t2 / t1 if t1 > 0 else float("nan")
     print(f"  ratio (b2/b1): {ratio:.2f}  (lower = better)")
-    print(f"  cache blobs:   {n_blobs_after_2}  (expected 1)")
+    print(f"  cache shards:  {n_shards_after_1} after b1 -> {n_shards_after_2} after b2")
 
     failures: list[str] = []
-    if n_blobs_after_1 != 1:
-        failures.append(f"expected exactly 1 blob after batch 1, got {n_blobs_after_1}")
-    if n_blobs_after_2 != 1:
+    if n_shards_after_1 < 1:
         failures.append(
-            f"expected exactly 1 blob after batch 2 (shared with batch 1), "
-            f"got {n_blobs_after_2}"
+            f"expected at least 1 cache shard after batch 1 (cache miss), "
+            f"got {n_shards_after_1}"
+        )
+    if n_shards_after_2 != n_shards_after_1:
+        failures.append(
+            f"batch 2 wrote {n_shards_after_2 - n_shards_after_1} new shard(s) — "
+            f"expected 0 (it should have hit the cache for every theta, not "
+            f"re-evolved)"
         )
     # Relaxed check on timing. Queueing noise can dominate at this size,
     # so we only flag extreme regressions (ratio > 0.9 means batch 2 was
@@ -402,7 +409,7 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("\nPASS: evolve-cache engaged on HPC; batch 2 reused batch 1's blob.")
+    print("\nPASS: evolve-cache engaged on HPC; batch 2 reused batch 1's shard.")
     return 0
 
 

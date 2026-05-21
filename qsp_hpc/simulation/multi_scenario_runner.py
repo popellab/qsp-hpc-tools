@@ -70,7 +70,6 @@ class MultiScenarioRunner:
         simulators: Mapping[str, CppSimulator],
         *,
         job_manager=None,
-        use_evolve_packs: bool = True,
         discard_trajectories: bool = False,
     ):
         if not simulators:
@@ -87,18 +86,9 @@ class MultiScenarioRunner:
 
         self._shared_samples_remote: Optional[str] = None
         self._shared_samples_local: Optional[Path] = None
-        # Content hash of the shared (sample_index, theta) CSV — keys the
-        # per-run evolve-pack directory (#86). Set by upload_shared_samples_csv.
-        self._shared_samples_hash: Optional[str] = None
         self._aux_samples_local: Optional[Path] = None
         self._aux_samples_remote: Optional[str] = None
         self._auxiliary_units: Optional[dict] = None
-        # Evolve-pack amortization (#86): scenario 1's array emits per-task
-        # QSEP packs of post-evolve ODE states; scenarios 2..N consume them
-        # via --initial-state instead of redoing the (~97%-of-runtime)
-        # burn-in. Kill switch — set False to fall back to a full evolve
-        # per scenario.
-        self.use_evolve_packs = use_evolve_packs
         # When True, array tasks unlink their raw trajectory parquet after
         # inline-derive — only the test stats are kept. The trajectories are
         # the bulk of pool disk and dead weight for an SBI run.
@@ -147,7 +137,6 @@ class MultiScenarioRunner:
         local_path = first._write_params_csv(n, start_index=0)
         try:
             content_hash = hashlib.sha256(local_path.read_bytes()).hexdigest()[:12]
-            self._shared_samples_hash = content_hash
             remote_filename = f"samples_shared_{content_hash}.csv"
             self._shared_samples_remote = self.job_manager.upload_shared_samples_csv(
                 str(local_path), remote_filename
@@ -388,69 +377,18 @@ class MultiScenarioRunner:
             shared_aux_remote = self.upload_shared_aux_samples_csv()
             per_scen_remotes = self._preupload_per_scenario_files()
 
-        # Evolve-pack amortization (#86): the emitter scenario's array emits
-        # per-task QSEP packs of post-evolve ODE states; later scenarios
-        # consume them via --initial-state, skipping the ~97%-of-runtime
-        # burn-in. Needs >1 scenario (nothing to amortize otherwise), an
-        # evolve phase, and the shared-samples hash that keys the per-run
-        # pack dir — the hash is only set on the non-fast-path (i.e. when
-        # something submits to HPC; the all-local path never reaches a
-        # submit).
-        #
-        # The emitter is NOT blindly scenario 1: if scenario 1 is satisfied
-        # from its local test-stats cache it never submits an array, so it
-        # would emit no packs and every consumer would crash on a missing
-        # chunk file. Pick the emitter as the first scenario (insertion
-        # order) that will actually submit — i.e. is not locally cached.
-        # Scenarios before it are local-cache hits (run "off"); scenarios
-        # after it consume. The serial blocking loop guarantees the emitter
-        # finishes before any consumer starts.
-        first_sim = next(iter(self.simulators.values()))
-        aux_probe = str(self._aux_samples_local) if self._aux_samples_local else None
-        cache_satisfied = [
-            sim.local_cache_satisfies(n, aux_samples_csv=aux_probe)
-            for sim in self.simulators.values()
-        ]
-        emitter_idx = next((i for i, hit in enumerate(cache_satisfied) if not hit), None)
-        use_packs = (
-            self.use_evolve_packs
-            and len(self.simulators) > 1
-            and first_sim.healthy_state_yaml is not None
-            and self._shared_samples_hash is not None
-            # An emitter that submits, with at least one scenario after it
-            # to consume — otherwise there is nothing to amortize.
-            and emitter_idx is not None
-            and emitter_idx < len(self.simulators) - 1
-        )
-        evolve_pack_key = self._shared_samples_hash if use_packs else None
-        if use_packs:
-            emitter_name = list(self.simulators.keys())[emitter_idx]
-            logger.info(
-                "MSR: evolve-pack amortization ON (key=%s) — '%s' (scenario %d) "
-                "emits, later scenarios consume",
-                evolve_pack_key,
-                emitter_name,
-                emitter_idx + 1,
-            )
-
+        # Each scenario submits its own array; the persistent evolve cache
+        # (#90) carries post-evolve ODE states across them. The evolve
+        # state depends on theta + healthy_state + binary, never on the
+        # scenario, so scenario 1's array writes its post-evolve states
+        # through into the shared theta-keyed namespace and — because this
+        # loop is serial and blocking — scenarios 2..N find them already
+        # there and skip the ~84%-of-runtime burn-in. Write-through,
+        # first-writer-wins: no emitter, no emit/consume ordering. A
+        # locally-cached scenario simply never submits and reads nothing.
         results: Dict[str, ScenarioResult] = {}
-        for scen_idx, (name, sim) in enumerate(self.simulators.items()):
-            # Emitter emits; scenarios after it consume; locally-cached
-            # scenarios before the emitter run "off" (they never submit).
-            if not use_packs:
-                pack_mode = "off"
-            elif scen_idx == emitter_idx:
-                pack_mode = "emit"
-            elif scen_idx > emitter_idx:
-                pack_mode = "consume"
-            else:
-                pack_mode = "off"
-            logger.info(
-                "MSR: %s run_hpc(n=%d, skip_setup=True, evolve_pack=%s)",
-                name,
-                n,
-                pack_mode,
-            )
+        for name, sim in self.simulators.items():
+            logger.info("MSR: %s run_hpc(n=%d, skip_setup=True)", name, n)
             theta_scen, x_scen = sim.run_hpc(
                 n,
                 samples_csv_remote=shared_remote,
@@ -463,8 +401,6 @@ class MultiScenarioRunner:
                 aux_samples_csv_remote=shared_aux_remote,
                 auxiliary_units=self._auxiliary_units,
                 skip_setup=True,
-                evolve_pack_key=evolve_pack_key,
-                evolve_pack_mode=pack_mode,
                 discard_trajectories=self.discard_trajectories,
             )
             sample_index_scen = (

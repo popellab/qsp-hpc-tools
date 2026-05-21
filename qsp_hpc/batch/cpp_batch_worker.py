@@ -170,23 +170,11 @@ def run_chunk(config: dict, array_idx: int) -> None:
     scenario_yaml = config.get("scenario_yaml")
     drug_metadata_yaml = config.get("drug_metadata_yaml")
     healthy_state_yaml = config.get("healthy_state_yaml")
-    # M13: shared evolve-to-diagnosis cache on scratch. First task to hit
-    # a given theta runs evolve + writes the QSTH blob under an advisory
-    # fcntl lock; every other task (including future scenario arrays) for
-    # the same theta skips evolve via --initial-state. None disables.
+    # Persistent, theta-keyed evolve cache (#90). Root on scratch; the
+    # worker opens the namespace under it derived from (binary,
+    # healthy_state) and reuses post-evolve ODE states across scenarios
+    # and runs via --initial-state. None disables.
     evolve_cache_root = config.get("evolve_cache_root")
-    # Per-task evolve-pack (#86). ``evolve_pack_dir`` + ``evolve_pack_mode``
-    # together drive the NFS-safe successor to the LMDB evolve cache:
-    #   - mode "emit"   (default): this task writes its post-evolve QSTH
-    #     blobs to ``{evolve_pack_dir}/chunk_NNN.qsep``.
-    #   - mode "consume": this task reads ``{evolve_pack_dir}/chunk_NNN.qsep``
-    #     (a prior scenario's pack at the same index — the chunking is
-    #     identical across scenarios sharing a theta pool) and runs from
-    #     each evolve state via --initial-state, skipping the burn-in.
-    # Either way the per-task file is chunk-NNN-named so pack ↔ parquet
-    # pair by array index. No shared writable store.
-    evolve_pack_dir = config.get("evolve_pack_dir")
-    evolve_pack_mode = config.get("evolve_pack_mode", "emit")
     # discard_trajectories: once test stats are derived inline, the raw
     # trajectory chunk parquet is dead weight for an SBI run (only test
     # stats are consumed downstream) and is the bulk of pool disk. When
@@ -205,15 +193,12 @@ def run_chunk(config: dict, array_idx: int) -> None:
     # These are also implicitly checked by CppBatchRunner/_worker_init, but
     # a partial config (e.g. evolve_cache_root set but healthy_state_yaml
     # None) silently disables the cache — and the SLURM task still exits 0.
-    # Logging here pins down "0 blobs written" to a specific cause without
+    # Logging here pins down "0 states written" to a specific cause without
     # needing a debug rerun.
     logger.info(
-        "Evolve-cache config: healthy_state_yaml=%s evolve_cache_root=%s "
-        "evolve_pack_dir=%s evolve_pack_mode=%s",
+        "Evolve-cache config: healthy_state_yaml=%s evolve_cache_root=%s",
         healthy_state_yaml,
         evolve_cache_root,
-        evolve_pack_dir,
-        evolve_pack_mode if evolve_pack_dir else "(n/a)",
     )
 
     start = array_idx * jobs_per_chunk
@@ -284,21 +269,6 @@ def run_chunk(config: dict, array_idx: int) -> None:
     filename = f"chunk_{array_idx:03d}.parquet"
     output_path = batch_dir / filename
 
-    # Per-task evolve-pack file: one QSEP per array task, named to match
-    # the chunk parquet so pack <-> parquet pair by index (#86). The same
-    # chunk_NNN.qsep path is the emit *target* or the consume *source*
-    # depending on evolve_pack_mode; only one is non-None per task.
-    evolve_pack_path = None  # emit target
-    evolve_pack_read_path = None  # consume source
-    if evolve_pack_dir and evolve_pack_mode in ("emit", "consume"):
-        _per_task_qsep = Path(evolve_pack_dir) / f"chunk_{array_idx:03d}.qsep"
-        if evolve_pack_mode == "consume":
-            evolve_pack_read_path = _per_task_qsep
-        else:
-            evolve_pack_path = _per_task_qsep
-    # mode "off" (a locally-cached scenario that never submits, defensively
-    # threaded through) is a true no-op: neither emit nor consume.
-
     t0 = time.time()
 
     runner = CppBatchRunner(
@@ -331,8 +301,6 @@ def run_chunk(config: dict, array_idx: int) -> None:
         seed=seed,
         max_workers=max_workers,
         per_sim_timeout_s=per_sim_timeout_s,
-        evolve_pack_path=evolve_pack_path,
-        evolve_pack_read_path=evolve_pack_read_path,
     )
 
     elapsed = time.time() - t0
@@ -343,7 +311,7 @@ def run_chunk(config: dict, array_idx: int) -> None:
         result.n_sims,
         elapsed,
         output_path,
-        f" + evolve pack {result.evolve_pack_path}" if result.evolve_pack_path else "",
+        f" + evolve-cache shard {result.evolve_shard_path}" if result.evolve_shard_path else "",
     )
 
     _run_inline_derive(

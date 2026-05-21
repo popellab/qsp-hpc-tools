@@ -56,6 +56,15 @@ This document provides context for AI assistants (particularly Claude Code) work
    - `HPCJobManager.submit_cpp_jobs(derive_test_stats=True, ...)`: chains
      a derivation job with `--dependency=afterok:<array_id>` so test
      stats land on HPC without raw-trajectory download.
+   - Evolve cache (`qsp_hpc/cpp/evolve_cache.py` + `evolve_pack.py` +
+     `qsth.py`, issue #90 Phase 1): `evolve_to_diagnosis` (the ~857-day
+     burn-in, ~84%+ of per-sim cost) is cached per theta in a
+     persistent, NFS-safe store — `{simulation_pool_path}/evolve_cache/
+     {namespace}/shard_*.qsep`. `namespace = hash(binary, healthy_state)`;
+     entry key is the rendered-param-XML hash. Write-through,
+     first-writer-wins (append-only QSEP shards, never a shared mutable
+     store — LMDB deadlocked on NFS, #86). Reuse spans scenarios and
+     runs. `EvolveCache.compact()` folds shard scans into `manifest.json`.
    - Full plan + history in `docs/CPP_SIMULATION_PLAN.md`.
 
 ### File Organization (Recently Updated)

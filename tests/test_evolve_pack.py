@@ -1,4 +1,4 @@
-"""Tests for :mod:`qsp_hpc.cpp.evolve_pack` — the per-task QSEP pack format.
+"""Tests for :mod:`qsp_hpc.cpp.evolve_pack` — the QSEP pack format.
 
 Pure-Python: synthetic QSTH blobs exercise the writer/reader without a
 qsp_sim binary. The blob payload is opaque to the pack, so the bytes only
@@ -13,18 +13,19 @@ from pathlib import Path
 
 import pytest
 
-from qsp_hpc.cpp.evolve_cache import (
+from qsp_hpc.cpp.evolve_pack import (
+    EvolveStatePackError,
+    EvolveStatePackReader,
+    EvolveStatePackWriter,
+    read_pack_index,
+    write_evolve_pack,
+)
+from qsp_hpc.cpp.qsth import (
     _QSTH_HASH_LEN,
     _QSTH_HEADER_SIZE,
     _QSTH_MAGIC,
     _QSTH_VERSION,
     wire_hash,
-)
-from qsp_hpc.cpp.evolve_pack import (
-    EvolveStatePackError,
-    EvolveStatePackReader,
-    EvolveStatePackWriter,
-    write_evolve_pack,
 )
 
 # --- synthetic QSTH blob helpers -------------------------------------------
@@ -266,3 +267,46 @@ def test_reader_rejects_bad_version(tmp_path: Path):
     p.write_bytes(data)
     with pytest.raises(EvolveStatePackError, match="version 999 unsupported"):
         EvolveStatePackReader(p)
+
+
+# --- read_pack_index (index-only scan) -------------------------------------
+
+
+def test_read_pack_index_returns_locations(tmp_path: Path):
+    """The index-only scan locates every blob's byte range without
+    reading the blob bytes — and the ranges round-trip to the reader."""
+    entries = _entries(8)
+    p = tmp_path / "t.qsep"
+    write_evolve_pack(p, entries)
+
+    records = read_pack_index(p)
+    assert len(records) == 8
+    assert {th for th, _, _ in records} == {th for th, _ in entries}
+
+    # Every (offset, length) must point at the exact blob bytes.
+    raw = p.read_bytes()
+    by_hash = {th: blob for th, blob in entries}
+    for theta_hash, offset, length in records:
+        assert raw[offset : offset + length] == by_hash[theta_hash]
+
+
+def test_read_pack_index_empty_pack(tmp_path: Path):
+    p = EvolveStatePackWriter().write(tmp_path / "empty.qsep")
+    assert read_pack_index(p) == []
+
+
+def test_read_pack_index_rejects_truncated(tmp_path: Path):
+    p = tmp_path / "short.qsep"
+    p.write_bytes(b"\x00" * 8)
+    with pytest.raises(EvolveStatePackError, match="footer"):
+        read_pack_index(p)
+
+
+def test_read_pack_index_rejects_bad_magic(tmp_path: Path):
+    p = tmp_path / "t.qsep"
+    write_evolve_pack(p, _entries(2))
+    data = bytearray(p.read_bytes())
+    data[-32:-28] = b"\xde\xad\xbe\xef"
+    p.write_bytes(data)
+    with pytest.raises(EvolveStatePackError, match="bad magic"):
+        read_pack_index(p)

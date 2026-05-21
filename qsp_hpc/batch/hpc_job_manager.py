@@ -1032,7 +1032,7 @@ class HPCJobManager:
         self,
         keep: Optional[set] = None,
         retention_days: float = 2.0,
-        always_keep: Tuple[str, ...] = ("theta_pools", "evolve_packs"),
+        always_keep: Tuple[str, ...] = ("theta_pools", "evolve_cache"),
     ) -> dict:
         """Delete stale simulation-pool directories to free allocation quota.
 
@@ -1151,8 +1151,6 @@ class HPCJobManager:
         aux_samples_csv_remote: Optional[str] = None,
         auxiliary_units: Optional[dict] = None,
         samples_start_offset: int = 0,
-        evolve_pack_key: Optional[str] = None,
-        evolve_pack_mode: str = "emit",
         discard_trajectories: bool = False,
     ) -> JobInfo:
         """Submit C++ simulation batch to HPC cluster.
@@ -1220,13 +1218,14 @@ class HPCJobManager:
                 every species as dimensionless and most calibration-target
                 ``.to('cell/mm**2')``-style conversions silently NaN out.
             evolve_cache: When True (default) and ``healthy_state_yaml`` is
-                set, each array task reuses a post-``evolve_to_diagnosis``
-                ODE state cache at
-                ``{simulation_pool_path}/evolve_cache/`` on scratch (M13).
-                Multi-scenario sweeps over the same theta amortize the
-                ~857-day evolve across scenarios: the first task builds
-                the QSTH blob under an ``fcntl`` lock, later tasks skip
-                evolve via ``--initial-state``. No effect when
+                set, each array task reuses post-``evolve_to_diagnosis``
+                ODE states from the persistent, theta-keyed cache at
+                ``{simulation_pool_path}/evolve_cache/`` on scratch (#90).
+                A cache miss evolves once and writes the state through
+                into a per-task QSEP shard; a hit skips the ~857-day
+                burn-in via ``--initial-state``. Reuse spans scenarios
+                and runs — any later array over the same theta pool and
+                binary hits these shards. No effect when
                 ``healthy_state_yaml`` is None (no evolve phase to cache).
             retry_missing_chunks: Max rounds of laptop-side sparse retry
                 (#29). 0 (default) fires array → derive and tolerates a
@@ -1367,26 +1366,18 @@ class HPCJobManager:
                 healthy_state_yaml, "healthy_state.yaml", simulation_pool_id
             )
 
-        # Evolve-cache root lives on scratch alongside the per-scenario
-        # sim pools so every scenario job hitting the same theta shares
-        # one cached QSTH blob. Silently inert without healthy_state_yaml
+        # Evolve-cache root lives on scratch, *outside* any per-scenario
+        # pool dir, so every array — whatever scenario, whatever run —
+        # over the same (theta, binary, healthy_state) shares one
+        # persistent, theta-keyed namespace of post-evolve states (#90).
+        # The worker derives the namespace subdir from the binary +
+        # healthy_state; a miss evolves once and writes through an
+        # append-only QSEP shard, a hit skips the burn-in. NFS-safe: no
+        # shared writable store. Silently inert without healthy_state_yaml
         # (no evolve phase to cache).
         evolve_cache_root: Optional[str] = None
         if evolve_cache and remote_healthy:
             evolve_cache_root = f"{self.config.simulation_pool_path}/evolve_cache"
-
-        # Per-task evolve-pack dir (#86) — the NFS-safe successor to the
-        # LMDB evolve cache. When ``evolve_pack_key`` is given (the joint
-        # runner's shared-theta hash) and there is an evolve phase, this
-        # array writes/reads ``{pool_path}/evolve_packs/{key}/chunk_NNN.qsep``
-        # per ``evolve_pack_mode`` ("emit" for scenario 1, "consume" for
-        # 2..N). Scenario-independent path: the evolve state depends on
-        # theta + healthy_state + binary, not the scenario. Supersedes the
-        # LMDB cache — the two are alternatives, never both.
-        evolve_pack_dir: Optional[str] = None
-        if evolve_pack_key and remote_healthy:
-            evolve_pack_dir = f"{self.config.simulation_pool_path}/evolve_packs/{evolve_pack_key}"
-            evolve_cache_root = None
 
         # Per-submission batch subdir name — fixed at submit time so every
         # array task (and every retry) writes into the same
@@ -1442,8 +1433,6 @@ class HPCJobManager:
             drug_metadata_yaml=remote_drug_meta,
             healthy_state_yaml=remote_healthy,
             evolve_cache_root=evolve_cache_root,
-            evolve_pack_dir=evolve_pack_dir,
-            evolve_pack_mode=evolve_pack_mode,
             discard_trajectories=discard_trajectories,
             batch_subdir=batch_subdir,
             samples_csv_remote=samples_csv_remote,
@@ -1626,8 +1615,6 @@ class HPCJobManager:
         drug_metadata_yaml: Optional[str] = None,
         healthy_state_yaml: Optional[str] = None,
         evolve_cache_root: Optional[str] = None,
-        evolve_pack_dir: Optional[str] = None,
-        evolve_pack_mode: str = "emit",
         discard_trajectories: bool = False,
         batch_subdir: Optional[str] = None,
         samples_csv_remote: Optional[str] = None,
@@ -1676,14 +1663,10 @@ class HPCJobManager:
             "scenario_yaml": scenario_yaml,
             "drug_metadata_yaml": drug_metadata_yaml,
             "healthy_state_yaml": healthy_state_yaml,
-            # Absolute remote path; None disables the M13 evolve-cache.
+            # Root of the persistent, theta-keyed evolve cache (#90); the
+            # worker opens the (binary, healthy_state) namespace under it.
+            # None disables.
             "evolve_cache_root": evolve_cache_root,
-            # Per-task evolve-pack dir + mode (#86). When evolve_pack_dir is
-            # set the worker emits ("emit") or consumes ("consume") one
-            # QSEP pack per array task at {evolve_pack_dir}/chunk_NNN.qsep.
-            # None disables. Mutually exclusive with evolve_cache_root.
-            "evolve_pack_dir": evolve_pack_dir,
-            "evolve_pack_mode": evolve_pack_mode,
             # When True, each task unlinks its raw trajectory chunk parquet
             # after a successful inline-derive — only test stats are kept.
             "discard_trajectories": discard_trajectories,

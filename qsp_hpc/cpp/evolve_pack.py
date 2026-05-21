@@ -1,24 +1,24 @@
-"""Per-task evolve-state pack: a flat, NFS-safe shard of QSTH blobs.
+"""QSEP pack: a flat, NFS-safe set of QSTH blobs with a theta_hash index.
 
 Why this exists
 ---------------
-``evolve_to_diagnosis`` is ~97-100% of every QSP sim's wall-clock and is
-identical across scenarios for a given theta. :class:`CppEvolveCache`
-amortizes it via an LMDB env — but LMDB needs coherent ``mmap`` + POSIX
-``fcntl`` locks, which NFS does not provide. Under SLURM fan-out the
-first scenario's array is all cache-misses → thousands of concurrent
-LMDB write transactions over NFS → deadlock. See qsp-hpc-tools#86.
+``evolve_to_diagnosis`` is ~84-100% of every QSP sim's wall-clock and is
+identical across scenarios for a given theta. Reusing it means never
+sharing a *writable* store across SLURM tasks: a shared mutable store
+(the LMDB env qsp-hpc-tools#86 replaced) needs coherent ``mmap`` + POSIX
+``fcntl`` locks, which NFS does not provide, and deadlocks under fan-out.
 
-The fix is to never share a *writable* store across tasks. Each array
-task that evolves a chunk of thetas writes its OWN pack file — one file
-per task, no shared writes, no contention (the same pattern the sim pool
-already uses for ``batch_*/chunk_NNN.parquet``). Later scenario arrays
-read those packs ``readonly`` — pure ``mmap`` reads of static files,
-which NFS handles fine.
+The QSEP pack is the NFS-safe primitive: an append-only file holding a
+set of QSTH blobs framed by a ``theta_hash -> blob`` index. A writer
+emits one pack atomically (the same pattern the sim pool uses for
+``batch_NNN/chunk_NNN.parquet``); readers ``mmap`` static files. The
+persistent, namespaced :class:`~qsp_hpc.cpp.evolve_cache.EvolveCache`
+layers a multi-shard ``theta_hash`` index over a directory of these
+packs.
 
-This module is the pack format: a writer (task-side emission) and a
-reader (scenario-side consumption). It has no LMDB / SLURM / binary
-dependency — just bytes — so it is unit-testable in isolation.
+This module is just the pack format — a writer, a reader, and an
+index-only scan (:func:`read_pack_index`). It has no SLURM / binary
+dependency, just bytes, so it is unit-testable in isolation.
 
 File format ("QSEP")
 --------------------
@@ -41,9 +41,9 @@ File format ("QSEP")
         uint64    index_length
 
 The QSTH blobs are self-describing (128-byte header + opaque payload —
-see :mod:`qsp_hpc.cpp.evolve_cache`); the pack just frames a set of them
-with an O(1) ``theta_hash -> blob`` index. Footer-trailed so the writer
-streams blobs first and finalises the index in one pass.
+see :mod:`qsp_hpc.cpp.qsth`); the pack just frames a set of them with an
+O(1) ``theta_hash -> blob`` index. Footer-trailed so the writer streams
+blobs first and finalises the index in one pass.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ import struct
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
-from qsp_hpc.cpp.evolve_cache import QsthHeader, QsthHeaderError, wire_hash
+from qsp_hpc.cpp.qsth import QsthHeader, QsthHeaderError, wire_hash
 
 logger = logging.getLogger(__name__)
 
@@ -301,3 +301,62 @@ class EvolveStatePackReader:
     def items(self) -> Iterator[Tuple[str, bytes]]:
         """Iterate ``(theta_hash, blob)`` over every layered entry."""
         return iter(self._blobs.items())
+
+
+# ---- index-only scan (cache-side) --------------------------------------
+
+
+def read_pack_index(path: str | Path) -> List[Tuple[str, int, int]]:
+    """Read a QSEP pack's footer + index *without* loading any blob bytes.
+
+    Returns ``[(theta_hash, blob_offset, blob_length), ...]`` in index
+    order. This is the cheap scan
+    :class:`~qsp_hpc.cpp.evolve_cache.EvolveCache` runs over many shards
+    to build a ``theta_hash -> location`` map: only the fixed 32-byte
+    footer and the ``n_entries x 80``-byte index are read, never the
+    (multi-KB) blob payloads.
+
+    Raises :class:`EvolveStatePackError` on a missing / truncated footer,
+    bad magic, unsupported version, or an index that overruns the file.
+    """
+    path = Path(path)
+    size = path.stat().st_size
+    if size < _FOOTER.size:
+        raise EvolveStatePackError(f"{path}: {size} bytes < {_FOOTER.size}-byte footer")
+    with open(path, "rb") as f:
+        f.seek(size - _FOOTER.size)
+        magic, version, n_entries, index_offset, index_length = _FOOTER.unpack(f.read(_FOOTER.size))
+        if magic != _PACK_MAGIC:
+            raise EvolveStatePackError(
+                f"{path}: bad magic 0x{magic:08x} != 0x{_PACK_MAGIC:08x} "
+                f"(not a QSEP evolve-state pack?)"
+            )
+        if version != _PACK_VERSION:
+            raise EvolveStatePackError(
+                f"{path}: QSEP version {version} unsupported (this code handles {_PACK_VERSION})"
+            )
+        if index_length != n_entries * _INDEX_REC.size:
+            raise EvolveStatePackError(
+                f"{path}: index_length {index_length} != n_entries {n_entries} "
+                f"x {_INDEX_REC.size}"
+            )
+        index_end = index_offset + index_length
+        if index_end > size - _FOOTER.size:
+            raise EvolveStatePackError(
+                f"{path}: index [{index_offset}:{index_end}] overruns file ({size} bytes)"
+            )
+        f.seek(index_offset)
+        index_data = f.read(index_length)
+    out: List[Tuple[str, int, int]] = []
+    for i in range(n_entries):
+        rec = index_data[i * _INDEX_REC.size : (i + 1) * _INDEX_REC.size]
+        hash_bytes, blob_offset, blob_length = _INDEX_REC.unpack(rec)
+        theta_hash = hash_bytes.decode("ascii", errors="strict")
+        if blob_offset + blob_length > index_offset:
+            raise EvolveStatePackError(
+                f"{path}: blob for {theta_hash[:16]} "
+                f"[{blob_offset}:{blob_offset + blob_length}] overruns the blob "
+                f"section (ends at {index_offset})"
+            )
+        out.append((theta_hash, blob_offset, blob_length))
+    return out

@@ -1,358 +1,463 @@
-"""Cache for ``evolve_to_diagnosis`` ODE states keyed on theta.
+"""Persistent, theta-keyed, NFS-safe cache of post-evolve ODE states.
 
-For multi-scenario sweeps (e.g. baseline + treatment arms sharing the
-same parameter set), the ~857-day healthy-state integration is ~95% of
-per-sim work and is identical across scenarios for a given theta. This
-module reuses it: run it once per theta, serialize the post-evolve ODE
-state, and let subsequent scenario runs load the state via qsp_sim's
-``--initial-state`` flag.
+``evolve_to_diagnosis`` (the ~857-day healthy-state burn-in) is
+~84-100% of every QSP sim's wall-clock and is identical across scenarios
+for a given theta — it depends only on ``theta + healthy_state +
+qsp_sim binary``, never on the scenario. This module caches it so:
 
-Cache layout
-------------
-::
+- a second scenario over the same theta pool skips the evolve entirely,
+- a re-run of the same sweep skips it,
+- within one task the evolve is computed once and reused.
 
-    <cache_root>/
-      <healthy_state_hash[:8]>_<binary_hash[:8]>/
-        data.mdb     # LMDB env; key=theta_hash[:16] -> QSTH blob bytes
-        lock.mdb     # LMDB writer/reader lock
+Design
+------
+The cache is a directory of **append-only QSEP shards**. Each writer
+(one SLURM array task, or one local batch) flushes its own
+``shard_<uuid>.qsep`` — shards are never mutated, so there is no shared
+writable store and no cross-task locking. That is the NFS-safe property:
+the LMDB env this module used to be (qsp-hpc-tools#86) needed coherent
+``mmap`` + POSIX ``fcntl`` locks, which NFS does not provide, and
+deadlocked under SLURM fan-out. Do not regress to a shared mutable store.
 
-One LMDB env per (healthy_state, qsp_sim) pair. ~50k blobs occupy two
-files instead of 50k inodes — load-bearing on group-quota HPC
-filesystems. LMDB's mmap + COW commit semantics give lock-free readers
-and a single writer transaction at a time, so the per-theta fcntl dance
-is gone.
+A reader builds a ``theta_hash -> (shard, offset, length)`` index by
+scanning shard footers (cheap — :func:`~qsp_hpc.cpp.evolve_pack.read_pack_index`
+reads only the footer + index, never the blob bytes) and serves
+:meth:`EvolveCache.get` with one targeted read. :meth:`EvolveCache.compact`
+folds the scan into ``manifest.json`` so later readers skip already-seen
+shards.
 
-Segmentation by ``<healthy_state_hash[:8]>_<binary_hash[:8]>`` makes
-invalidation automatic: edit ``healthy_state.yaml`` or rebuild
-``qsp_sim`` and new theta requests land in a fresh sub-directory.
-Old sub-directories are safe to prune but aren't removed automatically.
+Write-through, first-writer-wins: any task that evolves a theta on a
+cache miss writes the state into its shard. There is no designated
+emitter and no emit/consume ordering. A theta evolved twice by two
+overlapping batches lands in two shards; the reader dedups by
+``theta_hash``. The evolve is deterministic in the namespace inputs, so
+duplicate blobs are byte-identical and which one a reader picks is
+immaterial.
 
-The blob header stores the full ``theta_hash`` (SHA-256 of the rendered
-param-XML bytes — the same bytes ``qsp_sim`` parses). On load, ``qsp_sim
---params-hash`` verifies the stored hash matches the current theta and
-refuses the load on mismatch.
+Layout::
+
+    <root>/
+      <namespace>/
+        shard_<uuid>.qsep      append-only QSEP shards
+        manifest.json          theta_hash -> [shard, offset, length]  (optional, rebuildable)
+
+Namespace
+---------
+``namespace`` folds in everything ``evolve_to_diagnosis`` consumes
+*other than theta* — the qsp_sim binary bytes and the healthy-state YAML.
+A binary rebuild or a healthy-state edit lands new requests in a fresh
+namespace, so stale states are ignored rather than silently reused.
+``theta`` is the per-entry key (``theta_hash`` = SHA-256 of the rendered
+param-XML); namespace + theta_hash together are the full cache key.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
-import struct
+import os
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
-import lmdb
+from qsp_hpc.cpp.evolve_pack import (
+    EvolveStatePackError,
+    EvolveStatePackWriter,
+    read_pack_index,
+)
+from qsp_hpc.cpp.qsth import (
+    QsthHeader,
+    QsthHeaderError,
+    sha256_of_file,
+    theta_hash_for_xml,
+    wire_hash,
+)
 
-from qsp_hpc.cpp.param_xml import ParamXMLRenderer
-from qsp_hpc.cpp.runner import CppRunner
+# Re-exported for back-compat: callers and tests that imported the QSTH
+# header / hash helpers from this module before they moved to
+# ``qsp_hpc.cpp.qsth``. New code should import them from ``qsth`` directly.
+__all__ = [
+    "EvolveCache",
+    "EvolveCacheWriter",
+    "compute_namespace",
+    "QsthHeader",
+    "QsthHeaderError",
+    "theta_hash_for_xml",
+    "wire_hash",
+    "sha256_of_file",
+]
 
 logger = logging.getLogger(__name__)
 
-
-# ---- QSTH blob header (mirrors write_qsth_header in qsp_sim.cpp) --------
-#
-# Fixed 128-byte little-endian header, followed by the CVODEBase full-state
-# payload (state vectors + delay-event queue + trigger flags). Python reads
-# only the header — the payload is opaque and consumed by qsp_sim.
-#
-#   uint32   magic          = 0x53545148  ('QSTH' little-endian)
-#   uint32   version        = 1
-#   uint64   n_species_var
-#   float64  t_diagnosis_days
-#   float64  vt_diameter_cm
-#   char[32] params_hash_hex (null-padded ASCII)
-#   char[64] reserved       (zero-filled)
-
-_QSTH_MAGIC = 0x53545148
-_QSTH_VERSION = 1
-_QSTH_HEADER_SIZE = 128
-_QSTH_HASH_LEN = 32  # Max length of the params_hash field in the header.
-_QSTH_FIELD_STRUCT = struct.Struct(f"<IIQdd{_QSTH_HASH_LEN}s")
-assert _QSTH_FIELD_STRUCT.size <= _QSTH_HEADER_SIZE
+_SHARD_GLOB = "shard_*.qsep"
+_MANIFEST_NAME = "manifest.json"
+_MANIFEST_SCHEMA = "evolve-cache-manifest-v1"
+_NAMESPACE_LEN = 16  # hex chars of the namespace digest kept as the subdir name
 
 
-# The cache key (SHA-256 hex) is 64 chars; the QSTH params_hash field holds
-# at most 32. Everything that crosses the Python↔qsp_sim boundary (stored
-# in the blob, passed to --params-hash, compared against a header value)
-# uses this truncated form. 32 hex = 128 bits — plenty of collision space
-# even at 10^9 thetas. Full 64-char hash is kept as the filename stem
-# (16-char truncation) and for diagnostic logging.
-def wire_hash(full_hash: str) -> str:
-    """Truncate a full SHA-256 hex to the QSTH header's 32-char field."""
-    if len(full_hash) < _QSTH_HASH_LEN:
-        raise ValueError(f"hash too short: need >={_QSTH_HASH_LEN} chars, got {len(full_hash)}")
-    return full_hash[:_QSTH_HASH_LEN]
+def compute_namespace(
+    binary_path: str | Path,
+    healthy_state_yaml: str | Path,
+    *,
+    extra: bytes | None = None,
+) -> str:
+    """Return the cache namespace for an evolve configuration.
 
+    Folds the qsp_sim binary bytes and the healthy-state YAML bytes into
+    one short hex digest. Any change to either (a rebuild, a healthy-state
+    edit) yields a fresh namespace, so stale evolve states are ignored
+    rather than silently reused.
 
-class QsthHeaderError(RuntimeError):
-    """QSTH blob header is missing, truncated, or malformed."""
-
-
-@dataclass
-class QsthHeader:
-    version: int
-    n_species_var: int
-    t_diagnosis_days: float
-    vt_diameter_cm: float
-    params_hash: str  # hex string, as written by qsp_sim's --params-hash
-
-    @classmethod
-    def parse_bytes(cls, raw: bytes, *, source: str = "<bytes>") -> "QsthHeader":
-        if len(raw) < _QSTH_HEADER_SIZE:
-            raise QsthHeaderError(
-                f"QSTH blob {source} truncated: {len(raw)} bytes "
-                f"< {_QSTH_HEADER_SIZE}-byte header"
-            )
-        magic, version, n_sp, t_diag, vt_diam, hash_bytes = _QSTH_FIELD_STRUCT.unpack_from(raw, 0)
-        if magic != _QSTH_MAGIC:
-            raise QsthHeaderError(
-                f"{source} bad magic: 0x{magic:08x} != 0x{_QSTH_MAGIC:08x} "
-                f"(not a QSTH evolve-state blob?)"
-            )
-        if version != _QSTH_VERSION:
-            raise QsthHeaderError(
-                f"{source} QSTH version {version} unsupported "
-                f"(this code handles {_QSTH_VERSION})"
-            )
-        # Header stores hash null-padded; rebuild to a plain hex string.
-        hash_str = hash_bytes.rstrip(b"\x00").decode("ascii", errors="strict")
-        return cls(
-            version=version,
-            n_species_var=int(n_sp),
-            t_diagnosis_days=float(t_diag),
-            vt_diameter_cm=float(vt_diam),
-            params_hash=hash_str,
-        )
-
-    @classmethod
-    def parse(cls, path: Path) -> "QsthHeader":
-        try:
-            raw = path.read_bytes()
-        except OSError as e:
-            raise QsthHeaderError(f"cannot read QSTH blob {path}: {e}") from e
-        return cls.parse_bytes(raw, source=str(path))
-
-
-# ---- Hashing helpers ----------------------------------------------------
-
-
-def theta_hash_for_xml(xml_bytes: bytes) -> str:
-    """SHA-256 of the rendered param-XML bytes (hex, 64 chars).
-
-    Same input bytes qsp_sim parses, so a match implies parameter-level
-    identity. Stored in the QSTH header under ``params_hash``.
+    ``extra`` is an optional escape hatch for additional evolve-config
+    bytes (e.g. a diagnosis-target override not carried by the YAML);
+    unused today but keeps the key extensible without a layout migration.
     """
-    return hashlib.sha256(xml_bytes).hexdigest()
-
-
-def _sha256_of_file(path: Path, *, truncate: int | None = None) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    digest = h.hexdigest()
-    return digest[:truncate] if truncate else digest
+    h.update(b"evolve-cache-ns-v1\0")
+    h.update(sha256_of_file(Path(binary_path)).encode("ascii"))
+    h.update(b"\0")
+    h.update(sha256_of_file(Path(healthy_state_yaml)).encode("ascii"))
+    if extra is not None:
+        h.update(b"\0")
+        h.update(extra)
+    return h.hexdigest()[:_NAMESPACE_LEN]
 
 
-# ---- Cache --------------------------------------------------------------
+@dataclass(frozen=True)
+class _Loc:
+    """Where one theta's blob lives: shard filename + byte range."""
+
+    shard: str
+    offset: int
+    length: int
 
 
-# LMDB map_size: virtual address-space cap for the env's mmap. Disk grows
-# lazily, so this is a ceiling rather than an allocation. Sized for the
-# realistic worst case (millions of QSTH blobs at a few KB each) with
-# generous headroom; mostly-cheap on 64-bit hosts.
-_LMDB_MAP_SIZE = 16 * 1024 * 1024 * 1024  # 16 GiB
+class EvolveCacheWriter:
+    """Accumulates ``(theta_hash, blob)`` pairs and flushes one cache shard.
 
-
-class CppEvolveCache:
-    """Per-theta post-evolve ODE state, shared across scenarios.
-
-    Backed by one LMDB env per (healthy_state, qsp_sim_binary) pair, keyed
-    by ``theta_hash[:16]`` with QSTH blob bytes as the value. Across
-    processes, LMDB serializes write transactions internally — the prior
-    per-theta fcntl lockfile dance is unnecessary. Readers are lock-free
-    via the mmap'd snapshot.
-
-    The class is not thread-safe within a process (the underlying
-    ``CppRunner`` isn't), but is safe across processes hitting the same
-    on-disk env.
+    One writer per SLURM array task / local batch. The task evolves the
+    thetas it missed in the cache, :meth:`add`\\ s each QSTH blob, and
+    :meth:`flush` writes a single append-only ``shard_<uuid>.qsep`` into
+    the namespace directory. Shards are never mutated and each carries a
+    unique name, so concurrent writers never collide.
     """
 
-    def __init__(
-        self,
-        cache_root: str | Path,
-        renderer: ParamXMLRenderer,
-        runner: CppRunner,
-    ):
-        """
-        Args:
-            cache_root: Base directory for cached blobs. One LMDB env
-                sub-directory per (healthy_state_yaml, qsp_sim_binary)
-                pair lives inside it. Usually somewhere persistent like
-                ``cache/cpp_simulations/evolve_cache/`` locally or the
-                HPC scratch pool path.
-            renderer: Must match the renderer used for the actual sims —
-                the cache key is SHA-256 of the bytes this renderer
-                produces, so a template change invalidates all entries
-                implicitly (the bytes change → the hash changes).
-            runner: Must have ``healthy_state_yaml`` set. Invoked with
-                ``--dump-state`` to build missing blobs.
-        """
-        if runner.healthy_state_yaml is None:
-            raise ValueError(
-                "CppEvolveCache requires runner.healthy_state_yaml "
-                "(there's nothing to cache without evolve-to-diagnosis)"
-            )
-        self.cache_root = Path(cache_root).resolve()
-        self.renderer = renderer
-        self.runner = runner
+    def __init__(self, namespace_dir: str | Path) -> None:
+        self.namespace_dir = Path(namespace_dir)
+        self._pack = EvolveStatePackWriter()
+        self._flushed: Path | None = None
 
-        # Segment by healthy-state YAML + qsp_sim binary so edits to
-        # either auto-invalidate without touching existing blobs.
-        hs_hash = _sha256_of_file(runner.healthy_state_yaml, truncate=8)
-        bin_hash = _sha256_of_file(runner.binary_path, truncate=8)
-        self._subdir_name = f"{hs_hash}_{bin_hash}"
-        self._cache_dir = self.cache_root / self._subdir_name
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+    def add(self, theta_hash: str, blob: bytes, *, validate: bool = True) -> None:
+        """Stage one evolve-state blob under ``theta_hash`` (see
+        :meth:`EvolveStatePackWriter.add`)."""
+        self._pack.add(theta_hash, blob, validate=validate)
 
-        self._env = lmdb.open(
-            str(self._cache_dir),
-            map_size=_LMDB_MAP_SIZE,
-            subdir=True,
-            max_readers=512,
-            readahead=False,  # large random-access blobs; readahead just thrashes
-            meminit=False,
+    def __len__(self) -> int:
+        return len(self._pack)
+
+    def __contains__(self, theta_hash: str) -> bool:
+        return theta_hash in self._pack
+
+    @property
+    def flushed_path(self) -> Path | None:
+        """The shard written by :meth:`flush`, or None if not yet flushed."""
+        return self._flushed
+
+    def flush(self) -> Path | None:
+        """Write the staged blobs as one shard; return its path.
+
+        Returns None when nothing was staged (no misses → no shard).
+        The underlying :meth:`EvolveStatePackWriter.write` is atomic
+        (temp file + ``os.replace``), so a concurrent reader never sees a
+        partial shard.
+        """
+        if len(self._pack) == 0:
+            return None
+        self.namespace_dir.mkdir(parents=True, exist_ok=True)
+        shard = self.namespace_dir / f"shard_{uuid.uuid4().hex}.qsep"
+        self._flushed = self._pack.write(shard)
+        logger.info(
+            "evolve cache: wrote shard %s (%d theta state(s))",
+            shard.name,
+            len(self._pack),
         )
+        return self._flushed
 
+    def __enter__(self) -> "EvolveCacheWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        # Flush only on a clean exit — a raising task should not publish a
+        # shard mid-failure. Callers that want the partial evolve work
+        # preserved regardless call flush() explicitly.
+        if exc_type is None:
+            self.flush()
+        return False
+
+
+class EvolveCache:
+    """Persistent, theta-keyed view over one namespace of QSEP shards.
+
+    Construct via :meth:`for_run` (which derives the namespace from the
+    binary + healthy-state) or directly with an explicit namespace.
+    :meth:`load` builds the ``theta_hash -> location`` index;
+    :meth:`get` / :meth:`materialize` serve cached blobs; :meth:`writer`
+    opens a shard writer for write-through; :meth:`compact` refreshes the
+    manifest.
+
+    Read access is lock-free (static files). The class is not thread-safe
+    within a process, but is safe across processes / SLURM tasks hitting
+    the same on-disk namespace.
+    """
+
+    def __init__(self, root: str | Path, namespace: str) -> None:
+        self.root = Path(root).resolve()
+        self.namespace = namespace
+        self.namespace_dir = self.root / namespace
+        self._index: dict[str, _Loc] = {}
+        self._loaded = False
         self._stats_hits = 0
         self._stats_misses = 0
 
-    @property
-    def cache_dir(self) -> Path:
-        """LMDB env directory holding blobs for the current
-        (healthy_state, qsp_sim) pair."""
-        return self._cache_dir
+    @classmethod
+    def for_run(
+        cls,
+        root: str | Path,
+        *,
+        binary_path: str | Path,
+        healthy_state_yaml: str | Path,
+        extra: bytes | None = None,
+    ) -> "EvolveCache":
+        """Open the cache namespace for a (binary, healthy_state) pair."""
+        ns = compute_namespace(binary_path, healthy_state_yaml, extra=extra)
+        return cls(root, ns)
 
-    @property
-    def stats(self) -> dict[str, int]:
-        return {"hits": self._stats_hits, "misses": self._stats_misses}
+    # ---- read side ------------------------------------------------------
 
-    def close(self) -> None:
-        env = getattr(self, "_env", None)
-        if env is not None:
-            env.close()
-            self._env = None
+    def load(self) -> "EvolveCache":
+        """Build the ``theta_hash -> location`` index. Idempotent.
 
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
+        Reads ``manifest.json`` if present, then scans every shard the
+        manifest does not already cover. The manifest bounds the scan to
+        recently-added shards; with no manifest, every shard is scanned
+        (footer + index only — never the blob bytes).
+        """
+        if self._loaded:
+            return self
+        t0 = time.time()
+        self._index = {}
+        covered_shards: set[str] = set()
+        n_from_manifest = 0
+        manifest_path = self.namespace_dir / _MANIFEST_NAME
+        if manifest_path.exists():
+            entries, covered_shards = self._read_manifest(manifest_path)
+            self._index.update(entries)
+            n_from_manifest = len(entries)
 
-    def __enter__(self):
+        n_shards_scanned = 0
+        if self.namespace_dir.is_dir():
+            for shard in sorted(self.namespace_dir.glob(_SHARD_GLOB)):
+                if shard.name in covered_shards:
+                    continue
+                try:
+                    records = read_pack_index(shard)
+                except (EvolveStatePackError, OSError) as e:
+                    # A half-written shard (crashed task) or a foreign
+                    # file — skip it, never let it abort the load.
+                    logger.warning("evolve cache: skipping unreadable shard %s: %s", shard.name, e)
+                    continue
+                for theta_hash, offset, length in records:
+                    # First-writer-wins on a duplicate theta. The blob is
+                    # deterministic in the namespace inputs, so the choice
+                    # is immaterial — setdefault just keeps it stable.
+                    self._index.setdefault(theta_hash, _Loc(shard.name, offset, length))
+                n_shards_scanned += 1
+
+        self._loaded = True
+        logger.info(
+            "evolve cache loaded: namespace=%s — %d theta state(s) "
+            "(%d from manifest, %d shard(s) scanned) in %.2fs",
+            self.namespace,
+            len(self._index),
+            n_from_manifest,
+            n_shards_scanned,
+            time.time() - t0,
+        )
         return self
 
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
-
-    def theta_hash(self, params: Mapping[str, float]) -> tuple[str, bytes]:
-        """Render params and return ``(theta_hash_hex, xml_bytes)``."""
-        xml = self.renderer.render(params)
-        return theta_hash_for_xml(xml), xml
-
     @staticmethod
-    def _key_for_hash(theta_hash: str) -> bytes:
-        if len(theta_hash) < 16:
-            raise ValueError("theta_hash must be at least 16 hex chars")
-        return theta_hash[:16].encode("ascii")
+    def _read_manifest(path: Path) -> tuple[dict[str, _Loc], set[str]]:
+        """Parse ``manifest.json`` → (entries, covered shard names).
 
-    def _materialize(self, blob: bytes, theta_hash: str, workdir: Path) -> Path:
-        """Write blob bytes to a per-theta tmp file under workdir and
-        return the path. qsp_sim's ``--initial-state`` consumes a path,
-        so each get/build call needs an on-disk copy. The caller may
-        unlink the path once qsp_sim has finished with it."""
+        A missing / corrupt / wrong-schema manifest is treated as absent
+        (returns empties) — the caller then falls back to a full scan.
+        """
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("evolve cache: ignoring unreadable manifest %s: %s", path, e)
+            return {}, set()
+        if not isinstance(data, dict) or data.get("schema") != _MANIFEST_SCHEMA:
+            logger.warning(
+                "evolve cache: ignoring manifest %s — unexpected schema %r",
+                path,
+                data.get("schema") if isinstance(data, dict) else type(data).__name__,
+            )
+            return {}, set()
+        entries: dict[str, _Loc] = {}
+        for theta_hash, loc in data.get("entries", {}).items():
+            try:
+                shard, offset, length = loc
+                entries[theta_hash] = _Loc(str(shard), int(offset), int(length))
+            except (TypeError, ValueError):
+                logger.warning("evolve cache: skipping malformed manifest entry for %s", theta_hash)
+        covered = {str(s) for s in data.get("shards", [])}
+        return entries, covered
+
+    def get(self, theta_hash: str) -> bytes | None:
+        """Return the QSTH blob for ``theta_hash``, or None on a miss.
+
+        A blob whose header is malformed, or whose stored ``params_hash``
+        disagrees with ``theta_hash``, is treated as a miss (logged) —
+        the caller re-evolves rather than feeding qsp_sim a wrong state.
+        """
+        if not self._loaded:
+            self.load()
+        loc = self._index.get(theta_hash)
+        if loc is None:
+            self._stats_misses += 1
+            return None
+        shard_path = self.namespace_dir / loc.shard
+        try:
+            with open(shard_path, "rb") as f:
+                f.seek(loc.offset)
+                blob = f.read(loc.length)
+        except OSError as e:
+            logger.warning(
+                "evolve cache: cannot read blob for %s from %s: %s",
+                theta_hash[:16],
+                loc.shard,
+                e,
+            )
+            self._stats_misses += 1
+            return None
+        if len(blob) != loc.length:
+            logger.warning(
+                "evolve cache: short read for %s (%d/%d bytes from %s)",
+                theta_hash[:16],
+                len(blob),
+                loc.length,
+                loc.shard,
+            )
+            self._stats_misses += 1
+            return None
+        try:
+            header = QsthHeader.parse_bytes(blob, source=f"<{loc.shard}:{theta_hash[:16]}>")
+        except QsthHeaderError as e:
+            logger.warning("evolve cache: bad blob header for %s: %s", theta_hash[:16], e)
+            self._stats_misses += 1
+            return None
+        if header.params_hash != wire_hash(theta_hash):
+            logger.warning(
+                "evolve cache: params_hash mismatch for %s (stored=%s) — treating as miss",
+                theta_hash[:16],
+                header.params_hash,
+            )
+            self._stats_misses += 1
+            return None
+        self._stats_hits += 1
+        return blob
+
+    def materialize(self, theta_hash: str, workdir: str | Path) -> Path | None:
+        """Write a cached blob to a file under ``workdir`` for ``qsp_sim``.
+
+        ``qsp_sim --initial-state`` consumes a path, so a hit must land
+        on disk. Returns the path, or None on a cache miss.
+        """
+        blob = self.get(theta_hash)
+        if blob is None:
+            return None
+        workdir = Path(workdir)
         workdir.mkdir(parents=True, exist_ok=True)
         out = workdir / f"{theta_hash[:16]}.evolve_state.bin"
         out.write_bytes(blob)
         return out
 
-    def get_or_build(
-        self,
-        params: Mapping[str, float],
-        workdir: str | Path,
-        *,
-        timeout_s: float | None = None,
-    ) -> tuple[Path, str]:
-        """Return ``(state_blob_path, theta_hash)``, building the blob if
-        it's missing.
+    def __contains__(self, theta_hash: str) -> bool:
+        if not self._loaded:
+            self.load()
+        return theta_hash in self._index
 
-        On hit: blob bytes are written to a tmp file under ``workdir`` and
-        that path is returned. On miss: qsp_sim's ``--dump-state`` writes
-        the blob to a tmp file under ``workdir``, the bytes are validated
-        and committed to LMDB, and the same tmp path is returned. Across
-        processes LMDB serializes the put — racing builders both write,
-        the loser overwrites with bit-identical bytes.
+    def __len__(self) -> int:
+        if not self._loaded:
+            self.load()
+        return len(self._index)
+
+    @property
+    def stats(self) -> dict[str, int]:
+        """``{"hits": N, "misses": M}`` over this instance's lifetime."""
+        return {"hits": self._stats_hits, "misses": self._stats_misses}
+
+    # ---- write side -----------------------------------------------------
+
+    def writer(self) -> EvolveCacheWriter:
+        """Open a shard writer for write-through into this namespace."""
+        return EvolveCacheWriter(self.namespace_dir)
+
+    # ---- maintenance ----------------------------------------------------
+
+    def compact(self) -> Path | None:
+        """Rebuild ``manifest.json`` from a full shard scan. Atomic.
+
+        Folds every shard's ``theta_hash -> location`` records into one
+        manifest so subsequent :meth:`load` calls skip the per-shard
+        footer scan. Written via temp file + atomic rename, so concurrent
+        compactions are safe — last writer wins and the content converges.
+
+        Returns the manifest path, or None when the namespace has no
+        shards yet. This rewrites the *manifest*; it does not physically
+        merge shard files (shard count is bounded by writers-per-run and
+        pruned per namespace, and the manifest alone bounds reader scan
+        cost).
         """
-        th, _xml_bytes = self.theta_hash(params)
-        workdir = Path(workdir)
-        key = self._key_for_hash(th)
-        expected_wire = wire_hash(th)
-
-        # Read path: lock-free txn against the mmap snapshot.
-        with self._env.begin(write=False, buffers=False) as txn:
-            blob = txn.get(key)
-        if blob is not None:
+        if not self.namespace_dir.is_dir():
+            return None
+        shards = sorted(self.namespace_dir.glob(_SHARD_GLOB))
+        if not shards:
+            return None
+        index: dict[str, list] = {}
+        for shard in shards:
             try:
-                header = QsthHeader.parse_bytes(blob, source=f"<lmdb:{key.decode()}>")
-            except QsthHeaderError:
+                records = read_pack_index(shard)
+            except (EvolveStatePackError, OSError) as e:
                 logger.warning(
-                    "evolve cache: blob for %s has bad header, will rebuild", key.decode()
+                    "evolve cache compact: skipping unreadable shard %s: %s", shard.name, e
                 )
-                blob = None
-            else:
-                # Truncated-hash mismatch is the LMDB-side authoritative
-                # check; qsp_sim's --params-hash check on load is the
-                # secondary line of defense.
-                if header.params_hash != expected_wire:
-                    logger.warning(
-                        "evolve cache: blob for %s has params_hash mismatch "
-                        "(stored=%s expected=%s), will rebuild",
-                        key.decode(),
-                        header.params_hash,
-                        expected_wire,
-                    )
-                    blob = None
-
-        if blob is not None:
-            self._stats_hits += 1
-            logger.debug("evolve cache HIT: %s", key.decode())
-            path = self._materialize(bytes(blob), th, workdir)
-            return path, th
-
-        logger.info("evolve cache MISS — building (theta_hash=%s)", th[:16])
-        workdir.mkdir(parents=True, exist_ok=True)
-        tmp_out = workdir / f"{th[:16]}.evolve_state.bin"
-        # qsp_sim stores wire_hash(theta_hash) in the blob header; use the
-        # same truncated form when calling --params-hash so load-side
-        # comparisons succeed against the full theta_hash truncated the
-        # same way.
-        self.runner.dump_evolve_state(
-            params=params,
-            params_hash=expected_wire,
-            state_out=tmp_out,
-            workdir=workdir,
-            timeout_s=timeout_s,
+                continue
+            for theta_hash, offset, length in records:
+                index.setdefault(theta_hash, [shard.name, offset, length])
+        payload = {
+            "schema": _MANIFEST_SCHEMA,
+            "shards": [s.name for s in shards],
+            "entries": index,
+        }
+        manifest_path = self.namespace_dir / _MANIFEST_NAME
+        # Unique temp name so concurrent compactions don't fight over one
+        # ``.tmp`` (a shared name lets writer A rename its tmp away before
+        # writer B renames its own — FileNotFoundError on B).
+        tmp = manifest_path.with_name(f"{_MANIFEST_NAME}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+        try:
+            tmp.write_text(json.dumps(payload))
+            tmp.replace(manifest_path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        logger.info(
+            "evolve cache compacted: %s (%d theta state(s), %d shard(s))",
+            manifest_path,
+            len(index),
+            len(shards),
         )
-        new_blob = tmp_out.read_bytes()
-        # Sanity-check the bytes qsp_sim just produced before committing.
-        header = QsthHeader.parse_bytes(new_blob, source=str(tmp_out))
-        if header.params_hash != expected_wire:
-            raise QsthHeaderError(
-                f"qsp_sim --dump-state wrote params_hash={header.params_hash} "
-                f"but expected {expected_wire}"
-            )
-        with self._env.begin(write=True) as txn:
-            txn.put(key, new_blob, overwrite=True)
-        self._stats_misses += 1
-        return tmp_out, th
+        return manifest_path

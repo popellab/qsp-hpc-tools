@@ -1579,7 +1579,7 @@ class TestPruneSimulationPools:
                 f"{old}\tmsv5_old_bbbb_clinical",
                 f"{recent}\tmsv5_new_cccc_baseline",
                 f"{old}\ttheta_pools",
-                f"{old}\tevolve_packs",
+                f"{old}\tevolve_cache",
                 f"{old}\tmsv5_keepme_dddd_baseline",
             ]
         )
@@ -1589,7 +1589,7 @@ class TestPruneSimulationPools:
         for kept in (
             "msv5_new_cccc_baseline",
             "theta_pools",
-            "evolve_packs",
+            "evolve_cache",
             "msv5_keepme_dddd_baseline",
         ):
             assert kept in result["kept"]
@@ -1597,7 +1597,7 @@ class TestPruneSimulationPools:
         # rm command names exactly the two stale pools, nothing else.
         rm_cmd = calls[1]
         assert "msv5_old_aaaa_baseline" in rm_cmd and "msv5_old_bbbb_clinical" in rm_cmd
-        for spared in ("new_cccc", "theta_pools", "evolve_packs", "keepme"):
+        for spared in ("new_cccc", "theta_pools", "evolve_cache", "keepme"):
             assert spared not in rm_cmd
 
     def test_nothing_to_prune_issues_no_rm(self, mock_hpc_config):

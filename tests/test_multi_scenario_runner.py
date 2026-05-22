@@ -10,11 +10,16 @@ in the integration smoke (``workflows/sbi_runner``).
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import textwrap
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
+from qsp_hpc.cpp.batch_runner import BatchResult, CppBatchRunner, FusedScenarioSpec
 from qsp_hpc.simulation.multi_scenario_runner import (
     MultiScenarioRunner,
     ScenarioResult,
@@ -472,3 +477,337 @@ class TestJointNanMask:
         masks = MultiScenarioRunner.joint_nan_mask({"a": a, "b": b})
         np.testing.assert_array_equal(masks["a"], [True, False])
         np.testing.assert_array_equal(masks["b"], [True, False])
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: fused local posterior-predictive (simulate_with_parameters_all)
+# ---------------------------------------------------------------------------
+
+_PPC_TEMPLATE = b"""<Param>
+  <QSP>
+    <A>1.0</A>
+    <B>2.0</B>
+  </QSP>
+</Param>
+"""
+
+_PPC_PRIORS = """\
+name,distribution,dist_param1,dist_param2
+A,lognormal,0.0,0.5
+B,lognormal,0.5,0.3
+"""
+
+
+def _make_fused_binary(tmp_path: Path) -> tuple[Path, Path]:
+    """Fake qsp_sim with fused support.
+
+    ``--dump-state`` writes an opaque evolve-state blob and appends one
+    line to a counter file — so a test can assert how many evolves ran.
+    A scenario run writes a 2-species v3 trajectory (spA / spB). Returns
+    ``(binary, counter_file)``; the counter path is baked into the script
+    so it works regardless of subprocess env handling.
+    """
+    counter = tmp_path / "evolve_calls.log"
+    script = tmp_path / "fake_fused_qsp_sim.sh"
+    script.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        set -e
+        DUMP_STATE=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --binary-out) BIN_OUT="$2"; shift 2 ;;
+            --species-out) SP_OUT="$2"; shift 2 ;;
+            --compartments-out) COMP_OUT="$2"; shift 2 ;;
+            --rules-out) RULES_OUT="$2"; shift 2 ;;
+            --t-end-days) TEND="$2"; shift 2 ;;
+            --min-cadence-hours) DT="$2"; shift 2 ;;
+            --dump-state) DUMP_STATE="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        if [ -n "$DUMP_STATE" ]; then
+          printf 'FAKE_EVOLVE_STATE' > "$DUMP_STATE"
+          echo x >> "{counter}"
+          exit 0
+        fi
+        python3 - <<PY
+        import struct
+        header = struct.pack('<IIQQQQdddQQ', 0x51535042, 3, 2, 2, 0, 0, float("$DT"), float("$TEND"), 0.0, 0, 0)
+        body = struct.pack('<6d', 0.0, 10.0, 20.0, 0.1, 30.0, 40.0)
+        open("$BIN_OUT", 'wb').write(header + body)
+        open("$SP_OUT", 'w').write("spA\\nspB\\n")
+        open("$COMP_OUT", 'w').write('')
+        open("$RULES_OUT", 'w').write('')
+        PY
+    """))
+    script.chmod(0o755)
+    return script, counter
+
+
+def _make_cal_targets(tmp_path: Path) -> Path:
+    """One calibration target reading spA — minimum the loader accepts."""
+    import yaml as _yaml
+
+    cal_dir = tmp_path / "calibration_targets"
+    cal_dir.mkdir()
+    target = {
+        "calibration_target_id": "spA_t0",
+        "observable": {
+            "code": (
+                "def compute_observable(time, species_dict, constants):\n"
+                "    return species_dict['spA']\n"
+            ),
+            "units": "cell",
+            "species": ["spA"],
+            "constants": [],
+        },
+        "empirical_data": {
+            "median": [10.0],
+            "ci95": [[5.0, 20.0]],
+            "units": "cell",
+            "sample_size": 10,
+            "index_values": None,
+        },
+    }
+    (cal_dir / "spA_t0.yaml").write_text(_yaml.dump(target))
+    return cal_dir
+
+
+@pytest.fixture
+def ppc_env(tmp_path: Path) -> dict:
+    """Shared inputs for fused-PPC tests: a fused-capable fake binary,
+    template, priors, calibration targets, healthy state, cache dir."""
+    binary, counter = _make_fused_binary(tmp_path)
+    template = tmp_path / "template.xml"
+    template.write_bytes(_PPC_TEMPLATE)
+    priors = tmp_path / "priors.csv"
+    priors.write_text(_PPC_PRIORS)
+    healthy = tmp_path / "healthy.yaml"
+    healthy.write_text("# healthy state\n")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    return {
+        "binary": binary,
+        "evolve_counter": counter,
+        "template": template,
+        "priors": priors,
+        "cal_dir": _make_cal_targets(tmp_path),
+        "healthy": healthy,
+        "cache": cache,
+    }
+
+
+def _ppc_sim(
+    env: dict,
+    scenario: str,
+    *,
+    t_end_days: float = 0.2,
+    with_healthy: bool = True,
+    evolve_trajectory_dir: Path | None = None,
+):
+    """Build a real CppSimulator for one fused-PPC scenario."""
+    from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+    return CppSimulator(
+        priors_csv=env["priors"],
+        binary_path=env["binary"],
+        template_xml=env["template"],
+        cache_dir=env["cache"],
+        calibration_targets=env["cal_dir"],
+        scenario=scenario,
+        healthy_state_yaml=env["healthy"] if with_healthy else None,
+        t_end_days=t_end_days,
+        min_cadence_hours=0.1,
+        evolve_trajectory_dir=evolve_trajectory_dir,
+    )
+
+
+def _fake_run_fused(**kwargs):
+    """Stand-in for CppBatchRunner.run_fused: writes one synthetic species
+    parquet per FusedScenarioSpec. spA is scaled by scenario position so
+    each scenario derives a distinct ts:spA_t0; the evolve is never run."""
+    theta = kwargs["theta_matrix"]
+    param_names = list(kwargs["param_names"])
+    scenarios = kwargs["scenarios"]
+    sample_indices = np.asarray(kwargs["sample_indices"], dtype=np.int64)
+    n = theta.shape[0]
+    out: list[BatchResult] = []
+    for scen_idx, spec in enumerate(scenarios):
+        cols = {
+            "sample_index": pa.array(sample_indices),
+            "simulation_id": pa.array(np.arange(n, dtype=np.int64)),
+            "status": pa.array(np.zeros(n, dtype=np.int64)),
+            "time": pa.array([[0.0, 0.1]] * n, type=pa.list_(pa.float64())),
+        }
+        for j, name in enumerate(param_names):
+            cols[f"param:{name}"] = pa.array(theta[:, j].astype(np.float64))
+        # spA row i = (i + 1) * (scenario position + 1); spB constant.
+        spa = [
+            [float(i + 1) * (scen_idx + 1), float(i + 1) * (scen_idx + 1) + 0.1] for i in range(n)
+        ]
+        cols["spA"] = pa.array(spa, type=pa.list_(pa.float64()))
+        cols["spB"] = pa.array([[2.0, 2.1]] * n, type=pa.list_(pa.float64()))
+        Path(spec.output_path).parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table(cols), str(spec.output_path))
+        out.append(
+            BatchResult(
+                parquet_path=Path(spec.output_path),
+                n_sims=n,
+                n_failed=0,
+                species_names=["spA", "spB"],
+                n_times=2,
+            )
+        )
+    return out
+
+
+class TestSimulateWithParametersAll:
+    """MultiScenarioRunner.simulate_with_parameters_all — fused local PPC.
+
+    These patch CppBatchRunner.run_fused (the binary fan-out is covered
+    by test_batch_runner / test_cpp_batch_worker); the assertions are on
+    the orchestration: one fused call, per-scenario cache probe, derive,
+    and the {name: (theta_out, table)} contract.
+    """
+
+    def test_one_fused_call_for_all_uncached_scenarios(self, ppc_env):
+        sims = {n: _ppc_sim(ppc_env, n) for n in ("baseline", "clinical", "gvax")}
+        r = MultiScenarioRunner(sims)
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])
+        with patch.object(CppBatchRunner, "run_fused", side_effect=_fake_run_fused) as mock_fused:
+            results = r.simulate_with_parameters_all(theta)
+        # Exactly one fused batch, carrying all three scenarios.
+        assert mock_fused.call_count == 1
+        specs = mock_fused.call_args.kwargs["scenarios"]
+        assert [s.name for s in specs] == ["baseline", "clinical", "gvax"]
+        assert all(isinstance(s, FusedScenarioSpec) for s in specs)
+        assert all(s.start_index == 0 for s in specs)
+        # Contract: {name: (theta_out, table)} in insertion order.
+        assert list(results) == ["baseline", "clinical", "gvax"]
+        for theta_out, table in results.values():
+            np.testing.assert_allclose(theta_out, theta)
+            assert "ts:spA_t0" in table.column_names
+            assert table.num_rows == 2
+
+    def test_per_scenario_tables_are_distinct(self, ppc_env):
+        sims = {n: _ppc_sim(ppc_env, n) for n in ("s0", "s1", "s2")}
+        r = MultiScenarioRunner(sims)
+        theta = np.array([[0.5, 1.0], [1.5, 2.0], [3.0, 4.0]])
+        with patch.object(CppBatchRunner, "run_fused", side_effect=_fake_run_fused):
+            results = r.simulate_with_parameters_all(theta)
+        # _fake_run_fused scales spA by scenario position → ts:spA_t0 is
+        # (row+1) * (position+1).
+        np.testing.assert_allclose(results["s0"][1].column("ts:spA_t0").to_numpy(), [1, 2, 3])
+        np.testing.assert_allclose(results["s1"][1].column("ts:spA_t0").to_numpy(), [2, 4, 6])
+        np.testing.assert_allclose(results["s2"][1].column("ts:spA_t0").to_numpy(), [3, 6, 9])
+
+    def test_second_call_hits_cache_no_fused_run(self, ppc_env):
+        sims = {n: _ppc_sim(ppc_env, n) for n in ("a", "b")}
+        r = MultiScenarioRunner(sims)
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])
+        with patch.object(CppBatchRunner, "run_fused", side_effect=_fake_run_fused) as mock_fused:
+            first = r.simulate_with_parameters_all(theta)
+            assert mock_fused.call_count == 1
+            # Identical theta → every scenario satisfied from its
+            # suffix-pool cache; no second fused batch.
+            second = r.simulate_with_parameters_all(theta)
+            assert mock_fused.call_count == 1
+        for name in sims:
+            np.testing.assert_allclose(
+                first[name][1].column("ts:spA_t0").to_numpy(),
+                second[name][1].column("ts:spA_t0").to_numpy(),
+            )
+
+    def test_already_cached_scenario_excluded_from_fused_set(self, ppc_env):
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])
+        # Prime scenario "a" alone.
+        a_only = MultiScenarioRunner({"a": _ppc_sim(ppc_env, "a")})
+        with patch.object(CppBatchRunner, "run_fused", side_effect=_fake_run_fused):
+            a_only.simulate_with_parameters_all(theta)
+        # Now run "a" + "b": "a" is cached, only "b" should be fused.
+        r = MultiScenarioRunner({"a": _ppc_sim(ppc_env, "a"), "b": _ppc_sim(ppc_env, "b")})
+        with patch.object(CppBatchRunner, "run_fused", side_effect=_fake_run_fused) as mock_fused:
+            results = r.simulate_with_parameters_all(theta)
+        assert mock_fused.call_count == 1
+        specs = mock_fused.call_args.kwargs["scenarios"]
+        assert [s.name for s in specs] == ["b"]
+        assert set(results) == {"a", "b"}
+
+    def test_all_cached_runs_no_fused_batch(self, ppc_env):
+        theta = np.array([[0.5, 1.0]])
+        sims = {n: _ppc_sim(ppc_env, n) for n in ("a", "b")}
+        r = MultiScenarioRunner(sims)
+        with patch.object(CppBatchRunner, "run_fused", side_effect=_fake_run_fused):
+            r.simulate_with_parameters_all(theta)
+        # Fresh runner, same theta → all cached, run_fused never called.
+        r2 = MultiScenarioRunner({n: _ppc_sim(ppc_env, n) for n in ("a", "b")})
+        with patch.object(CppBatchRunner, "run_fused", side_effect=_fake_run_fused) as mock_fused:
+            results = r2.simulate_with_parameters_all(theta)
+        assert mock_fused.call_count == 0
+        assert set(results) == {"a", "b"}
+
+    def test_result_primes_single_scenario_cache(self, ppc_env):
+        """A fused PPC result is byte-identical-cache-compatible with the
+        single-scenario CppSimulator.simulate_with_parameters."""
+        sims = {n: _ppc_sim(ppc_env, n) for n in ("a", "b")}
+        r = MultiScenarioRunner(sims)
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])
+        with patch.object(CppBatchRunner, "run_fused", side_effect=_fake_run_fused):
+            fused = r.simulate_with_parameters_all(theta)
+        # The single-scenario path on the same theta now hits the cache —
+        # its own runner is never invoked.
+        sim_a = sims["a"]
+        with patch.object(sim_a._runner, "run") as mock_run:
+            theta_out, table = sim_a.simulate_with_parameters(theta)
+            mock_run.assert_not_called()
+        np.testing.assert_allclose(
+            table.column("ts:spA_t0").to_numpy(),
+            fused["a"][1].column("ts:spA_t0").to_numpy(),
+        )
+
+    def test_requires_healthy_state(self, ppc_env):
+        sims = {n: _ppc_sim(ppc_env, n, with_healthy=False) for n in ("a", "b")}
+        r = MultiScenarioRunner(sims)
+        with pytest.raises(ValueError, match="requires healthy_state_yaml"):
+            r.simulate_with_parameters_all(np.array([[0.5, 1.0]]))
+
+    def test_rejects_t_end_mismatch(self, ppc_env):
+        sims = {
+            "a": _ppc_sim(ppc_env, "a", t_end_days=0.2),
+            "b": _ppc_sim(ppc_env, "b", t_end_days=0.9),
+        }
+        r = MultiScenarioRunner(sims)
+        with pytest.raises(ValueError, match="t_end_days"):
+            r.simulate_with_parameters_all(np.array([[0.5, 1.0]]))
+
+    def test_rejects_evolve_trajectory_dir(self, ppc_env, tmp_path):
+        sims = {
+            "a": _ppc_sim(ppc_env, "a"),
+            "b": _ppc_sim(ppc_env, "b", evolve_trajectory_dir=tmp_path / "traj"),
+        }
+        r = MultiScenarioRunner(sims)
+        with pytest.raises(NotImplementedError, match="evolve_trajectory_dir"):
+            r.simulate_with_parameters_all(np.array([[0.5, 1.0]]))
+
+
+class TestSimulateWithParametersAllEvolveOnce:
+    """The headline #90 Phase 3 acceptance criterion, end to end with a
+    real fused batch + real binary: PPC evolves each theta ONCE, not once
+    per scenario."""
+
+    def test_evolve_runs_once_per_theta_not_per_scenario(self, ppc_env):
+        sims = {n: _ppc_sim(ppc_env, n) for n in ("baseline", "clinical", "gvax")}
+        r = MultiScenarioRunner(sims)
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])  # 2 thetas, 3 scenarios
+
+        results = r.simulate_with_parameters_all(theta)
+
+        # 2 thetas × 3 scenarios: a per-scenario loop would evolve 6
+        # times; the fused batch evolves exactly 2 (once per theta).
+        n_evolves = len(ppc_env["evolve_counter"].read_text().splitlines())
+        assert n_evolves == 2
+        assert set(results) == {"baseline", "clinical", "gvax"}
+        for theta_out, table in results.values():
+            np.testing.assert_allclose(theta_out, theta)
+            assert table.num_rows == 2
+            assert "ts:spA_t0" in table.column_names

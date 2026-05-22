@@ -329,6 +329,54 @@ def test_compact_leaves_no_tmp_files(tmp_path: Path):
     assert leftovers == [], f"compact left temp files: {leftovers}"
 
 
+# --- maybe_compact: threshold-gated compaction (#90 Phase 4) ---------------
+
+
+def _write_shards(cache: EvolveCache, tag: str, n: int) -> None:
+    """Write ``n`` one-theta shards into ``cache``'s namespace."""
+    for i in range(n):
+        th = _theta_hash(f"{tag}{i}")
+        w = cache.writer()
+        w.add(th, _blob_for(th))
+        w.flush()
+
+
+def test_maybe_compact_below_threshold_is_noop(tmp_path: Path):
+    cache = EvolveCache(tmp_path / "cache", "ns0")
+    _write_shards(cache, "t", 3)
+    assert cache.maybe_compact(min_uncompacted=5) is None
+    assert not (cache.namespace_dir / "manifest.json").exists()
+
+
+def test_maybe_compact_at_threshold_compacts(tmp_path: Path):
+    cache = EvolveCache(tmp_path / "cache", "ns0")
+    _write_shards(cache, "t", 5)
+    manifest = cache.maybe_compact(min_uncompacted=5)
+    assert manifest is not None and manifest.name == "manifest.json"
+    data = json.loads(manifest.read_text())
+    assert len(data["shards"]) == 5 and len(data["entries"]) == 5
+
+
+def test_maybe_compact_counts_only_uncovered_shards(tmp_path: Path):
+    """After a compaction only shards added since the manifest count
+    toward the next maybe_compact threshold — so it is self-limiting."""
+    cache = EvolveCache(tmp_path / "cache", "ns0")
+    _write_shards(cache, "old", 5)
+    cache.compact()  # manifest now covers all 5 shards
+
+    _write_shards(cache, "new", 2)  # 7 shards total, only 2 uncovered
+    assert cache.maybe_compact(min_uncompacted=5) is None
+
+    _write_shards(cache, "extra", 1)  # 3 uncovered now
+    assert cache.maybe_compact(min_uncompacted=3) is not None
+
+
+def test_maybe_compact_no_shards_returns_none(tmp_path: Path):
+    cache = EvolveCache(tmp_path / "cache", "ns0")
+    cache.namespace_dir.mkdir(parents=True, exist_ok=True)
+    assert cache.maybe_compact(min_uncompacted=1) is None
+
+
 def test_evolve_cache_writer_standalone(tmp_path: Path):
     """EvolveCacheWriter can be used directly against a namespace dir."""
     ns_dir = tmp_path / "cache" / "nsX"

@@ -1148,39 +1148,105 @@ class HPCJobManager:
         keep: Optional[set] = None,
         retention_days: float = 2.0,
         always_keep: Tuple[str, ...] = ("theta_pools", "evolve_cache"),
+        keep_evolve_namespaces: Optional[set] = None,
     ) -> dict:
         """Delete stale simulation-pool directories to free allocation quota.
 
         Because the pool-id config hash churns run-to-run, old pools are
         never reused — they just accumulate until the HPC allocation
-        quota is hit. This prunes them. A pool directory under
+        quota is hit. This prunes them in two age-based passes:
+
+        **Pass 1 — pool dirs.** A directory directly under
         ``simulation_pool_path`` is deleted only when ALL hold:
 
         - its name is not in ``keep`` (the current run's pool ids), and
         - its name is not in ``always_keep`` (the theta-pool cache and the
-          evolve-pack tree — small, shared, regenerable), and
+          ``evolve_cache`` tree — small, shared, regenerable), and
         - its directory mtime is older than ``retention_days``.
 
-        Age-based by design: a concurrent run's freshly-created pools are
-        young, so they are never touched even without being passed in
-        ``keep``. ``keep`` is belt-and-braces for the calling run.
+        **Pass 2 — evolve-cache namespaces.** The ``evolve_cache`` dir
+        itself is always kept, but the namespace subdirs *inside* it
+        (``evolve_cache/<namespace>/``) are pruned the same way. A
+        namespace folds in the qsp_sim binary + healthy-state hash, so a
+        binary rebuild orphans the old namespace while the live one keeps
+        getting fresh shards — its dir mtime stays young and age-based
+        pruning spares it. ``keep_evolve_namespaces`` is belt-and-braces
+        for the current run's namespace(s).
 
-        Returns ``{"deleted": [...], "kept": [...], "errors": [...]}``.
+        Age-based by design: a concurrent run's freshly-created dirs are
+        young, so they are never touched even without being passed in
+        ``keep`` / ``keep_evolve_namespaces``.
+
+        Returns ``{"deleted": [...], "kept": [...], "errors": [...]}``;
+        pruned namespaces appear as ``evolve_cache/<namespace>``.
         Best-effort — never raises on a remote failure; logs and reports.
         """
         keep = set(keep or ())
+        cutoff = time.time() - retention_days * 86400.0
         pool_path = self.config.simulation_pool_path
+
+        # Pass 1: stale pool dirs. ``evolve_cache`` stays in always_keep —
+        # the dir itself is never deleted; pass 2 prunes the namespaces
+        # inside it.
+        pools = self._prune_stale_subdirs(
+            pool_path,
+            keep=keep,
+            always_keep=set(always_keep),
+            cutoff=cutoff,
+            retention_days=retention_days,
+            label="prune_simulation_pools",
+        )
+
+        # Pass 2: stale evolve-cache namespace subdirs. A missing tree (no
+        # evolve cache ever written) is benign, not an error.
+        ns = self._prune_stale_subdirs(
+            f"{pool_path}/evolve_cache",
+            keep=set(keep_evolve_namespaces or ()),
+            always_keep=set(),
+            cutoff=cutoff,
+            retention_days=retention_days,
+            label="prune_simulation_pools[evolve_cache]",
+            missing_ok=True,
+        )
+
+        return {
+            "deleted": pools["deleted"] + [f"evolve_cache/{n}" for n in ns["deleted"]],
+            "kept": pools["kept"] + [f"evolve_cache/{n}" for n in ns["kept"]],
+            "errors": pools["errors"] + ns["errors"],
+        }
+
+    def _prune_stale_subdirs(
+        self,
+        parent: str,
+        *,
+        keep: set,
+        always_keep: set,
+        cutoff: float,
+        retention_days: float,
+        label: str,
+        missing_ok: bool = False,
+    ) -> dict:
+        """Age-based delete of immediate subdirs of ``parent``.
+
+        Lists ``parent``'s immediate subdirs, deletes those older than
+        ``cutoff`` whose name is in neither ``keep`` nor ``always_keep``,
+        and returns ``{"deleted", "kept", "errors"}``. ``missing_ok``
+        makes a failed listing (e.g. ``parent`` does not exist) benign
+        rather than an error. Best-effort — never raises.
+        """
         # find: one line per immediate subdir as "<mtime_epoch>\t<name>".
         rc, out = self.transport.exec(
-            f"find {shlex.quote(pool_path)} -maxdepth 1 -mindepth 1 -type d "
+            f"find {shlex.quote(parent)} -maxdepth 1 -mindepth 1 -type d "
             f"-printf '%T@\\t%f\\n' 2>/dev/null",
             timeout=120,
         )
         if rc != 0:
-            self.logger.warning("prune_simulation_pools: could not list %s", pool_path)
+            if missing_ok:
+                self.logger.debug("%s: nothing to list at %s (rc=%d)", label, parent, rc)
+                return {"deleted": [], "kept": [], "errors": []}
+            self.logger.warning("%s: could not list %s", label, parent)
             return {"deleted": [], "kept": [], "errors": ["list failed"]}
 
-        cutoff = time.time() - retention_days * 86400.0
         to_delete, kept = [], []
         for line in out.splitlines():
             if "\t" not in line:
@@ -1200,30 +1266,31 @@ class HPCJobManager:
 
         if not to_delete:
             self.logger.info(
-                "prune_simulation_pools: nothing older than %.1f d to prune "
-                "(%d pool dir(s) kept)",
+                "%s: nothing older than %.1f d to prune (%d dir(s) kept)",
+                label,
                 retention_days,
                 len(kept),
             )
             return {"deleted": [], "kept": kept, "errors": []}
 
         self.logger.info(
-            "prune_simulation_pools: deleting %d pool dir(s) older than %.1f d " "(keeping %d)",
+            "%s: deleting %d dir(s) older than %.1f d (keeping %d)",
+            label,
             len(to_delete),
             retention_days,
             len(kept),
         )
         # Explicit enumerated rm — never a glob. cd-guarded; each name is a
-        # find-confirmed immediate subdir of pool_path.
+        # find-confirmed immediate subdir of ``parent``.
         quoted = " ".join(shlex.quote(n) for n in to_delete)
-        rc, out = self.transport.exec(
-            f"cd {shlex.quote(pool_path)} && for d in {quoted}; do "
+        rc, _out = self.transport.exec(
+            f"cd {shlex.quote(parent)} && for d in {quoted}; do "
             f'rm -rf -- "./$d" && echo "PRUNED $d"; done',
             timeout=900,
         )
         errors = [] if rc == 0 else [f"rm rc={rc}"]
         for name in to_delete:
-            self.logger.info("  pruned stale pool: %s", name)
+            self.logger.info("  %s: pruned %s", label, name)
         return {"deleted": to_delete, "kept": kept, "errors": errors}
 
     def submit_cpp_jobs(

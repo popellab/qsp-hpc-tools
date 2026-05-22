@@ -77,6 +77,17 @@ This document provides context for AI assistants (particularly Claude Code) work
      amortizes the evolve across scenarios in-run; the Phase 1 cache
      amortizes it across runs — they compose. Single-scenario path
      (`submit_cpp_jobs` / `CppSimulator.run_hpc`) untouched.
+   - Fused local posterior-predictive (issue #90 Phase 3):
+     `MultiScenarioRunner.simulate_with_parameters_all(theta)` — the
+     local, posterior-predictive twin of `run_all`. One fused
+     `CppBatchRunner.run_fused` batch evaluates a user-supplied theta
+     matrix under every scenario on-host, evolving each theta once, not
+     once per scenario. `CppSimulator`'s PPC front half is extracted into
+     `_resolve_ppc_context` / `_ppc_cache_hit` / `_finalize_ppc` (→
+     `PpcContext`), shared with single-scenario `simulate_with_parameters`
+     so a fused run primes the cache a later single-scenario call reads.
+     `MultiScenarioRunner.job_manager` is now optional at construction
+     (only `run_all` needs it).
    - Full plan + history in `docs/CPP_SIMULATION_PLAN.md`.
 
 ### File Organization (Recently Updated)

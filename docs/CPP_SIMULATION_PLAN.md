@@ -570,8 +570,8 @@ Removed: `CppEvolveCache` (LMDB), `evolve_pack_path` / `evolve_pack_read_path`
 QSEP format are kept — `evolve_cache.py` builds on them.
 
 Status: code + unit tests landed; HPC end-to-end validated. Issue #90
-Phase 2 (scenario-fused task) landed next; Phases 3–4 (local-PPC reuse,
-compaction job + namespace pruning) are follow-ups.
+Phase 2 (scenario-fused task) landed next, then Phase 3 (local-PPC
+reuse); Phase 4 (compaction job + namespace pruning) is the follow-up.
 
 #### #90 Phase 2 — scenario-fused multi-scenario task
 
@@ -611,6 +611,45 @@ per-scenario top-up. Fusion and the Phase 1 cache compose: fusion
 amortizes the evolve across scenarios in-run, the cache across runs.
 
 Status: code + unit tests landed; HPC end-to-end validation pending.
+
+#### #90 Phase 3 — fused local posterior-predictive
+
+Phase 2 fused the *HPC training* path. Phase 3 brings the same evolve-
+once-per-theta win to the *local posterior-predictive* path. Where
+`run_all` is the HPC training entry point, the new
+`MultiScenarioRunner.simulate_with_parameters_all` is its
+posterior-predictive twin: it evaluates a user-supplied theta matrix
+(posterior draws) under every scenario on this host, in **one** fused
+`CppBatchRunner.run_fused` batch — so a 4-scenario PPC evolves each
+theta once, not four times.
+
+New code, all additive — the single-scenario
+`CppSimulator.simulate_with_parameters` is untouched in behavior:
+
+- `CppSimulator` — the posterior-predictive front half is extracted into
+  `_resolve_ppc_context` (theta validation + suffix-pool cache-key
+  hashing + merged test-stats load → `PpcContext`), `_ppc_cache_hit`,
+  and `_finalize_ppc`. The single-scenario `simulate_with_parameters`
+  and the fused multi-scenario path now share one definition of "where
+  does this PPC land", so a fused run primes the exact suffix-pool cache
+  a later single-scenario call reads.
+- `MultiScenarioRunner.simulate_with_parameters_all` — probes each
+  scenario's suffix-pool cache (fully-cached scenarios short-circuit),
+  fuses the rest into one `run_fused` call, derives per scenario, and
+  returns `{name: (theta_out, table)}` — the same pair
+  `CppSimulator.simulate_with_parameters` returns.
+- `MultiScenarioRunner` — `job_manager` is now optional at construction
+  (`run_all` raises if it is missing; the local PPC path needs no
+  transport). `_validate_fused_local` fails fast on binary / template /
+  healthy-state / `t_end_days` mismatches across simulators.
+
+The persistent evolve cache (#90 Phase 1) composes underneath: fusion
+shares the evolve across scenarios within one PPC call; the cache
+carries it across calls (repeated PPC rounds, or a later single-scenario
+`simulate_with_parameters` on the same theta).
+
+Status: code + unit tests landed (including a real-binary test asserting
+the evolve runs once per theta, not once per scenario).
 
 ## Completed milestones and benchmarks (2026-04-15 through 2026-04-16)
 

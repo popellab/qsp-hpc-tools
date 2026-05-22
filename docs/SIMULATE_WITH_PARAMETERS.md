@@ -97,6 +97,40 @@ When this is set, the suffix-pool cache is **bypassed**: the cached
 test-statistic parquet has no trajectory data, so a hit can't surface the
 binaries the caller is asking for. Force-fresh sims fire each call.
 
+## Multi-scenario posterior-predictive (fused)
+
+When the same posterior is evaluated under several scenarios (baseline +
+treatment arms), call `MultiScenarioRunner.simulate_with_parameters_all`
+instead of looping `CppSimulator.simulate_with_parameters` once per
+scenario:
+
+```python
+from qsp_hpc.simulation import MultiScenarioRunner
+
+runner = MultiScenarioRunner({"baseline": sim_baseline, "gvax": sim_gvax})
+results = runner.simulate_with_parameters_all(theta)   # {name: (theta_out, table)}
+```
+
+It is the posterior-predictive counterpart of `run_all`, and runs
+**locally** — `job_manager` is not required. Every scenario still
+needing sims goes into **one** fused `CppBatchRunner.run_fused` batch:
+per theta the `evolve_to_diagnosis` burn-in (~84%+ of per-sim cost) is
+resolved **once** and every scenario runs from that state. A 4-scenario
+PPC pays one evolve per theta, not four.
+
+Each scenario's result is written to its own suffix-pool cache,
+byte-identical to what `CppSimulator.simulate_with_parameters` produces —
+so a fused run primes the cache a later single-scenario call reads, and
+a fully-cached scenario short-circuits without re-simulating. The
+persistent theta-keyed evolve cache composes underneath, carrying
+evolves across calls.
+
+All simulators must agree on the binary, param template, healthy state,
+and `t_end_days` / `min_cadence_hours` (one shared evolve); scenario and
+drug-metadata YAMLs are expected to differ. `evolve_trajectory_dir` is
+not supported on the fused path — use the single-scenario method for
+burn-in dumps.
+
 ## Theta restriction
 
 `simulate_with_parameters` evaluates whatever thetas the caller provides — it
@@ -119,7 +153,8 @@ swap to `backend="hpc"` for production runs.
 ## See also
 
 - [`docs/EVOLVE_TRAJECTORIES.md`](EVOLVE_TRAJECTORIES.md) — burn-in trajectory
-  dumping, the LMDB-backed `evolve_cache`, and the long-form assemblers.
+  dumping, the persistent theta-keyed `evolve_cache`, and the long-form
+  assemblers.
 - [`docs/CONFIGURATION.md`](CONFIGURATION.md) — `cpp:` block fields the local
   and HPC backends rely on.
 - [`docs/CPP_SIMULATION_PLAN.md`](CPP_SIMULATION_PLAN.md) — design notes and

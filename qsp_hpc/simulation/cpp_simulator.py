@@ -16,6 +16,7 @@ import logging
 import re
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Mapping, Optional, Tuple, Union
@@ -33,6 +34,31 @@ if TYPE_CHECKING:
     from qsp_hpc.batch.hpc_job_manager import HPCJobManager
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PpcContext:
+    """Resolved inputs for one posterior-predictive run of one scenario.
+
+    Produced by :meth:`CppSimulator._resolve_ppc_context` — folds the
+    theta-shape validation, suffix-pool cache-key hashing, suffix-pool
+    directory resolution, and merged test-stats DataFrame load into a
+    single object. Both the single-scenario
+    :meth:`CppSimulator.simulate_with_parameters` and the fused
+    multi-scenario
+    :meth:`~qsp_hpc.simulation.multi_scenario_runner.MultiScenarioRunner.simulate_with_parameters_all`
+    resolve through this one method, so a theta evaluated either way
+    lands in the same suffix pool and hits the same cache.
+    """
+
+    theta: np.ndarray  # contiguous float64, shape (n_samples, n_params)
+    n_samples: int
+    sample_indices: np.ndarray  # arange(n_samples), int64
+    pool_suffix: str
+    pred_dir: Optional[Path]
+    suffix_pool_dir: Path
+    cache_path: Path  # suffix_pool_dir / "test_stats.parquet"
+    test_stats_df: "pd.DataFrame"
 
 
 class CppSimulator:
@@ -1185,19 +1211,6 @@ class CppSimulator:
         """
         if backend not in ("local", "hpc"):
             raise ValueError(f"backend must be 'local' or 'hpc'; got {backend!r}")
-        if self.test_stats_csv is None and self._calibration_targets_dir is None:
-            raise RuntimeError(
-                "simulate_with_parameters() requires test_stats_csv or "
-                "calibration_targets at construction; without them there is "
-                "nothing to derive."
-            )
-        if theta.ndim != 2:
-            raise ValueError(f"theta must be 2-D; got shape {theta.shape}")
-        if theta.shape[1] != len(self.param_names):
-            raise ValueError(
-                f"theta has {theta.shape[1]} columns but priors CSV has "
-                f"{len(self.param_names)} parameters"
-            )
         if backend == "hpc" and prediction_targets is not None:
             raise NotImplementedError(
                 "simulate_with_parameters(backend='hpc', prediction_targets=...) "
@@ -1213,6 +1226,95 @@ class CppSimulator:
         if backend == "hpc" and self.job_manager is None:
             raise RuntimeError(
                 "simulate_with_parameters(backend='hpc') requires job_manager " "at construction."
+            )
+
+        ctx = self._resolve_ppc_context(
+            theta,
+            backend=backend,
+            prediction_targets=prediction_targets,
+            pool_suffix=pool_suffix,
+            aux_by_sample_index=aux_by_sample_index,
+            auxiliary_units=auxiliary_units,
+        )
+
+        # Burn-in trajectory dump bypasses the suffix-pool cache: the cached
+        # parquet has only test-stat columns, so a hit can't surface the
+        # per-sim trajectory binaries the caller is asking for.
+        hit = self._ppc_cache_hit(ctx, bypass=evolve_trajectory_dir is not None)
+        if hit is not None:
+            return hit
+
+        if backend == "local":
+            table = self._simulate_with_parameters_local(
+                theta=ctx.theta,
+                sample_indices=ctx.sample_indices,
+                test_stats_df=ctx.test_stats_df,
+                suffix_pool_dir=ctx.suffix_pool_dir,
+                pool_suffix=ctx.pool_suffix,
+                evolve_trajectory_dir=evolve_trajectory_dir,
+                evolve_trajectory_dt_days=evolve_trajectory_dt_days,
+                aux_by_sample_index=aux_by_sample_index,
+                auxiliary_units=auxiliary_units,
+            )
+        else:
+            if aux_by_sample_index:
+                raise NotImplementedError(
+                    "simulate_with_parameters(backend='hpc', aux_by_sample_index=...) "
+                    "is not yet supported. Local backend handles aux PPC; "
+                    "extend the HPC submit path if cluster-side PPC with "
+                    "auxiliary parameters becomes a regular need."
+                )
+            table = self._simulate_with_parameters_hpc(
+                theta=ctx.theta,
+                sample_indices=ctx.sample_indices,
+                test_stats_df=ctx.test_stats_df,
+                suffix_pool_dir=ctx.suffix_pool_dir,
+                pool_suffix=ctx.pool_suffix,
+            )
+
+        return self._finalize_ppc(ctx, table)
+
+    # ------------------------------------------------------------------
+    # Posterior-predictive context: resolution, cache probe, finalize.
+    # Extracted so the single-scenario path above and the fused
+    # multi-scenario MultiScenarioRunner.simulate_with_parameters_all
+    # share one definition of "where does this PPC land" (#90 Phase 3).
+    # ------------------------------------------------------------------
+
+    def _resolve_ppc_context(
+        self,
+        theta: np.ndarray,
+        *,
+        backend: str,
+        prediction_targets: Optional[str | Path],
+        pool_suffix: str,
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]],
+        auxiliary_units: Optional[dict[str, str]],
+    ) -> PpcContext:
+        """Validate theta + targets, build the suffix-pool cache key, load
+        the merged test-stats DataFrame — the shared front half of every
+        posterior-predictive run.
+
+        The cache key folds theta bytes + calibration-target hash +
+        prediction-target hash + ``backend`` tag + auxiliary-draw hash, so
+        a given theta lands in the same suffix pool whether it arrives via
+        the single-scenario :meth:`simulate_with_parameters` or the fused
+        :meth:`~qsp_hpc.simulation.multi_scenario_runner.MultiScenarioRunner.simulate_with_parameters_all`
+        — a fused run primes the exact cache a later single-scenario call
+        reads.
+        """
+        if self.test_stats_csv is None and self._calibration_targets_dir is None:
+            raise RuntimeError(
+                "simulate_with_parameters() requires test_stats_csv or "
+                "calibration_targets at construction; without them there is "
+                "nothing to derive."
+            )
+        if theta.ndim != 2:
+            raise ValueError(f"theta must be 2-D; got shape {theta.shape}")
+        if theta.shape[1] != len(self.param_names):
+            raise ValueError(
+                f"theta has {theta.shape[1]} columns but priors CSV has "
+                f"{len(self.param_names)} parameters"
             )
 
         theta = np.ascontiguousarray(theta, dtype=np.float64)
@@ -1251,27 +1353,6 @@ class CppSimulator:
         )
         self.logger.info(f"  suffix pool: {suffix_pool_dir.name}")
 
-        # Burn-in trajectory dump bypasses the suffix-pool cache: the
-        # cached parquet has only test-stat columns, so a hit can't
-        # surface the per-sim trajectory binaries the caller is asking
-        # for. Force-fresh sims when ``evolve_trajectory_dir`` is set.
-        if evolve_trajectory_dir is not None and cache_path.exists():
-            self.logger.info(
-                "suffix-pool cache present but bypassed: "
-                "evolve_trajectory_dir is set (need fresh sims for burn-in dump)"
-            )
-        elif cache_path.exists():
-            cached = pq.read_table(str(cache_path))
-            if cached.num_rows >= n_samples:
-                self.logger.info(f"✓ suffix-pool cache hit ({cached.num_rows} rows)")
-                cached = cached.slice(0, n_samples)
-                theta_out = self._theta_from_table(cached)
-                return theta_out, cached
-            self.logger.info(
-                f"suffix-pool cache has {cached.num_rows}/{n_samples} — "
-                "recomputing (partial caches are discarded)"
-            )
-
         # Resolve the merged test-stats DataFrame. load_calibration_targets
         # only runs when the caller didn't pre-flatten via test_stats_csv.
         test_stats_df = self._load_test_stats_df(pred_dir)
@@ -1280,41 +1361,58 @@ class CppSimulator:
         # theta_hash so there's no cross-scenario alignment to worry about.
         sample_indices = np.arange(n_samples, dtype=np.int64)
 
-        if backend == "local":
-            table = self._simulate_with_parameters_local(
-                theta=theta,
-                sample_indices=sample_indices,
-                test_stats_df=test_stats_df,
-                suffix_pool_dir=suffix_pool_dir,
-                pool_suffix=pool_suffix,
-                evolve_trajectory_dir=evolve_trajectory_dir,
-                evolve_trajectory_dt_days=evolve_trajectory_dt_days,
-                aux_by_sample_index=aux_by_sample_index,
-                auxiliary_units=auxiliary_units,
-            )
-        else:
-            if aux_by_sample_index:
-                raise NotImplementedError(
-                    "simulate_with_parameters(backend='hpc', aux_by_sample_index=...) "
-                    "is not yet supported. Local backend handles aux PPC; "
-                    "extend the HPC submit path if cluster-side PPC with "
-                    "auxiliary parameters becomes a regular need."
-                )
-            table = self._simulate_with_parameters_hpc(
-                theta=theta,
-                sample_indices=sample_indices,
-                test_stats_df=test_stats_df,
-                suffix_pool_dir=suffix_pool_dir,
-                pool_suffix=pool_suffix,
-            )
+        return PpcContext(
+            theta=theta,
+            n_samples=n_samples,
+            sample_indices=sample_indices,
+            pool_suffix=pool_suffix,
+            pred_dir=pred_dir,
+            suffix_pool_dir=suffix_pool_dir,
+            cache_path=cache_path,
+            test_stats_df=test_stats_df,
+        )
 
-        pq.write_table(table, str(cache_path))
+    def _ppc_cache_hit(
+        self, ctx: PpcContext, *, bypass: bool = False
+    ) -> Optional[Tuple[np.ndarray, pa.Table]]:
+        """Return the cached ``(theta_out, table)`` for ``ctx`` when the
+        suffix pool already covers every requested sample, else ``None``.
+
+        ``bypass=True`` forces a miss — used when a burn-in trajectory
+        dump is requested, since the cached parquet carries only
+        test-stat columns and cannot surface per-sim trajectory binaries.
+        Partial caches (fewer rows than requested) are treated as a miss;
+        :meth:`simulate_with_parameters` discards and recomputes them.
+        """
+        cache_path = ctx.cache_path
+        if bypass:
+            if cache_path.exists():
+                self.logger.info(
+                    "suffix-pool cache present but bypassed: "
+                    "evolve_trajectory_dir is set (need fresh sims for burn-in dump)"
+                )
+            return None
+        if not cache_path.exists():
+            return None
+        cached = pq.read_table(str(cache_path))
+        if cached.num_rows >= ctx.n_samples:
+            self.logger.info(f"✓ suffix-pool cache hit ({cached.num_rows} rows)")
+            cached = cached.slice(0, ctx.n_samples)
+            return self._theta_from_table(cached), cached
+        self.logger.info(
+            f"suffix-pool cache has {cached.num_rows}/{ctx.n_samples} — "
+            "recomputing (partial caches are discarded)"
+        )
+        return None
+
+    def _finalize_ppc(self, ctx: PpcContext, table: pa.Table) -> Tuple[np.ndarray, pa.Table]:
+        """Write the suffix-pool cache parquet and return ``(theta_out, table)``."""
+        pq.write_table(table, str(ctx.cache_path))
         self.logger.info(
             f"simulate_with_parameters complete: {table.num_rows} rows × "
-            f"{len(test_stats_df)} test stats → {cache_path.name}"
+            f"{len(ctx.test_stats_df)} test stats → {ctx.cache_path.name}"
         )
-        theta_out = self._theta_from_table(table)
-        return theta_out, table
+        return self._theta_from_table(table), table
 
     # ------------------------------------------------------------------
     # Backend-specific execution helpers

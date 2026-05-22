@@ -281,36 +281,100 @@ class SSHTransport:
             return f"{self.config.ssh_user}@{self.config.ssh_host}"
         return self.config.ssh_host
 
+    def _cm_socket_opts(self) -> list[str]:
+        """Just the ControlPath option (no ControlMaster mode).
+
+        ``%C`` expands to a hash of (local host, remote host, user,
+        port) so sessions to different hosts use different sockets. A
+        dedicated ``~/.qsp_hpc_cm/`` dir avoids colliding with the
+        user's global ssh config.
+        """
+        cm_dir = Path("~/.qsp_hpc_cm").expanduser()
+        cm_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return ["-o", f"ControlPath={cm_dir}/cm-%C"]
+
     def _control_master_opts(self) -> list[str]:
-        """OpenSSH ControlMaster options for connection multiplexing.
+        """SSH multiplexing options for *client* ssh/scp/rsync calls.
 
-        ControlMaster=auto opens a master socket on the first ssh/scp
-        call and routes subsequent calls through it, skipping the
-        ~1.5–2s TCP+TLS+key handshake. ControlPersist=60s keeps the
-        master alive a minute past the last child exit so back-to-back
-        commands within a session reuse the connection.
+        Clients run ``ControlMaster=auto``: they route over the master
+        socket :meth:`_ensure_master` pre-established (and so skip the
+        TCP+auth handshake). ``auto`` would also *create* a master if
+        none exists — but that path (creating a master from inside a
+        ``subprocess.run`` with captured pipes) is what stopped the
+        master persisting before, so :meth:`_ensure_master` always runs
+        first to guarantee a clean, detached master is already up.
 
-        ``%C`` in ControlPath expands to a hash of (l,r,h,p,u) so
-        concurrent sessions to different hosts (or as different users)
-        don't fight over the same socket. A dedicated socket directory
-        under ``~/.qsp_hpc_cm/`` avoids colliding with the user's
-        global ssh config.
-
-        ``ssh_control_master=False`` in the BatchConfig disables this
-        for environments that ban multiplexing (rare).
+        ``ssh_control_master=False`` disables multiplexing entirely.
         """
         if not getattr(self.config, "ssh_control_master", True):
             return []
-        cm_dir = Path("~/.qsp_hpc_cm").expanduser()
-        cm_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        return [
-            "-o",
-            "ControlMaster=auto",
-            "-o",
-            f"ControlPath={cm_dir}/cm-%C",
-            "-o",
-            "ControlPersist=60s",
-        ]
+        return ["-o", "ControlMaster=auto", *self._cm_socket_opts()]
+
+    def _ensure_master(self) -> None:
+        """Pre-establish a backgrounded ControlMaster connection.
+
+        Runs ``ssh -fN -M`` with stdio detached to /dev/null: ``-f``
+        backgrounds it after auth, ``-N`` runs no command, ``-M`` makes
+        it the master. Because its stdio is detached (not a captured
+        subprocess pipe) the master cleanly persists, and every later
+        client call multiplexes over it (~0.1s instead of ~2s).
+
+        Idempotent and self-healing: a live master is detected via
+        ``ssh -O check``; re-checked at most every 5 min so a master
+        that died during a long idle gap gets rebuilt. No-op when
+        ``ssh_control_master`` is disabled.
+        """
+        if not getattr(self.config, "ssh_control_master", True):
+            return
+        now = time.time()
+        if now - getattr(self, "_master_checked_at", 0.0) < 300.0:
+            return
+
+        target = self._build_ssh_target()
+        key_opt = ["-i", self.config.ssh_key] if self.config.ssh_key else []
+        sock = self._cm_socket_opts()
+
+        check = ["ssh", *key_opt, *sock, "-O", "check", target]
+        try:
+            rc = subprocess.run(check, capture_output=True, text=True, timeout=10).returncode
+        except Exception:
+            # Best-effort: any failure here just means "no live master".
+            rc = 1
+
+        if rc != 0:
+            establish = [
+                "ssh",
+                "-fN",
+                "-M",
+                *key_opt,
+                "-o",
+                f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ControlPersist=600",
+                *sock,
+                target,
+            ]
+            try:
+                subprocess.run(
+                    establish,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                    check=False,
+                )
+            except Exception as exc:
+                # Non-fatal: clients just run without multiplexing.
+                self._logger.warning(
+                    "ControlMaster establish failed (%s); continuing unmultiplexed",
+                    exc,
+                )
+
+        self._master_checked_at = now
 
     def _warn_insecure_ssh(self):
         """Warn user once about disabled host key checking."""
@@ -352,6 +416,7 @@ class SSHTransport:
             from qsp_hpc.utils.security for safe command construction.
         """
         self._warn_insecure_ssh()
+        self._ensure_master()
 
         ssh_cmd = ["ssh"]
 
@@ -400,6 +465,7 @@ class SSHTransport:
             RemoteCommandError: If upload fails on the final retry attempt.
         """
         self._warn_insecure_ssh()
+        self._ensure_master()
 
         scp_cmd = ["scp"]
 
@@ -444,6 +510,7 @@ class SSHTransport:
             RemoteCommandError: If download fails on the final retry attempt.
         """
         self._warn_insecure_ssh()
+        self._ensure_master()
 
         scp_cmd = ["scp"]
 
@@ -485,6 +552,7 @@ class SSHTransport:
         ``test -f`` + scp per file.
         """
         self._warn_insecure_ssh()
+        self._ensure_master()
 
         ssh_parts = ["ssh"]
         if self.config.ssh_key:

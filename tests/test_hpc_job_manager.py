@@ -770,6 +770,9 @@ class TestSSHRetry:
                 "ssh_retry_max_attempts": 3,
                 "ssh_retry_base_delay_s": 0.0,
                 "ssh_retry_max_delay_s": 0.0,
+                # Off so _ensure_master doesn't consume the mocked
+                # subprocess.run side-effects these retry tests set up.
+                "ssh_control_master": False,
             }
         )
 
@@ -874,6 +877,7 @@ class TestSSHRetry:
                     for f in mock_hpc_config.__dataclass_fields__.values()
                 },
                 "ssh_retry_max_attempts": 1,
+                "ssh_control_master": False,
             }
         )
         transport = SSHTransport(cfg)
@@ -1796,3 +1800,53 @@ class TestDeferredSharedUploads:
         assert "--ignore-existing" in cmd
         assert "-e" in cmd
         assert cmd[-1].endswith(":/remote/batch_jobs/input/")
+
+
+class TestEnsureMaster:
+    """`_ensure_master` pre-establishes the SSH ControlMaster so client
+    calls multiplex instead of each paying a fresh handshake."""
+
+    def _cfg(self, mock_hpc_config, **overrides):
+        return BatchConfig(
+            **{
+                **{
+                    f.name: getattr(mock_hpc_config, f.name)
+                    for f in mock_hpc_config.__dataclass_fields__.values()
+                },
+                **overrides,
+            }
+        )
+
+    def test_noop_when_control_master_disabled(self, mock_hpc_config):
+        t = SSHTransport(self._cfg(mock_hpc_config, ssh_control_master=False))
+        with patch("subprocess.run") as run:
+            t._ensure_master()
+        run.assert_not_called()
+
+    def test_throttled_within_recheck_window(self, mock_hpc_config):
+        t = SSHTransport(mock_hpc_config)
+        t._master_checked_at = time.time()  # just checked
+        with patch("subprocess.run") as run:
+            t._ensure_master()
+        run.assert_not_called()
+
+    def test_establishes_when_no_live_master(self, mock_hpc_config):
+        t = SSHTransport(mock_hpc_config)
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            # First call is `ssh -O check` → report no master (rc=1).
+            rc = 1 if "-O" in cmd else 0
+            return subprocess.CompletedProcess(cmd, rc, "", "")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            t._ensure_master()
+
+        assert any("-O" in c and "check" in c for c in calls)
+        assert any("-fN" in c and "-M" in c for c in calls)  # establish
+
+    def test_client_opts_use_auto_mode(self, mock_hpc_config):
+        opts = SSHTransport(mock_hpc_config)._control_master_opts()
+        assert "ControlMaster=auto" in opts
+        assert any("ControlPath=" in o for o in opts)

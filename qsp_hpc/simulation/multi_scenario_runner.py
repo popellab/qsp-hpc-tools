@@ -381,11 +381,17 @@ class MultiScenarioRunner:
             )
 
         self.prepare_session()
+        # Batched shared-input upload: register every shared file (samples,
+        # healthy state, model structure, aux, per-scenario YAMLs/CSVs)
+        # then rsync them all in ONE round-trip, instead of one ~2s
+        # ``test -f`` probe per file.
+        self.job_manager.begin_deferred_shared_uploads()
         shared_remote = self.upload_shared_samples_csv(n)
         shared_healthy_remote = self.upload_shared_healthy_state()
         shared_model_structure_remote = self.upload_shared_model_structure()
         shared_aux_remote = self.upload_shared_aux_samples_csv()
         per_scen_remotes = self._preupload_per_scenario_files()
+        self.job_manager.flush_shared_uploads()
 
         # One fused array for every scenario still needing sims. The
         # persistent evolve cache (#90 Phase 1) composes underneath:

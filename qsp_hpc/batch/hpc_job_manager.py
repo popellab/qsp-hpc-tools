@@ -474,6 +474,53 @@ class SSHTransport:
 
         self._retry(_once, description=f"scp download {Path(remote_path).name}")
 
+    def rsync_dir(self, local_dir: str, remote_dir: str) -> None:
+        """Sync a local directory into ``remote_dir`` in one connection.
+
+        Backs the batched shared-input upload. rsync's file-list
+        exchange skips files that already exist on the destination
+        (``--ignore-existing``); since shared inputs use content-hash
+        filenames, "name already there" ⟺ "byte-identical", so a warm
+        run transfers ~0 bytes — one SSH connection instead of one
+        ``test -f`` + scp per file.
+        """
+        self._warn_insecure_ssh()
+
+        ssh_parts = ["ssh"]
+        if self.config.ssh_key:
+            ssh_parts += ["-i", self.config.ssh_key]
+        ssh_parts += [
+            "-o",
+            f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
+            "-o",
+            "BatchMode=yes",
+            *self._control_master_opts(),
+        ]
+        ssh_e = " ".join(shlex.quote(p) for p in ssh_parts)
+
+        rsync_cmd = [
+            "rsync",
+            "-rt",
+            "--ignore-existing",
+            "-e",
+            ssh_e,
+            f"{local_dir.rstrip('/')}/",
+            f"{self._build_ssh_target()}:{remote_dir}/",
+        ]
+        timeout = self.config.scp_timeout_s or None
+
+        def _once() -> None:
+            try:
+                subprocess.run(
+                    rsync_cmd, check=True, capture_output=True, text=True, timeout=timeout
+                )
+            except subprocess.CalledProcessError as exc:
+                raise RemoteCommandError(
+                    f"rsync to {remote_dir}", exc.returncode, exc.stderr or str(exc)
+                ) from exc
+
+        self._retry(_once, description=f"rsync -> {remote_dir}")
+
 
 class HPCJobManager:
     """
@@ -2174,6 +2221,18 @@ class HPCJobManager:
         remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
         remote_path = f"{remote_input_dir}/{remote_filename}"
 
+        # Deferred / batched mode: the remote path is fully determined by
+        # content hash, so no round-trip is needed to compute the return
+        # value. Register the (local, remote) pair and let
+        # flush_shared_uploads() rsync every pending file in ONE
+        # connection. Turns ~16 test-f probes (one per shared file,
+        # ~2s each) into a single rsync. See begin_deferred_shared_uploads.
+        if getattr(self, "_defer_shared_uploads", False):
+            pending = self._pending_shared_uploads
+            if remote_path not in {rp for _, rp in pending}:
+                pending.append((str(local), remote_path))
+            return remote_path
+
         # Combined mkdir + skip-if-exists probe in one ssh exec. mkdir
         # is folded into the && chain on first call per HPCJobManager;
         # subsequent calls drop it via the _shared_input_dir_ready memo
@@ -2195,6 +2254,52 @@ class HPCJobManager:
         self.transport.upload(str(local), remote_path)
         self.logger.debug("Shared upload cache MISS, uploaded: %s", remote_path)
         return remote_path
+
+    def begin_deferred_shared_uploads(self) -> None:
+        """Enter batched shared-upload mode.
+
+        While active, :meth:`_upload_shared_file` registers each file and
+        returns its (content-hash-deterministic) remote path *without*
+        any round-trip. :meth:`flush_shared_uploads` then transfers the
+        whole batch in one rsync. Collapses the per-file ``test -f``
+        probe storm — ~16 probes at ~2s each — into a single connection.
+        """
+        self._defer_shared_uploads = True
+        self._pending_shared_uploads: List[Tuple[str, str]] = []
+
+    def flush_shared_uploads(self) -> None:
+        """Transfer every file registered since
+        :meth:`begin_deferred_shared_uploads` in one rsync, then leave
+        deferred mode. No-op when nothing is pending.
+
+        rsync ``--ignore-existing`` skips files already on HPC (warm
+        re-runs transfer ~0 bytes) and uploads the rest — so after this
+        returns, every registered path is guaranteed present.
+        """
+        pending = getattr(self, "_pending_shared_uploads", [])
+        self._defer_shared_uploads = False
+        if not pending:
+            return
+
+        import shutil
+
+        remote_input_dir = f"{self.config.remote_project_path}/batch_jobs/input"
+        self.transport.exec(f"mkdir -p {shlex.quote(remote_input_dir)}", timeout=15)
+        self._shared_input_dir_ready = True
+
+        with tempfile.TemporaryDirectory(prefix="qsp_shared_stage_") as stage:
+            for local_path, remote_path in pending:
+                dest = Path(stage) / Path(remote_path).name
+                if not dest.exists():
+                    shutil.copy2(local_path, dest)
+            self.transport.rsync_dir(stage, remote_input_dir)
+
+        if self.verbose:
+            self.logger.info(
+                "Shared uploads: rsynced %d file(s) to HPC in one round-trip",
+                len(pending),
+            )
+        self._pending_shared_uploads = []
 
     def upload_shared_scenario_yaml(
         self, scenario_yaml: str, remote_filename: Optional[str] = None

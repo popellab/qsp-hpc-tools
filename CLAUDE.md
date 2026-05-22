@@ -88,6 +88,15 @@ This document provides context for AI assistants (particularly Claude Code) work
      so a fused run primes the cache a later single-scenario call reads.
      `MultiScenarioRunner.job_manager` is now optional at construction
      (only `run_all` needs it).
+   - Evolve-cache hygiene (issue #90 Phase 4): `EvolveCache.maybe_compact()`
+     rebuilds `manifest.json` only once enough shards accumulate outside it
+     (default 64), called by `CppBatchRunner.run` / `run_fused` after the
+     write-through — bounds the per-task footer scan, self-limiting, no
+     compaction storm. `HPCJobManager.prune_simulation_pools` gained a
+     second age-based pass over `evolve_cache/{namespace}/` subdirs (a
+     binary rebuild orphans old namespaces); shared find+age+rm logic
+     factored into `_prune_stale_subdirs`, `keep_evolve_namespaces` spares
+     the live namespace.
    - Full plan + history in `docs/CPP_SIMULATION_PLAN.md`.
 
 ### File Organization (Recently Updated)

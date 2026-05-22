@@ -571,7 +571,7 @@ QSEP format are kept — `evolve_cache.py` builds on them.
 
 Status: code + unit tests landed; HPC end-to-end validated. Issue #90
 Phase 2 (scenario-fused task) landed next, then Phase 3 (local-PPC
-reuse); Phase 4 (compaction job + namespace pruning) is the follow-up.
+reuse), then Phase 4 (cache compaction + namespace pruning).
 
 #### #90 Phase 2 — scenario-fused multi-scenario task
 
@@ -650,6 +650,31 @@ carries it across calls (repeated PPC rounds, or a later single-scenario
 
 Status: code + unit tests landed (including a real-binary test asserting
 the evolve runs once per theta, not once per scenario).
+
+#### #90 Phase 4 — evolve-cache hygiene (compaction + namespace pruning)
+
+Phases 1–3 made the evolve cache fast; Phase 4 keeps it healthy as
+shards and namespaces accumulate run after run.
+
+- **Threshold-gated compaction.** `EvolveCache.maybe_compact()` rebuilds
+  `manifest.json` only once enough shards have piled up outside it
+  (`_COMPACT_MIN_UNCOMPACTED_SHARDS`, default 64) — so a reader's
+  per-task footer scan (:meth:`EvolveCache.load`) stays bounded without
+  paying a full compaction on every write. `CppBatchRunner.run` /
+  `run_fused` call it after the evolve-cache write-through. It is
+  best-effort (atomic + idempotent), and self-limiting: the first task
+  to finish a SLURM array writes the manifest, and the rest then see too
+  few uncovered shards and skip — no O(tasks²) compaction storm.
+- **Namespace-aware pruning.** `HPCJobManager.prune_simulation_pools`
+  gains a second pass over `evolve_cache/<namespace>/` subdirs. A
+  namespace folds in the qsp_sim binary + healthy-state hash, so a
+  binary rebuild orphans the old namespace; age-based pruning (the same
+  policy as pool dirs — the live namespace keeps getting fresh shards so
+  its dir mtime stays young) reclaims it. `keep_evolve_namespaces` is
+  belt-and-braces for the current run. The shared find+age+rm logic is
+  factored into `_prune_stale_subdirs`, used for both passes.
+
+Status: code + unit tests landed.
 
 ## Completed milestones and benchmarks (2026-04-15 through 2026-04-16)
 

@@ -1557,16 +1557,17 @@ class TestPruneSimulationPools:
     """prune_simulation_pools: age-based deletion of stale pool dirs (#disk-hygiene)."""
 
     @staticmethod
-    def _mgr_with_fake_transport(mock_hpc_config, find_out):
-        """HPCJobManager whose transport.exec replays a canned `find`
-        output, then records the `rm` command."""
+    def _mgr_with_fake_transport(mock_hpc_config, find_out, evolve_find_out=""):
+        """HPCJobManager whose transport.exec replays canned `find` output
+        — routed by path so the pool-root pass and the evolve_cache pass
+        get distinct listings — then records the `rm` command(s)."""
         mgr = HPCJobManager(config=mock_hpc_config)
         calls = []
 
         def fake_exec(cmd, timeout=None):
             calls.append(cmd)
             if cmd.lstrip().startswith("find"):
-                return (0, find_out)
+                return (0, evolve_find_out if "evolve_cache" in cmd else find_out)
             return (0, "PRUNED")
 
         mgr.transport = Mock()
@@ -1611,7 +1612,9 @@ class TestPruneSimulationPools:
         result = mgr.prune_simulation_pools(retention_days=2.0)
         assert result["deleted"] == []
         assert calls and calls[0].lstrip().startswith("find")
-        assert len(calls) == 1, "no rm should be issued when nothing is stale"
+        # Two finds (pool root + evolve_cache), no rm — nothing is stale.
+        assert len(calls) == 2, "no rm should be issued when nothing is stale"
+        assert all(c.lstrip().startswith("find") for c in calls)
 
     def test_list_failure_is_non_fatal(self, mock_hpc_config):
         mgr = HPCJobManager(config=mock_hpc_config)
@@ -1619,6 +1622,66 @@ class TestPruneSimulationPools:
         mgr.transport.exec = Mock(return_value=(1, ""))  # find fails
         result = mgr.prune_simulation_pools(retention_days=2.0)
         assert result["deleted"] == [] and result["errors"]
+
+    def test_prunes_stale_evolve_cache_namespaces(self, mock_hpc_config):
+        """Pass 2: stale namespace subdirs under evolve_cache/ are pruned
+        and reported as evolve_cache/<namespace>; the dir itself stays."""
+        now = time.time()
+        old, recent = now - 5 * 86400, now - 3600
+        pool_find = f"{recent}\tmsv5_run_aaaa_baseline\n{old}\tevolve_cache"
+        evolve_find = "\n".join(
+            [
+                f"{old}\t0badf00d0badf00d",  # orphaned by a binary rebuild
+                f"{recent}\tcafebabecafebabe",  # live — fresh shards keep it young
+            ]
+        )
+        mgr, calls = self._mgr_with_fake_transport(mock_hpc_config, pool_find, evolve_find)
+        result = mgr.prune_simulation_pools(retention_days=2.0)
+
+        assert result["deleted"] == ["evolve_cache/0badf00d0badf00d"]
+        assert "evolve_cache/cafebabecafebabe" in result["kept"]
+        assert "evolve_cache" in result["kept"]  # the tree root is spared
+        assert result["errors"] == []
+        # The namespace rm runs cd'd into evolve_cache/, names only the
+        # stale namespace.
+        ns_rm = next(c for c in calls if not c.lstrip().startswith("find"))
+        assert "evolve_cache" in ns_rm and "0badf00d0badf00d" in ns_rm
+        assert "cafebabecafebabe" not in ns_rm
+
+    def test_keep_evolve_namespaces_spares_live_namespace(self, mock_hpc_config):
+        """An explicitly-kept namespace survives even when it is old."""
+        now = time.time()
+        old = now - 5 * 86400
+        evolve_find = f"{old}\tcafebabecafebabe\n{old}\t0badf00d0badf00d"
+        mgr, _calls = self._mgr_with_fake_transport(
+            mock_hpc_config, f"{now}\tevolve_cache", evolve_find
+        )
+        result = mgr.prune_simulation_pools(
+            retention_days=2.0, keep_evolve_namespaces={"cafebabecafebabe"}
+        )
+        assert result["deleted"] == ["evolve_cache/0badf00d0badf00d"]
+        assert "evolve_cache/cafebabecafebabe" in result["kept"]
+
+    def test_missing_evolve_cache_tree_is_benign(self, mock_hpc_config):
+        """No evolve_cache tree (never used) → pass 2 is a no-op, not an
+        error; pass-1 pool pruning still works."""
+        now = time.time()
+        mgr = HPCJobManager(config=mock_hpc_config)
+        calls = []
+
+        def fake_exec(cmd, timeout=None):
+            calls.append(cmd)
+            if cmd.lstrip().startswith("find"):
+                if "evolve_cache" in cmd:
+                    return (1, "")  # tree does not exist
+                return (0, f"{now - 5 * 86400}\tmsv5_old_aaaa_baseline")
+            return (0, "PRUNED")
+
+        mgr.transport = Mock()
+        mgr.transport.exec = fake_exec
+        result = mgr.prune_simulation_pools(retention_days=2.0)
+        assert result["deleted"] == ["msv5_old_aaaa_baseline"]
+        assert result["errors"] == []  # missing evolve_cache tree is not an error
 
 
 class TestDownloadTestStatsFused:

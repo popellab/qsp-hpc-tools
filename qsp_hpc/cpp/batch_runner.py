@@ -1046,6 +1046,16 @@ class CppBatchRunner:
                 n_sims,
             )
 
+        # Fold accumulated shards into the manifest once enough have piled
+        # up — bounds the per-task footer scan future readers pay at load
+        # (#90 Phase 4). Best-effort: the compaction is atomic + idempotent,
+        # and a failure only means later readers scan a few more shards.
+        if evolve_cache is not None:
+            try:
+                evolve_cache.maybe_compact()
+            except Exception as e:  # noqa: BLE001 — maintenance is best-effort
+                logger.error("Evolve-cache maybe_compact failed (%s) — harmless", e)
+
         logger.info(
             "Batch complete: %d/%d succeeded, wrote %s (cols: %d species + %d comps + %d rules)",
             n_sims - n_failed,
@@ -1341,6 +1351,14 @@ class CppBatchRunner:
                 logger.error("Fused evolve-cache shard write failed (%s)", e)
         elif evolve_cache is not None:
             logger.info("Fused evolve-cache write-through: nothing to write (all hit)")
+
+        # Bound future readers' per-task footer scan (#90 Phase 4) — see
+        # the matching call in run(). Best-effort, atomic + idempotent.
+        if evolve_cache is not None:
+            try:
+                evolve_cache.maybe_compact()
+            except Exception as e:  # noqa: BLE001 — maintenance is best-effort
+                logger.error("Fused evolve-cache maybe_compact failed (%s) — harmless", e)
 
         batch_results: list[BatchResult | None] = []
         for spec in scenarios:

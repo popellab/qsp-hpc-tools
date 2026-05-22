@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import textwrap
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -565,6 +566,50 @@ def test_run_fused_requires_healthy_state(tmp_path, template_path):
             scenarios=[FusedScenarioSpec(name="x", output_path=tmp_path / "x.parquet")],
             sample_indices=np.array([0]),
         )
+
+
+def test_run_triggers_evolve_cache_maybe_compact(tmp_path, template_path, healthy_yaml):
+    """run() folds accumulated shards into the manifest after the
+    evolve-cache write-through (#90 Phase 4)."""
+    from qsp_hpc.cpp.evolve_cache import EvolveCache
+
+    runner = CppBatchRunner(
+        _make_fake_fused_binary(tmp_path),
+        template_path,
+        healthy_state_yaml=healthy_yaml,
+        evolve_cache_root=tmp_path / "evolve_cache",
+    )
+    with patch.object(EvolveCache, "maybe_compact", autospec=True) as mc:
+        runner.run(
+            theta_matrix=np.array([[1.1, 2.1]]),
+            param_names=["A", "B"],
+            t_end_days=0.2,
+            min_cadence_hours=0.1,
+            output_path=tmp_path / "out.parquet",
+        )
+    assert mc.call_count == 1
+
+
+def test_run_fused_triggers_evolve_cache_maybe_compact(tmp_path, template_path, healthy_yaml):
+    """run_fused() folds shards into the manifest after write-through."""
+    from qsp_hpc.cpp.evolve_cache import EvolveCache
+
+    runner = CppBatchRunner(
+        _make_fake_fused_binary(tmp_path),
+        template_path,
+        healthy_state_yaml=healthy_yaml,
+        evolve_cache_root=tmp_path / "evolve_cache",
+    )
+    with patch.object(EvolveCache, "maybe_compact", autospec=True) as mc:
+        runner.run_fused(
+            theta_matrix=np.array([[1.1, 2.1]]),
+            param_names=["A", "B"],
+            t_end_days=0.2,
+            min_cadence_hours=0.1,
+            scenarios=[FusedScenarioSpec(name="baseline", output_path=tmp_path / "b.parquet")],
+            sample_indices=np.array([0]),
+        )
+    assert mc.call_count == 1
 
 
 def test_run_fused_happy_path(tmp_path, template_path, healthy_yaml):

@@ -95,6 +95,12 @@ _SHARD_GLOB = "shard_*.qsep"
 _MANIFEST_NAME = "manifest.json"
 _MANIFEST_SCHEMA = "evolve-cache-manifest-v1"
 _NAMESPACE_LEN = 16  # hex chars of the namespace digest kept as the subdir name
+# Default trigger for :meth:`EvolveCache.maybe_compact` — fold shards into
+# the manifest once this many have accumulated outside it, so a reader's
+# per-task footer scan (see :meth:`load`) stays bounded without compacting
+# on every write. One SLURM array task writes one shard, so this is also
+# roughly "compact every N tasks' worth of shards".
+_COMPACT_MIN_UNCOMPACTED_SHARDS = 64
 
 
 def compute_namespace(
@@ -461,3 +467,41 @@ class EvolveCache:
             len(shards),
         )
         return manifest_path
+
+    def maybe_compact(self, min_uncompacted: int = _COMPACT_MIN_UNCOMPACTED_SHARDS) -> Path | None:
+        """Compact only if enough shards have accumulated outside the manifest.
+
+        A reader's per-task scan cost (:meth:`load`) is one footer read
+        per shard the manifest does not already cover. This folds those
+        shards in once the uncovered count reaches ``min_uncompacted`` —
+        so scan cost stays bounded without paying a full compaction on
+        every write.
+
+        Cheap enough for the write path: one directory glob plus a small
+        manifest read. Returns the manifest path when a compaction ran,
+        else None (too few uncovered shards, or none at all). Compaction
+        itself is atomic and idempotent (see :meth:`compact`), so the
+        several tasks that finish a SLURM array near-together may each
+        call this: the first to write the manifest covers the bulk, and
+        the rest then see too few uncovered shards and skip — the work is
+        self-limiting, not an O(tasks²) storm.
+        """
+        if not self.namespace_dir.is_dir():
+            return None
+        shards = list(self.namespace_dir.glob(_SHARD_GLOB))
+        if not shards:
+            return None
+        covered: set[str] = set()
+        manifest_path = self.namespace_dir / _MANIFEST_NAME
+        if manifest_path.exists():
+            _entries, covered = self._read_manifest(manifest_path)
+        n_uncovered = sum(1 for s in shards if s.name not in covered)
+        if n_uncovered < min_uncompacted:
+            return None
+        logger.info(
+            "evolve cache: %d shard(s) outside the manifest (>= %d) — " "compacting namespace %s",
+            n_uncovered,
+            min_uncompacted,
+            self.namespace,
+        )
+        return self.compact()

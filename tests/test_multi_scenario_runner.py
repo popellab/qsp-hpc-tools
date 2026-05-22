@@ -78,10 +78,20 @@ class TestConstructorValidation:
         with pytest.raises(ValueError, match="simulators cannot be empty"):
             MultiScenarioRunner({})
 
-    def test_no_job_manager_anywhere_rejected(self):
+    def test_no_job_manager_construction_allowed(self):
+        """job_manager is optional at construction — the local PPC path
+        (simulate_with_parameters_all) needs no transport."""
         sim = _fake_sim(job_manager=None)
+        r = MultiScenarioRunner({"a": sim})
+        assert r.job_manager is None
+
+    def test_run_all_without_job_manager_rejected(self):
+        """run_all is the HPC path — it raises when no job_manager is
+        reachable, pointing the caller at the local PPC method."""
+        sim = _fake_sim(job_manager=None)
+        r = MultiScenarioRunner({"a": sim})
         with pytest.raises(ValueError, match="needs a job_manager"):
-            MultiScenarioRunner({"a": sim})
+            r.run_all(1)
 
     def test_explicit_job_manager_accepted(self):
         sim = _fake_sim(job_manager=None)

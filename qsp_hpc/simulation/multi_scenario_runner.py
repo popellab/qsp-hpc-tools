@@ -9,6 +9,10 @@ combine + download). This module adds the joint-θ layer on top:
 - per-scenario ``run_hpc(n, samples_csv_remote=..., skip_setup=...)`` so
   scenarios 2..N skip the redundant venv refresh / git pull / cmake
 - a :func:`joint_nan_mask` helper for cross-scenario alignment
+- :meth:`MultiScenarioRunner.simulate_with_parameters_all` — the local,
+  posterior-predictive counterpart: one fused C++ batch evaluates a
+  user-supplied theta matrix under every scenario, evolving each theta
+  once (#90 Phase 3)
 
 Inference-agnostic: returns per-scenario ``(theta, x, sample_index)``
 arrays the way :meth:`CppSimulator.run_hpc` already produces them.
@@ -21,12 +25,16 @@ import hashlib
 import logging
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Mapping, Optional
+from typing import Dict, Mapping, Optional, Tuple
 
 import numpy as np
+import pandas as pd
+import pyarrow as pa
 
-from qsp_hpc.simulation.cpp_simulator import CppSimulator
+from qsp_hpc.cpp.batch_runner import CppBatchRunner, FusedScenarioSpec, write_pool_manifest
+from qsp_hpc.simulation.cpp_simulator import CppSimulator, PpcContext
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +63,10 @@ class MultiScenarioRunner:
             scenario A vs B at the same ``sample_index``, breaking
             joint-inference alignment.
         job_manager: Optional override; defaults to the job_manager on
-            the first simulator. Useful when you want a single shared
-            transport but supplied multiple sims that were built without
-            one.
+            the first simulator. Required only by :meth:`run_all` (the HPC
+            training path); :meth:`simulate_with_parameters_all` runs the
+            fused C++ batch locally and needs no transport, so the runner
+            can be constructed without one for local-only PPC.
 
     Top-up: each :meth:`CppSimulator.run_hpc` call already handles
     deficit submission. Top-up cases silently drop ``samples_csv_remote``
@@ -77,12 +86,13 @@ class MultiScenarioRunner:
             raise ValueError("simulators cannot be empty")
         self.simulators: Dict[str, CppSimulator] = dict(simulators)
         first = next(iter(self.simulators.values()))
+        # job_manager is required only by the HPC training path
+        # (:meth:`run_all`). The local posterior-predictive path
+        # (:meth:`simulate_with_parameters_all`) runs the fused C++ batch
+        # on this host and needs no transport — so the "missing
+        # job_manager" failure is deferred to :meth:`run_all`, letting a
+        # local-only PPC caller construct the runner without one.
         self.job_manager = job_manager or first.job_manager
-        if self.job_manager is None:
-            raise ValueError(
-                "MultiScenarioRunner needs a job_manager (set on the simulators "
-                "or passed explicitly)"
-            )
         self._validate_alignment()
 
         self._shared_samples_remote: Optional[str] = None
@@ -356,6 +366,12 @@ class MultiScenarioRunner:
 
         Returns ``{name: ScenarioResult}`` in scenario-insertion order.
         """
+        if self.job_manager is None:
+            raise ValueError(
+                "MultiScenarioRunner.run_all needs a job_manager (set it on the "
+                "simulators or pass it explicitly); for a local posterior-"
+                "predictive run use simulate_with_parameters_all instead."
+            )
         aux = str(self._aux_samples_local) if self._aux_samples_local else None
         if self._all_local(n):
             logger.info(
@@ -631,6 +647,214 @@ class MultiScenarioRunner:
                 )
 
         # Preserve scenario insertion order.
+        return {name: results[name] for name in self.simulators}
+
+    # ---- Phase 3 fused local posterior-predictive ------------------------
+
+    def _validate_fused_local(self) -> None:
+        """Fail fast before a fused local PPC run when simulators disagree
+        on anything the single shared scenario-agnostic runner holds fixed.
+
+        A fused batch runs every scenario through **one** ``qsp_sim``
+        binary and **one** ``evolve_to_diagnosis`` per theta, then writes
+        each scenario from that shared state. So the binary, the param
+        template, and the healthy state must match across simulators, and
+        ``t_end_days`` / ``min_cadence_hours`` must too —
+        :meth:`CppBatchRunner.run_fused` takes one value of each for the
+        whole batch. Scenario + drug-metadata YAMLs are *expected* to
+        differ (that is the point of fusion) and ride per
+        :class:`FusedScenarioSpec`.
+
+        ``evolve_trajectory_dir`` is rejected: a burn-in trajectory dump
+        needs the full evolve, which is incompatible with the fused
+        cached-state execution model.
+        """
+        first_name, first = next(iter(self.simulators.items()))
+        if first.healthy_state_yaml is None:
+            raise ValueError(
+                "simulate_with_parameters_all requires healthy_state_yaml — "
+                "fused PPC amortizes the evolve_to_diagnosis burn-in across "
+                "scenarios, and there is no burn-in without a healthy state."
+            )
+        for name, sim in self.simulators.items():
+            for attr in (
+                "binary_path",
+                "template_xml",
+                "healthy_state_yaml",
+                "t_end_days",
+                "min_cadence_hours",
+                "subtree",
+            ):
+                a, b = getattr(first, attr), getattr(sim, attr)
+                if a != b:
+                    raise ValueError(
+                        f"simulate_with_parameters_all: simulators[{name!r}].{attr}="
+                        f"{b!r} differs from simulators[{first_name!r}].{attr}={a!r}; "
+                        f"a fused local PPC runs every scenario through one shared "
+                        f"binary + evolve, so these must match."
+                    )
+            if getattr(sim, "evolve_trajectory_dir", None) is not None:
+                raise NotImplementedError(
+                    f"simulate_with_parameters_all: simulators[{name!r}] has "
+                    f"evolve_trajectory_dir set — a burn-in trajectory dump needs "
+                    f"the full evolve and is incompatible with fused cached-state "
+                    f"execution. Use the single-scenario "
+                    f"CppSimulator.simulate_with_parameters for trajectory dumps."
+                )
+
+    def simulate_with_parameters_all(
+        self,
+        theta: np.ndarray,
+        *,
+        pool_suffix: str = "posterior_predictive",
+        prediction_targets: Optional[str | Path] = None,
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]] = None,
+        auxiliary_units: Optional[dict[str, str]] = None,
+    ) -> Dict[str, Tuple[np.ndarray, pa.Table]]:
+        """Run every scenario at explicit ``theta`` locally, fused (#90 Phase 3).
+
+        The posterior-predictive analogue of :meth:`run_all`: where
+        ``run_all`` submits an HPC array over the deterministic theta
+        pool, this evaluates a **user-supplied** theta matrix (posterior
+        draws) on this host. It is the multi-scenario counterpart of
+        :meth:`CppSimulator.simulate_with_parameters` — and the reason it
+        lives here rather than looping that method N times is fusion:
+
+        - Each scenario's suffix-pool cache is probed first
+          (:meth:`CppSimulator._resolve_ppc_context` /
+          :meth:`~CppSimulator._ppc_cache_hit`); fully-cached scenarios
+          short-circuit and never re-simulate.
+        - The scenarios still needing sims go into **one**
+          :meth:`CppBatchRunner.run_fused` call. Per theta the
+          ``evolve_to_diagnosis`` burn-in (~84%+ of per-sim cost) is
+          resolved **once** and every scenario runs from that state — so
+          a 4-scenario PPC pays one evolve per theta, not four.
+        - The persistent theta-keyed evolve cache (#90 Phase 1) composes
+          underneath: fusion shares the evolve across scenarios within
+          this call; the cache carries it across calls (repeated PPC
+          rounds, or a later single-scenario ``simulate_with_parameters``
+          on the same theta).
+
+        Each scenario's result is written to its own suffix-pool cache,
+        byte-identical to what :meth:`CppSimulator.simulate_with_parameters`
+        would produce — so a later single-scenario call on the same theta
+        is a cache hit.
+
+        Args:
+            theta: Parameter matrix ``(n_samples, n_params)``, columns
+                aligned with the shared ``param_names``. The same theta is
+                evaluated under every scenario (joint posterior-predictive).
+            pool_suffix: Suffix-pool label, applied to every scenario.
+            prediction_targets: Optional directory of PredictionTarget
+                YAMLs, merged into every scenario's derived columns.
+            aux_by_sample_index: Optional per-sim auxiliary draws, keyed by
+                ``sample_index``; shared across scenarios.
+            auxiliary_units: ``{aux_name: units}`` for the aux draws.
+
+        Returns:
+            ``{name: (theta_out, table)}`` in scenario-insertion order —
+            each entry exactly the pair
+            :meth:`CppSimulator.simulate_with_parameters` returns.
+        """
+        self._validate_fused_local()
+        first = next(iter(self.simulators.values()))
+
+        # Per-scenario PPC context + suffix-pool cache probe. A scenario
+        # already covered by its cache short-circuits; the rest are fused.
+        results: Dict[str, Tuple[np.ndarray, pa.Table]] = {}
+        uncached: list[tuple[str, CppSimulator, PpcContext]] = []
+        for name, sim in self.simulators.items():
+            ctx = sim._resolve_ppc_context(
+                theta,
+                backend="local",
+                prediction_targets=prediction_targets,
+                pool_suffix=pool_suffix,
+                aux_by_sample_index=aux_by_sample_index,
+                auxiliary_units=auxiliary_units,
+            )
+            hit = sim._ppc_cache_hit(ctx)
+            if hit is not None:
+                logger.info("MSR PPC: scenario %s — suffix-pool cache hit", name)
+                results[name] = hit
+            else:
+                uncached.append((name, sim, ctx))
+
+        if not uncached:
+            logger.info(
+                "MSR PPC: all %d scenario(s) satisfied from suffix-pool cache " "— no sims run",
+                len(self.simulators),
+            )
+            return {name: results[name] for name in self.simulators}
+
+        # One fused batch for every scenario still needing sims. Each
+        # scenario writes its own species Parquet into its suffix pool;
+        # fusion only amortizes the shared per-theta evolve.
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fused_specs: list[FusedScenarioSpec] = []
+        for name, sim, ctx in uncached:
+            write_pool_manifest(ctx.suffix_pool_dir, sim._runner.template_defaults, sim.param_names)
+            species_parquet = (
+                ctx.suffix_pool_dir
+                / f"species_{ts}_{pool_suffix}_{ctx.n_samples}sims_seed{sim.seed}.parquet"
+            )
+            fused_specs.append(
+                FusedScenarioSpec(
+                    name=name,
+                    output_path=species_parquet,
+                    scenario_yaml=sim.scenario_yaml,
+                    drug_metadata_yaml=sim.drug_metadata_yaml,
+                    start_index=0,  # PPC theta is user-supplied — every scenario runs all rows
+                )
+            )
+
+        # One scenario-agnostic runner — per-scenario YAMLs ride on the
+        # FusedScenarioSpecs. evolve_cache_root threads the persistent
+        # Phase 1 cache through so PPC runs accumulate reusable evolves.
+        runner = CppBatchRunner(
+            binary_path=first.binary_path,
+            template_path=first.template_xml,
+            subtree=first.subtree,
+            default_timeout_s=first.per_sim_timeout_s or 120.0,
+            scenario_yaml=None,
+            drug_metadata_yaml=None,
+            healthy_state_yaml=first.healthy_state_yaml,
+            evolve_cache_root=first.evolve_cache_root,
+        )
+        ref_ctx = uncached[0][2]
+        logger.info(
+            "MSR PPC: fused batch — %d scenario(s) × %d sims, one evolve per theta",
+            len(uncached),
+            ref_ctx.n_samples,
+        )
+        batch_results = runner.run_fused(
+            theta_matrix=ref_ctx.theta,
+            param_names=list(first.param_names),
+            t_end_days=first.t_end_days,
+            min_cadence_hours=first.min_cadence_hours,
+            scenarios=fused_specs,
+            sample_indices=ref_ctx.sample_indices,
+            max_workers=first.max_workers,
+            per_sim_timeout_s=first.per_sim_timeout_s,
+        )
+
+        # Derive per scenario from its species Parquet, write its
+        # suffix-pool cache, and assemble the (theta_out, table) pair.
+        for (name, sim, ctx), batch in zip(uncached, batch_results):
+            if batch is None:
+                # start_index=0 ⇒ every scenario receives a parquet; a
+                # None here means the fused batch dropped the scenario.
+                raise RuntimeError(f"fused PPC produced no output for scenario {name!r}")
+            species_df = pd.read_parquet(batch.parquet_path)
+            table = sim._derive_test_stats_table(
+                species_df,
+                ctx.test_stats_df,
+                ctx.theta,
+                ctx.sample_indices,
+                aux_by_sample_index=aux_by_sample_index,
+                auxiliary_units=auxiliary_units,
+            )
+            results[name] = sim._finalize_ppc(ctx, table)
+
         return {name: results[name] for name in self.simulators}
 
     # ---- joint NaN filter (static) ---------------------------------------

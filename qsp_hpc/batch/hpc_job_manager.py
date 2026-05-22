@@ -3397,10 +3397,15 @@ class HPCJobManager:
             for line in output.strip().split("\n"):
                 self.logger.info(f"  {line}")
 
-        # Stage the two small files per scenario into one dir, tar, download once.
+        # Stage the two small files per scenario into one dir, tar, download
+        # once. The staging dir + tarball MUST live on shared storage, not
+        # node-local /tmp: the cluster round-robins login nodes, so the
+        # exec that builds the tarball and the scp that fetches it can land
+        # on different nodes (the scp would then see no such file).
         stamp = f"fused_dl_{int(time.time() * 1000)}"
-        remote_stage = f"/tmp/{stamp}"
-        remote_tarball = f"/tmp/{stamp}.tgz"
+        shared_staging = f"{self.config.remote_project_path}/batch_jobs/.fused_staging"
+        remote_stage = f"{shared_staging}/{stamp}"
+        remote_tarball = f"{shared_staging}/{stamp}.tgz"
         stage_lines = [f'mkdir -p "{remote_stage}"']
         for name, ts_dir in test_stats_dirs.items():
             stage_lines.append(

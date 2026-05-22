@@ -1668,6 +1668,10 @@ class TestDownloadTestStatsFused:
         assert "pool_b/test_stats/h_b" in combine[0]
         # combined_params.csv is never fetched — theta is local.
         assert not any("combined_params.csv" in c for c in exec_calls)
+        # Staging tarball lives on shared storage, never node-local /tmp
+        # (the cluster round-robins login nodes — exec and scp can differ).
+        assert not any("/tmp/fused_dl" in c for c in exec_calls)
+        assert any(".fused_staging" in c for c in exec_calls)
 
         for name in ("a", "b"):
             si, ts = result[name]

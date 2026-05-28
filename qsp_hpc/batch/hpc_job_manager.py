@@ -467,36 +467,38 @@ class SSHTransport:
         self._warn_insecure_ssh()
         self._ensure_master()
 
-        scp_cmd = ["scp"]
-
+        # rsync over ssh instead of scp. On clusters that throttle or reset
+        # the sftp subsystem (e.g. Rockfish login nodes drop scp uploads
+        # >~30MB with "Connection reset by peer"), scp fails before rsync
+        # would. rsync's protocol resumes through transient blips and lets
+        # the same control-master + retry plumbing route everything else.
+        ssh_inner = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
+        ]
         if self.config.ssh_key:
-            scp_cmd.extend(["-i", self.config.ssh_key])
+            ssh_inner.extend(["-i", self.config.ssh_key])
+        ssh_inner.extend(self._control_master_opts())
 
         remote_target = f"{self._build_ssh_target()}:{remote_path}"
-
-        scp_cmd.extend(
-            [
-                "-o",
-                f'StrictHostKeyChecking={"yes" if self.config.strict_host_key_checking else "no"}',
-                "-o",
-                "BatchMode=yes",
-                *self._control_master_opts(),
-                local_path,
-                remote_target,
-            ]
-        )
+        rsync_cmd = ["rsync", "-q", "-e", " ".join(ssh_inner), local_path, remote_target]
 
         timeout = self.config.scp_timeout_s or None
 
         def _once() -> None:
             try:
-                subprocess.run(scp_cmd, check=True, capture_output=True, text=True, timeout=timeout)
+                subprocess.run(
+                    rsync_cmd, check=True, capture_output=True, text=True, timeout=timeout
+                )
             except subprocess.CalledProcessError as exc:
                 raise RemoteCommandError(
-                    f"scp upload to {remote_path}", exc.returncode, exc.stderr or str(exc)
+                    f"rsync upload to {remote_path}", exc.returncode, exc.stderr or str(exc)
                 ) from exc
 
-        self._retry(_once, description=f"scp upload {Path(local_path).name}")
+        self._retry(_once, description=f"rsync upload {Path(local_path).name}")
 
     def download(self, remote_path: str, local_dir: str) -> None:
         """

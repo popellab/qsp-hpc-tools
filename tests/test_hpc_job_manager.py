@@ -511,17 +511,22 @@ class TestCommandExecutionBehaviors:
         with pytest.raises(MissingOutputError):
             manager._download_combined_results()
 
-    def test_scp_upload_wrapped_error(self, mock_hpc_config):
-        """Test that SCP upload errors are wrapped in RemoteCommandError."""
+    def test_rsync_upload_wrapped_error(self, mock_hpc_config):
+        """Test that rsync upload errors are wrapped in RemoteCommandError.
+
+        upload() switched from scp to rsync over ssh because Rockfish's
+        login-node sftp subsystem drops scp transfers >~30MB; the wrapped
+        error message should reflect the new transport.
+        """
         manager = HPCJobManager(config=mock_hpc_config)
         # Mock subprocess.run to raise CalledProcessError
         with patch(
             "subprocess.run",
-            side_effect=subprocess.CalledProcessError(1, "scp", stderr="upload failed"),
+            side_effect=subprocess.CalledProcessError(1, "rsync", stderr="upload failed"),
         ):
             with pytest.raises(RemoteCommandError) as exc_info:
                 manager.transport.upload("/tmp/file", "/remote/path")
-            assert "scp upload" in str(exc_info.value)
+            assert "rsync upload" in str(exc_info.value)
 
     def test_scp_download_wrapped_error(self, mock_hpc_config):
         """Test that SCP download errors are wrapped in RemoteCommandError."""

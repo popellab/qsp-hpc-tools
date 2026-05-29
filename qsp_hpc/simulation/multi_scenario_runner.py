@@ -638,6 +638,21 @@ class MultiScenarioRunner:
                 # pool — never downloaded. sample_index is the join key.
                 theta_scen = sim._generate_parameters(sample_index_scen)
                 sim.last_sample_index = sample_index_scen
+                # Persist the local Tier-1 parquet the single-scenario
+                # path writes via ``_download_and_persist`` (#90 fused
+                # refactor dropped this). Without it ``local_cache_satisfies``
+                # never hits after a fused run — every re-run pays an SSH
+                # round-trip — and direct parquet readers (e.g. the
+                # restriction-classifier retrain) find nothing on disk.
+                # theta_scen is the sampled subset (``self.param_names``
+                # order), so it keys the ``param:*`` columns directly.
+                sim._persist_local_test_stats(
+                    sim._local_test_stats_path(sim._compute_test_stats_hash(aux_samples_csv=aux)),
+                    theta_scen,
+                    x_scen,
+                    sample_index=sample_index_scen,
+                    param_names=sim.param_names,
+                )
                 results[name] = ScenarioResult(
                     theta=theta_scen,
                     x=x_scen,

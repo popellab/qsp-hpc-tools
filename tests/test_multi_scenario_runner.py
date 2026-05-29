@@ -253,6 +253,32 @@ class TestRunAll:
         a._generate_parameters.assert_called_once()
         np.testing.assert_array_equal(a._generate_parameters.call_args.args[0], [5, 7])
 
+    def test_fused_teardown_persists_local_parquet(self, tmp_path):
+        """The fused teardown must write the local Tier-1 parquet the
+        single-scenario path writes via ``_download_and_persist``. The #90
+        fused refactor dropped this, so ``local_cache_satisfies`` never hit
+        after a fused run (every re-run paid an SSH round-trip) and direct
+        parquet readers — e.g. the restriction-classifier retrain — found
+        nothing on disk."""
+        jm = _fake_jm()
+        a = _fake_sim(job_manager=jm, pool_id="pool_a")
+        a.param_names = ["k"]
+        _wire_samples(jm, a, tmp_path)
+        jm.download_test_stats_fused.side_effect = lambda specs, dest: {
+            specs[0]["name"]: (np.array([0, 1], dtype=np.int64), np.zeros((2, 1)))
+        }
+
+        MultiScenarioRunner({"a": a}).run_all(2)
+
+        # Persisted exactly once, keyed by the same hash scen_specs used,
+        # with the regenerated theta + downloaded x + sample_index sidecar.
+        a._persist_local_test_stats.assert_called_once()
+        a._local_test_stats_path.assert_called_once_with("tshash_pool_a")
+        call = a._persist_local_test_stats.call_args
+        assert call.args[0] is a._local_test_stats_path.return_value
+        np.testing.assert_array_equal(call.kwargs["sample_index"], [0, 1])
+        assert call.kwargs["param_names"] == ["k"]
+
     def test_local_cache_sample_index_falls_back_to_arange(self, tmp_path):
         """A locally-cached scenario whose run_hpc leaves last_sample_index
         unset falls back to a positional arange."""

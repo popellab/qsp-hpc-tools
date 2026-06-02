@@ -995,14 +995,33 @@ class HPCJobManager:
                         f"{shlex.quote(self.config.cpp_codegen_source)} && "
                     )
                     cmake_python_override = f"-DPython3_EXECUTABLE={shlex.quote(venv_python)} "
+                    # Self-heal a stale build dir: a CMakeCache.txt left by an
+                    # earlier build pins Python3_EXECUTABLE, and the `if [ ! -f
+                    # CMakeCache.txt ]` guard below skips reconfigure when it
+                    # exists. If that cached python differs from the venv we now
+                    # install qsp-codegen into, cmake keeps resolving qsp_sim_core
+                    # from the OLD venv's codegen — e.g. a pre-rename CancerVCT
+                    # namespace against a qsp_sim_core ODE, which fails to compile
+                    # with no hint that the cache is the culprit. Wipe the cache
+                    # so the configure below re-runs against the right python.
+                    cache_guard = (
+                        "if [ -f CMakeCache.txt ] && "
+                        f"! grep -qF {shlex.quote('=' + venv_python)} CMakeCache.txt; then "
+                        '  echo ">> qsp-hpc-tools: CMakeCache pins a different '
+                        'Python3_EXECUTABLE; wiping build dir for a clean reconfigure"; '
+                        "  rm -rf CMakeCache.txt CMakeFiles; "
+                        "fi && "
+                    )
                 else:
                     codegen_install = ""
                     cmake_python_override = ""
+                    cache_guard = ""
 
                 build_inner = (
                     f"set -e && {module_prelude} && "
                     f"{codegen_install}"
                     f"cd {shlex.quote(sim_dir)} && mkdir -p build && cd build && "
+                    f"{cache_guard}"
                     "if [ ! -f CMakeCache.txt ]; then "
                     f"  cmake .. -DCMAKE_BUILD_TYPE=Release {cmake_python_override}; "
                     "fi && "

@@ -11,6 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from qsp_hpc.utils.hpc_guard import ensure_remote_writes_allowed
 from qsp_hpc.utils.logging_config import setup_logger
 
 
@@ -58,6 +59,7 @@ class SLURMJobSubmitter:
         Raises:
             SubmissionError: If job submission fails or job ID cannot be parsed
         """
+        ensure_remote_writes_allowed("submit_job")
         start_time = time.time()
 
         # Log SLURM configuration
@@ -178,6 +180,7 @@ echo "Job completed at $(date)"
         Returns:
             Job ID string.
         """
+        ensure_remote_writes_allowed("submit_cpp_job")
         self.logger.info("C++ SLURM Configuration:")
         self.logger.info(f"  Partition: {self.config.partition}")
         self.logger.info(f"  Time limit: {self.config.time_limit}")
@@ -312,6 +315,7 @@ echo "Job completed at $(date)"
         Returns:
             Job ID string
         """
+        ensure_remote_writes_allowed("submit_derivation_job")
         # Log configuration
         self.logger.info("SLURM Derivation Configuration:")
         self.logger.info(f"  Partition: {self.config.partition}")
@@ -465,6 +469,7 @@ python3 -m qsp_hpc.batch.derive_test_stats_worker "{test_stats_config}"
         Returns:
             Job ID string
         """
+        ensure_remote_writes_allowed("submit_trajectory_grid_job")
         self.logger.info("SLURM Trajectory Grid Configuration:")
         self.logger.info(f"  Partition: {self.config.partition}")
         self.logger.info("  Time limit: 00:15:00 (fixed for grid extraction)")

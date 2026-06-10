@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from qsp_hpc.utils.hpc_guard import ensure_remote_writes_allowed
 from qsp_hpc.utils.logging_config import setup_logger
 from qsp_hpc.utils.security import safe_shell_quote
 
@@ -154,6 +155,11 @@ class HPCFileTransfer:
         """
         if skip_sync:
             return
+
+        # Kill switch: refuse the destructive rsync --delete when the dev-machine
+        # guard is set. Fires before the same-host check so an exported
+        # QSP_HPC_NO_SUBMIT blocks every codebase sync unconditionally.
+        ensure_remote_writes_allowed("sync_codebase")
 
         # Safety: bail out if we'd be rsyncing onto the same host we're running
         # on. This almost always happens when a workflow meant for "laptop →

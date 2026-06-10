@@ -149,3 +149,23 @@ After configuration, verify everything works:
 qsp-hpc test   # Test connection and SLURM
 qsp-hpc info   # View configuration
 ```
+
+## Blocking accidental HPC writes (`QSP_HPC_NO_SUBMIT`)
+
+A machine with a valid `credentials.yaml` reaches the real cluster the moment a
+simulator cache-misses — `QSPSimulator.__call__` / `CppSimulator.run_hpc` /
+`HPCJobManager.submit_*` will submit jobs, and the MATLAB submit path also runs
+`rsync -avz --delete` to mirror your repo onto `remote_project_path`.
+
+To make that impossible on a development machine (e.g. while running tests or
+notebooks), export the kill switch:
+
+```bash
+export QSP_HPC_NO_SUBMIT=1
+```
+
+Any cluster-*mutating* operation — codebase sync and `sbatch` submission — then
+raises `HPCSubmitBlockedError` instead of executing. Read-only operations
+(`squeue`, `ls`, status checks, `qsp-hpc info`) are unaffected, so you can still
+inspect and debug. Unset it (or run from a machine intended to reach the
+cluster) to allow submission again.

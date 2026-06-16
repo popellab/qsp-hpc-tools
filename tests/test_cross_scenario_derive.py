@@ -107,3 +107,30 @@ def test_compute_cross_inputs_batch_none_when_unreferenced():
     matrix, keys = compute_cross_inputs_batch(sim, df, "unrelated", {})
     assert matrix is None
     assert keys == []
+
+
+def test_derive_then_compose_end_to_end():
+    """Full Option-B chain: derive per-arm cross inputs on each scenario's
+    sim_df, assemble the cross_inputs channel, compose the cross-arm ratio."""
+    import numpy as np
+
+    from qsp_hpc.batch.cross_scenario_worker import compute_cross_scenario_statistics
+
+    df = _cross_df("invar")
+    units = {"V_T.CD8_TLA": "cell", "V_T.CD8_TLA_act": "cell"}
+
+    # nivo arm: within-TLA number at d21 = resting + active.
+    nivo_sim = _sim_df(resting_per_row=[10.0, 20.0, 30.0], active_per_row=[0.0, 0.0, 0.0])
+    # urelumab arm: same number, activation shifted (number invariant).
+    ure_sim = _sim_df(resting_per_row=[2.0, 4.0, 6.0], active_per_row=[8.0, 16.0, 24.0])
+
+    nivo_mat, nivo_keys = compute_cross_inputs_batch(nivo_sim, df, "gvax_nivo", units)
+    ure_mat, ure_keys = compute_cross_inputs_batch(ure_sim, df, "gvax_nivo_urelumab", units)
+
+    scenario_meta = {
+        "gvax_nivo": {"cross_inputs": {k: nivo_mat[:, i] for i, k in enumerate(nivo_keys)}},
+        "gvax_nivo_urelumab": {"cross_inputs": {k: ure_mat[:, i] for i, k in enumerate(ure_keys)}},
+    }
+    out = compute_cross_scenario_statistics(scenario_meta, df)
+    # nivo = [10,20,30], urelumab = [10,20,30] → ratio = 1.0 everywhere.
+    np.testing.assert_array_almost_equal(out[:, 0], [1.0, 1.0, 1.0])

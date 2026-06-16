@@ -568,10 +568,24 @@ class SSHTransport:
         ]
         ssh_e = " ".join(shlex.quote(p) for p in ssh_parts)
 
+        # -z: compress on the wire. Shared-stage uploads are dominated by the
+        #   samples CSV (theta × N rows), which is highly compressible (~7-10x);
+        #   a 30k-row, ~140 MB CSV transfers as ~15-20 MB. Without it the raw
+        #   transfer runs long enough that a busy Rockfish login node resets the
+        #   connection mid-stream ("closed by remote host"), and large-N runs
+        #   can't upload at all.
+        # --partial-dir: keep interrupted chunks in a side dir (NOT under the
+        #   destination name) so an interrupted transfer is resumable. Using
+        #   --partial-dir rather than bare --partial is required alongside
+        #   --ignore-existing: bare --partial leaves the incomplete file at the
+        #   destination name, which --ignore-existing would then skip forever,
+        #   silently shipping a truncated file.
         rsync_cmd = [
             "rsync",
             "-rt",
+            "-z",
             "--ignore-existing",
+            "--partial-dir=.rsync-partial",
             "-e",
             ssh_e,
             f"{local_dir.rstrip('/')}/",

@@ -1855,8 +1855,9 @@ class TestDeferredSharedUploads:
         assert mgr._defer_shared_uploads is False
 
     def test_rsync_dir_command_has_ignore_existing(self, mock_hpc_config, tmp_path):
-        """SSHTransport.rsync_dir issues an rsync with --ignore-existing
-        over an -e ssh tunnel."""
+        """SSHTransport.rsync_dir issues an rsync with --ignore-existing,
+        on-wire compression (-z), and resumable --partial-dir over an -e ssh
+        tunnel."""
         transport = SSHTransport(mock_hpc_config)
         captured = {}
 
@@ -1870,6 +1871,12 @@ class TestDeferredSharedUploads:
         cmd = captured["cmd"]
         assert cmd[0] == "rsync"
         assert "--ignore-existing" in cmd
+        assert "-z" in cmd  # compress large samples CSVs so login-node resets don't kill the upload
+        # Resumability must use --partial-dir, not bare --partial, so the
+        # incomplete file never lands at the destination name where
+        # --ignore-existing would skip it forever.
+        assert "--partial-dir=.rsync-partial" in cmd
+        assert "--partial" not in cmd
         assert "-e" in cmd
         assert cmd[-1].endswith(":/remote/batch_jobs/input/")
 

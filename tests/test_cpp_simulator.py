@@ -144,6 +144,94 @@ class TestCppSimulatorInit:
         assert sim.pool_dir.exists()
         assert sim.config_hash  # non-empty string
 
+    def test_cross_input_rows_appended_and_invalidate_hash(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        """cross_input_test_stats_df is concatenated onto the test-stats CSV so
+        the per-arm inputs derive as ordinary test stats; appending rows
+        changes the CSV content and thus the test_stats_hash (cache key)."""
+        import pandas as pd
+
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        base = tmp_path / "ts.csv"
+        pd.DataFrame(
+            {
+                "test_statistic_id": ["real_obs"],
+                "required_species": ["spA"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return float(species_dict['spA'][-1])\n"
+                ],
+            }
+        ).to_csv(base, index=False)
+
+        cross = pd.DataFrame(
+            {
+                "test_statistic_id": ["invar::nivo", "invar::urelumab"],
+                "required_species": ["spA", "spA"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict):\n    return 1.0\n",
+                    "def compute_test_statistic(time, species_dict):\n    return 2.0\n",
+                ],
+            }
+        )
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            test_stats_csv=base,
+            cross_input_test_stats_df=cross,
+        )
+        written = pd.read_csv(sim.test_stats_csv)
+        assert list(written["test_statistic_id"]) == [
+            "real_obs",
+            "invar::nivo",
+            "invar::urelumab",
+        ]
+
+        sim_no_cross = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            test_stats_csv=base,
+        )
+        assert sim._compute_test_stats_hash() != sim_no_cross._compute_test_stats_hash()
+
+    def test_empty_cross_input_df_is_noop(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        import pandas as pd
+
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        base = tmp_path / "ts.csv"
+        pd.DataFrame(
+            {
+                "test_statistic_id": ["real_obs"],
+                "required_species": ["spA"],
+                "model_output_code": [
+                    "def compute_test_statistic(time, species_dict):\n    return 0.0\n"
+                ],
+            }
+        ).to_csv(base, index=False)
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            test_stats_csv=base,
+            cross_input_test_stats_df=pd.DataFrame(
+                columns=["test_statistic_id", "required_species", "model_output_code"]
+            ),
+        )
+        # Empty cross df → base CSV used as-is, no temp rewrite.
+        assert sim.test_stats_csv == base.resolve()
+
     def test_missing_priors_raises(self, binary_path, template_path, cache_dir):
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 

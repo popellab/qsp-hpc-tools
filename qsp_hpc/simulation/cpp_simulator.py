@@ -104,6 +104,7 @@ class CppSimulator:
         job_manager: Optional["HPCJobManager"] = None,
         test_stats_csv: Optional[str | Path] = None,
         calibration_targets: Optional[str | Path | list] = None,
+        cross_input_test_stats_df: Optional["pd.DataFrame"] = None,
         model_structure_file: Optional[str | Path] = None,
         poll_interval: float = 5.0,
         max_wait_time: Optional[float] = None,
@@ -161,6 +162,20 @@ class CppSimulator:
             raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
         self._calibration_targets_dir: Optional[List[Path]] = None
         self._temp_test_stats_csv: Optional[Path] = None
+
+        # Optional self-contained cross-scenario per-arm inputs. These derive
+        # as ordinary test stats (they are scalar-from-trajectory observables),
+        # so they're appended to this scenario's test-stats CSV and ride the
+        # normal test-stats transport into x. The inference runner strips the
+        # `{target}::{role}` columns out of the NPE training x post-derive and
+        # feeds them to the cross-scenario composer instead. Appending rows
+        # changes the CSV content, so the test_stats_hash invalidates the
+        # derive cache automatically — no separate hashing.
+        _cross_rows = cross_input_test_stats_df
+        if _cross_rows is not None and len(_cross_rows) == 0:
+            _cross_rows = None
+
+        _base_df: Optional["pd.DataFrame"] = None
         if calibration_targets is not None:
             from qsp_hpc.calibration import load_calibration_targets
             from qsp_hpc.calibration.yaml_loader import _resolve_yaml_dirs
@@ -169,13 +184,24 @@ class CppSimulator:
             # (literature + mechanistic) cases use the same downstream code.
             cal_dirs = [d.resolve() for d in _resolve_yaml_dirs(calibration_targets)]
             self._calibration_targets_dir = cal_dirs
-            df = load_calibration_targets(cal_dirs)
+            _base_df = load_calibration_targets(cal_dirs)
+        elif _cross_rows is not None:
+            # Cross inputs to append, but the base came in as a flat CSV.
+            if test_stats_csv is None:
+                raise ValueError(
+                    "cross_input_test_stats_df requires calibration_targets or test_stats_csv"
+                )
+            _base_df = pd.read_csv(test_stats_csv)
+
+        if _base_df is not None:
+            if _cross_rows is not None:
+                _base_df = pd.concat([_base_df, _cross_rows], ignore_index=True)
             tmp = tempfile.NamedTemporaryFile(
                 mode="w", suffix=".csv", delete=False, prefix="cpp_cal_targets_"
             )
             tmp.close()
             self._temp_test_stats_csv = Path(tmp.name)
-            df.to_csv(self._temp_test_stats_csv, index=False)
+            _base_df.to_csv(self._temp_test_stats_csv, index=False)
             test_stats_csv = self._temp_test_stats_csv
         self.test_stats_csv = Path(test_stats_csv).resolve() if test_stats_csv else None
         self.model_structure_file = (

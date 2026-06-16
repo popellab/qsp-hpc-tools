@@ -3,9 +3,10 @@ Cross-Scenario Calibration Target Loader.
 
 Loads CrossScenarioCalibrationTarget YAMLs (defined in maple) and produces
 a DataFrame parallel in spirit to ``load_calibration_targets``, but with
-inputs serialized as JSON (a list of role-keyed dicts) since each cross-
-scenario target can mix scalar and timeseries inputs from arbitrary
-scenarios.
+inputs serialized as JSON (a list of role-keyed dicts). Each input is
+self-contained: it carries its own per-arm observable (``observable_code`` +
+``required_species``) computed at derive time on the worker, rather than
+referencing a per-scenario calibration target.
 
 The runtime composer worker
 (``qsp_hpc.batch.cross_scenario_worker.compute_cross_scenario_statistics``)
@@ -32,7 +33,7 @@ _CROSS_SCENARIO_COLUMNS = [
     "cross_scenario_target_id",
     "composer_code",
     "units",
-    "inputs_json",  # JSON-encoded list[dict]: [{role, scenario, input_kind, ...}, ...]
+    "inputs_json",  # JSON-encoded list[dict]: [{role, scenario, observable_code, required_species}, ...]
     "median",
     "ci95_lower",
     "ci95_upper",
@@ -48,41 +49,47 @@ def _resolve_yaml_dir(yaml_dir: Path | str) -> Path:
 
 
 def _normalize_input(raw: dict) -> dict:
-    """Strip optional fields with None values so the JSON payload is
-    minimal and stable across edits that toggle between input kinds.
+    """Normalize one self-contained per-arm input into the serialized JSON
+    payload: ``{role, scenario, observable_code, required_species}``.
 
-    Validation of the payload (kind ↔ test_statistic_id / required_species
-    consistency) happens at YAML authoring time via maple's
+    Full validation happens at YAML authoring time via maple's
     CrossScenarioInput Pydantic model. We re-check the minimum invariants
     here so a hand-edited YAML doesn't sail past with a silently broken
-    composer at runtime.
+    derive/compose at runtime. Legacy ``input_kind`` / ``test_statistic_id``
+    fields are rejected loudly so stale YAMLs don't load as no-ops.
     """
     role = raw.get("role")
     scenario = raw.get("scenario")
-    kind = raw.get("input_kind")
-    if not role or not scenario or kind not in ("test_statistic", "timeseries"):
+    if not role or not scenario:
         raise ValueError(
-            f"Cross-scenario input is missing required fields or has invalid " f"input_kind: {raw}"
+            f"Cross-scenario input is missing required 'role'/'scenario' fields: {raw}"
         )
 
-    out: dict = {"role": role, "scenario": scenario, "input_kind": kind}
-    if kind == "test_statistic":
-        tsid = raw.get("test_statistic_id")
-        if not tsid:
-            raise ValueError(
-                f"Cross-scenario input role='{role}' has input_kind='test_statistic' "
-                f"but no test_statistic_id."
-            )
-        out["test_statistic_id"] = tsid
-    else:
-        species = raw.get("required_species") or []
-        if not species:
-            raise ValueError(
-                f"Cross-scenario input role='{role}' has input_kind='timeseries' "
-                f"but no required_species."
-            )
-        out["required_species"] = list(species)
-    return out
+    if "input_kind" in raw or "test_statistic_id" in raw:
+        raise ValueError(
+            f"Cross-scenario input role='{role}' uses the retired "
+            "'input_kind'/'test_statistic_id' schema. Each input must now "
+            "carry its own 'observable_code' + 'required_species' (see "
+            "maple CrossScenarioInput)."
+        )
+
+    observable_code = raw.get("observable_code")
+    if not observable_code:
+        raise ValueError(
+            f"Cross-scenario input role='{role}' has no observable_code. Each "
+            "input must define compute_test_statistic(time, species_dict)."
+        )
+
+    species = raw.get("required_species") or []
+    if not species:
+        raise ValueError(f"Cross-scenario input role='{role}' has no required_species.")
+
+    return {
+        "role": role,
+        "scenario": scenario,
+        "observable_code": observable_code,
+        "required_species": list(species),
+    }
 
 
 def load_cross_scenario_targets(yaml_dir: Path | str) -> pd.DataFrame:
@@ -98,16 +105,14 @@ def load_cross_scenario_targets(yaml_dir: Path | str) -> pd.DataFrame:
             cross_scenario_target_id, composer_code, units, inputs_json,
             median, ci95_lower, ci95_upper, sample_size
 
-        ``inputs_json`` is a JSON-encoded list of dicts; each dict has at
-        least ``role``, ``scenario``, ``input_kind`` plus
-        ``test_statistic_id`` (scalar inputs) or ``required_species``
-        (timeseries inputs).
+        ``inputs_json`` is a JSON-encoded list of dicts; each dict has
+        ``role``, ``scenario``, ``observable_code``, and ``required_species``.
 
     Raises:
         FileNotFoundError: If yaml_dir does not exist.
         ValueError: If no YAMLs are found, or any YAML has invalid input
-            shape (missing role/scenario/input_kind, or kind/payload
-            mismatch).
+            shape (missing role/scenario/observable_code/required_species,
+            or a retired input_kind/test_statistic_id field).
     """
     yaml_dir = _resolve_yaml_dir(yaml_dir)
     yaml_files = sorted(yaml_dir.glob("*.yaml"))

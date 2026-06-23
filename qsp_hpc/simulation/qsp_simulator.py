@@ -96,7 +96,14 @@ def _run_worker_batch(
 
 class QSPSimulator:
     """
-    QSP Simulator with three-tier caching and HPC integration.
+    QSP Simulator with three-tier caching and HPC integration (legacy MATLAB backend).
+
+    .. note::
+        This is the **legacy** MATLAB/SimBiology backend, retained for groups
+        working from an existing SimBiology model. New work should prefer
+        :class:`~qsp_hpc.simulation.cpp_simulator.CppSimulator`, the generated
+        C++ backend, which is faster and shares the identical calibration-target
+        and caching interface. See ``docs/CPP_SIMULATION_PLAN.md``.
 
     Wraps a MATLAB QSP model as a Python callable that returns
     (parameters, observables) pairs. Manages simulation caching,

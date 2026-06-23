@@ -8,9 +8,9 @@ A Python package for running quantitative systems pharmacology (QSP) simulations
 
 ## Features
 
-- **Two backends**: original MATLAB / SimBiology path and a faster C++ `qsp_sim`
-  path (~25-87× speedup; closes the column-set gap with SimBiology so calibration
-  targets work unchanged). See [docs/CPP_SIMULATION_PLAN.md](docs/CPP_SIMULATION_PLAN.md).
+- **Two backends**: a generated C++ `qsp_sim` path (**primary**; ~25-87× speedup
+  over MATLAB, with calibration targets working unchanged) and a **legacy** MATLAB /
+  SimBiology path. See [docs/CPP_SIMULATION_PLAN.md](docs/CPP_SIMULATION_PLAN.md).
 - **Simulation Pool Management**: Efficient local caching of simulation results with scenario support
 - **HPC Integration**: Submit and monitor QSP simulations on SLURM clusters via SSH
 - **Multi-Scenario Support**: Run the same parameters under different therapy protocols independently
@@ -20,10 +20,11 @@ A Python package for running quantitative systems pharmacology (QSP) simulations
   on both backends — runs the simulator at user-supplied thetas (typically
   posterior draws from `qsp-inference`) with theta-hashed pool caching. See
   [docs/SIMULATE_WITH_PARAMETERS.md](docs/SIMULATE_WITH_PARAMETERS.md).
-- **Burn-in trajectory dumps + LMDB-packed `evolve_cache`**: dump per-sim
+- **Burn-in trajectory dumps + append-only `evolve_cache`**: dump per-sim
   pre-diagnosis trajectories with `--evolve-trajectory-out` / `evolve_trajectory_dir`
   and reuse post-evolve ODE state across scenarios (~N× speedup on the dominant
-  term). See [docs/EVOLVE_TRAJECTORIES.md](docs/EVOLVE_TRAJECTORIES.md).
+  term) via an NFS-safe, append-only QSEP-shard cache. See
+  [docs/EVOLVE_TRAJECTORIES.md](docs/EVOLVE_TRAJECTORIES.md).
 - **Classifier-restricted theta pool**: `get_theta_pool(...,
   restriction_classifier_dir=...)` rejection-samples the prior against a
   `qsp_inference.inference.RestrictionClassifier` so simulator jobs aren't
@@ -43,25 +44,8 @@ qsp-hpc setup
 
 ### Basic Usage
 
-**MATLAB backend** (`QSPSimulator`):
-
-```python
-from qsp_hpc import QSPSimulator
-
-simulator = QSPSimulator(
-    priors_csv='priors.csv',
-    submodel_priors_yaml='submodel_priors.yaml',  # optional: narrows priors for calibrated params
-    calibration_targets='calibration_targets/control/',
-    model_structure_file='model_structure.json',
-    model_script='my_qsp_model',
-    model_version='v1',
-    scenario='control',
-)
-params, observables = simulator(1000)
-```
-
-**C++ backend** (`CppSimulator`) — drop-in for the simulation step, runs
-the same 3-tier cache walk via `run_hpc()` when given an `HPCJobManager`:
+**C++ backend** (`CppSimulator`) — the primary path. Runs the 3-tier cache
+walk via `run_hpc()` when given an `HPCJobManager`:
 
 ```python
 from qsp_hpc.batch.hpc_job_manager import HPCJobManager
@@ -83,6 +67,24 @@ simulator = CppSimulator(
 params, test_stats = simulator.run_hpc(1000)
 ```
 
+**MATLAB backend** (`QSPSimulator`) — legacy path for groups working from an
+existing SimBiology model; exposes the same callable interface:
+
+```python
+from qsp_hpc import QSPSimulator
+
+simulator = QSPSimulator(
+    priors_csv='priors.csv',
+    submodel_priors_yaml='submodel_priors.yaml',  # optional: narrows priors for calibrated params
+    calibration_targets='calibration_targets/control/',
+    model_structure_file='model_structure.json',
+    model_script='my_qsp_model',
+    model_version='v1',
+    scenario='control',
+)
+params, observables = simulator(1000)
+```
+
 ### CLI Commands
 
 ```bash
@@ -100,7 +102,7 @@ qsp-hpc logs      # View HPC job logs
 - **[CLI Reference](docs/CLI.md)** - Command-line interface documentation
 - **[Architecture](docs/ARCHITECTURE.md)** - System design and caching strategy
 - **[`simulate_with_parameters`](docs/SIMULATE_WITH_PARAMETERS.md)** - Posterior-predictive sims at user-supplied thetas, local vs HPC backend, cache key
-- **[Evolve trajectories](docs/EVOLVE_TRAJECTORIES.md)** - Burn-in trajectory dumps, the LMDB-packed `evolve_cache`, and the long-form assemblers
+- **[Evolve trajectories](docs/EVOLVE_TRAJECTORIES.md)** - Burn-in trajectory dumps, the append-only `evolve_cache`, and the long-form assemblers
 - **[C++ Simulation Plan](docs/CPP_SIMULATION_PLAN.md)** - Design notes and milestone history for the C++ backend
 - **[Development Guide](docs/DEVELOPMENT.md)** - Contributing and testing
 

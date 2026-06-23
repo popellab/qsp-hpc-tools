@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Minimal parameter template for the offline feature walkthrough. Each leaf
+  under <QSP> is one model parameter; CppSimulator's param-XML renderer maps a
+  priors-CSV column name to the QSP-subtree leaf with the same tag. The values
+  here are template defaults (overwritten per-simulation by sampled draws).
+  A real model uses param_all.xml emitted by qsp-codegen; this stub only needs
+  the six parameters exercised by examples/data/priors.csv.
+-->
+<Param>
+  <QSP>
+    <k_tumor_growth>0.1</k_tumor_growth>
+    <k_tumor_death>0.05</k_tumor_death>
+    <k_immune_kill>0.02</k_immune_kill>
+    <k_immune_recruit>0.03</k_immune_recruit>
+    <k_drug_effect>0.2</k_drug_effect>
+    <V_tumor_carrying_capacity>90.0</V_tumor_carrying_capacity>
+  </QSP>
+</Param>

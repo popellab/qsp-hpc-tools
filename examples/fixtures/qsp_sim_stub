@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Placeholder for the compiled `qsp_sim` C++ binary, committed solely so the
+# offline feature walkthrough can construct a CppSimulator without a real
+# build. CppSimulator hashes this file's BYTES into the pool-directory id, so
+# the committed example pool resolves to a deterministic cache hit on any
+# machine. It is NEVER executed: the walkthrough only reads pre-baked cached
+# results, which short-circuits before the binary would run.
+#
+# To run real simulations, point binary_path at an actual qsp_sim built from
+# the companion qsp-codegen package (see docs/CPP_SIMULATION_PLAN.md).
+echo "qsp_sim_stub: this is a placeholder, not a real simulator binary" >&2
+exit 1

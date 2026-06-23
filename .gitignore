@@ -49,6 +49,11 @@ Thumbs.db
 # Allow MATLAB test fixtures (CSVs needed by tests/test_matlab.py).
 !qsp_hpc/matlab/tests/fixtures/*.csv
 cache/
+# but track the bundled offline example pool used by examples/feature_walkthrough.ipynb
+!examples/cache/
+!examples/cache/**
+# except the regenerable 100k theta-pool cache (large, rebuilt on demand)
+examples/cache/theta_pools/
 simulations/
 # HPC job state pickles written by HPCJobManager._save_job_state
 batch_jobs/

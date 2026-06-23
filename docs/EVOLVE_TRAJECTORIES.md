@@ -1,4 +1,4 @@
-# Evolve trajectories: burn-in dumps, the LMDB cache, and assemblers
+# Evolve trajectories: burn-in dumps, the evolve cache, and assemblers
 
 Most calibration scenarios start with an `evolve_to_diagnosis` burn-in: integrate
 the model from a healthy steady state up to the diagnosis time, then start the
@@ -66,9 +66,15 @@ from `~N × T_evolve` to `~T_evolve + N × T_post`.
 
 ### Storage layout
 
-Cache entries are packed into one LMDB environment per
-`(model, config)` subdirectory. Previous versions used one file per entry,
-which scaled poorly to millions of small reads on parallel filesystems.
+Cache entries are written as **append-only QSEP shards** under one
+`(model, config)` namespace subdirectory: each writer (a SLURM array task or a
+local batch) flushes its own `shard_<uuid>.qsep` and never mutates an existing
+shard, so there is no shared writable store and no cross-task locking. Readers
+build a `theta_hash -> (shard, offset, length)` index by scanning shard footers
+and fold the scan into a rebuildable `manifest.json` so later readers skip
+already-seen shards. This append-only design is the NFS-safe property: an
+earlier LMDB-backed version needed coherent `mmap` + POSIX locks, which NFS does
+not provide, and deadlocked under SLURM fan-out (qsp-hpc-tools#86).
 
 The engagement / disable state is logged loudly at runner startup:
 

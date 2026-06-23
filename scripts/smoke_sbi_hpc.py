@@ -246,13 +246,14 @@ def main() -> int:
         else:
             print("  ✓ test_stats differ across scenarios (as expected)")
 
-    # Evolve-cache LMDB env count on HPC: one env per (healthy_state, binary)
-    # pair; per-theta blobs live as keys inside each env, not as files.
+    # Evolve-cache shard count on HPC: one namespace subdir per
+    # (healthy_state, binary) pair; per-theta blobs live in append-only
+    # shard_*.qsep files inside each namespace.
     cache_root = f"{manager.config.simulation_pool_path}/evolve_cache"
-    find_cmd = f'bash -lc \'find "{cache_root}" -name "data.mdb" -type f 2>/dev/null | wc -l\''
+    find_cmd = f'bash -lc \'find "{cache_root}" -name "shard_*.qsep" -type f 2>/dev/null | wc -l\''
     status, output = manager.transport.exec(find_cmd, timeout=30)
-    env_count = int(output.strip()) if status == 0 else -1
-    print(f"  evolve-cache LMDB env count (HPC scratch): {env_count}")
+    shard_count = int(output.strip()) if status == 0 else -1
+    print(f"  evolve-cache shard count (HPC scratch): {shard_count}")
 
     if failures:
         print("\nFAIL:")

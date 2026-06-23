@@ -816,6 +816,193 @@ class TestSimulateWithParametersAll:
             r.simulate_with_parameters_all(np.array([[0.5, 1.0]]))
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: fused HPC posterior-predictive
+# (simulate_with_parameters_all backend='hpc')
+# ---------------------------------------------------------------------------
+
+
+def _ppc_hpc_jm(results_by_name: dict, *, pool_path: str = "/scratch/pools"):
+    """A MagicMock HPCJobManager for the fused-HPC PPC path.
+
+    ``results_by_name`` maps scenario name → ``(sample_index, test_stats)``,
+    the pair :meth:`download_test_stats_fused` returns for that scenario.
+    Session prep + deferred uploads are no-op MagicMock calls; the submit
+    returns a stub JobInfo and the download replays ``results_by_name``.
+    """
+    jm = MagicMock()
+    jm.config.simulation_pool_path = pool_path
+    jm.config.cpp_binary_path = "/remote/qsp_sim"
+    jm.config.cpp_template_path = "/remote/template.xml"
+    jm.upload_shared_samples_csv.return_value = "remote/ppc_samples.csv"
+    jm.upload_shared_healthy_state.return_value = "remote/healthy.yaml"
+    jm.upload_shared_model_structure.return_value = "remote/model_structure.json"
+    jm.upload_shared_test_stats_csv.return_value = "remote/test_stats.csv"
+    jm.submit_cpp_fused_jobs.return_value = MagicMock(job_ids=["job1"])
+
+    def _dl(scen_specs, local_dest):
+        return {s["name"]: results_by_name[s["name"]] for s in scen_specs}
+
+    jm.download_test_stats_fused.side_effect = _dl
+    return jm
+
+
+def _model_structure_file(tmp_path: Path) -> Path:
+    p = tmp_path / "model_structure.json"
+    p.write_text("{}\n")
+    return p
+
+
+def _ppc_hpc_sim(env, scenario, jm, model_structure, *, t_end_days: float = 0.2):
+    """Real CppSimulator wired for the fused-HPC PPC path: job_manager +
+    model_structure + remote binary/template paths."""
+    from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+    return CppSimulator(
+        priors_csv=env["priors"],
+        binary_path=env["binary"],
+        template_xml=env["template"],
+        cache_dir=env["cache"],
+        calibration_targets=env["cal_dir"],
+        scenario=scenario,
+        healthy_state_yaml=env["healthy"],
+        model_structure_file=model_structure,
+        job_manager=jm,
+        remote_binary_path="/remote/qsp_sim",
+        remote_template_xml="/remote/template.xml",
+        t_end_days=t_end_days,
+        min_cadence_hours=0.1,
+    )
+
+
+class TestSimulateWithParametersAllHpc:
+    """MultiScenarioRunner.simulate_with_parameters_all backend='hpc'.
+
+    The cluster fan-out (submit_cpp_fused_jobs / download_test_stats_fused)
+    is mocked; the assertions are on the orchestration: one fused submit
+    over the suffix-pool ids, the download reshaped into the same
+    (theta_out, table) contract as the local path, suffix-pool caching, and
+    the fail-fast guards.
+    """
+
+    def test_requires_job_manager(self, ppc_env, tmp_path):
+        ms = _model_structure_file(tmp_path)
+        # job_manager=None on the sims → MSR has none → hpc backend rejects.
+        sims = {n: _ppc_hpc_sim(ppc_env, n, None, ms) for n in ("a", "b")}
+        r = MultiScenarioRunner(sims)
+        with pytest.raises(RuntimeError, match="requires a\n.*job_manager|job_manager"):
+            r.simulate_with_parameters_all(np.array([[0.5, 1.0]]), backend="hpc")
+
+    def test_rejects_prediction_targets(self, ppc_env, tmp_path):
+        ms = _model_structure_file(tmp_path)
+        jm = _ppc_hpc_jm({})
+        sims = {n: _ppc_hpc_sim(ppc_env, n, jm, ms) for n in ("a", "b")}
+        r = MultiScenarioRunner(sims)
+        with pytest.raises(NotImplementedError, match="prediction_targets"):
+            r.simulate_with_parameters_all(
+                np.array([[0.5, 1.0]]), backend="hpc", prediction_targets="/tmp/pred"
+            )
+
+    def test_rejects_unknown_backend(self, ppc_env, tmp_path):
+        ms = _model_structure_file(tmp_path)
+        jm = _ppc_hpc_jm({})
+        sims = {n: _ppc_hpc_sim(ppc_env, n, jm, ms) for n in ("a", "b")}
+        r = MultiScenarioRunner(sims)
+        with pytest.raises(ValueError, match="backend must be"):
+            r.simulate_with_parameters_all(np.array([[0.5, 1.0]]), backend="cloud")
+
+    def test_one_fused_submit_reshapes_and_caches(self, ppc_env, tmp_path):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        ms = _model_structure_file(tmp_path)
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])
+        n = theta.shape[0]
+        # One ts column (spA_t0); distinct values per scenario.
+        results = {
+            "a": (np.arange(n, dtype=np.int64), np.array([[10.0], [11.0]])),
+            "b": (np.arange(n, dtype=np.int64), np.array([[20.0], [21.0]])),
+        }
+        jm = _ppc_hpc_jm(results)
+        sims = {nm: _ppc_hpc_sim(ppc_env, nm, jm, ms) for nm in ("a", "b")}
+        r = MultiScenarioRunner(sims)
+        with patch.object(CppSimulator, "_wait_for_jobs"):
+            out = r.simulate_with_parameters_all(theta, backend="hpc")
+
+        # Exactly one fused submit, carrying both scenarios at start_offset 0,
+        # keyed by their theta-hashed suffix-pool dirs (not the base pool id).
+        assert jm.submit_cpp_fused_jobs.call_count == 1
+        scen_arg = jm.submit_cpp_fused_jobs.call_args.kwargs["scenarios"]
+        assert [s["name"] for s in scen_arg] == ["a", "b"]
+        assert all(s["samples_start_offset"] == 0 for s in scen_arg)
+        assert all("posterior_predictive" in s["simulation_pool_id"] for s in scen_arg)
+        assert jm.submit_cpp_fused_jobs.call_args.kwargs["num_simulations"] == n
+
+        # Contract: {name: (theta_out, table)}, reshaped like the local path.
+        assert list(out) == ["a", "b"]
+        for nm in ("a", "b"):
+            theta_out, table = out[nm]
+            np.testing.assert_allclose(theta_out, theta)
+            assert "ts:spA_t0" in table.column_names
+            assert table.num_rows == n
+        np.testing.assert_allclose(out["a"][1].column("ts:spA_t0").to_numpy(), [10.0, 11.0])
+        np.testing.assert_allclose(out["b"][1].column("ts:spA_t0").to_numpy(), [20.0, 21.0])
+
+    def test_reshape_reorders_shuffled_sample_index(self, ppc_env, tmp_path):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        ms = _model_structure_file(tmp_path)
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])
+        # Download returns rows out of caller order: sample 1 first, then 0.
+        results = {"a": (np.array([1, 0], dtype=np.int64), np.array([[99.0], [10.0]]))}
+        jm = _ppc_hpc_jm(results)
+        sims = {"a": _ppc_hpc_sim(ppc_env, "a", jm, ms)}
+        r = MultiScenarioRunner(sims)
+        with patch.object(CppSimulator, "_wait_for_jobs"):
+            out = r.simulate_with_parameters_all(theta, backend="hpc")
+        # Reordered to caller order: sample 0 → 10.0, sample 1 → 99.0.
+        np.testing.assert_allclose(out["a"][1].column("ts:spA_t0").to_numpy(), [10.0, 99.0])
+
+    def test_second_call_hits_cache_no_submit(self, ppc_env, tmp_path):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        ms = _model_structure_file(tmp_path)
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])
+        n = theta.shape[0]
+        results = {
+            nm: (np.arange(n, dtype=np.int64), np.array([[1.0], [2.0]])) for nm in ("a", "b")
+        }
+        jm = _ppc_hpc_jm(results)
+        sims = {nm: _ppc_hpc_sim(ppc_env, nm, jm, ms) for nm in ("a", "b")}
+        r = MultiScenarioRunner(sims)
+        with patch.object(CppSimulator, "_wait_for_jobs"):
+            r.simulate_with_parameters_all(theta, backend="hpc")
+            assert jm.submit_cpp_fused_jobs.call_count == 1
+            # Identical theta → suffix-pool cache hit, no second submit.
+            r.simulate_with_parameters_all(theta, backend="hpc")
+            assert jm.submit_cpp_fused_jobs.call_count == 1
+
+    def test_hpc_cache_distinct_from_local(self, ppc_env, tmp_path):
+        """The 'hpc' backend tag keys a different suffix pool, so a prior
+        local fused run does not satisfy an hpc call (and vice versa)."""
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        ms = _model_structure_file(tmp_path)
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])
+        n = theta.shape[0]
+        results = {"a": (np.arange(n, dtype=np.int64), np.array([[1.0], [2.0]]))}
+        jm = _ppc_hpc_jm(results)
+        # Prime the LOCAL cache first.
+        local_sim = _ppc_hpc_sim(ppc_env, "a", jm, ms)
+        r_local = MultiScenarioRunner({"a": local_sim})
+        with patch.object(CppBatchRunner, "run_fused", side_effect=_fake_run_fused):
+            r_local.simulate_with_parameters_all(theta, backend="local")
+        # HPC call on the same theta must still submit (distinct pool key).
+        r_hpc = MultiScenarioRunner({"a": _ppc_hpc_sim(ppc_env, "a", jm, ms)})
+        with patch.object(CppSimulator, "_wait_for_jobs"):
+            r_hpc.simulate_with_parameters_all(theta, backend="hpc")
+        assert jm.submit_cpp_fused_jobs.call_count == 1
+
+
 class TestSimulateWithParametersAllEvolveOnce:
     """The headline #90 Phase 3 acceptance criterion, end to end with a
     real fused batch + real binary: PPC evolves each theta ONCE, not once

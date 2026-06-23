@@ -721,17 +721,18 @@ class MultiScenarioRunner:
         self,
         theta: np.ndarray,
         *,
+        backend: str = "local",
         pool_suffix: str = "posterior_predictive",
         prediction_targets: Optional[str | Path] = None,
         aux_by_sample_index: Optional[dict[int, dict[str, float]]] = None,
         auxiliary_units: Optional[dict[str, str]] = None,
     ) -> Dict[str, Tuple[np.ndarray, pa.Table]]:
-        """Run every scenario at explicit ``theta`` locally, fused (#90 Phase 3).
+        """Run every scenario at explicit ``theta``, fused (#90 Phase 3).
 
         The posterior-predictive analogue of :meth:`run_all`: where
         ``run_all`` submits an HPC array over the deterministic theta
         pool, this evaluates a **user-supplied** theta matrix (posterior
-        draws) on this host. It is the multi-scenario counterpart of
+        draws). It is the multi-scenario counterpart of
         :meth:`CppSimulator.simulate_with_parameters` — and the reason it
         lives here rather than looping that method N times is fusion:
 
@@ -759,6 +760,15 @@ class MultiScenarioRunner:
             theta: Parameter matrix ``(n_samples, n_params)``, columns
                 aligned with the shared ``param_names``. The same theta is
                 evaluated under every scenario (joint posterior-predictive).
+            backend: ``"local"`` runs the fused C++ batch on this host (the
+                default). ``"hpc"`` ships ``theta`` to the cluster as a
+                shared samples CSV and submits **one fused array** over the
+                uncached scenarios (:meth:`HPCJobManager.submit_cpp_fused_jobs`),
+                deriving test stats inline and downloading in one combine.
+                HPC mode requires ``job_manager`` and is incompatible with
+                ``prediction_targets`` (the merged CSV isn't shipped). The
+                ``"hpc"`` backend tags a distinct suffix pool, so HPC and
+                local results for the same theta cache separately.
             pool_suffix: Suffix-pool label, applied to every scenario.
             prediction_targets: Optional directory of PredictionTarget
                 YAMLs, merged into every scenario's derived columns.
@@ -771,7 +781,17 @@ class MultiScenarioRunner:
             each entry exactly the pair
             :meth:`CppSimulator.simulate_with_parameters` returns.
         """
+        if backend not in ("local", "hpc"):
+            raise ValueError(f"backend must be 'local' or 'hpc'; got {backend!r}")
         self._validate_fused_local()
+        if backend == "hpc":
+            return self._run_ppc_hpc(
+                theta,
+                pool_suffix=pool_suffix,
+                prediction_targets=prediction_targets,
+                aux_by_sample_index=aux_by_sample_index,
+                auxiliary_units=auxiliary_units,
+            )
         first = next(iter(self.simulators.values()))
 
         # Per-scenario PPC context + suffix-pool cache probe. A scenario
@@ -871,6 +891,296 @@ class MultiScenarioRunner:
             results[name] = sim._finalize_ppc(ctx, table)
 
         return {name: results[name] for name in self.simulators}
+
+    # ---- Phase 2 fused HPC posterior-predictive --------------------------
+
+    def _run_ppc_hpc(
+        self,
+        theta: np.ndarray,
+        *,
+        pool_suffix: str,
+        prediction_targets: Optional[str | Path],
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]],
+        auxiliary_units: Optional[dict[str, str]],
+    ) -> Dict[str, Tuple[np.ndarray, pa.Table]]:
+        """HPC backend for :meth:`simulate_with_parameters_all`.
+
+        The cluster counterpart of the local fused PPC: instead of running
+        ``CppBatchRunner.run_fused`` on this host, it ships the
+        user-supplied ``theta`` to HPC as a shared samples CSV and submits
+        **one fused array** (:meth:`HPCJobManager.submit_cpp_fused_jobs`)
+        over every scenario still needing sims. Each task evolves a theta
+        once and runs every scenario from that state, deriving test stats
+        inline on the cluster; results download in one combine
+        (:meth:`HPCJobManager.download_test_stats_fused`) and are reshaped +
+        cached byte-identically to the local path, so a later
+        single-scenario or local call on the same theta is a cache hit.
+
+        Aux draws arrive in the local API's per-sim dict form; on HPC the
+        derivation runs on the cluster, so they are materialized to a CSV
+        and shipped the same way :meth:`attach_auxiliary_samples` ships them
+        for training. ``prediction_targets`` is unsupported — same
+        limitation as :meth:`CppSimulator.simulate_with_parameters`
+        ``backend='hpc'`` (the merged CSV isn't shipped to the cluster).
+        """
+        if self.job_manager is None:
+            raise RuntimeError(
+                "simulate_with_parameters_all(backend='hpc') requires a "
+                "job_manager (set it on the simulators or pass it to the runner)."
+            )
+        if prediction_targets is not None:
+            raise NotImplementedError(
+                "simulate_with_parameters_all(backend='hpc', prediction_targets=...) "
+                "is not supported; the merged calibration+prediction CSV is not "
+                "shipped to the cluster. Run locally or split the call."
+            )
+
+        # Per-scenario PPC context + suffix-pool cache probe — identical to
+        # the local path, but the 'hpc' backend tag keeps HPC and local
+        # caches for the same theta distinct. Pre-flight the cluster-only
+        # inputs (flat test-stats CSV + model structure) here so a missing
+        # one fails before any SSH.
+        results: Dict[str, Tuple[np.ndarray, pa.Table]] = {}
+        uncached: list[tuple[str, CppSimulator, PpcContext]] = []
+        for name, sim in self.simulators.items():
+            if sim.test_stats_csv is None:
+                raise RuntimeError(
+                    f"simulators[{name!r}] has no test_stats_csv — the HPC fused "
+                    "PPC ships the flat test-stats CSV to the cluster for inline "
+                    "derivation; without it there is nothing to derive."
+                )
+            if sim.model_structure_file is None:
+                raise RuntimeError(
+                    f"simulators[{name!r}] has no model_structure_file — the "
+                    "derive worker treats every species as dimensionless without it."
+                )
+            ctx = sim._resolve_ppc_context(
+                theta,
+                backend="hpc",
+                prediction_targets=None,
+                pool_suffix=pool_suffix,
+                aux_by_sample_index=aux_by_sample_index,
+                auxiliary_units=auxiliary_units,
+            )
+            hit = sim._ppc_cache_hit(ctx)
+            if hit is not None:
+                logger.info("MSR PPC[hpc]: scenario %s — suffix-pool cache hit", name)
+                results[name] = hit
+            else:
+                uncached.append((name, sim, ctx))
+
+        if not uncached:
+            logger.info(
+                "MSR PPC[hpc]: all %d scenario(s) satisfied from suffix-pool "
+                "cache — no HPC submit",
+                len(self.simulators),
+            )
+            return {name: results[name] for name in self.simulators}
+
+        first = next(iter(self.simulators.values()))
+        n_samples = uncached[0][2].n_samples
+
+        # Session prep + shared uploads. Same rail as run_all, but the
+        # shared samples CSV is the USER theta (posterior draws), not the
+        # deterministic theta pool. The aux CSV is built locally first, then
+        # uploaded inside the deferred-upload block with everything else.
+        self.prepare_session()
+        aux_local = self._write_ppc_aux_csv(aux_by_sample_index)
+        self.job_manager.begin_deferred_shared_uploads()
+        shared_remote = self._upload_ppc_samples_csv(theta)
+        shared_healthy_remote = self.upload_shared_healthy_state()
+        shared_model_structure_remote = self.upload_shared_model_structure()
+        shared_aux_remote = None
+        if aux_local is not None:
+            aux_hash = hashlib.sha256(Path(aux_local).read_bytes()).hexdigest()[:12]
+            shared_aux_remote = self.job_manager.upload_shared_aux_samples_csv(
+                aux_local, f"ppc_aux_shared_{aux_hash}.csv"
+            )
+        per_scen_remotes = self._preupload_per_scenario_files()
+        self.job_manager.flush_shared_uploads()
+
+        # One fused array over the user theta. Each scenario's HPC pool is
+        # its theta-hashed suffix-pool dir name, so concurrent PPC calls
+        # with distinct thetas never collide; start_offset=0 because a
+        # user-supplied theta has no deterministic-pool depth to skip.
+        scenarios = []
+        for name, sim, ctx in uncached:
+            scenarios.append(
+                {
+                    "name": name,
+                    "simulation_pool_id": ctx.suffix_pool_dir.name,
+                    "scenario_yaml_remote": per_scen_remotes[name]["scenario_yaml"],
+                    "drug_metadata_yaml_remote": per_scen_remotes[name]["drug_metadata_yaml"],
+                    "test_stats_csv_remote": per_scen_remotes[name]["test_stats_csv"],
+                    "test_stats_hash": sim._compute_test_stats_hash(aux_samples_csv=aux_local),
+                    "samples_start_offset": 0,
+                }
+            )
+
+        remote_binary = first.remote_binary_path or self.job_manager.config.cpp_binary_path
+        remote_template = first.remote_template_xml or self.job_manager.config.cpp_template_path
+
+        logger.info(
+            "MSR PPC[hpc]: submitting ONE fused array — %d scenario(s) × %d sims, "
+            "one evolve per theta",
+            len(uncached),
+            n_samples,
+        )
+        job_info = self.job_manager.submit_cpp_fused_jobs(
+            scenarios=scenarios,
+            samples_csv_remote=shared_remote,
+            num_simulations=n_samples,
+            samples_start_offset=0,
+            t_end_days=first.t_end_days,
+            min_cadence_hours=first.min_cadence_hours,
+            seed=first.seed,
+            binary_path=remote_binary,
+            template_path=remote_template,
+            subtree=first.subtree,
+            healthy_state_yaml_remote=shared_healthy_remote,
+            model_structure_remote=shared_model_structure_remote,
+            aux_samples_csv_remote=shared_aux_remote,
+            auxiliary_units=auxiliary_units,
+            evolve_cache=first.evolve_cache_root is not None,
+            per_sim_timeout_s=first.per_sim_timeout_s or 300.0,
+            discard_trajectories=self.discard_trajectories,
+            skip_setup=True,  # prepare_session already ran
+        )
+        logger.info("MSR PPC[hpc]: fused array submitted (%s) — waiting", job_info.job_ids)
+        first._wait_for_jobs(job_info.job_ids)
+
+        # One fused combine + download for every scenario, then reshape each
+        # scenario's derived test stats into the (theta_out, table) pair and
+        # write its suffix-pool cache (byte-identical to the local path).
+        pool_root = self.job_manager.config.simulation_pool_path
+        scen_specs = [
+            {
+                "name": name,
+                "pool_path": f"{pool_root}/{ctx.suffix_pool_dir.name}",
+                "test_stats_hash": sim._compute_test_stats_hash(aux_samples_csv=aux_local),
+            }
+            for name, sim, ctx in uncached
+        ]
+        with tempfile.TemporaryDirectory(prefix="msr_ppc_hpc_dl_") as tmp:
+            fused_dl = self.job_manager.download_test_stats_fused(scen_specs, Path(tmp))
+
+        for name, sim, ctx in uncached:
+            sample_index_dl, test_stats_dl = fused_dl[name]
+            table = self._reshape_hpc_ppc_table(sim, ctx, sample_index_dl, test_stats_dl)
+            results[name] = sim._finalize_ppc(ctx, table)
+
+        return {name: results[name] for name in self.simulators}
+
+    def _upload_ppc_samples_csv(self, theta: np.ndarray) -> str:
+        """Write the user ``theta`` as a (sample_index, theta) CSV and upload
+        it once as the shared samples CSV for an HPC fused PPC.
+
+        Mirrors :meth:`upload_shared_samples_csv` but the rows are the
+        caller's posterior draws, not the deterministic theta pool — so the
+        pool-indexed local writer (``CppSimulator._write_params_csv``) can't
+        be reused. ``sample_index`` is ``arange(n)`` so the downloaded
+        parquet round-trips back to caller order.
+        """
+        first = next(iter(self.simulators.values()))
+        theta = np.ascontiguousarray(theta, dtype=np.float64)
+        df = pd.DataFrame(theta, columns=list(first.param_names))
+        df.insert(0, "sample_index", np.arange(theta.shape[0], dtype=np.int64))
+        content_hash = hashlib.sha256(df.to_csv(index=False).encode()).hexdigest()[:12]
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", delete=False, prefix="ppc_samples_"
+        )
+        df.to_csv(tmp.name, index=False)
+        tmp.close()
+        # Keep the local file alive for the duration of the call (mirrors
+        # upload_shared_samples_csv's _shared_samples_local), then upload.
+        self._ppc_samples_local = Path(tmp.name)
+        return self.job_manager.upload_shared_samples_csv(
+            tmp.name, f"ppc_samples_{content_hash}.csv"
+        )
+
+    def _write_ppc_aux_csv(
+        self,
+        aux_by_sample_index: Optional[dict[int, dict[str, float]]],
+    ) -> Optional[str]:
+        """Materialize per-sim aux draws (the local API's dict form) to a CSV
+        for the cluster derive worker, returning the local path (or None).
+
+        The local fused PPC merges ``aux_by_sample_index`` into
+        ``species_dict`` in-process; on HPC, derivation runs on the cluster,
+        so the draws must travel as a CSV — one row per ``sample_index``, one
+        column per aux name — the same shape :meth:`attach_auxiliary_samples`
+        ships for training. The returned path is fed to
+        ``_compute_test_stats_hash`` so the cluster-side derive subdir key
+        matches.
+        """
+        if not aux_by_sample_index:
+            return None
+        rows = sorted(aux_by_sample_index.items())
+        aux_names = list(rows[0][1].keys())
+        data: dict[str, list] = {"sample_index": [int(i) for i, _ in rows]}
+        for nm in aux_names:
+            data[nm] = [float(d[nm]) for _, d in rows]
+        df = pd.DataFrame(data)
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, prefix="ppc_aux_")
+        df.to_csv(tmp.name, index=False)
+        tmp.close()
+        self._ppc_aux_local = Path(tmp.name)  # keep alive for the call
+        return tmp.name
+
+    def _reshape_hpc_ppc_table(
+        self,
+        sim: CppSimulator,
+        ctx: PpcContext,
+        hpc_sample_index: np.ndarray,
+        hpc_test_stats: np.ndarray,
+    ) -> pa.Table:
+        """Reshape a fused-download ``(sample_index, test_stats)`` pair into
+        the ``(sample_index, status, param:*, ts:*)`` table the local fused
+        path produces, so :meth:`CppSimulator._finalize_ppc` caches a
+        byte-identical parquet regardless of backend.
+
+        Mirrors the reshape in
+        :meth:`CppSimulator._simulate_with_parameters_hpc`: rows are
+        reordered to the caller's ``sample_index`` and the test-stat columns
+        remapped from positional to ``ts:<test_statistic_id>``.
+        """
+        n_samples = ctx.n_samples
+        test_stats_df = ctx.test_stats_df
+        if hpc_test_stats.shape[1] != len(test_stats_df):
+            raise RuntimeError(
+                f"HPC fused PPC returned {hpc_test_stats.shape[1]} test stats but "
+                f"test_stats_df expects {len(test_stats_df)} — pool may have been "
+                "derived with a different cal-target CSV."
+            )
+        if hpc_sample_index is None or len(hpc_sample_index) != n_samples:
+            raise RuntimeError(
+                f"HPC fused PPC returned "
+                f"{0 if hpc_sample_index is None else len(hpc_sample_index)} rows "
+                f"but caller expects {n_samples} — derivation incomplete?"
+            )
+        # Reorder rows so they match ctx.sample_indices (arange(n)).
+        order = (
+            pd.Series(np.arange(len(hpc_sample_index)), index=hpc_sample_index)
+            .reindex(ctx.sample_indices)
+            .to_numpy()
+        )
+        if np.any(np.isnan(order.astype(np.float64))):
+            raise RuntimeError(
+                "HPC fused PPC sample_index missing rows expected by caller "
+                "— derivation incomplete?"
+            )
+        hpc_test_stats = hpc_test_stats[order.astype(np.int64)]
+
+        theta = ctx.theta
+        cols: dict[str, pa.Array] = {
+            "sample_index": pa.array(ctx.sample_indices.astype(np.int64), type=pa.int64()),
+            "status": pa.array(np.zeros(n_samples, dtype=np.int64), type=pa.int64()),
+        }
+        for j, pname in enumerate(sim.param_names):
+            cols[f"param:{pname}"] = pa.array(theta[:, j].astype(np.float64))
+        for j, tsid in enumerate(test_stats_df["test_statistic_id"].tolist()):
+            cols[f"ts:{tsid}"] = pa.array(hpc_test_stats[:, j].astype(np.float64))
+        return pa.table(cols)
 
     # ---- joint NaN filter (static) ---------------------------------------
 

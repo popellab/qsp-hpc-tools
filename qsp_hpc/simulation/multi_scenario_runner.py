@@ -1143,13 +1143,21 @@ class MultiScenarioRunner:
         :meth:`CppSimulator._simulate_with_parameters_hpc`: rows are
         reordered to the caller's ``sample_index`` and the test-stat columns
         remapped from positional to ``ts:<test_statistic_id>``.
+
+        Column ids come from the **shipped** ``test_stats_csv`` — the exact
+        CSV the cluster derived from — not ``ctx.test_stats_df``. The two
+        diverge when the scenario carries cross-input rows: the constructor
+        appends them into ``test_stats_csv`` (so the cluster derives them),
+        but ``_load_test_stats_df`` rebuilds ``ctx.test_stats_df`` from the
+        calibration-target YAMLs without them. Keying off the shipped CSV
+        keeps the reshape aligned with the downloaded column count + order.
         """
         n_samples = ctx.n_samples
-        test_stats_df = ctx.test_stats_df
-        if hpc_test_stats.shape[1] != len(test_stats_df):
+        ts_ids = pd.read_csv(sim.test_stats_csv)["test_statistic_id"].tolist()
+        if hpc_test_stats.shape[1] != len(ts_ids):
             raise RuntimeError(
                 f"HPC fused PPC returned {hpc_test_stats.shape[1]} test stats but "
-                f"test_stats_df expects {len(test_stats_df)} — pool may have been "
+                f"the shipped test_stats_csv has {len(ts_ids)} — pool may have been "
                 "derived with a different cal-target CSV."
             )
         if hpc_sample_index is None or len(hpc_sample_index) != n_samples:
@@ -1178,7 +1186,7 @@ class MultiScenarioRunner:
         }
         for j, pname in enumerate(sim.param_names):
             cols[f"param:{pname}"] = pa.array(theta[:, j].astype(np.float64))
-        for j, tsid in enumerate(test_stats_df["test_statistic_id"].tolist()):
+        for j, tsid in enumerate(ts_ids):
             cols[f"ts:{tsid}"] = pa.array(hpc_test_stats[:, j].astype(np.float64))
         return pa.table(cols)
 

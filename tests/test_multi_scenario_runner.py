@@ -853,9 +853,13 @@ def _model_structure_file(tmp_path: Path) -> Path:
     return p
 
 
-def _ppc_hpc_sim(env, scenario, jm, model_structure, *, t_end_days: float = 0.2):
+def _ppc_hpc_sim(env, scenario, jm, model_structure, *, t_end_days: float = 0.2, cross_rows=None):
     """Real CppSimulator wired for the fused-HPC PPC path: job_manager +
-    model_structure + remote binary/template paths."""
+    model_structure + remote binary/template paths.
+
+    ``cross_rows`` (a DataFrame) is appended to the shipped test_stats_csv
+    via the constructor's cross-input path — so test_stats_csv ends up with
+    more rows than ctx.test_stats_df (rebuilt from the cal-target YAMLs)."""
     from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
     return CppSimulator(
@@ -864,6 +868,7 @@ def _ppc_hpc_sim(env, scenario, jm, model_structure, *, t_end_days: float = 0.2)
         template_xml=env["template"],
         cache_dir=env["cache"],
         calibration_targets=env["cal_dir"],
+        cross_input_test_stats_df=cross_rows,
         scenario=scenario,
         healthy_state_yaml=env["healthy"],
         model_structure_file=model_structure,
@@ -1001,6 +1006,35 @@ class TestSimulateWithParametersAllHpc:
         with patch.object(CppSimulator, "_wait_for_jobs"):
             r_hpc.simulate_with_parameters_all(theta, backend="hpc")
         assert jm.submit_cpp_fused_jobs.call_count == 1
+
+    def test_reshape_keys_off_shipped_csv_with_cross_input_rows(self, ppc_env, tmp_path):
+        """Regression: a scenario carrying cross-input rows ships them in
+        test_stats_csv (so the cluster derives them), but ctx.test_stats_df
+        is rebuilt from the cal-target YAMLs without them. The reshape must
+        key off the shipped CSV (2 cols here), not ctx.test_stats_df (1)."""
+        import pandas as pd
+
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        ms = _model_structure_file(tmp_path)
+        theta = np.array([[0.5, 1.0], [1.5, 2.0]])
+        n = theta.shape[0]
+        # One cross-input row appended → shipped CSV has 2 test stats.
+        cross_rows = pd.DataFrame({"test_statistic_id": ["xfer::donor"]})
+        # Cluster derives 2 columns (base spA_t0 + cross), in CSV order.
+        results = {"a": (np.arange(n, dtype=np.int64), np.array([[10.0, 99.0], [11.0, 98.0]]))}
+        jm = _ppc_hpc_jm(results)
+        sim = _ppc_hpc_sim(ppc_env, "a", jm, ms, cross_rows=cross_rows)
+        assert len(pd.read_csv(sim.test_stats_csv)) == 2  # shipped CSV: base + cross
+        r = MultiScenarioRunner({"a": sim})
+        with patch.object(CppSimulator, "_wait_for_jobs"):
+            out = r.simulate_with_parameters_all(theta, backend="hpc")
+        _, table = out["a"]
+        # Both the calibration column and the cross-input column survive.
+        assert "ts:spA_t0" in table.column_names
+        assert "ts:xfer::donor" in table.column_names
+        np.testing.assert_allclose(table.column("ts:spA_t0").to_numpy(), [10.0, 11.0])
+        np.testing.assert_allclose(table.column("ts:xfer::donor").to_numpy(), [99.0, 98.0])
 
 
 class TestSimulateWithParametersAllEvolveOnce:

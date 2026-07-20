@@ -680,9 +680,12 @@ class TestCppSimulatorRunHpc:
     """run_hpc() mirrors QSPSimulator's 3-tier flow against C++ pools."""
 
     @staticmethod
-    def _stub_test_stats_csv(tmp_path: Path) -> Path:
+    def _stub_test_stats_csv(tmp_path: Path, n: int = 3) -> Path:
+        """Three named statistics -- pools key their observable columns by
+        ``test_statistic_id``, so the CSV has to declare one per column."""
         p = tmp_path / "test_stats.csv"
-        p.write_text("name,model_output_code\n")
+        rows = "".join(f"ts_{i},code_{i}\n" for i in range(n))
+        p.write_text("test_statistic_id,model_output_code\n" + rows)
         return p
 
     @staticmethod
@@ -1823,3 +1826,86 @@ class TestSimulateWithParametersHPC:
 
         # After reindexing, row j's ts aligns with theta[j]
         assert table.column("ts:spA_t0").to_numpy().tolist() == [10.0, 20.0, 30.0]
+
+
+class TestNamedObservableColumns:
+    """Base pools key observables by ``test_statistic_id``, matching the suffix /
+    posterior-predictive writers. Positional ``ts:j`` names carried no record of
+    what each slot meant, so consumers had to assume they re-derived the same
+    order the simulator used."""
+
+    @staticmethod
+    def _sim(priors_csv, binary_path, template_path, cache_dir, tmp_path, ts_csv):
+        from unittest.mock import MagicMock
+
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        ms_file = tmp_path / "model_structure.json"
+        ms_file.write_text("{}\n")
+        return CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            job_manager=MagicMock(),
+            test_stats_csv=ts_csv,
+            model_structure_file=ms_file,
+        )
+
+    def test_columns_named_by_test_statistic_id(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        import pyarrow.parquet as pq
+
+        ts_csv = tmp_path / "ts.csv"
+        ts_csv.write_text(
+            "test_statistic_id,model_output_code\ncd8_density,x\ntreg_frac,y\nil6,z\n"
+        )
+        sim = self._sim(priors_csv, binary_path, template_path, cache_dir, tmp_path, ts_csv)
+        path = sim._local_test_stats_path(sim._compute_test_stats_hash())
+
+        rng = np.random.default_rng(0)
+        sim._persist_local_test_stats(path, rng.uniform(size=(4, 2)), rng.uniform(size=(4, 3)))
+
+        names = pq.read_table(str(path)).column_names
+        assert "ts:cd8_density" in names and "ts:treg_frac" in names and "ts:il6" in names
+        assert "ts:0" not in names
+
+    def test_roundtrip_preserves_derive_order(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        """Column j out must be observable j in, regardless of how the ids sort
+        lexicographically -- the old numeric sort got this for free, the named
+        form has to take the order from the test-stats CSV."""
+        ts_csv = tmp_path / "ts.csv"
+        # Deliberately anti-alphabetical so a naive sorted() would reorder them.
+        ts_csv.write_text("test_statistic_id,model_output_code\nzeta,x\nalpha,y\nmid,z\n")
+        sim = self._sim(priors_csv, binary_path, template_path, cache_dir, tmp_path, ts_csv)
+        path = sim._local_test_stats_path(sim._compute_test_stats_hash())
+
+        params = np.arange(8, dtype=float).reshape(4, 2)
+        test_stats = np.array([[1.0, 2.0, 3.0]] * 4)
+        sim._persist_local_test_stats(path, params, test_stats)
+
+        _, out_ts = sim._load_local_test_stats(path)
+        np.testing.assert_allclose(out_ts, test_stats)
+
+    def test_pool_from_a_different_target_set_is_rejected(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        """The failure this whole change exists to prevent: a pool simulated from
+        one target set, read by a scenario that now derives another. Previously
+        the columns were paired positionally and, whenever the counts happened to
+        line up, nothing raised."""
+        ts_csv = tmp_path / "ts.csv"
+        ts_csv.write_text("test_statistic_id,model_output_code\naaa,x\nbbb,y\nccc,z\n")
+        sim = self._sim(priors_csv, binary_path, template_path, cache_dir, tmp_path, ts_csv)
+        path = sim._local_test_stats_path(sim._compute_test_stats_hash())
+        rng = np.random.default_rng(0)
+        sim._persist_local_test_stats(path, rng.uniform(size=(4, 2)), rng.uniform(size=(4, 3)))
+
+        # Same COUNT, different ids -- the silent-mispairing case.
+        ts_csv.write_text("test_statistic_id,model_output_code\naaa,x\nbbb,y\nDIFFERENT,z\n")
+        sim2 = self._sim(priors_csv, binary_path, template_path, cache_dir, tmp_path, ts_csv)
+        with pytest.raises(RuntimeError, match="different calibration-target set"):
+            sim2._load_local_test_stats(path)

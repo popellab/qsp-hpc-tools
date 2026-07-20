@@ -686,10 +686,7 @@ class CppSimulator:
                 f"Local cache at {path} missing {len(missing)} sampled "
                 f"param columns (e.g. {missing[:5]})."
             )
-        ts_cols = sorted(
-            (c for c in table.column_names if c.startswith("ts:")),
-            key=lambda c: int(c.split(":", 1)[1]),
-        )
+        ts_cols = self._ordered_ts_columns(table.column_names, path)
         params = np.column_stack([table.column(c).to_numpy() for c in selected])
         test_stats = np.column_stack([table.column(c).to_numpy() for c in ts_cols])
         if "sample_index" in table.column_names:
@@ -697,6 +694,56 @@ class CppSimulator:
         else:
             self.last_sample_index = None
         return params, test_stats
+
+    def _test_statistic_ids(self, n_ts: int) -> List[str]:
+        """Ordered ``test_statistic_id`` for the pool's observable columns.
+
+        Base pools used to key observables positionally (``ts:0`` … ``ts:N-1``),
+        unlike every other writer here — the suffix / posterior-predictive pools
+        have always used ``ts:<test_statistic_id>``. Positional names carry no
+        record of what each slot means, so a consumer pairing them with
+        calibration targets is really trusting that it re-derives the same order
+        the simulator used. Change the target set and every column past the
+        first change shifts; add some while removing others and the count still
+        reconciles, so the mispairing is silent. Naming the columns removes the
+        assumption instead of documenting it.
+
+        The shipped test-stats CSV must carry ``test_statistic_id``; there is no
+        positional fallback, because falling back is what allowed an unlabelled
+        pool to exist in the first place.
+        """
+        if self.test_stats_csv is None:
+            raise RuntimeError("test_stats_csv is required to name a pool's observable columns.")
+        df = pd.read_csv(self.test_stats_csv)
+        if "test_statistic_id" not in df.columns:
+            raise RuntimeError(
+                f"Test-stats CSV {self.test_stats_csv} has no 'test_statistic_id' "
+                f"column, so its observables cannot be named."
+            )
+        if len(df) != n_ts:
+            raise RuntimeError(
+                f"Test-stats CSV {self.test_stats_csv} lists {len(df)} statistics "
+                f"but {n_ts} observable columns were derived."
+            )
+        return df["test_statistic_id"].astype(str).tolist()
+
+    def _ordered_ts_columns(self, column_names, path: Path) -> List[str]:
+        """The pool's ``ts:`` columns in derive order.
+
+        Ordered by the shipped test-stats CSV, which IS the derive order, so the
+        read order is explicit rather than inferred from how the names sort.
+        """
+        present = [c for c in column_names if c.startswith("ts:")]
+        expected = [f"ts:{tsid}" for tsid in self._test_statistic_ids(len(present))]
+        missing = [c for c in expected if c not in present]
+        if missing:
+            raise RuntimeError(
+                f"Pool at {path} does not carry the observables this scenario "
+                f"derives: {len(missing)} of {len(expected)} missing (e.g. "
+                f"{missing[:5]}). The pool was simulated from a different "
+                f"calibration-target set and must be re-simulated."
+            )
+        return expected
 
     def _persist_local_test_stats(
         self,
@@ -730,8 +777,8 @@ class CppSimulator:
             )
         for i, name in enumerate(names):
             cols[f"param:{name}"] = params[:, i]
-        for j in range(test_stats.shape[1]):
-            cols[f"ts:{j}"] = test_stats[:, j]
+        for j, tsid in enumerate(self._test_statistic_ids(test_stats.shape[1])):
+            cols[f"ts:{tsid}"] = test_stats[:, j]
         table = pa.table(cols)
         pq.write_table(table, str(path))
 

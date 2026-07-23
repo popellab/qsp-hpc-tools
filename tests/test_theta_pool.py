@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from qsp_hpc.simulation.theta_pool import (
+    _load_vary_list,
     get_theta_pool,
     theta_for_indices,
     theta_pool_cache_path,
@@ -61,6 +62,41 @@ def test_cache_path_changes_with_classifier(tmp_path):
     # Restricted paths carry the suffix.
     assert str(p_a).endswith("_restricted.npy")
     assert str(p_none).endswith(f"_n{100}.npy")
+
+
+def test_cache_path_changes_with_vary_policy(tmp_path):
+    """A σ-overlay vary policy keys a distinct pool with an ``_overlay`` suffix,
+    and editing the policy content changes the hash."""
+    priors = _make_priors_csv(tmp_path)
+    pol_a = tmp_path / "policy_a.yaml"
+    pol_a.write_text("vary:\n  - p0\n  - p1\n")
+    pol_b = tmp_path / "policy_b.yaml"
+    pol_b.write_text("vary:\n  - p0\n")  # different allowlist → different hash
+
+    p_none = theta_pool_cache_path(tmp_path, priors, None, 1, 100)
+    p_a = theta_pool_cache_path(tmp_path, priors, None, 1, 100, vary_policy=pol_a)
+    p_b = theta_pool_cache_path(tmp_path, priors, None, 1, 100, vary_policy=pol_b)
+    assert len({p_none, p_a, p_b}) == 3
+    assert str(p_a).endswith("_overlay.npy")
+    assert str(p_none).endswith("_n100.npy")
+
+
+def test_vary_policy_requires_submodel_yaml(tmp_path):
+    """The overlay overlays the composite center prior, so a vary policy with no
+    submodel YAML is a misconfiguration — fail loudly, don't silently ignore it."""
+    priors = _make_priors_csv(tmp_path)
+    pol = tmp_path / "policy.yaml"
+    pol.write_text("vary:\n  - p0\n")
+    with pytest.raises(ValueError, match="requires a submodel_priors.yaml"):
+        get_theta_pool(priors, None, seed=1, n_total=10, cache_dir=tmp_path / "c", vary_policy=pol)
+
+
+def test_load_vary_list_rejects_empty(tmp_path):
+    assert _load_vary_list(None) is None
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("vary: []\n")
+    with pytest.raises(ValueError, match="no non-empty"):
+        _load_vary_list(empty)
 
 
 def test_restricted_pool_uses_classifier(tmp_path):

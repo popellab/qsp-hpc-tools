@@ -94,6 +94,7 @@ class CppSimulator:
         restriction_classifier_dir: Optional[str | Path] = None,
         restriction_threshold: float = 0.5,
         classifier_feature_fills: Optional[Mapping[str, float]] = None,
+        vary_policy: Optional[str | Path] = None,
         max_workers: int | None = None,
         per_sim_timeout_s: float | None = None,
         submodel_priors_yaml: Optional[str | Path] = None,
@@ -147,6 +148,13 @@ class CppSimulator:
         self.classifier_feature_fills = (
             dict(classifier_feature_fills) if classifier_feature_fills else None
         )
+        # Optional σ-overlay vary/pin policy. When set, the theta pool is drawn
+        # from the overlay prior (load_overlay_prior_log): center μ everywhere,
+        # population σ where an observed_distribution is declared, every param
+        # outside the policy's ``vary:`` allowlist pinned to its center. The
+        # policy content is folded into the config hash so an overlaid pool
+        # lives alongside the unoverlaid one and a policy edit invalidates it.
+        self.vary_policy = Path(vary_policy).resolve() if vary_policy else None
         self.max_workers = max_workers
         self.per_sim_timeout_s = per_sim_timeout_s
         self.submodel_priors_yaml = Path(submodel_priors_yaml) if submodel_priors_yaml else None
@@ -354,6 +362,11 @@ class CppSimulator:
                     f"{k}={float(v):.12g}" for k, v in sorted(self.classifier_feature_fills.items())
                 )
                 h.update(f"|fills={fills_str}".encode("utf-8"))
+        # σ-overlay vary/pin policy: when set, the theta pool is drawn from a
+        # different (overlaid) prior, so its content must key a distinct pool.
+        if self.vary_policy is not None and self.vary_policy.exists():
+            h.update(b"|vary_policy|")
+            h.update(self.vary_policy.read_text().encode("utf-8"))
         return h.hexdigest()
 
     def __del__(self):
@@ -444,6 +457,7 @@ class CppSimulator:
             restriction_classifier_dir=self.restriction_classifier_dir,
             restriction_threshold=self.restriction_threshold,
             classifier_feature_fills=self.classifier_feature_fills,
+            vary_policy=self.vary_policy,
         )
 
     # ------------------------------------------------------------------

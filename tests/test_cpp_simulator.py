@@ -1001,76 +1001,80 @@ class TestCppSimulatorRunHpc:
 
 
 # ---------------------------------------------------------------------------
-# M9: calibration_targets — public-facing API used by pdac-build
+# M9: test_stats_df — public-facing API used by pdac-build
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def sample_calibration_targets_dir(tmp_path: Path) -> Path:
-    """One YAML calibration target — minimum the loader accepts."""
-    import yaml as _yaml
+def sample_test_stats_df():
+    """A compiled test-statistics DataFrame (maple compiler output) whose sole
+    test statistic reads spA at t=0."""
+    import pandas as pd
 
-    cal_dir = tmp_path / "calibration_targets"
-    cal_dir.mkdir()
-    target = {
-        "calibration_target_id": "spA_t0",
-        "observable": {
-            "code": (
-                "def compute_observable(time, species_dict, constants):\n"
-                "    return species_dict['spA']\n"
-            ),
-            "units": "cell",
-            "species": ["spA"],
-            "constants": [],
-        },
-        "empirical_data": {
-            "median": [10.0],
-            "ci95": [[5.0, 20.0]],
-            "units": "cell",
-            "sample_size": 10,
-            "index_values": None,
-        },
-    }
-    (cal_dir / "spA_t0.yaml").write_text(_yaml.dump(target))
-    return cal_dir
+    return pd.DataFrame(
+        [
+            {
+                "test_statistic_id": "spA_t0",
+                "required_species": "spA",
+                "model_output_code": (
+                    "import numpy as np\n"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return float(np.asarray(species_dict['spA'], dtype=float)[0])\n"
+                ),
+                "median": 10.0,
+                "ci95_lower": 5.0,
+                "ci95_upper": 20.0,
+                "units": "cell",
+                "sample_size": 10,
+            }
+        ]
+    )
 
 
-class TestCppSimulatorCalibrationTargets:
-    """CppSimulator accepts calibration_targets (YAML dir) the same way
+@pytest.fixture
+def prediction_test_stats_df():
+    """A compiled prediction-target DataFrame (is_prediction_only=True) whose
+    observable also picks off spA at t=0.
+
+    Keeps the species surface minimal so the fake qsp_sim binary
+    (produces 'spA'/'spB') can feed the derive worker without shims.
+    """
+    import pandas as pd
+
+    return pd.DataFrame(
+        [
+            {
+                "test_statistic_id": "pred_spa_at_t0",
+                "required_species": "spA",
+                "model_output_code": (
+                    "import numpy as np\n"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return float(np.asarray(species_dict['spA'], dtype=float)[0])\n"
+                ),
+                "median": 10.0,
+                "ci95_lower": 5.0,
+                "ci95_upper": 20.0,
+                "units": "cell",
+                "sample_size": 10,
+                "is_prediction_only": True,
+            }
+        ]
+    )
+
+
+class TestCppSimulatorTestStatsDf:
+    """CppSimulator accepts test_stats_df (a compiled table) the same way
     QSPSimulator does — serializes to a temp CSV used everywhere
     downstream (hashing, HPC upload).
     """
 
-    def test_init_with_calibration_targets(
+    def test_init_with_test_stats_df(
         self,
         priors_csv,
         binary_path,
         template_path,
         cache_dir,
-        sample_calibration_targets_dir,
-    ):
-        from qsp_hpc.simulation.cpp_simulator import CppSimulator
-
-        sim = CppSimulator(
-            priors_csv=priors_csv,
-            binary_path=binary_path,
-            template_xml=template_path,
-            cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
-        )
-        assert sim.test_stats_csv is not None
-        assert sim.test_stats_csv.exists()
-        # _calibration_targets_dir is normalized to List[Path] so the
-        # multi-dir form (literature + mechanistic) is supported uniformly.
-        assert sim._calibration_targets_dir == [sample_calibration_targets_dir.resolve()]
-
-    def test_temp_csv_has_expected_columns(
-        self,
-        priors_csv,
-        binary_path,
-        template_path,
-        cache_dir,
-        sample_calibration_targets_dir,
+        sample_test_stats_df,
     ):
         import pandas as pd
 
@@ -1081,34 +1085,59 @@ class TestCppSimulatorCalibrationTargets:
             binary_path=binary_path,
             template_xml=template_path,
             cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_df=sample_test_stats_df,
+        )
+        assert sim.test_stats_csv is not None
+        assert sim.test_stats_csv.exists()
+        # The DataFrame is serialized to a temp CSV that drives the sim.
+        df = pd.read_csv(sim.test_stats_csv)
+        assert df.iloc[0]["test_statistic_id"] == "spA_t0"
+
+    def test_temp_csv_has_expected_columns(
+        self,
+        priors_csv,
+        binary_path,
+        template_path,
+        cache_dir,
+        sample_test_stats_df,
+    ):
+        import pandas as pd
+
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        sim = CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            test_stats_df=sample_test_stats_df,
         )
         df = pd.read_csv(sim.test_stats_csv)
         assert "test_statistic_id" in df.columns
         assert "model_output_code" in df.columns
         assert df.iloc[0]["test_statistic_id"] == "spA_t0"
 
-    def test_both_csv_and_yaml_raises(
+    def test_both_csv_and_df_raises(
         self,
         priors_csv,
         binary_path,
         template_path,
         cache_dir,
         tmp_path,
-        sample_calibration_targets_dir,
+        sample_test_stats_df,
     ):
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
         ts = tmp_path / "ts.csv"
         ts.write_text("name,model_output_code\n")
-        with pytest.raises(ValueError, match="test_stats_csv OR calibration_targets"):
+        with pytest.raises(ValueError, match="test_stats_csv OR test_stats_df"):
             CppSimulator(
                 priors_csv=priors_csv,
                 binary_path=binary_path,
                 template_xml=template_path,
                 cache_dir=cache_dir,
                 test_stats_csv=ts,
-                calibration_targets=sample_calibration_targets_dir,
+                test_stats_df=sample_test_stats_df,
             )
 
     def test_run_hpc_uses_serialized_csv_for_hash(
@@ -1118,9 +1147,9 @@ class TestCppSimulatorCalibrationTargets:
         template_path,
         cache_dir,
         tmp_path,
-        sample_calibration_targets_dir,
+        sample_test_stats_df,
     ):
-        """When calibration_targets is provided, _compute_test_stats_hash
+        """When test_stats_df is provided, _compute_test_stats_hash
         hashes the serialized temp CSV — so HPC and local agree."""
         from unittest.mock import MagicMock
 
@@ -1134,7 +1163,7 @@ class TestCppSimulatorCalibrationTargets:
             binary_path=binary_path,
             template_xml=template_path,
             cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_df=sample_test_stats_df,
             job_manager=job_manager,
         )
         expected = compute_test_stats_hash(sim.test_stats_csv)
@@ -1261,40 +1290,6 @@ class TestCppSimulatorValidate:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def prediction_targets_dir(tmp_path: Path) -> Path:
-    """Prediction-target YAMLs whose observable picks off spA at t=0.
-
-    Keeps the species surface minimal so the fake qsp_sim binary
-    (produces 'spA'/'spB') can feed the derive worker without shims.
-    """
-    import yaml as _yaml
-
-    pred_dir = tmp_path / "predictions"
-    pred_dir.mkdir()
-    target = {
-        "prediction_target_id": "pred_spa_at_t0",
-        "description": "Prediction of spA species at t=0.",
-        "observable": {
-            "code": (
-                "def compute_observable(time, species_dict, constants):\n"
-                "    return species_dict['spA']\n"
-            ),
-            "units": "cell",
-            "species": ["spA"],
-            "constants": [],
-        },
-        "scenario": "ctrl",
-        "index_values": None,
-        "index_unit": None,
-        "index_type": None,
-        "rationale": "smoke test.",
-        "tags": [],
-    }
-    (pred_dir / "pred_spa_at_t0.yaml").write_text(_yaml.dump(target))
-    return pred_dir
-
-
 def _fake_run_factory(species=("spA", "spB")):
     """Build a fake ``_runner.run`` that writes a synthetic parquet matching
     the requested theta/param layout. Mirrors the helper the other
@@ -1348,7 +1343,7 @@ class TestSimulateWithParameters:
     user-supplied thetas, with optional prediction targets mixed into the
     output columns alongside calibration targets."""
 
-    def test_requires_targets_csv_or_yaml(self, priors_csv, binary_path, template_path, cache_dir):
+    def test_requires_test_stats_csv_or_df(self, priors_csv, binary_path, template_path, cache_dir):
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
         sim = CppSimulator(
@@ -1357,11 +1352,11 @@ class TestSimulateWithParameters:
             template_xml=template_path,
             cache_dir=cache_dir,
         )
-        with pytest.raises(RuntimeError, match="test_stats_csv or calibration_targets"):
+        with pytest.raises(RuntimeError, match="test_stats_csv or test_stats_df"):
             sim.simulate_with_parameters(np.zeros((2, 2)))
 
     def test_rejects_wrong_shape(
-        self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
+        self, priors_csv, binary_path, template_path, cache_dir, sample_test_stats_df
     ):
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
@@ -1370,7 +1365,7 @@ class TestSimulateWithParameters:
             binary_path=binary_path,
             template_xml=template_path,
             cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_df=sample_test_stats_df,
         )
         with pytest.raises(ValueError, match="2-D"):
             sim.simulate_with_parameters(np.zeros(5))
@@ -1378,7 +1373,7 @@ class TestSimulateWithParameters:
             sim.simulate_with_parameters(np.zeros((3, 7)))
 
     def test_returns_table_with_named_ts_columns(
-        self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
+        self, priors_csv, binary_path, template_path, cache_dir, sample_test_stats_df
     ):
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
@@ -1387,7 +1382,7 @@ class TestSimulateWithParameters:
             binary_path=binary_path,
             template_xml=template_path,
             cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_df=sample_test_stats_df,
             scenario="ctrl",
             t_end_days=0.2,
             min_cadence_hours=0.1,
@@ -1412,11 +1407,11 @@ class TestSimulateWithParameters:
         binary_path,
         template_path,
         cache_dir,
-        sample_calibration_targets_dir,
-        prediction_targets_dir,
+        sample_test_stats_df,
+        prediction_test_stats_df,
     ):
         """Handoff acceptance criterion: 'prediction columns appear in the
-        output test_stats DataFrame' when prediction_targets is supplied."""
+        output test_stats DataFrame' when prediction_test_stats_df is supplied."""
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
         sim = CppSimulator(
@@ -1424,7 +1419,7 @@ class TestSimulateWithParameters:
             binary_path=binary_path,
             template_xml=template_path,
             cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_df=sample_test_stats_df,
             scenario="ctrl",
             t_end_days=0.2,
             min_cadence_hours=0.1,
@@ -1432,7 +1427,7 @@ class TestSimulateWithParameters:
         theta = np.array([[0.5, 1.0], [1.5, 2.0]])
         with patch.object(sim._runner, "run", side_effect=_fake_run_factory()):
             _, table = sim.simulate_with_parameters(
-                theta, prediction_targets=prediction_targets_dir
+                theta, prediction_test_stats_df=prediction_test_stats_df
             )
         assert "ts:spA_t0" in table.column_names
         assert "ts:pred_spa_at_t0" in table.column_names
@@ -1443,7 +1438,7 @@ class TestSimulateWithParameters:
         )
 
     def test_second_call_hits_cache_without_rerunning_sim(
-        self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
+        self, priors_csv, binary_path, template_path, cache_dir, sample_test_stats_df
     ):
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
@@ -1452,7 +1447,7 @@ class TestSimulateWithParameters:
             binary_path=binary_path,
             template_xml=template_path,
             cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_df=sample_test_stats_df,
             scenario="ctrl",
             t_end_days=0.2,
             min_cadence_hours=0.1,
@@ -1466,7 +1461,7 @@ class TestSimulateWithParameters:
             assert mock_run.call_count == 1
 
     def test_different_theta_produces_different_cache_dir(
-        self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
+        self, priors_csv, binary_path, template_path, cache_dir, sample_test_stats_df
     ):
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
@@ -1475,7 +1470,7 @@ class TestSimulateWithParameters:
             binary_path=binary_path,
             template_xml=template_path,
             cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_df=sample_test_stats_df,
             scenario="ctrl",
             t_end_days=0.2,
             min_cadence_hours=0.1,
@@ -1502,13 +1497,11 @@ class TestSimulateWithParameters:
         binary_path,
         template_path,
         cache_dir,
-        sample_calibration_targets_dir,
-        prediction_targets_dir,
+        sample_test_stats_df,
+        prediction_test_stats_df,
     ):
-        """Editing a prediction YAML must force a re-derivation — otherwise
-        the cache returns endpoint values from the old observable code."""
-        import yaml as _yaml
-
+        """Changing the prediction test-stats table must force a re-derivation —
+        otherwise the cache returns endpoint values from the old observable."""
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
         sim = CppSimulator(
@@ -1516,23 +1509,27 @@ class TestSimulateWithParameters:
             binary_path=binary_path,
             template_xml=template_path,
             cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_df=sample_test_stats_df,
             scenario="ctrl",
             t_end_days=0.2,
             min_cadence_hours=0.1,
         )
         theta = np.array([[0.5, 1.0]])
         with patch.object(sim._runner, "run", side_effect=_fake_run_factory()) as mock_run:
-            sim.simulate_with_parameters(theta, prediction_targets=prediction_targets_dir)
+            sim.simulate_with_parameters(theta, prediction_test_stats_df=prediction_test_stats_df)
             assert mock_run.call_count == 1
 
-            # Edit the prediction YAML.
-            yaml_file = prediction_targets_dir / "pred_spa_at_t0.yaml"
-            data = _yaml.safe_load(yaml_file.read_text())
-            data["rationale"] = "rewritten for v2"
-            yaml_file.write_text(_yaml.dump(data))
+            # Edit the prediction test-stats table (mirrors editing a YAML then
+            # recompiling). Any content change flips the prediction-targets hash.
+            edited = prediction_test_stats_df.copy()
+            edited.loc[0, "model_output_code"] = (
+                "import numpy as np\n"
+                "def compute_test_statistic(time, species_dict):\n"
+                "    # rewritten for v2\n"
+                "    return float(np.asarray(species_dict['spA'], dtype=float)[0])\n"
+            )
 
-            sim.simulate_with_parameters(theta, prediction_targets=prediction_targets_dir)
+            sim.simulate_with_parameters(theta, prediction_test_stats_df=edited)
             assert mock_run.call_count == 2
 
     def test_id_collision_raises(
@@ -1541,48 +1538,46 @@ class TestSimulateWithParameters:
         binary_path,
         template_path,
         cache_dir,
-        sample_calibration_targets_dir,
-        tmp_path,
+        sample_test_stats_df,
     ):
         """Prediction id that collides with a calibration id would silently
         overwrite one function in the registry — must raise early."""
-        import yaml as _yaml
+        import pandas as pd
 
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
-        pred_dir = tmp_path / "colliding"
-        pred_dir.mkdir()
-        (pred_dir / "spA_t0.yaml").write_text(
-            _yaml.dump(
+        colliding_pred_df = pd.DataFrame(
+            [
                 {
-                    "prediction_target_id": "spA_t0",  # same as calibration id
-                    "description": "collision",
-                    "observable": {
-                        "code": (
-                            "def compute_observable(time, species_dict, constants):\n"
-                            "    return species_dict['spA']\n"
-                        ),
-                        "units": "cell",
-                        "species": ["spA"],
-                        "constants": [],
-                    },
-                    "scenario": "ctrl",
-                    "rationale": "collision test.",
-                    "tags": [],
+                    "test_statistic_id": "spA_t0",  # same as calibration id
+                    "required_species": "spA",
+                    "model_output_code": (
+                        "import numpy as np\n"
+                        "def compute_test_statistic(time, species_dict):\n"
+                        "    return float(np.asarray(species_dict['spA'], dtype=float)[0])\n"
+                    ),
+                    "median": 10.0,
+                    "ci95_lower": 5.0,
+                    "ci95_upper": 20.0,
+                    "units": "cell",
+                    "sample_size": 10,
+                    "is_prediction_only": True,
                 }
-            )
+            ]
         )
         sim = CppSimulator(
             priors_csv=priors_csv,
             binary_path=binary_path,
             template_xml=template_path,
             cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_df=sample_test_stats_df,
             scenario="ctrl",
         )
         with patch.object(sim._runner, "run", side_effect=_fake_run_factory()):
             with pytest.raises(ValueError, match="collide"):
-                sim.simulate_with_parameters(np.array([[0.1, 0.2]]), prediction_targets=pred_dir)
+                sim.simulate_with_parameters(
+                    np.array([[0.1, 0.2]]), prediction_test_stats_df=colliding_pred_df
+                )
 
 
 class TestSimulateWithParametersHPC:
@@ -1591,7 +1586,7 @@ class TestSimulateWithParametersHPC:
 
     @staticmethod
     def _make_sim(
-        priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir, tmp_path
+        priors_csv, binary_path, template_path, cache_dir, sample_test_stats_df, tmp_path
     ):
         from unittest.mock import MagicMock
 
@@ -1609,7 +1604,7 @@ class TestSimulateWithParametersHPC:
             binary_path=binary_path,
             template_xml=template_path,
             cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_df=sample_test_stats_df,
             job_manager=job_manager,
             model_structure_file=ms_file,
             scenario="ctrl",
@@ -1619,7 +1614,7 @@ class TestSimulateWithParametersHPC:
         return sim, job_manager
 
     def test_hpc_backend_requires_job_manager(
-        self, priors_csv, binary_path, template_path, cache_dir, sample_calibration_targets_dir
+        self, priors_csv, binary_path, template_path, cache_dir, sample_test_stats_df
     ):
         from qsp_hpc.simulation.cpp_simulator import CppSimulator
 
@@ -1628,7 +1623,7 @@ class TestSimulateWithParametersHPC:
             binary_path=binary_path,
             template_xml=template_path,
             cache_dir=cache_dir,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_df=sample_test_stats_df,
             scenario="ctrl",
         )
         with pytest.raises(RuntimeError, match="job_manager"):
@@ -1640,8 +1635,8 @@ class TestSimulateWithParametersHPC:
         binary_path,
         template_path,
         cache_dir,
-        sample_calibration_targets_dir,
-        prediction_targets_dir,
+        sample_test_stats_df,
+        prediction_test_stats_df,
         tmp_path,
     ):
         sim, _jm = self._make_sim(
@@ -1649,14 +1644,14 @@ class TestSimulateWithParametersHPC:
             binary_path,
             template_path,
             cache_dir,
-            sample_calibration_targets_dir,
+            sample_test_stats_df,
             tmp_path,
         )
-        with pytest.raises(NotImplementedError, match="prediction_targets"):
+        with pytest.raises(NotImplementedError, match="prediction_test_stats_df"):
             sim.simulate_with_parameters(
                 np.array([[0.1, 0.2]]),
                 backend="hpc",
-                prediction_targets=prediction_targets_dir,
+                prediction_test_stats_df=prediction_test_stats_df,
             )
 
     def test_hpc_backend_fresh_submit_and_download(
@@ -1665,7 +1660,7 @@ class TestSimulateWithParametersHPC:
         binary_path,
         template_path,
         cache_dir,
-        sample_calibration_targets_dir,
+        sample_test_stats_df,
         tmp_path,
     ):
         """Full HPC path: no pre-derived stats → submit_cpp_jobs + download →
@@ -1677,7 +1672,7 @@ class TestSimulateWithParametersHPC:
             binary_path,
             template_path,
             cache_dir,
-            sample_calibration_targets_dir,
+            sample_test_stats_df,
             tmp_path,
         )
         jm.check_hpc_test_stats.return_value = False
@@ -1723,7 +1718,7 @@ class TestSimulateWithParametersHPC:
         binary_path,
         template_path,
         cache_dir,
-        sample_calibration_targets_dir,
+        sample_test_stats_df,
         tmp_path,
     ):
         """If HPC already has derived test stats at the pool, skip
@@ -1735,7 +1730,7 @@ class TestSimulateWithParametersHPC:
             binary_path,
             template_path,
             cache_dir,
-            sample_calibration_targets_dir,
+            sample_test_stats_df,
             tmp_path,
         )
         jm.check_hpc_test_stats.return_value = True
@@ -1758,7 +1753,7 @@ class TestSimulateWithParametersHPC:
         binary_path,
         template_path,
         cache_dir,
-        sample_calibration_targets_dir,
+        sample_test_stats_df,
         tmp_path,
     ):
         """Second call with the same theta should load from the local suffix
@@ -1770,7 +1765,7 @@ class TestSimulateWithParametersHPC:
             binary_path,
             template_path,
             cache_dir,
-            sample_calibration_targets_dir,
+            sample_test_stats_df,
             tmp_path,
         )
         jm.check_hpc_test_stats.return_value = True
@@ -1797,7 +1792,7 @@ class TestSimulateWithParametersHPC:
         binary_path,
         template_path,
         cache_dir,
-        sample_calibration_targets_dir,
+        sample_test_stats_df,
         tmp_path,
     ):
         """HPC may return rows in arbitrary order; the reshape must reindex
@@ -1810,7 +1805,7 @@ class TestSimulateWithParametersHPC:
             binary_path,
             template_path,
             cache_dir,
-            sample_calibration_targets_dir,
+            sample_test_stats_df,
             tmp_path,
         )
         jm.check_hpc_test_stats.return_value = True

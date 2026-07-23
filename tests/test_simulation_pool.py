@@ -538,79 +538,53 @@ class TestListPools:
 
 
 @pytest.fixture
-def sample_calibration_targets_dir(temp_dir):
-    """Create a temp dir with a simple calibration target YAML."""
-    import yaml
-
-    cal_dir = temp_dir / "calibration_targets"
-    cal_dir.mkdir()
-
-    target = {
-        "calibration_target_id": "test_observable",
-        "observable": {
-            "code": (
-                "def compute_observable(time, species_dict, constants, ureg):\n"
-                "    return species_dict['V_T.C1']\n"
-            ),
-            "units": "cell",
-            "species": ["V_T.C1"],
-            "constants": [],
-        },
-        "empirical_data": {
-            "median": [100.0],
-            "ci95": [[50.0, 200.0]],
-            "units": "cell",
-            "sample_size": 20,
-            "index_values": None,
-        },
-    }
-
-    with open(cal_dir / "test_observable.yaml", "w") as f:
-        yaml.dump(target, f)
-
-    return cal_dir
+def sample_compiled_test_stats_csv(temp_dir):
+    """Write a minimal compiled test-statistics CSV (maple compiler output)."""
+    df = pd.DataFrame(
+        [
+            {
+                "test_statistic_id": "test_observable",
+                "required_species": "V_T.C1",
+                "model_output_code": (
+                    "import numpy as np\n"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return float(np.asarray(species_dict['V_T.C1'], dtype=float)[-1])\n"
+                ),
+                "median": 100.0,
+                "ci95_lower": 50.0,
+                "ci95_upper": 200.0,
+                "units": "cell",
+                "sample_size": 20,
+            }
+        ]
+    )
+    csv_path = temp_dir / "compiled_test_stats.csv"
+    df.to_csv(csv_path, index=False)
+    return csv_path
 
 
-class TestSimulationPoolCalibrationTargets:
-    """Tests for SimulationPoolManager with calibration_targets parameter."""
+class TestSimulationPoolTestStats:
+    """Tests for SimulationPoolManager with a compiled test_stats_csv."""
 
-    def test_init_with_calibration_targets(
-        self, temp_dir, sample_priors_csv, sample_calibration_targets_dir
+    def test_init_with_test_stats_csv(
+        self, temp_dir, sample_priors_csv, sample_compiled_test_stats_csv
     ):
-        """Pool manager accepts calibration_targets and initializes correctly."""
+        """Pool manager accepts test_stats_csv and initializes correctly."""
         pool = SimulationPoolManager(
             cache_dir=temp_dir / "cache",
             model_version="test_v1",
             model_description="Test model",
             priors_csv=sample_priors_csv,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_csv=sample_compiled_test_stats_csv,
             model_script="test_model",
         )
 
         assert pool.pool_dir.exists()
-        # _calibration_targets_dir is normalized to List[Path] so the
-        # multi-dir form (literature + mechanistic) is supported uniformly.
-        assert pool._calibration_targets_dir == [sample_calibration_targets_dir]
-        assert pool.test_stats_csv is None
+        assert pool.test_stats_csv == sample_compiled_test_stats_csv
 
-    def test_both_csv_and_yaml_raises(
-        self, temp_dir, sample_priors_csv, sample_test_stats_csv, sample_calibration_targets_dir
-    ):
-        """Providing both test_stats_csv and calibration_targets raises ValueError."""
-        with pytest.raises(ValueError, match="Provide test_stats_csv OR calibration_targets"):
-            SimulationPoolManager(
-                cache_dir=temp_dir / "cache",
-                model_version="test_v1",
-                model_description="Test model",
-                priors_csv=sample_priors_csv,
-                test_stats_csv=sample_test_stats_csv,
-                calibration_targets=sample_calibration_targets_dir,
-                model_script="test_model",
-            )
-
-    def test_neither_csv_nor_yaml_raises(self, temp_dir, sample_priors_csv):
-        """Providing neither test_stats_csv nor calibration_targets raises ValueError."""
-        with pytest.raises(ValueError, match="Must provide either"):
+    def test_missing_test_stats_csv_raises(self, temp_dir, sample_priors_csv):
+        """Omitting test_stats_csv raises ValueError."""
+        with pytest.raises(ValueError, match="Must provide test_stats_csv"):
             SimulationPoolManager(
                 cache_dir=temp_dir / "cache",
                 model_version="test_v1",
@@ -620,42 +594,42 @@ class TestSimulationPoolCalibrationTargets:
             )
 
     def test_config_hash_independent_of_test_stats_source(
-        self, temp_dir, sample_priors_csv, sample_test_stats_csv, sample_calibration_targets_dir
+        self, temp_dir, sample_priors_csv, sample_test_stats_csv, sample_compiled_test_stats_csv
     ):
-        """Test stats / calibration targets do NOT affect config_hash.
+        """Test-stats content does NOT affect config_hash.
 
-        Both feed the test_stats_hash subdir instead, so multiple test_stat
+        It feeds the test_stats_hash subdir instead, so multiple test_stat
         variants share the same raw-sim pool.
         """
-        pool_csv = SimulationPoolManager(
-            cache_dir=temp_dir / "cache_csv",
+        pool_a = SimulationPoolManager(
+            cache_dir=temp_dir / "cache_a",
             model_version="test_v1",
             model_description="Test model",
             priors_csv=sample_priors_csv,
             test_stats_csv=sample_test_stats_csv,
             model_script="test_model",
         )
-        pool_yaml = SimulationPoolManager(
-            cache_dir=temp_dir / "cache_yaml",
+        pool_b = SimulationPoolManager(
+            cache_dir=temp_dir / "cache_b",
             model_version="test_v1",
             model_description="Test model",
             priors_csv=sample_priors_csv,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_csv=sample_compiled_test_stats_csv,
             model_script="test_model",
         )
 
-        assert pool_csv.config_hash == pool_yaml.config_hash
+        assert pool_a.config_hash == pool_b.config_hash
 
-    def test_config_hash_deterministic_with_yaml(
-        self, temp_dir, sample_priors_csv, sample_calibration_targets_dir
+    def test_config_hash_deterministic(
+        self, temp_dir, sample_priors_csv, sample_compiled_test_stats_csv
     ):
-        """Config hash is deterministic for same calibration_targets."""
+        """Config hash is deterministic for the same test_stats_csv."""
         pool1 = SimulationPoolManager(
             cache_dir=temp_dir / "cache1",
             model_version="test_v1",
             model_description="Test model",
             priors_csv=sample_priors_csv,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_csv=sample_compiled_test_stats_csv,
             model_script="test_model",
         )
         pool2 = SimulationPoolManager(
@@ -663,22 +637,22 @@ class TestSimulationPoolCalibrationTargets:
             model_version="test_v1",
             model_description="Test model",
             priors_csv=sample_priors_csv,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_csv=sample_compiled_test_stats_csv,
             model_script="test_model",
         )
 
         assert pool1.config_hash == pool2.config_hash
 
-    def test_add_and_load_with_calibration_targets(
-        self, temp_dir, sample_priors_csv, sample_calibration_targets_dir
+    def test_add_and_load_with_test_stats_csv(
+        self, temp_dir, sample_priors_csv, sample_compiled_test_stats_csv
     ):
-        """Can add and load simulations from a calibration_targets-based pool."""
+        """Can add and load simulations from a test_stats_csv-based pool."""
         pool = SimulationPoolManager(
             cache_dir=temp_dir / "cache",
             model_version="test_v1",
             model_description="Test model",
             priors_csv=sample_priors_csv,
-            calibration_targets=sample_calibration_targets_dir,
+            test_stats_csv=sample_compiled_test_stats_csv,
             model_script="test_model",
         )
 

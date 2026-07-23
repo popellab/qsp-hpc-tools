@@ -15,10 +15,11 @@ The simulator handles:
 
 Usage:
     from qsp_hpc import QSPSimulator
+    from maple.core.calibration import load_calibration_targets
 
     sim = QSPSimulator(
         priors_csv='priors.csv',
-        calibration_targets='calibration_targets/',
+        test_stats_df=load_calibration_targets('calibration_targets/'),
         model_script='my_model',
         model_version='v1',
         scenario='control',
@@ -104,7 +105,7 @@ class QSPSimulator:
 
     Attributes:
         priors_csv: Path to priors CSV (defines parameter names and distributions)
-        calibration_targets: Path to calibration target YAMLs (defines observables)
+        test_stats_csv: Path to a compiled test-statistics CSV (defines observables)
         model_script: MATLAB model script name
         model_version: Descriptive version name for simulation pooling
         cache_dir: Directory for caching results
@@ -116,7 +117,7 @@ class QSPSimulator:
         self,
         priors_csv: Union[str, Path],
         test_stats_csv: Optional[Union[str, Path]] = None,
-        calibration_targets: Optional[Union[str, Path, list]] = None,
+        test_stats_df: Optional[pd.DataFrame] = None,
         model_structure_file: Optional[Union[str, Path]] = None,
         submodel_priors_yaml: Optional[Union[str, Path]] = None,
         model_script: str = "",
@@ -144,9 +145,15 @@ class QSPSimulator:
 
         Args:
             priors_csv: Path to priors CSV defining parameter names and distributions
-            calibration_targets: Path to directory of calibration target YAML files
-                                (from MAPLE). Defines the observables to extract from
-                                each simulation.
+            test_stats_csv: Path to a compiled test-statistics CSV (mutually
+                            exclusive with test_stats_df).
+            test_stats_df: A compiled test-statistics DataFrame defining the
+                           observables to extract from each simulation. Callers
+                           holding maple calibration-target YAMLs compile them
+                           first via ``maple.core.calibration.load_calibration_targets``;
+                           this simulator consumes only the compiled table, never
+                           the maple schema. Serialized to a temp CSV internally
+                           (mutually exclusive with test_stats_csv).
             model_structure_file: Path to model_structure.json with species metadata (array-of-objects
                                   format with name, compartment, base_name, units, description).
             submodel_priors_yaml: Path to submodel_priors.yaml with fitted marginals and copula
@@ -169,26 +176,16 @@ class QSPSimulator:
             verbose: If True, print detailed progress information (default: False)
         """
         # Validate mutually exclusive observables sources
-        if test_stats_csv is not None and calibration_targets is not None:
-            raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
+        if test_stats_csv is not None and test_stats_df is not None:
+            raise ValueError("Provide test_stats_csv OR test_stats_df, not both")
 
-        # Handle calibration_targets: load YAMLs, serialize to temp CSV for downstream use
-        self._calibration_targets_dir = None
+        # Handle a prebuilt test-stats DataFrame: serialize to a temp CSV so the
+        # downstream pool-key hashing, HPC upload, and CSV consumers are
+        # identical to the test_stats_csv path.
         self._temp_csv = None
-        if calibration_targets is not None:
-            from qsp_hpc.calibration import load_calibration_targets
-            from qsp_hpc.calibration.yaml_loader import _resolve_yaml_dirs
-
-            # ``calibration_targets`` is normalized to a List[Path] so that
-            # downstream pool-key hashing + reload paths handle the
-            # single-dir and multi-dir cases identically. The multi-dir form
-            # is the wiring point for splitting literature targets and
-            # mechanistic-prior targets into parallel directory trees per
-            # scenario.
-            cal_dirs = _resolve_yaml_dirs(calibration_targets)
-            self._calibration_targets_dir = cal_dirs
-            self._test_stats_df = load_calibration_targets(cal_dirs)
-            # Serialize to temp CSV for internal use + HPC upload
+        self._test_stats_df = None
+        if test_stats_df is not None:
+            self._test_stats_df = test_stats_df
             tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
             tmp.close()
             self._temp_csv = Path(tmp.name)
@@ -250,10 +247,7 @@ class QSPSimulator:
                 submodel_priors_yaml=submodel_priors_yaml,
                 seed=self.seed,
             )
-            if self._calibration_targets_dir is not None:
-                pool_kwargs["calibration_targets"] = self._calibration_targets_dir
-            else:
-                pool_kwargs["test_stats_csv"] = test_stats_csv
+            pool_kwargs["test_stats_csv"] = self.test_stats_csv
             self.pool = SimulationPoolManager(**pool_kwargs)
         else:
             self.pool = None  # No pooling for QC-only simulations
@@ -1878,10 +1872,7 @@ class QSPSimulator:
                 scenario=pool_scenario,
                 seed=self.seed,
             )
-            if self._calibration_targets_dir is not None:
-                pool_kwargs["calibration_targets"] = self._calibration_targets_dir
-            else:
-                pool_kwargs["test_stats_csv"] = self.test_stats_csv
+            pool_kwargs["test_stats_csv"] = self.test_stats_csv
             self._suffix_pools[pool_scenario] = SimulationPoolManager(**pool_kwargs)
         return self._suffix_pools[pool_scenario]
 
@@ -2151,14 +2142,18 @@ class QSPSimulator:
 
 def get_observed_data(
     test_stats_csv: Optional[Union[str, Path]] = None,
-    calibration_targets: Optional[Union[str, Path]] = None,
+    test_stats_df: Optional[pd.DataFrame] = None,
     value_column: str = "median",
 ) -> Dict[str, np.ndarray]:
     """
-    Extract observed data from calibration target YAMLs.
+    Extract observed data from a compiled test-statistics table.
 
     Args:
-        calibration_targets: Path to directory of calibration target YAML files
+        test_stats_csv: Path to a compiled test-statistics CSV (mutually
+            exclusive with test_stats_df).
+        test_stats_df: A compiled test-statistics DataFrame (mutually exclusive
+            with test_stats_csv). Callers holding maple calibration-target YAMLs
+            compile them via ``maple.core.calibration.load_calibration_targets``.
         value_column: Column name to use for observed values (default: 'median')
 
     Returns:
@@ -2166,21 +2161,20 @@ def get_observed_data(
         Each array has shape (1, 1) for compatibility with BayesFlow workflow.
 
     Example:
-        obs = get_observed_data(calibration_targets='calibration_targets/')
+        from maple.core.calibration import load_calibration_targets
+        obs = get_observed_data(test_stats_df=load_calibration_targets('calibration_targets/'))
         posterior_samples = workflow.sample(conditions=obs, num_samples=1000)
     """
     import pandas as pd
 
-    if test_stats_csv is not None and calibration_targets is not None:
-        raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
+    if test_stats_csv is not None and test_stats_df is not None:
+        raise ValueError("Provide test_stats_csv OR test_stats_df, not both")
 
-    if test_stats_csv is None and calibration_targets is None:
-        raise ValueError("Must provide either test_stats_csv or calibration_targets")
+    if test_stats_csv is None and test_stats_df is None:
+        raise ValueError("Must provide either test_stats_csv or test_stats_df")
 
-    if calibration_targets is not None:
-        from qsp_hpc.calibration import load_calibration_targets
-
-        df = load_calibration_targets(Path(calibration_targets))
+    if test_stats_df is not None:
+        df = test_stats_df
     else:
         test_stats_csv = Path(test_stats_csv)
         if not test_stats_csv.exists():

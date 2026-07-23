@@ -55,7 +55,6 @@ class PpcContext:
     n_samples: int
     sample_indices: np.ndarray  # arange(n_samples), int64
     pool_suffix: str
-    pred_dir: Optional[Path]
     suffix_pool_dir: Path
     cache_path: Path  # suffix_pool_dir / "test_stats.parquet"
     test_stats_df: "pd.DataFrame"
@@ -103,7 +102,7 @@ class CppSimulator:
         healthy_state_yaml: Optional[str | Path] = None,
         job_manager: Optional["HPCJobManager"] = None,
         test_stats_csv: Optional[str | Path] = None,
-        calibration_targets: Optional[str | Path | list] = None,
+        test_stats_df: Optional["pd.DataFrame"] = None,
         cross_input_test_stats_df: Optional["pd.DataFrame"] = None,
         model_structure_file: Optional[str | Path] = None,
         poll_interval: float = 5.0,
@@ -155,12 +154,13 @@ class CppSimulator:
         self.drug_metadata_yaml = Path(drug_metadata_yaml).resolve() if drug_metadata_yaml else None
         self.healthy_state_yaml = Path(healthy_state_yaml).resolve() if healthy_state_yaml else None
         self.job_manager = job_manager
-        # calibration_targets and test_stats_csv are mutually exclusive — the
-        # YAML directory is the public-facing API used by pdac-build; the CSV
-        # form is the internal/legacy path. Mirrors QSPSimulator.__init__.
-        if calibration_targets is not None and test_stats_csv is not None:
-            raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
-        self._calibration_targets_dir: Optional[List[Path]] = None
+        # test_stats_df and test_stats_csv are mutually exclusive. Callers
+        # holding maple calibration-target YAMLs compile them into a DataFrame
+        # via maple.core.calibration.load_calibration_targets and pass it as
+        # test_stats_df; the CSV form is the internal/serialized path. This
+        # simulator never parses the maple schema. Mirrors QSPSimulator.__init__.
+        if test_stats_df is not None and test_stats_csv is not None:
+            raise ValueError("Provide test_stats_csv OR test_stats_df, not both")
         self._temp_test_stats_csv: Optional[Path] = None
 
         # Optional self-contained cross-scenario per-arm inputs. These derive
@@ -176,20 +176,13 @@ class CppSimulator:
             _cross_rows = None
 
         _base_df: Optional["pd.DataFrame"] = None
-        if calibration_targets is not None:
-            from qsp_hpc.calibration import load_calibration_targets
-            from qsp_hpc.calibration.yaml_loader import _resolve_yaml_dirs
-
-            # Normalize to List[Path] so single-dir and multi-dir
-            # (literature + mechanistic) cases use the same downstream code.
-            cal_dirs = [d.resolve() for d in _resolve_yaml_dirs(calibration_targets)]
-            self._calibration_targets_dir = cal_dirs
-            _base_df = load_calibration_targets(cal_dirs)
+        if test_stats_df is not None:
+            _base_df = test_stats_df
         elif _cross_rows is not None:
             # Cross inputs to append, but the base came in as a flat CSV.
             if test_stats_csv is None:
                 raise ValueError(
-                    "cross_input_test_stats_df requires calibration_targets or test_stats_csv"
+                    "cross_input_test_stats_df requires test_stats_df or test_stats_csv"
                 )
             _base_df = pd.read_csv(test_stats_csv)
 
@@ -364,7 +357,7 @@ class CppSimulator:
         return h.hexdigest()
 
     def __del__(self):
-        """Clean up the temp CSV serialized from calibration_targets."""
+        """Clean up the temp CSV serialized from test_stats_df."""
         tmp = getattr(self, "_temp_test_stats_csv", None)
         if tmp is not None and tmp.exists():
             try:
@@ -1222,7 +1215,7 @@ class CppSimulator:
         theta: np.ndarray,
         *,
         backend: str = "local",
-        prediction_targets: Optional[str | Path] = None,
+        prediction_test_stats_df: Optional["pd.DataFrame"] = None,
         pool_suffix: str = "posterior_predictive",
         evolve_trajectory_dir: Optional[str | Path] = None,
         evolve_trajectory_dt_days: Optional[float] = None,
@@ -1248,13 +1241,14 @@ class CppSimulator:
                 chained test-stat derivation on the cluster, then
                 downloads and reshapes the result to match the local
                 output format. HPC mode requires ``job_manager`` set at
-                construction and is incompatible with ``prediction_targets``
+                construction and is incompatible with ``prediction_test_stats_df``
                 for now (the merged CSV isn't yet shipped to the cluster).
-            prediction_targets: Optional directory of PredictionTarget
-                YAMLs (``prediction_target_id`` schema). When given, the
-                prediction rows are concatenated with calibration rows
-                before derivation and contribute extra ``ts:*`` columns.
-                Local backend only.
+            prediction_test_stats_df: Optional compiled PredictionTarget
+                test-stats DataFrame (carrying ``is_prediction_only=True``),
+                produced by ``maple.core.calibration.load_prediction_targets``.
+                When given, the prediction rows are concatenated with
+                calibration rows before derivation and contribute extra
+                ``ts:*`` columns. Local backend only.
             pool_suffix: Label combined with the theta hash to build the
                 suffix-pool directory name. Only change this when you want
                 two logically distinct posterior-predictive runs to stay
@@ -1284,9 +1278,9 @@ class CppSimulator:
         """
         if backend not in ("local", "hpc"):
             raise ValueError(f"backend must be 'local' or 'hpc'; got {backend!r}")
-        if backend == "hpc" and prediction_targets is not None:
+        if backend == "hpc" and prediction_test_stats_df is not None:
             raise NotImplementedError(
-                "simulate_with_parameters(backend='hpc', prediction_targets=...) "
+                "simulate_with_parameters(backend='hpc', prediction_test_stats_df=...) "
                 "is not yet supported; the merged calibration+prediction CSV is "
                 "not shipped to the cluster. Run locally or split the call."
             )
@@ -1304,7 +1298,7 @@ class CppSimulator:
         ctx = self._resolve_ppc_context(
             theta,
             backend=backend,
-            prediction_targets=prediction_targets,
+            prediction_test_stats_df=prediction_test_stats_df,
             pool_suffix=pool_suffix,
             aux_by_sample_index=aux_by_sample_index,
             auxiliary_units=auxiliary_units,
@@ -1359,7 +1353,7 @@ class CppSimulator:
         theta: np.ndarray,
         *,
         backend: str,
-        prediction_targets: Optional[str | Path],
+        prediction_test_stats_df: Optional["pd.DataFrame"],
         pool_suffix: str,
         aux_by_sample_index: Optional[dict[int, dict[str, float]]],
         auxiliary_units: Optional[dict[str, str]],
@@ -1376,10 +1370,10 @@ class CppSimulator:
         — a fused run primes the exact cache a later single-scenario call
         reads.
         """
-        if self.test_stats_csv is None and self._calibration_targets_dir is None:
+        if self.test_stats_csv is None:
             raise RuntimeError(
                 "simulate_with_parameters() requires test_stats_csv or "
-                "calibration_targets at construction; without them there is "
+                "test_stats_df at construction; without them there is "
                 "nothing to derive."
             )
         if theta.ndim != 2:
@@ -1393,12 +1387,8 @@ class CppSimulator:
         theta = np.ascontiguousarray(theta, dtype=np.float64)
         n_samples = theta.shape[0]
 
-        pred_dir: Optional[Path] = (
-            Path(prediction_targets).resolve() if prediction_targets is not None else None
-        )
-
         # Cache key: theta + calibration targets + prediction targets + backend
-        # tag + aux draws. Without the target hashes, editing a YAML silently
+        # tag + aux draws. Without the target hashes, editing a target silently
         # hits a stale pool and the caller sees endpoint columns derived from
         # the old observable code. The backend tag keeps local and HPC caches
         # for the same theta distinct. The aux hash folds in the per-sim aux
@@ -1406,7 +1396,7 @@ class CppSimulator:
         # don't collide on the same cache.
         theta_hash = hashlib.sha256(theta.tobytes()).hexdigest()
         cal_hash = self._calibration_targets_hash()
-        pred_hash = self._prediction_targets_hash(pred_dir)
+        pred_hash = self._prediction_targets_hash(prediction_test_stats_df)
         aux_hash = self._aux_hash(aux_by_sample_index, auxiliary_units)
         key_hash = hashlib.sha256(
             (
@@ -1426,9 +1416,9 @@ class CppSimulator:
         )
         self.logger.info(f"  suffix pool: {suffix_pool_dir.name}")
 
-        # Resolve the merged test-stats DataFrame. load_calibration_targets
-        # only runs when the caller didn't pre-flatten via test_stats_csv.
-        test_stats_df = self._load_test_stats_df(pred_dir)
+        # Resolve the merged test-stats DataFrame: the compiled calibration
+        # CSV read back, optionally concatenated with the prediction rows.
+        test_stats_df = self._load_test_stats_df(prediction_test_stats_df)
 
         # Sample indices are local (arange) — the suffix pool is isolated by
         # theta_hash so there's no cross-scenario alignment to worry about.
@@ -1439,7 +1429,6 @@ class CppSimulator:
             n_samples=n_samples,
             sample_indices=sample_indices,
             pool_suffix=pool_suffix,
-            pred_dir=pred_dir,
             suffix_pool_dir=suffix_pool_dir,
             cache_path=cache_path,
             test_stats_df=test_stats_df,
@@ -1712,43 +1701,38 @@ class CppSimulator:
     # ------------------------------------------------------------------
 
     def _calibration_targets_hash(self) -> str:
-        """Hash of the calibration-target directory, or of the flat CSV
-        when the caller passed ``test_stats_csv`` directly."""
-        if self._calibration_targets_dir is not None:
-            from qsp_hpc.calibration import hash_calibration_targets
-
-            return hash_calibration_targets(self._calibration_targets_dir)
+        """Content hash of the compiled test-stats CSV (calibration rows).
+        The CSV is the byte-stable compiled artifact — whether it came from
+        a caller-supplied ``test_stats_csv`` or was serialized from a
+        ``test_stats_df`` — so editing a target invalidates the cache."""
         if self.test_stats_csv is not None:
             return hashlib.sha256(self.test_stats_csv.read_bytes()).hexdigest()
         return ""
 
-    def _prediction_targets_hash(self, pred_dir: Optional[Path]) -> str:
-        """Hash of the prediction-target directory. Empty string when
-        prediction targets are not requested — keeps the cache key stable
-        for calibration-only callers."""
-        if pred_dir is None:
+    def _prediction_targets_hash(self, prediction_test_stats_df: Optional["pd.DataFrame"]) -> str:
+        """Content hash of the compiled prediction test-stats DataFrame.
+        Empty string when prediction targets are not requested — keeps the
+        cache key stable for calibration-only callers."""
+        if prediction_test_stats_df is None:
             return ""
-        from qsp_hpc.calibration import hash_prediction_targets
+        # Hash the serialized DataFrame bytes so an edited PredictionTarget
+        # (recompiled upstream by maple) invalidates the PPC cache.
+        csv_bytes = prediction_test_stats_df.to_csv(index=False).encode()
+        return hashlib.sha256(csv_bytes).hexdigest()
 
-        return hash_prediction_targets(pred_dir)
-
-    def _load_test_stats_df(self, pred_dir: Optional[Path]) -> pd.DataFrame:
+    def _load_test_stats_df(
+        self, prediction_test_stats_df: Optional["pd.DataFrame"]
+    ) -> pd.DataFrame:
         """Merge calibration + prediction rows into the single DataFrame
         passed to ``compute_test_statistics_batch``.
 
-        When constructed with ``calibration_targets=`` (directory), we
-        reload from YAMLs so the ``is_prediction_only`` flag lines up with
-        the prediction rows. When constructed with the legacy
-        ``test_stats_csv=`` path we read that CSV and assume every row is
-        a calibration target (``is_prediction_only=False``) — the common
-        case for SBI training flows that don't care about predictions.
+        The calibration rows are read back from the compiled test-stats CSV
+        (byte-stable, so ``compute_test_stats_hash`` is preserved) and every
+        row is assumed to be a calibration target (``is_prediction_only=False``).
+        Prediction rows, when supplied, are compiled upstream by maple's
+        ``load_prediction_targets`` (already carrying ``is_prediction_only=True``).
         """
-        if self._calibration_targets_dir is not None:
-            from qsp_hpc.calibration import load_calibration_targets
-
-            cal_df = load_calibration_targets(self._calibration_targets_dir)
-        else:
-            cal_df = pd.read_csv(self.test_stats_csv)
+        cal_df = pd.read_csv(self.test_stats_csv)
 
         # Calibration rows intentionally lack ``is_prediction_only`` — the
         # column is dropped from the canonical CSV schema so
@@ -1759,12 +1743,10 @@ class CppSimulator:
             cal_df = cal_df.copy()
             cal_df["is_prediction_only"] = False
 
-        if pred_dir is None:
+        if prediction_test_stats_df is None:
             return cal_df
 
-        from qsp_hpc.calibration import load_prediction_targets
-
-        pred_df = load_prediction_targets(pred_dir)
+        pred_df = prediction_test_stats_df
         # Guard against id collisions — calibration and prediction share
         # the ``test_statistic_id`` column, and compute_test_statistics_batch
         # keys its registry on that id. A collision would silently overwrite

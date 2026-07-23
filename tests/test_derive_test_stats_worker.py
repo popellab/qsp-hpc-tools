@@ -493,7 +493,7 @@ class TestAuxiliaryParameterMerge:
 
     def test_aux_value_attached_with_units_and_consumed_by_wrapper(self):
         # Wrapper that asks for an aux name in species_dict (matching what
-        # yaml_loader._generate_wrapper_code emits for aux-bearing targets).
+        # maple's wrapper-code generation emits for aux-bearing targets).
         test_stats_df = pd.DataFrame(
             {
                 "test_statistic_id": ["aux_scaled"],

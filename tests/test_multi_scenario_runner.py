@@ -570,39 +570,34 @@ def _make_fused_binary(tmp_path: Path) -> tuple[Path, Path]:
     return script, counter
 
 
-def _make_cal_targets(tmp_path: Path) -> Path:
-    """One calibration target reading spA — minimum the loader accepts."""
-    import yaml as _yaml
+def _make_test_stats_df():
+    """One compiled test statistic reading spA at t=0 (maple compiler output)."""
+    import pandas as pd
 
-    cal_dir = tmp_path / "calibration_targets"
-    cal_dir.mkdir()
-    target = {
-        "calibration_target_id": "spA_t0",
-        "observable": {
-            "code": (
-                "def compute_observable(time, species_dict, constants):\n"
-                "    return species_dict['spA']\n"
-            ),
-            "units": "cell",
-            "species": ["spA"],
-            "constants": [],
-        },
-        "empirical_data": {
-            "median": [10.0],
-            "ci95": [[5.0, 20.0]],
-            "units": "cell",
-            "sample_size": 10,
-            "index_values": None,
-        },
-    }
-    (cal_dir / "spA_t0.yaml").write_text(_yaml.dump(target))
-    return cal_dir
+    return pd.DataFrame(
+        [
+            {
+                "test_statistic_id": "spA_t0",
+                "required_species": "spA",
+                "model_output_code": (
+                    "import numpy as np\n"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return float(np.asarray(species_dict['spA'], dtype=float)[0])\n"
+                ),
+                "median": 10.0,
+                "ci95_lower": 5.0,
+                "ci95_upper": 20.0,
+                "units": "cell",
+                "sample_size": 10,
+            }
+        ]
+    )
 
 
 @pytest.fixture
 def ppc_env(tmp_path: Path) -> dict:
     """Shared inputs for fused-PPC tests: a fused-capable fake binary,
-    template, priors, calibration targets, healthy state, cache dir."""
+    template, priors, compiled test stats, healthy state, cache dir."""
     binary, counter = _make_fused_binary(tmp_path)
     template = tmp_path / "template.xml"
     template.write_bytes(_PPC_TEMPLATE)
@@ -617,7 +612,7 @@ def ppc_env(tmp_path: Path) -> dict:
         "evolve_counter": counter,
         "template": template,
         "priors": priors,
-        "cal_dir": _make_cal_targets(tmp_path),
+        "test_stats_df": _make_test_stats_df(),
         "healthy": healthy,
         "cache": cache,
     }
@@ -639,7 +634,7 @@ def _ppc_sim(
         binary_path=env["binary"],
         template_xml=env["template"],
         cache_dir=env["cache"],
-        calibration_targets=env["cal_dir"],
+        test_stats_df=env["test_stats_df"],
         scenario=scenario,
         healthy_state_yaml=env["healthy"] if with_healthy else None,
         t_end_days=t_end_days,
@@ -867,7 +862,7 @@ def _ppc_hpc_sim(env, scenario, jm, model_structure, *, t_end_days: float = 0.2,
         binary_path=env["binary"],
         template_xml=env["template"],
         cache_dir=env["cache"],
-        calibration_targets=env["cal_dir"],
+        test_stats_df=env["test_stats_df"],
         cross_input_test_stats_df=cross_rows,
         scenario=scenario,
         healthy_state_yaml=env["healthy"],
@@ -898,14 +893,16 @@ class TestSimulateWithParametersAllHpc:
         with pytest.raises(RuntimeError, match="requires a\n.*job_manager|job_manager"):
             r.simulate_with_parameters_all(np.array([[0.5, 1.0]]), backend="hpc")
 
-    def test_rejects_prediction_targets(self, ppc_env, tmp_path):
+    def test_rejects_prediction_test_stats_df(self, ppc_env, tmp_path):
         ms = _model_structure_file(tmp_path)
         jm = _ppc_hpc_jm({})
         sims = {n: _ppc_hpc_sim(ppc_env, n, jm, ms) for n in ("a", "b")}
         r = MultiScenarioRunner(sims)
-        with pytest.raises(NotImplementedError, match="prediction_targets"):
+        with pytest.raises(NotImplementedError, match="prediction_test_stats_df"):
             r.simulate_with_parameters_all(
-                np.array([[0.5, 1.0]]), backend="hpc", prediction_targets="/tmp/pred"
+                np.array([[0.5, 1.0]]),
+                backend="hpc",
+                prediction_test_stats_df=_make_test_stats_df(),
             )
 
     def test_rejects_unknown_backend(self, ppc_env, tmp_path):

@@ -7,7 +7,7 @@ cross-input matrices. Runs *after* each scenario's per-arm cross inputs have
 been derived (``cross_scenario_derive.compute_cross_inputs_batch``) and
 gathered; consumes the resulting ``scenario_meta`` dict plus a
 ``cross_scenario_df`` produced by
-``qsp_hpc.calibration.cross_scenario_loader.load_cross_scenario_targets``.
+``maple.core.calibration.load_cross_scenario_targets``.
 
 Each cross-scenario target's inputs are self-contained per-arm scalars (one
 per (target, role), keyed ``f"{target}::{role}"``). The composer is a pure,

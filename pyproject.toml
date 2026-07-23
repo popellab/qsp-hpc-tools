@@ -35,6 +35,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# theta_pool builds its cloud from qsp-inference's copula priors (composite /
+# sigma-overlay / derived / tempered) and rejection-samples with its
+# RestrictionClassifier. That is the only feature here that needs it, so it is an
+# extra rather than a hard dependency — and the imports in theta_pool.py are
+# function-local to match. Install with: pip install "qsp-hpc-tools[priors]"
+priors = [
+    "qsp-inference @ git+https://github.com/popellab/qsp-inference.git@main",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=3.0",

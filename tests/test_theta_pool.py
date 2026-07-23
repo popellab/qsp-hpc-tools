@@ -173,3 +173,84 @@ def test_restricted_pool_uses_classifier(tmp_path):
         restriction_threshold=0.5,
     )
     np.testing.assert_array_equal(restricted, again)
+
+
+# ---------------------------------------------------------------------------
+# proposal_temperature: the training proposal for the proposal/prior decoupling
+# ---------------------------------------------------------------------------
+
+
+def test_cache_path_changes_with_proposal_temperature(tmp_path):
+    """A tempered pool is drawn from a different distribution, so it must key a
+    distinct file. Reusing an untempered pool for a tempered run would corrupt
+    every importance weight downstream, silently."""
+    priors = _make_priors_csv(tmp_path)
+    p1 = theta_pool_cache_path(tmp_path, priors, None, 1, 100)
+    p2 = theta_pool_cache_path(tmp_path, priors, None, 1, 100, proposal_temperature=2.0)
+    p4 = theta_pool_cache_path(tmp_path, priors, None, 1, 100, proposal_temperature=4.0)
+    assert len({p1, p2, p4}) == 3
+    assert str(p2).endswith("_T2.npy")
+
+
+def test_temperature_one_is_hash_inert(tmp_path):
+    """T=1 must hash identically to never passing the argument, so pools cached
+    before the decoupling existed stay valid and a switched-off run is
+    bit-identical."""
+    priors = _make_priors_csv(tmp_path)
+    assert theta_pool_cache_path(tmp_path, priors, None, 7, 50) == theta_pool_cache_path(
+        tmp_path, priors, None, 7, 50, proposal_temperature=1.0
+    )
+
+
+def test_temperature_composes_with_other_policies(tmp_path):
+    """Temperature keys independently of the vary/derived suffixes."""
+    priors = _make_priors_csv(tmp_path)
+    d = tmp_path / "derived.yaml"
+    d.write_text(
+        "parameters:\n  p1:\n    parents: {p0: 1.0}\n    log_coeff: -0.5\n    sigma_coeff: 0.4\n"
+    )
+    plain = theta_pool_cache_path(tmp_path, priors, None, 1, 100, derived_yaml=d)
+    hot = theta_pool_cache_path(
+        tmp_path, priors, None, 1, 100, derived_yaml=d, proposal_temperature=3.0
+    )
+    assert plain != hot
+    assert str(hot).endswith("_derived_T3.npy")
+
+
+def test_proposal_temperature_requires_submodel_yaml(tmp_path):
+    """Tempering is defined on the log-space copula prior. The CSV-only fallback
+    samples uniform/beta families for which sigma*sqrt(T) has no meaning."""
+    priors = _make_priors_csv(tmp_path)
+    with pytest.raises(ValueError, match="requires a submodel_priors.yaml"):
+        get_theta_pool(
+            priors,
+            None,
+            seed=1,
+            n_total=10,
+            cache_dir=tmp_path / "c",
+            proposal_temperature=2.0,
+        )
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0])
+def test_nonpositive_temperature_rejected(tmp_path, bad):
+    priors = _make_priors_csv(tmp_path)
+    with pytest.raises(ValueError, match="must be > 0"):
+        get_theta_pool(
+            priors,
+            None,
+            seed=1,
+            n_total=10,
+            cache_dir=tmp_path / "c",
+            proposal_temperature=bad,
+        )
+
+
+def test_temperature_one_pool_is_unchanged(tmp_path):
+    """The end-to-end inertness check: T=1 yields the same cloud as no argument."""
+    priors = _make_priors_csv(tmp_path)
+    a = get_theta_pool(priors, None, seed=3, n_total=64, cache_dir=tmp_path / "a")
+    b = get_theta_pool(
+        priors, None, seed=3, n_total=64, cache_dir=tmp_path / "b", proposal_temperature=1.0
+    )
+    np.testing.assert_array_equal(a, b)

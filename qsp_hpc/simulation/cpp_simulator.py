@@ -96,6 +96,7 @@ class CppSimulator:
         classifier_feature_fills: Optional[Mapping[str, float]] = None,
         vary_policy: Optional[str | Path] = None,
         derived_yaml: Optional[str | Path] = None,
+        proposal_temperature: float = 1.0,
         max_workers: int | None = None,
         per_sim_timeout_s: float | None = None,
         submodel_priors_yaml: Optional[str | Path] = None,
@@ -157,6 +158,7 @@ class CppSimulator:
         # lives alongside the unoverlaid one and a policy edit invalidates it.
         self.vary_policy = Path(vary_policy).resolve() if vary_policy else None
         self.derived_yaml = Path(derived_yaml).resolve() if derived_yaml else None
+        self.proposal_temperature = float(proposal_temperature)
         self.max_workers = max_workers
         self.per_sim_timeout_s = per_sim_timeout_s
         self.submodel_priors_yaml = Path(submodel_priors_yaml) if submodel_priors_yaml else None
@@ -372,6 +374,11 @@ class CppSimulator:
         if self.derived_yaml is not None and self.derived_yaml.exists():
             h.update(b"|derived_yaml|")
             h.update(self.derived_yaml.read_text().encode("utf-8"))
+        # A tempered proposal draws a different cloud, so its sims must not
+        # share a pool directory with an untempered run. T == 1.0 contributes
+        # nothing, keeping every pre-existing sim cache valid.
+        if self.proposal_temperature != 1.0:
+            h.update(f"|proposal_temperature={self.proposal_temperature:.12g}".encode("utf-8"))
         return h.hexdigest()
 
     def __del__(self):
@@ -464,6 +471,7 @@ class CppSimulator:
             classifier_feature_fills=self.classifier_feature_fills,
             vary_policy=self.vary_policy,
             derived_yaml=self.derived_yaml,
+            proposal_temperature=self.proposal_temperature,
         )
 
     # ------------------------------------------------------------------

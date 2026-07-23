@@ -92,16 +92,23 @@ def theta_pool_cache_path(
     classifier_feature_fills: Optional[Mapping[str, float]] = None,
     vary_policy: Optional[Union[str, Path]] = None,
     derived_yaml: Optional[Union[str, Path]] = None,
+    proposal_temperature: float = 1.0,
 ) -> Path:
     """Deterministic on-disk path for a cached theta pool.
 
     Hash includes priors CSV content + submodel priors YAML content (when
     present) + seed + n_total + restriction classifier bytes (when
     restricted) + vary-policy content (when a σ-overlay policy is applied) +
-    derived-parameter policy content (when derived params are injected). Pool
-    layout drift (e.g. different priors revisions, a different classifier, or a
-    change to the vary/pin or derived policy) thus produces a different file
-    rather than silently reusing a stale pool.
+    derived-parameter policy content (when derived params are injected) +
+    proposal temperature (when the pool is drawn from a tempered proposal
+    rather than the prior itself). Pool layout drift (e.g. different priors
+    revisions, a different classifier, or a change to the vary/pin, derived or
+    proposal settings) thus produces a different file rather than silently
+    reusing a stale pool.
+
+    ``proposal_temperature == 1.0`` contributes nothing to the hash, so pools
+    cached before the proposal/prior decoupling existed remain valid and a run
+    with the decoupling switched off is bit-identical to one without it.
     """
     h = hashlib.sha256()
     h.update(Path(priors_csv).read_text().encode("utf-8"))
@@ -132,10 +139,19 @@ def theta_pool_cache_path(
             h.update(b"|derived_yaml|")
             h.update(dp.read_text().encode("utf-8"))
         derived_suffix = "_derived"
+    # A tempered pool is drawn from a *different distribution* than an
+    # untempered one, so it must never share a cache entry: reusing a pool
+    # drawn under the prior for a run that reports importance weights against
+    # a tempered proposal would corrupt every weight silently.
+    proposal_suffix = ""
+    if proposal_temperature != 1.0:
+        h.update(f"|proposal_temperature={float(proposal_temperature):.12g}".encode("utf-8"))
+        proposal_suffix = f"_T{float(proposal_temperature):g}"
     suffix = (
         ("_restricted" if restriction_classifier_dir is not None else "")
         + overlay_suffix
         + derived_suffix
+        + proposal_suffix
     )
     return Path(cache_dir) / f"theta_pool_{h.hexdigest()[:16]}_n{n_total}{suffix}.npy"
 
@@ -147,6 +163,7 @@ def _sample_prior_batch(
     seed: int,
     vary_policy: Optional[Path] = None,
     derived_yaml: Optional[Path] = None,
+    proposal_temperature: float = 1.0,
 ) -> tuple[np.ndarray, list[str]]:
     """Draw ``n`` theta rows from the composite prior (copula or lognormal).
 
@@ -166,6 +183,16 @@ def _sample_prior_batch(
     children of their parents (``load_derived_specs`` /
     ``apply_derived_priors``), applied AFTER any σ-overlay so a derived child
     tracks its post-overlay parents.
+
+    When ``proposal_temperature != 1``, the cloud is drawn from the *tempered*
+    prior ``π^(1/T)`` (``temper_prior``) rather than from ``π`` itself —
+    applied LAST, after the overlay and the derived params, so the proposal is
+    a pure widening of the fully composed prior and differs from it in nothing
+    but scale. This is the training proposal for the proposal/prior
+    decoupling: the posterior is recovered under ``π`` by importance
+    reweighting (``qsp_inference.inference.importance``). Drawing a cloud this
+    way without applying that reweight downstream would silently change the
+    reported prior, so the two belong together.
     """
     use_submodel = submodel_priors_yaml is not None and submodel_priors_yaml.exists()
     if use_submodel:
@@ -189,11 +216,24 @@ def _sample_prior_batch(
                 str(priors_csv),
                 derived_yaml=str(derived_yaml) if derived_yaml else None,
             )
+        if proposal_temperature != 1.0:
+            from qsp_inference.priors.copula_prior import temper_prior
+
+            prior_log = temper_prior(prior_log, proposal_temperature)
+
         torch.manual_seed(int(seed))
         with torch.no_grad():
             log_samples = prior_log.sample((n,)).numpy()
         return np.exp(log_samples), list(param_names)
 
+    if proposal_temperature != 1.0:
+        raise ValueError(
+            "proposal_temperature requires a submodel_priors.yaml. Tempering is "
+            "defined on the log-space copula prior (scale every marginal sigma by "
+            "sqrt(T), leave the correlation alone); the CSV-only fallback samples "
+            "per-parameter from families including uniform and beta, for which that "
+            "operation has no meaning."
+        )
     if vary_policy is not None:
         raise ValueError(
             "vary_policy σ-overlay requires a submodel_priors.yaml (it overlays "
@@ -244,6 +284,7 @@ def get_theta_pool(
     classifier_feature_fills: Optional[Mapping[str, float]] = None,
     vary_policy: Optional[Union[str, Path]] = None,
     derived_yaml: Optional[Union[str, Path]] = None,
+    proposal_temperature: float = 1.0,
 ) -> np.ndarray:
     """Return a deterministic ``(n_total, n_params)`` theta matrix.
 
@@ -260,7 +301,17 @@ def get_theta_pool(
     doubled (up to ``restriction_max_oversample`` × baseline) and resampled
     with a fresh seed derived from ``seed`` — guaranteeing termination but
     keeping the cache key deterministic on the input args.
+
+    ``proposal_temperature`` draws the cloud from the tempered prior
+    ``pi^(1/T)`` instead of ``pi`` — the training proposal for the
+    proposal/prior decoupling, to be paired with an importance reweight
+    downstream (``qsp_inference.inference.importance``). It keys a distinct
+    pool. ``T == 1.0`` (the default) is inert and hashes identically to a call
+    that never passed the argument, so pools cached before this existed stay
+    valid.
     """
+    if proposal_temperature <= 0:
+        raise ValueError(f"proposal_temperature must be > 0; got {proposal_temperature}")
     priors_csv = Path(priors_csv)
     submodel_priors_yaml = Path(submodel_priors_yaml) if submodel_priors_yaml else None
     vary_policy = Path(vary_policy) if vary_policy else None
@@ -276,6 +327,7 @@ def get_theta_pool(
         classifier_feature_fills=classifier_feature_fills,
         vary_policy=vary_policy,
         derived_yaml=derived_yaml,
+        proposal_temperature=proposal_temperature,
     )
     if pool_path.exists():
         return np.load(pool_path)
@@ -288,6 +340,7 @@ def get_theta_pool(
             seed,
             vary_policy=vary_policy,
             derived_yaml=derived_yaml,
+            proposal_temperature=proposal_temperature,
         )
     else:
         from qsp_inference.inference.restriction import RestrictionClassifier
@@ -323,6 +376,7 @@ def get_theta_pool(
                 batch_seed,
                 vary_policy=vary_policy,
                 derived_yaml=derived_yaml,
+                proposal_temperature=proposal_temperature,
             )
             if list(batch_names) == list(clf.feature_order):
                 keep = clf.accept(theta_batch, threshold=restriction_threshold)
@@ -355,6 +409,7 @@ def theta_for_indices(
     classifier_feature_fills: Optional[Mapping[str, float]] = None,
     vary_policy: Optional[Union[str, Path]] = None,
     derived_yaml: Optional[Union[str, Path]] = None,
+    proposal_temperature: float = 1.0,
 ) -> np.ndarray:
     """Slice the theta pool by integer ``sample_index`` array.
 
@@ -372,6 +427,7 @@ def theta_for_indices(
         classifier_feature_fills=classifier_feature_fills,
         vary_policy=vary_policy,
         derived_yaml=derived_yaml,
+        proposal_temperature=proposal_temperature,
     )
     indices = np.asarray(indices, dtype=np.int64)
     if indices.size and (indices.min() < 0 or indices.max() >= n_total):

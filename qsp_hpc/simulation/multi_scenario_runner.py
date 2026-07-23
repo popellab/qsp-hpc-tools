@@ -122,6 +122,7 @@ class MultiScenarioRunner:
                 "submodel_priors_yaml",
                 "binary_path",
                 "vary_policy",
+                "derived_yaml",
             ):
                 a, b = getattr(first, attr), getattr(sim, attr)
                 if a != b:

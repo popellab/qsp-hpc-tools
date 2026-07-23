@@ -91,7 +91,6 @@ class SimulationPoolManager:
         model_description: str,
         priors_csv: Union[str, Path],
         test_stats_csv: Optional[Union[str, Path]] = None,
-        calibration_targets: Optional[Union[str, Path, list]] = None,
         model_script: str = "",
         scenario: str = "default",
         submodel_priors_yaml: Optional[Union[str, Path]] = None,
@@ -105,19 +104,17 @@ class SimulationPoolManager:
             model_version: Descriptive version name (e.g., 'baseline_gvax')
             model_description: Brief description of model configuration
             priors_csv: Path to priors CSV file
-            test_stats_csv: Path to test statistics CSV file (mutually exclusive
-                           with calibration_targets)
-            calibration_targets: Path to directory of calibration target YAML files
-                                (mutually exclusive with test_stats_csv)
+            test_stats_csv: Path to test statistics CSV file. Callers holding
+                maple calibration-target YAMLs compile them into this CSV first
+                via ``maple.core.calibration.load_calibration_targets`` — the
+                pool consumes only the compiled CSV, never the YAML schema.
             model_script: MATLAB model script name
             scenario: Scenario name (e.g., 'baseline_no_treatment', 'gvax_standard_regimen')
             submodel_priors_yaml: Path to submodel_priors.yaml with fitted marginals
                                   and copula correlations (overrides CSV for matched params)
         """
-        if test_stats_csv is not None and calibration_targets is not None:
-            raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
-        if test_stats_csv is None and calibration_targets is None:
-            raise ValueError("Must provide either test_stats_csv or calibration_targets")
+        if test_stats_csv is None:
+            raise ValueError("Must provide test_stats_csv")
 
         self.cache_dir = Path(cache_dir)
         self.model_version = model_version
@@ -129,19 +126,10 @@ class SimulationPoolManager:
         self.model_script = model_script
         self.scenario = scenario
         self.seed = seed
-        self._calibration_targets_dir = None
 
-        if calibration_targets is not None:
-            from qsp_hpc.calibration.yaml_loader import _resolve_yaml_dirs
-
-            # Normalized to List[Path] so the multi-dir form (literature +
-            # mechanistic-prior parallel trees) is supported uniformly.
-            self._calibration_targets_dir = _resolve_yaml_dirs(calibration_targets)
-            self.test_stats_csv = None  # Not used when calibration_targets provided
-        else:
-            self.test_stats_csv = Path(test_stats_csv)
-            if not self.test_stats_csv.exists():
-                raise FileNotFoundError(f"Test statistics CSV not found: {self.test_stats_csv}")
+        self.test_stats_csv = Path(test_stats_csv)
+        if not self.test_stats_csv.exists():
+            raise FileNotFoundError(f"Test statistics CSV not found: {self.test_stats_csv}")
 
         # Verify files exist
         if not self.priors_csv.exists():
@@ -177,10 +165,7 @@ class SimulationPoolManager:
         # Log pool configuration (verbose)
         self.logger.debug(f"  Config hash: {self.config_hash[:16]}...")
         self.logger.debug(f"  Priors: {self.priors_csv}")
-        if self._calibration_targets_dir is not None:
-            self.logger.debug(f"  Calibration targets: {self._calibration_targets_dir}")
-        else:
-            self.logger.debug(f"  Test stats: {self.test_stats_csv}")
+        self.logger.debug(f"  Test stats: {self.test_stats_csv}")
 
     def _compute_config_hash(self) -> str:
         """

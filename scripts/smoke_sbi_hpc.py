@@ -170,6 +170,8 @@ def main() -> int:
             print(f"ERROR: calibration targets dir not found: {cal_targets}", file=sys.stderr)
             return 1
 
+        from maple.core.calibration import load_calibration_targets
+
         print(f"\n--- Running scenario: {scen} ---")
         sim = CppSimulator(
             priors_csv=str(args.priors_csv),
@@ -186,7 +188,7 @@ def main() -> int:
             drug_metadata_yaml=str(args.drug_metadata_yaml),
             healthy_state_yaml=str(args.healthy_state_yaml),
             job_manager=manager,
-            calibration_targets=str(cal_targets),
+            test_stats_df=load_calibration_targets(cal_targets),
             model_structure_file=str(args.model_structure_file),
             remote_binary_path=manager.config.cpp_binary_path,
             remote_template_xml=manager.config.cpp_template_path,

@@ -218,9 +218,10 @@ def main() -> None:
         from qsp_hpc.utils.hash_utils import compute_test_stats_hash
 
         if args.calibration_targets is not None:
-            # Mirror QSPSimulator/CppSimulator: serialize calibration target
-            # YAMLs to a temp CSV and let submit_cpp_jobs upload that.
-            from qsp_hpc.calibration import load_calibration_targets
+            # Compile calibration target YAMLs (maple's schema) to a CSV via
+            # maple, then let submit_cpp_jobs upload that. qsp-hpc-tools itself
+            # never parses the maple schema.
+            from maple.core.calibration import load_calibration_targets
 
             cal_df = load_calibration_targets(args.calibration_targets)
             tmp_csv = out_dir / "calibration_targets.csv"

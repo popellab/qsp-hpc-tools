@@ -98,11 +98,13 @@ def main() -> int:
     print(f"  seed             : {args.seed}")
     print("=" * 72)
 
+    from maple.core.calibration import load_calibration_targets
+
     from qsp_hpc import QSPSimulator
 
     sim = QSPSimulator(
         priors_csv=args.priors_csv,
-        calibration_targets=args.calibration_targets,
+        test_stats_df=load_calibration_targets(args.calibration_targets),
         model_structure_file=args.model_structure_file,
         model_script=args.model_script,
         model_version=args.model_version,

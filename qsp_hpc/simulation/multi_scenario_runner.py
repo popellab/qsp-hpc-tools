@@ -723,7 +723,7 @@ class MultiScenarioRunner:
         *,
         backend: str = "local",
         pool_suffix: str = "posterior_predictive",
-        prediction_targets: Optional[str | Path] = None,
+        prediction_test_stats_df: Optional["pd.DataFrame"] = None,
         aux_by_sample_index: Optional[dict[int, dict[str, float]]] = None,
         auxiliary_units: Optional[dict[str, str]] = None,
     ) -> Dict[str, Tuple[np.ndarray, pa.Table]]:
@@ -766,12 +766,13 @@ class MultiScenarioRunner:
                 uncached scenarios (:meth:`HPCJobManager.submit_cpp_fused_jobs`),
                 deriving test stats inline and downloading in one combine.
                 HPC mode requires ``job_manager`` and is incompatible with
-                ``prediction_targets`` (the merged CSV isn't shipped). The
+                ``prediction_test_stats_df`` (the merged CSV isn't shipped). The
                 ``"hpc"`` backend tags a distinct suffix pool, so HPC and
                 local results for the same theta cache separately.
             pool_suffix: Suffix-pool label, applied to every scenario.
-            prediction_targets: Optional directory of PredictionTarget
-                YAMLs, merged into every scenario's derived columns.
+            prediction_test_stats_df: Optional compiled PredictionTarget
+                test-stats DataFrame (from ``maple.core.calibration.load_prediction_targets``),
+                merged into every scenario's derived columns.
             aux_by_sample_index: Optional per-sim auxiliary draws, keyed by
                 ``sample_index``; shared across scenarios.
             auxiliary_units: ``{aux_name: units}`` for the aux draws.
@@ -788,7 +789,7 @@ class MultiScenarioRunner:
             return self._run_ppc_hpc(
                 theta,
                 pool_suffix=pool_suffix,
-                prediction_targets=prediction_targets,
+                prediction_test_stats_df=prediction_test_stats_df,
                 aux_by_sample_index=aux_by_sample_index,
                 auxiliary_units=auxiliary_units,
             )
@@ -802,7 +803,7 @@ class MultiScenarioRunner:
             ctx = sim._resolve_ppc_context(
                 theta,
                 backend="local",
-                prediction_targets=prediction_targets,
+                prediction_test_stats_df=prediction_test_stats_df,
                 pool_suffix=pool_suffix,
                 aux_by_sample_index=aux_by_sample_index,
                 auxiliary_units=auxiliary_units,
@@ -899,7 +900,7 @@ class MultiScenarioRunner:
         theta: np.ndarray,
         *,
         pool_suffix: str,
-        prediction_targets: Optional[str | Path],
+        prediction_test_stats_df: Optional["pd.DataFrame"],
         aux_by_sample_index: Optional[dict[int, dict[str, float]]],
         auxiliary_units: Optional[dict[str, str]],
     ) -> Dict[str, Tuple[np.ndarray, pa.Table]]:
@@ -919,7 +920,7 @@ class MultiScenarioRunner:
         Aux draws arrive in the local API's per-sim dict form; on HPC the
         derivation runs on the cluster, so they are materialized to a CSV
         and shipped the same way :meth:`attach_auxiliary_samples` ships them
-        for training. ``prediction_targets`` is unsupported — same
+        for training. ``prediction_test_stats_df`` is unsupported — same
         limitation as :meth:`CppSimulator.simulate_with_parameters`
         ``backend='hpc'`` (the merged CSV isn't shipped to the cluster).
         """
@@ -928,9 +929,9 @@ class MultiScenarioRunner:
                 "simulate_with_parameters_all(backend='hpc') requires a "
                 "job_manager (set it on the simulators or pass it to the runner)."
             )
-        if prediction_targets is not None:
+        if prediction_test_stats_df is not None:
             raise NotImplementedError(
-                "simulate_with_parameters_all(backend='hpc', prediction_targets=...) "
+                "simulate_with_parameters_all(backend='hpc', prediction_test_stats_df=...) "
                 "is not supported; the merged calibration+prediction CSV is not "
                 "shipped to the cluster. Run locally or split the call."
             )
@@ -957,7 +958,7 @@ class MultiScenarioRunner:
             ctx = sim._resolve_ppc_context(
                 theta,
                 backend="hpc",
-                prediction_targets=None,
+                prediction_test_stats_df=None,
                 pool_suffix=pool_suffix,
                 aux_by_sample_index=aux_by_sample_index,
                 auxiliary_units=auxiliary_units,

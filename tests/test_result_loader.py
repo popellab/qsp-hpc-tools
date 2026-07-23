@@ -145,18 +145,39 @@ def test_loader_raises_when_short(tmp_path):
         loader.load(n_simulations=20)
 
 
-def test_loader_rejects_both_test_stats_and_calibration(tmp_path):
+def test_loader_rejects_both_test_stats_csv_and_df(tmp_path):
+    import pandas as pd
+
     priors_file = tmp_path / "priors.csv"
     priors_file.write_text(PRIORS_CSV)
     stats_csv = tmp_path / "test_stats.csv"
     stats_csv.write_text(TEST_STATS_CSV)
 
-    with pytest.raises(ValueError, match="test_stats_csv OR calibration_targets"):
+    stats_df = pd.DataFrame(
+        [
+            {
+                "test_statistic_id": "stat1",
+                "required_species": "V_T.C1",
+                "model_output_code": (
+                    "import numpy as np\n"
+                    "def compute_test_statistic(time, species_dict):\n"
+                    "    return float(np.mean(np.asarray(species_dict['V_T.C1'], dtype=float)))\n"
+                ),
+                "median": 1.0,
+                "ci95_lower": 0.5,
+                "ci95_upper": 1.5,
+                "units": "dimensionless",
+                "sample_size": 3,
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="test_stats_csv OR test_stats_df"):
         QSPResultLoader(
             pool_root=tmp_path / "pool",
             priors_csv=priors_file,
             test_stats_csv=stats_csv,
-            calibration_targets=tmp_path / "cal_targets",
+            test_stats_df=stats_df,
             model_version="mv1",
             model_script="dummy",
             scenario="s",

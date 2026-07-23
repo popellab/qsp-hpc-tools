@@ -64,15 +64,15 @@ class QSPResultLoader:
         scenario: str,
         *,
         test_stats_csv: Optional[Union[str, Path]] = None,
-        calibration_targets: Optional[Union[str, Path]] = None,
+        test_stats_df: Optional[pd.DataFrame] = None,
         submodel_priors_yaml: Optional[Union[str, Path]] = None,
         seed: Optional[int] = None,
         binary_path: Optional[Union[str, Path]] = None,
     ) -> None:
-        if test_stats_csv is not None and calibration_targets is not None:
-            raise ValueError("Provide test_stats_csv OR calibration_targets, not both")
-        if test_stats_csv is None and calibration_targets is None:
-            raise ValueError("Must provide test_stats_csv or calibration_targets")
+        if test_stats_csv is not None and test_stats_df is not None:
+            raise ValueError("Provide test_stats_csv OR test_stats_df, not both")
+        if test_stats_csv is None and test_stats_df is None:
+            raise ValueError("Must provide test_stats_csv or test_stats_df")
 
         self.pool_root = Path(pool_root)
         self.priors_csv = Path(priors_csv)
@@ -87,12 +87,12 @@ class QSPResultLoader:
 
         self._temp_csv: Optional[Path] = None
         self._test_stats_df: Optional[pd.DataFrame] = None
-        if calibration_targets is not None:
-            # Mirror QSPSimulator's YAML → DataFrame → temp-CSV flow so the
-            # hash matches exactly.
-            from qsp_hpc.calibration import load_calibration_targets
-
-            self._test_stats_df = load_calibration_targets(Path(calibration_targets))
+        if test_stats_df is not None:
+            # Serialize the compiled test-stats DataFrame to a temp CSV so the
+            # hash and downstream CSV consumers match the test_stats_csv path
+            # exactly. Callers compile maple YAMLs to this DataFrame via
+            # maple.core.calibration.load_calibration_targets.
+            self._test_stats_df = test_stats_df
             tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
             tmp.close()
             self._temp_csv = Path(tmp.name)

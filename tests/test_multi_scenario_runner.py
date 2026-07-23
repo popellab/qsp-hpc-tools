@@ -32,6 +32,7 @@ def _fake_sim(
     seed=2025,
     submodel_priors_yaml=None,
     binary_path="qsp_sim",
+    vary_policy=None,
     pool_id="poolXYZ",
     job_manager=None,
     healthy_state_yaml="healthy.yaml",
@@ -49,6 +50,7 @@ def _fake_sim(
     sim.seed = seed
     sim.submodel_priors_yaml = submodel_priors_yaml
     sim.binary_path = binary_path
+    sim.vary_policy = vary_policy
     sim.simulation_pool_id = pool_id
     sim.job_manager = job_manager
     sim.healthy_state_yaml = healthy_state_yaml

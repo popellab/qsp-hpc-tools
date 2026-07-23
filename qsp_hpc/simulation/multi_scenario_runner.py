@@ -116,7 +116,13 @@ class MultiScenarioRunner:
         """
         first_name, first = next(iter(self.simulators.items()))
         for name, sim in self.simulators.items():
-            for attr in ("priors_csv", "seed", "submodel_priors_yaml", "binary_path"):
+            for attr in (
+                "priors_csv",
+                "seed",
+                "submodel_priors_yaml",
+                "binary_path",
+                "vary_policy",
+            ):
                 a, b = getattr(first, attr), getattr(sim, attr)
                 if a != b:
                     raise ValueError(

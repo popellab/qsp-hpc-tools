@@ -95,6 +95,7 @@ class CppSimulator:
         restriction_threshold: float = 0.5,
         classifier_feature_fills: Optional[Mapping[str, float]] = None,
         vary_policy: Optional[str | Path] = None,
+        derived_yaml: Optional[str | Path] = None,
         max_workers: int | None = None,
         per_sim_timeout_s: float | None = None,
         submodel_priors_yaml: Optional[str | Path] = None,
@@ -155,6 +156,7 @@ class CppSimulator:
         # policy content is folded into the config hash so an overlaid pool
         # lives alongside the unoverlaid one and a policy edit invalidates it.
         self.vary_policy = Path(vary_policy).resolve() if vary_policy else None
+        self.derived_yaml = Path(derived_yaml).resolve() if derived_yaml else None
         self.max_workers = max_workers
         self.per_sim_timeout_s = per_sim_timeout_s
         self.submodel_priors_yaml = Path(submodel_priors_yaml) if submodel_priors_yaml else None
@@ -367,6 +369,9 @@ class CppSimulator:
         if self.vary_policy is not None and self.vary_policy.exists():
             h.update(b"|vary_policy|")
             h.update(self.vary_policy.read_text().encode("utf-8"))
+        if self.derived_yaml is not None and self.derived_yaml.exists():
+            h.update(b"|derived_yaml|")
+            h.update(self.derived_yaml.read_text().encode("utf-8"))
         return h.hexdigest()
 
     def __del__(self):
@@ -458,6 +463,7 @@ class CppSimulator:
             restriction_threshold=self.restriction_threshold,
             classifier_feature_fills=self.classifier_feature_fills,
             vary_policy=self.vary_policy,
+            derived_yaml=self.derived_yaml,
         )
 
     # ------------------------------------------------------------------

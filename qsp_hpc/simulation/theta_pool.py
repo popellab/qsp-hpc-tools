@@ -91,15 +91,17 @@ def theta_pool_cache_path(
     restriction_threshold: float = 0.5,
     classifier_feature_fills: Optional[Mapping[str, float]] = None,
     vary_policy: Optional[Union[str, Path]] = None,
+    derived_yaml: Optional[Union[str, Path]] = None,
 ) -> Path:
     """Deterministic on-disk path for a cached theta pool.
 
     Hash includes priors CSV content + submodel priors YAML content (when
     present) + seed + n_total + restriction classifier bytes (when
-    restricted) + vary-policy content (when a σ-overlay policy is applied).
-    Pool layout drift (e.g. different priors revisions, a different
-    classifier, or a change to the vary/pin policy) thus produces a
-    different file rather than silently reusing a stale pool.
+    restricted) + vary-policy content (when a σ-overlay policy is applied) +
+    derived-parameter policy content (when derived params are injected). Pool
+    layout drift (e.g. different priors revisions, a different classifier, or a
+    change to the vary/pin or derived policy) thus produces a different file
+    rather than silently reusing a stale pool.
     """
     h = hashlib.sha256()
     h.update(Path(priors_csv).read_text().encode("utf-8"))
@@ -123,7 +125,18 @@ def theta_pool_cache_path(
             h.update(b"|vary_policy|")
             h.update(vp.read_text().encode("utf-8"))
         overlay_suffix = "_overlay"
-    suffix = ("_restricted" if restriction_classifier_dir is not None else "") + overlay_suffix
+    derived_suffix = ""
+    if derived_yaml is not None:
+        dp = Path(derived_yaml)
+        if dp.exists():
+            h.update(b"|derived_yaml|")
+            h.update(dp.read_text().encode("utf-8"))
+        derived_suffix = "_derived"
+    suffix = (
+        ("_restricted" if restriction_classifier_dir is not None else "")
+        + overlay_suffix
+        + derived_suffix
+    )
     return Path(cache_dir) / f"theta_pool_{h.hexdigest()[:16]}_n{n_total}{suffix}.npy"
 
 
@@ -133,6 +146,7 @@ def _sample_prior_batch(
     n: int,
     seed: int,
     vary_policy: Optional[Path] = None,
+    derived_yaml: Optional[Path] = None,
 ) -> tuple[np.ndarray, list[str]]:
     """Draw ``n`` theta rows from the composite prior (copula or lognormal).
 
@@ -147,6 +161,11 @@ def _sample_prior_batch(
     to its center (σ→~0, copula-decoupled). This is what makes a vary/pin
     policy actually reach the training cloud rather than only the Python-side
     embedding prior.
+
+    When ``derived_yaml`` is given, listed params are replaced by power-law
+    children of their parents (``load_derived_specs`` /
+    ``apply_derived_priors``), applied AFTER any σ-overlay so a derived child
+    tracks its post-overlay parents.
     """
     use_submodel = submodel_priors_yaml is not None and submodel_priors_yaml.exists()
     if use_submodel:
@@ -157,13 +176,18 @@ def _sample_prior_batch(
             from qsp_inference.priors.copula_prior import load_overlay_prior_log
 
             prior_log, param_names = load_overlay_prior_log(
-                str(submodel_priors_yaml), str(priors_csv), vary_params=vary
+                str(submodel_priors_yaml),
+                str(priors_csv),
+                vary_params=vary,
+                derived_yaml=str(derived_yaml) if derived_yaml else None,
             )
         else:
             from qsp_inference.priors.copula_prior import load_composite_prior_log
 
             prior_log, param_names = load_composite_prior_log(
-                str(submodel_priors_yaml), str(priors_csv)
+                str(submodel_priors_yaml),
+                str(priors_csv),
+                derived_yaml=str(derived_yaml) if derived_yaml else None,
             )
         torch.manual_seed(int(seed))
         with torch.no_grad():
@@ -174,6 +198,11 @@ def _sample_prior_batch(
         raise ValueError(
             "vary_policy σ-overlay requires a submodel_priors.yaml (it overlays "
             "the composite center prior); none was provided."
+        )
+    if derived_yaml is not None:
+        raise ValueError(
+            "derived_yaml requires a submodel_priors.yaml (derived params inject "
+            "into the composite copula prior); none was provided."
         )
 
     import pandas as pd
@@ -214,6 +243,7 @@ def get_theta_pool(
     restriction_max_oversample: int = 8,
     classifier_feature_fills: Optional[Mapping[str, float]] = None,
     vary_policy: Optional[Union[str, Path]] = None,
+    derived_yaml: Optional[Union[str, Path]] = None,
 ) -> np.ndarray:
     """Return a deterministic ``(n_total, n_params)`` theta matrix.
 
@@ -234,6 +264,7 @@ def get_theta_pool(
     priors_csv = Path(priors_csv)
     submodel_priors_yaml = Path(submodel_priors_yaml) if submodel_priors_yaml else None
     vary_policy = Path(vary_policy) if vary_policy else None
+    derived_yaml = Path(derived_yaml) if derived_yaml else None
     pool_path = theta_pool_cache_path(
         cache_dir,
         priors_csv,
@@ -244,13 +275,19 @@ def get_theta_pool(
         restriction_threshold=restriction_threshold,
         classifier_feature_fills=classifier_feature_fills,
         vary_policy=vary_policy,
+        derived_yaml=derived_yaml,
     )
     if pool_path.exists():
         return np.load(pool_path)
 
     if restriction_classifier_dir is None:
         theta, _ = _sample_prior_batch(
-            priors_csv, submodel_priors_yaml, n_total, seed, vary_policy=vary_policy
+            priors_csv,
+            submodel_priors_yaml,
+            n_total,
+            seed,
+            vary_policy=vary_policy,
+            derived_yaml=derived_yaml,
         )
     else:
         from qsp_inference.inference.restriction import RestrictionClassifier
@@ -280,7 +317,12 @@ def get_theta_pool(
             # Deterministic offset per attempt so cache is reproducible.
             batch_seed = int(seed) + attempt - 1
             theta_batch, batch_names = _sample_prior_batch(
-                priors_csv, submodel_priors_yaml, batch_n, batch_seed, vary_policy=vary_policy
+                priors_csv,
+                submodel_priors_yaml,
+                batch_n,
+                batch_seed,
+                vary_policy=vary_policy,
+                derived_yaml=derived_yaml,
             )
             if list(batch_names) == list(clf.feature_order):
                 keep = clf.accept(theta_batch, threshold=restriction_threshold)
@@ -312,6 +354,7 @@ def theta_for_indices(
     restriction_threshold: float = 0.5,
     classifier_feature_fills: Optional[Mapping[str, float]] = None,
     vary_policy: Optional[Union[str, Path]] = None,
+    derived_yaml: Optional[Union[str, Path]] = None,
 ) -> np.ndarray:
     """Slice the theta pool by integer ``sample_index`` array.
 
@@ -328,6 +371,7 @@ def theta_for_indices(
         restriction_threshold=restriction_threshold,
         classifier_feature_fills=classifier_feature_fills,
         vary_policy=vary_policy,
+        derived_yaml=derived_yaml,
     )
     indices = np.asarray(indices, dtype=np.int64)
     if indices.size and (indices.min() < 0 or indices.max() >= n_total):

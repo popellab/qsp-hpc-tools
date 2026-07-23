@@ -99,6 +99,38 @@ def test_load_vary_list_rejects_empty(tmp_path):
         _load_vary_list(empty)
 
 
+def test_cache_path_changes_with_derived_yaml(tmp_path):
+    """A derived-parameter policy keys a distinct pool with a ``_derived`` suffix,
+    and editing the policy content changes the hash."""
+    priors = _make_priors_csv(tmp_path)
+    d_a = tmp_path / "derived_a.yaml"
+    d_a.write_text(
+        "parameters:\n  p1:\n    parents: {p0: 1.0}\n    log_coeff: -0.5\n    sigma_coeff: 0.4\n"
+    )
+    d_b = tmp_path / "derived_b.yaml"
+    d_b.write_text(
+        "parameters:\n  p1:\n    parents: {p0: 1.0}\n    log_coeff: -1.0\n    sigma_coeff: 0.4\n"
+    )
+
+    p_none = theta_pool_cache_path(tmp_path, priors, None, 1, 100)
+    p_a = theta_pool_cache_path(tmp_path, priors, None, 1, 100, derived_yaml=d_a)
+    p_b = theta_pool_cache_path(tmp_path, priors, None, 1, 100, derived_yaml=d_b)
+    assert len({p_none, p_a, p_b}) == 3
+    assert str(p_a).endswith("_derived.npy")
+
+
+def test_derived_yaml_requires_submodel_yaml(tmp_path):
+    """Derived params inject into the composite copula prior, so a derived policy
+    with no submodel YAML is a misconfiguration — fail loudly."""
+    priors = _make_priors_csv(tmp_path)
+    d = tmp_path / "derived.yaml"
+    d.write_text(
+        "parameters:\n  p1:\n    parents: {p0: 1.0}\n    log_coeff: -0.5\n    sigma_coeff: 0.4\n"
+    )
+    with pytest.raises(ValueError, match="requires a submodel_priors.yaml"):
+        get_theta_pool(priors, None, seed=1, n_total=10, cache_dir=tmp_path / "c", derived_yaml=d)
+
+
 def test_restricted_pool_uses_classifier(tmp_path):
     """Classifier-restricted pool should only contain accepted thetas."""
     pytest.importorskip("sklearn")

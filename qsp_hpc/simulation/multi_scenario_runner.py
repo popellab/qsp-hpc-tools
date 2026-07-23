@@ -1161,29 +1161,55 @@ class MultiScenarioRunner:
                 f"the shipped test_stats_csv has {len(ts_ids)} — pool may have been "
                 "derived with a different cal-target CSV."
             )
-        if hpc_sample_index is None or len(hpc_sample_index) != n_samples:
+        if hpc_sample_index is None or len(hpc_sample_index) == 0:
             raise RuntimeError(
-                f"HPC fused PPC returned "
-                f"{0 if hpc_sample_index is None else len(hpc_sample_index)} rows "
-                f"but caller expects {n_samples} — derivation incomplete?"
+                "HPC fused PPC returned 0 rows but caller expects "
+                f"{n_samples} — derivation incomplete?"
             )
-        # Reorder rows so they match ctx.sample_indices (arange(n)).
-        order = (
-            pd.Series(np.arange(len(hpc_sample_index)), index=hpc_sample_index)
-            .reindex(ctx.sample_indices)
-            .to_numpy()
-        )
-        if np.any(np.isnan(order.astype(np.float64))):
+        # Reorder rows so they match ctx.sample_indices (arange(n)). A handful
+        # of tasks can fail on the cluster (e.g. CVODE cannot integrate an
+        # extreme theta draw), leaving their sample_index absent. Rather than
+        # abort the whole run, NaN-fill the missing rows and flag status=1 —
+        # identical to how a sim that returned NaN is already handled, so the
+        # downstream joint NaN filter / valid-cohort filter drops them. Only a
+        # large shortfall (systemic breakage) still raises.
+        # A retried/duplicated cluster task can emit the same sample_index
+        # twice; the rows are identical (same theta -> same result), so keep
+        # the first and drop the rest before reindexing.
+        order_series = pd.Series(np.arange(len(hpc_sample_index)), index=hpc_sample_index)
+        n_dup = int(order_series.index.duplicated().sum())
+        if n_dup:
+            logger.warning(
+                "HPC fused PPC had %d duplicate sample_index rows "
+                "(retried tasks); keeping first.",
+                n_dup,
+            )
+            order_series = order_series[~order_series.index.duplicated(keep="first")]
+        order = order_series.reindex(ctx.sample_indices).to_numpy()
+        missing = np.isnan(order.astype(np.float64))
+        n_missing = int(missing.sum())
+        max_missing_frac = 0.10
+        if n_missing > max_missing_frac * n_samples:
             raise RuntimeError(
-                "HPC fused PPC sample_index missing rows expected by caller "
-                "— derivation incomplete?"
+                f"HPC fused PPC missing {n_missing}/{n_samples} rows "
+                f"(> {max_missing_frac:.0%}) — derivation likely broken, not "
+                "just a few failed sims."
             )
-        hpc_test_stats = hpc_test_stats[order.astype(np.int64)]
+        if n_missing:
+            logger.warning(
+                "HPC fused PPC missing %d/%d rows (failed sims); NaN-filling "
+                "and flagging status=1 so the NaN/valid-cohort filter drops them.",
+                n_missing,
+                n_samples,
+            )
+        safe_order = np.where(missing, 0, order).astype(np.int64)
+        hpc_test_stats = hpc_test_stats[safe_order].astype(np.float64)
+        hpc_test_stats[missing, :] = np.nan
 
         theta = ctx.theta
         cols: dict[str, pa.Array] = {
             "sample_index": pa.array(ctx.sample_indices.astype(np.int64), type=pa.int64()),
-            "status": pa.array(np.zeros(n_samples, dtype=np.int64), type=pa.int64()),
+            "status": pa.array(missing.astype(np.int64), type=pa.int64()),
         }
         for j, pname in enumerate(sim.param_names):
             cols[f"param:{pname}"] = pa.array(theta[:, j].astype(np.float64))

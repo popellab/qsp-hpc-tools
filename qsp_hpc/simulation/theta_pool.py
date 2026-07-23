@@ -71,11 +71,10 @@ def _load_vary_list(vary_policy: Optional[Union[str, Path]]) -> Optional[list[st
     """
     if vary_policy is None:
         return None
-    from ruamel.yaml import YAML
+    import yaml
 
-    yaml = YAML()
     with open(vary_policy) as f:
-        data = yaml.load(f)
+        data = yaml.safe_load(f)
     vary = list((data or {}).get("vary") or [])
     if not vary:
         raise ValueError(f"vary policy {vary_policy} has no non-empty `vary:` list")

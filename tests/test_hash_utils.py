@@ -308,7 +308,7 @@ class TestGenerateFilename:
 class TestComputePoolIdHash:
     """Regression tests for compute_pool_id_hash seed behaviour (#20).
 
-    Theta-pool draws are seed-dependent (qsp_hpc/simulation/theta_pool.py
+    Theta-pool draws are seed-dependent (qsp_inference.priors.theta_pool
     keys on seed), so row sample_index=i points at a different theta
     under a different seed. Before #20, the sim-pool dir was seed-blind,
     so Run 2 at seed=B silently served cached sims from Run 1 at seed=A.

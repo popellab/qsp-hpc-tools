@@ -464,19 +464,23 @@ class QSPSimulator:
 
         Replaces the old stateful ``_generate_parameters(n)`` whose draws
         depended on prior call history, which broke cross-scenario theta
-        alignment. See :mod:`qsp_hpc.simulation.theta_pool`.
-        """
-        from qsp_hpc.simulation.theta_pool import theta_for_indices
+        alignment. See :mod:`qsp_inference.priors.theta_pool`.
 
-        n_total = self.theta_pool_size
-        return theta_for_indices(
-            indices=indices,
-            priors_csv=self.priors_csv,
-            submodel_priors_yaml=self.submodel_priors_yaml,
+        This simulator takes no vary policy, derived policy or proposal
+        temperature, so its spec is the plain composite (or CSV-only) prior.
+        That is not an oversight: it is the MATLAB-era path, and the knobs
+        landed on the C++ one.
+        """
+        from qsp_inference.priors import PriorSpec, ThetaPoolSpec, theta_for_indices
+
+        smp = self.submodel_priors_yaml
+        smp = str(smp) if smp is not None and Path(smp).exists() else None
+        spec = ThetaPoolSpec(
+            prior=PriorSpec(priors_csv=str(self.priors_csv), submodel_priors_yaml=smp),
             seed=self.seed,
-            n_total=n_total,
-            cache_dir=Path(self.cache_dir) / "theta_pools",
+            n_total=self.theta_pool_size,
         )
+        return theta_for_indices(indices, spec, Path(self.cache_dir) / "theta_pools")
 
     def _format_number(self, value: float) -> str:
         """

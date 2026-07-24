@@ -1904,3 +1904,83 @@ class TestNamedObservableColumns:
         sim2 = self._sim(priors_csv, binary_path, template_path, cache_dir, tmp_path, ts_csv)
         with pytest.raises(RuntimeError, match="different calibration-target set"):
             sim2._load_local_test_stats(path)
+
+
+class TestPoolSpecSeam:
+    """CppSimulator delegates theta identity to qsp-inference's ThetaPoolSpec.
+
+    The pool's own behaviour is tested where it lives. What has to be tested
+    here is the seam: that the simulator hands over the right inputs, and that
+    the config hash still moves when the theta distribution moves. That last
+    property used to be maintained by hand in three places, and the failure mode
+    is silent reuse of simulations run under a different prior.
+    """
+
+    def _sim(self, priors_csv, binary_path, template_path, cache_dir, **kwargs):
+        from qsp_hpc.simulation.cpp_simulator import CppSimulator
+
+        return CppSimulator(
+            priors_csv=priors_csv,
+            binary_path=binary_path,
+            template_xml=template_path,
+            cache_dir=cache_dir,
+            **kwargs,
+        )
+
+    def test_spec_carries_the_simulator_settings(
+        self, priors_csv, binary_path, template_path, cache_dir
+    ):
+        sim = self._sim(
+            priors_csv, binary_path, template_path, cache_dir, seed=99, theta_pool_size=4242
+        )
+        assert sim.pool_spec.seed == 99
+        assert sim.pool_spec.n_total == 4242
+        assert sim.pool_spec.prior.priors_csv == str(priors_csv)
+
+    def test_missing_submodel_yaml_falls_back_to_csv_only(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        """Preserved behaviour: the old sampler tested .exists() and fell back."""
+        sim = self._sim(
+            priors_csv,
+            binary_path,
+            template_path,
+            cache_dir,
+            submodel_priors_yaml=tmp_path / "nope.yaml",
+        )
+        assert sim.pool_spec.prior.submodel_priors_yaml is None
+
+    def test_config_hash_moves_with_the_theta_distribution(
+        self, priors_csv, binary_path, template_path, cache_dir, tmp_path
+    ):
+        base = self._sim(priors_csv, binary_path, template_path, cache_dir)
+        variants = {
+            "seed": self._sim(
+                priors_csv, binary_path, template_path, cache_dir, seed=base.seed + 1
+            ),
+            "pool size": self._sim(
+                priors_csv,
+                binary_path,
+                template_path,
+                cache_dir,
+                theta_pool_size=base.theta_pool_size + 1,
+            ),
+        }
+        for name, sim in variants.items():
+            assert sim.config_hash != base.config_hash, f"{name} did not key a pool"
+
+    def test_generate_parameters_uses_the_shared_pool(
+        self, priors_csv, binary_path, template_path, cache_dir
+    ):
+        sim = self._sim(priors_csv, binary_path, template_path, cache_dir, theta_pool_size=64)
+        idx = np.array([5, 1, 63])
+        theta = sim._generate_parameters(idx)
+        assert theta.shape[0] == 3
+        # Same indices, same rows: the pool is what makes cross-scenario
+        # alignment an integer-set intersection.
+        assert np.array_equal(theta, sim._generate_parameters(idx))
+
+    def test_out_of_range_index_raises(self, priors_csv, binary_path, template_path, cache_dir):
+        sim = self._sim(priors_csv, binary_path, template_path, cache_dir, theta_pool_size=16)
+        with pytest.raises(IndexError, match="out of range"):
+            sim._generate_parameters(np.array([16]))

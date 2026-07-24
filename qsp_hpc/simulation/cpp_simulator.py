@@ -272,6 +272,13 @@ class CppSimulator:
             evolve_trajectory_dt_days=self.evolve_trajectory_dt_days,
         )
 
+        # The theta pool this simulator draws from, as one object owned by
+        # qsp-inference. It answers both "what were these theta drawn from" and
+        # "which pool is this" — questions that used to be answered separately
+        # here, in qsp_hpc.simulation.theta_pool, and again in the calling
+        # project, by three implementations that had to agree and did not.
+        self.pool_spec = self._build_pool_spec()
+
         self.config_hash = self._compute_config_hash()
 
         pool_name = f"{model_version}_{self.config_hash[:HASH_PREFIX_LENGTH]}_{scenario}"
@@ -318,17 +325,58 @@ class CppSimulator:
         for line in format_config(config_info):
             self.logger.info(line)
 
+    def _build_pool_spec(self):
+        """The theta pool this simulator draws from.
+
+        A missing ``submodel_priors.yaml`` is normalized to ``None`` rather than
+        raising, which is what the previous sampler did (it tested ``.exists()``
+        and fell back to the CSV). Preserved deliberately so this change is not
+        also a behaviour change, but it is worth knowing that a typo in the path
+        silently downgrades a composite prior to the CSV-only one.
+        """
+        from qsp_inference.priors import PriorSpec, ThetaPoolSpec
+
+        smp = self.submodel_priors_yaml
+        smp = str(smp) if smp is not None and Path(smp).exists() else None
+        return ThetaPoolSpec(
+            prior=PriorSpec(
+                priors_csv=str(self.priors_csv),
+                submodel_priors_yaml=smp,
+                vary_policy=str(self.vary_policy) if self.vary_policy else None,
+                derived_yaml=str(self.derived_yaml) if self.derived_yaml else None,
+                proposal_temperature=self.proposal_temperature,
+            ),
+            seed=self.seed,
+            n_total=self.theta_pool_size,
+            restriction_classifier_dir=(
+                str(self.restriction_classifier_dir)
+                if self.restriction_classifier_dir is not None
+                else None
+            ),
+            restriction_threshold=self.restriction_threshold,
+            classifier_feature_fills=self.classifier_feature_fills,
+        )
+
     def _compute_config_hash(self) -> str:
         """Hash inputs that affect simulation outputs.
 
-        Extends the standard pool-id hash with the template XML content
-        so editing the template invalidates the cache. The C++ binary's
-        SHA-256 is folded in by :func:`compute_pool_id_hash` directly
-        (#56) so the same hash agrees across CppSimulator,
-        :class:`SimulationPool`, and :class:`QSPResultLoader`. When a
-        restriction classifier is configured, its bytes + threshold are
-        folded in so restricted and unrestricted pools (sharing all
-        other config) get distinct on-disk pool dirs.
+        Two parts, and the split is the point:
+
+        - Everything about *what distribution theta came from* is
+          ``pool_spec.fingerprint()``: priors CSV, submodel YAML, vary policy,
+          derived policy, proposal temperature, seed, pool size, restriction
+          classifier and threshold. That used to be open-coded here, and again
+          in ``qsp_hpc.simulation.theta_pool``, and again in the calling
+          project. Three copies of one identity, each of which had to be
+          updated in lockstep for a new knob, and none of which raised when it
+          was not.
+        - Everything about *what the simulator does with theta* stays here: the
+          binary, the XML template, and the scenario / drug-metadata /
+          healthy-state YAMLs.
+
+        The C++ binary's SHA-256 is folded in by :func:`compute_pool_id_hash`
+        so the hash agrees across CppSimulator, :class:`SimulationPool` and
+        :class:`QSPResultLoader`.
         """
         from qsp_hpc.utils.hash_utils import compute_pool_id_hash_legacy as compute_pool_id_hash
 
@@ -348,37 +396,11 @@ class CppSimulator:
         for yml in (self.scenario_yaml, self.drug_metadata_yaml, self.healthy_state_yaml):
             if yml is not None:
                 h.update(yml.read_bytes())
-        # Restriction classifier: when set, the theta pool is a rejection-
-        # sampled subset of the prior. Fold classifier bytes + threshold
-        # into the hash so restricted and unrestricted pools (sharing all
-        # other config) get distinct on-disk directories.
-        if self.restriction_classifier_dir is not None:
-            h.update(b"|restriction|")
-            pkl = self.restriction_classifier_dir / "classifier.pkl"
-            meta = self.restriction_classifier_dir / "metadata.json"
-            if pkl.exists():
-                h.update(pkl.read_bytes())
-            if meta.exists():
-                h.update(meta.read_bytes())
-            h.update(f"|tau={self.restriction_threshold:.6f}".encode("utf-8"))
-            if self.classifier_feature_fills:
-                fills_str = ",".join(
-                    f"{k}={float(v):.12g}" for k, v in sorted(self.classifier_feature_fills.items())
-                )
-                h.update(f"|fills={fills_str}".encode("utf-8"))
-        # σ-overlay vary/pin policy: when set, the theta pool is drawn from a
-        # different (overlaid) prior, so its content must key a distinct pool.
-        if self.vary_policy is not None and self.vary_policy.exists():
-            h.update(b"|vary_policy|")
-            h.update(self.vary_policy.read_text().encode("utf-8"))
-        if self.derived_yaml is not None and self.derived_yaml.exists():
-            h.update(b"|derived_yaml|")
-            h.update(self.derived_yaml.read_text().encode("utf-8"))
-        # A tempered proposal draws a different cloud, so its sims must not
-        # share a pool directory with an untempered run. T == 1.0 contributes
-        # nothing, keeping every pre-existing sim cache valid.
-        if self.proposal_temperature != 1.0:
-            h.update(f"|proposal_temperature={self.proposal_temperature:.12g}".encode("utf-8"))
+        # Everything identifying the theta distribution and the sample drawn
+        # from it, in one call. Adding a knob to the prior can no longer miss
+        # this hash, because there is nothing here to forget to update.
+        h.update(b"|theta_pool|")
+        h.update(self.pool_spec.fingerprint().encode("utf-8"))
         return h.hexdigest()
 
     def __del__(self):
@@ -457,22 +479,9 @@ class CppSimulator:
     # ------------------------------------------------------------------
 
     def _generate_parameters(self, indices: np.ndarray) -> np.ndarray:
-        from qsp_hpc.simulation.theta_pool import theta_for_indices
+        from qsp_inference.priors import theta_for_indices
 
-        return theta_for_indices(
-            indices=indices,
-            priors_csv=self.priors_csv,
-            submodel_priors_yaml=self.submodel_priors_yaml,
-            seed=self.seed,
-            n_total=self.theta_pool_size,
-            cache_dir=self.cache_dir / "theta_pools",
-            restriction_classifier_dir=self.restriction_classifier_dir,
-            restriction_threshold=self.restriction_threshold,
-            classifier_feature_fills=self.classifier_feature_fills,
-            vary_policy=self.vary_policy,
-            derived_yaml=self.derived_yaml,
-            proposal_temperature=self.proposal_temperature,
-        )
+        return theta_for_indices(indices, self.pool_spec, self.cache_dir / "theta_pools")
 
     # ------------------------------------------------------------------
     # Main entry point

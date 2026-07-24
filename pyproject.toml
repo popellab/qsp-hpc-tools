@@ -32,17 +32,15 @@ dependencies = [
     "pyyaml>=5.4",
     "click>=8.0",
     "pint>=0.25",  # For unit-aware test statistic calculations
+    # Owns the theta pool: both what the cloud is drawn from (composite prior,
+    # sigma-overlay, derived params, proposal temperature) and which pool that
+    # is. Promoted from an optional extra to a hard dependency because every
+    # simulator now takes its theta from it; there is no configuration in which
+    # a simulation runs without it.
+    "qsp-inference @ git+https://github.com/popellab/qsp-inference.git@main",
 ]
 
 [project.optional-dependencies]
-# theta_pool builds its cloud from qsp-inference's copula priors (composite /
-# sigma-overlay / derived / tempered) and rejection-samples with its
-# RestrictionClassifier. That is the only feature here that needs it, so it is an
-# extra rather than a hard dependency — and the imports in theta_pool.py are
-# function-local to match. Install with: pip install "qsp-hpc-tools[priors]"
-priors = [
-    "qsp-inference @ git+https://github.com/popellab/qsp-inference.git@main",
-]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=3.0",

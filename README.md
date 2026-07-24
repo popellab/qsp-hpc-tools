@@ -24,8 +24,9 @@ A Python package for running quantitative systems pharmacology (QSP) simulations
   pre-diagnosis trajectories with `--evolve-trajectory-out` / `evolve_trajectory_dir`
   and reuse post-evolve ODE state across scenarios (~N× speedup on the dominant
   term). See [docs/EVOLVE_TRAJECTORIES.md](docs/EVOLVE_TRAJECTORIES.md).
-- **Classifier-restricted theta pool**: `get_theta_pool(...,
-  restriction_classifier_dir=...)` rejection-samples the prior against a
+- **Classifier-restricted theta pool**: the pool is owned by
+  `qsp_inference.priors.theta_pool`; pass a `restriction_classifier_dir` to
+  `CppSimulator` and it rejection-samples the prior against a
   `qsp_inference.inference.RestrictionClassifier` so simulator jobs aren't
   wasted on draws that always fail. Supports `lognormal` / `normal` /
   `uniform` / `beta` priors in the CSV.

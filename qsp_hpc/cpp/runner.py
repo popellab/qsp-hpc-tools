@@ -46,7 +46,20 @@ _SUPPORTED_VERSION = 3
 
 
 class QspSimError(RuntimeError):
-    """`qsp_sim` exited nonzero or produced unreadable output."""
+    """`qsp_sim` exited nonzero or produced unreadable output.
+
+    ``returncode`` and ``stderr`` are fields, not just prose in the message. The
+    driver returns 2 when the model-init hook rejects a theta and dies on a
+    signal when the solver gives out, so the exit code separates "this theta is
+    not an admissible patient" from "we could not integrate it". Those are
+    different facts and a caller filtering on failure has no other way to tell
+    them apart. ``None`` when the failure was not a subprocess exit.
+    """
+
+    def __init__(self, message: str, *, returncode: int | None = None, stderr: str | None = None):
+        super().__init__(message)
+        self.returncode = returncode
+        self.stderr = stderr
 
 
 class BinaryFormatError(RuntimeError):
@@ -410,7 +423,9 @@ class CppRunner:
             raise QspSimError(
                 f"qsp_sim exited {proc.returncode} for sim {sim_id}.\n"
                 f"  XML: {stash}\n"
-                f"  stderr:\n{_indent(proc.stderr)}"
+                f"  stderr:\n{_indent(proc.stderr)}",
+                returncode=proc.returncode,
+                stderr=proc.stderr,
             )
 
         try:
@@ -543,7 +558,9 @@ class CppRunner:
             raise QspSimError(
                 f"qsp_sim --dump-state exited {proc.returncode} for sim "
                 f"{sim_id}.\n  XML: {stash}\n"
-                f"  stderr:\n{_indent(proc.stderr)}"
+                f"  stderr:\n{_indent(proc.stderr)}",
+                returncode=proc.returncode,
+                stderr=proc.stderr,
             )
         if not out.exists():
             stash = self._stash_failure(work, sim_id, xml_path, reason="dump-missing-output")

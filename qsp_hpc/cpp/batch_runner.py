@@ -52,9 +52,70 @@ from qsp_hpc.cpp.runner import CppRunner, QspSimError, SimResult
 logger = logging.getLogger(__name__)
 
 
+# Status codes written to the ``status`` column. Everything downstream tests
+# ``status == 0``, so adding codes above 2 does not change any existing filter.
+#
+# The split below the line matters because "failed" was carrying two unrelated
+# claims. A rejected theta is a statement about the patient: the model-init hook
+# ran fine and decided this parameter vector does not describe an admissible one.
+# A dead solver is a statement about us. Collapsing them means a caller cannot
+# tell whether a prior is generating implausible people or merely stiff ODEs, and
+# those call for opposite fixes. They also differ in whether the rejection is
+# information: a screen rejection is a selection effect that arguably belongs in
+# the population model, while an integration failure is only ever waste.
 STATUS_OK = 0
-STATUS_FAILED = 1
+STATUS_FAILED = 1  # the solver died: crash, signal, timeout, unreadable output
 STATUS_FUTURE_TIMEOUT = 2  # worker future never completed (pool broken / hung worker)
+STATUS_INIT_REJECTED = 3  # model-init hook rejected theta, reason not recognised
+STATUS_INIT_REJECTED_FAST = 4  # hook rejected: target reached too fast
+STATUS_INIT_REJECTED_SLOW = 5  # hook rejected: target not reached in the window
+STATUS_INIT_REJECTED_DEGENERATE = 6  # hook rejected: already at target at t=0
+
+#: Exit code the qsp_sim driver returns when the model-init hook rejects theta.
+#: See qsp-codegen ``cpp/src/qsp_sim_main.cpp``: ``if (!er.success) ... return 2``.
+#: Any other nonzero exit, or death by signal, is a solver failure.
+INIT_REJECT_EXIT_CODE = 2
+
+#: stderr token -> status. The hook writes ``reject_reason`` to stderr and the
+#: driver passes it through untouched. Tokens rather than prose: a model owns its
+#: own reject reasons and the wording is its business, so matching on the phrasing
+#: would make this file break every time someone reworded an error. A model that
+#: emits no token still lands in STATUS_INIT_REJECTED, which is honest -- rejected,
+#: reason not classified -- rather than silently miscounted as a solver failure.
+INIT_REJECT_TOKENS = {
+    "EVOLVE_TOO_FAST": STATUS_INIT_REJECTED_FAST,
+    "EVOLVE_TOO_SLOW": STATUS_INIT_REJECTED_SLOW,
+    "EVOLVE_DEGENERATE": STATUS_INIT_REJECTED_DEGENERATE,
+}
+
+#: Every code that means the hook rejected theta rather than the solver failing.
+STATUS_INIT_REJECTED_ALL = frozenset({STATUS_INIT_REJECTED, *INIT_REJECT_TOKENS.values()})
+
+#: Code -> label, for reports that have to say which failure a run hit.
+STATUS_LABELS = {
+    STATUS_OK: "ok",
+    STATUS_FAILED: "solver_failed",
+    STATUS_FUTURE_TIMEOUT: "worker_timeout",
+    STATUS_INIT_REJECTED: "rejected_unclassified",
+    STATUS_INIT_REJECTED_FAST: "rejected_too_fast",
+    STATUS_INIT_REJECTED_SLOW: "rejected_too_slow",
+    STATUS_INIT_REJECTED_DEGENERATE: "rejected_degenerate",
+}
+
+
+def classify_failure(exc: BaseException) -> int:
+    """Failed-sim exception -> status code.
+
+    Falls back to :data:`STATUS_FAILED` for anything that is not a recognised
+    init rejection, including exceptions with no exit code at all.
+    """
+    if getattr(exc, "returncode", None) != INIT_REJECT_EXIT_CODE:
+        return STATUS_FAILED
+    stderr = getattr(exc, "stderr", None) or ""
+    for token, status in INIT_REJECT_TOKENS.items():
+        if token in stderr:
+            return status
+    return STATUS_INIT_REJECTED
 
 
 POOL_MANIFEST_FILENAME = "pool_manifest.json"
@@ -416,7 +477,7 @@ def _run_one_in_worker(
         # a reusable evolve state for that theta.
         return (
             sim_id,
-            STATUS_FAILED,
+            classify_failure(e),
             None,
             None,
             None,
@@ -528,7 +589,9 @@ def _run_one_fused_in_worker(
                         name,
                         str(e)[:120],
                     )
-                    results.append((name, STATUS_FAILED, None, None, None, None, None, str(e)))
+                    results.append(
+                        (name, classify_failure(e), None, None, None, None, None, str(e))
+                    )
         finally:
             evolve_state_path.unlink(missing_ok=True)
         logging.getLogger(__name__).debug(
@@ -552,10 +615,11 @@ def _run_one_fused_in_worker(
             sim_id,
             str(e)[:120],
         )
-        err = str(e)
+        # One classification for every arm: the evolve is shared, so if it
+        # rejected theta then every arm was rejected for that same reason.
+        err, status = str(e), classify_failure(e)
         results = [
-            (name, STATUS_FAILED, None, None, None, None, None, err)
-            for (name, _s, _d) in scenario_specs
+            (name, status, None, None, None, None, None, err) for (name, _s, _d) in scenario_specs
         ]
         return (sim_id, theta_hash, evolve_blob, results)
 
